@@ -28,6 +28,70 @@ models.AbFlow.AbFlow_model.isMEANModel = models.AbFlow.AbFlow_model.AbFlowModel
 models.AbFlow.AbFlow_model.dyMEANModel = models.AbFlow.AbFlow_model.AbFlowModel
 models.AbFlow.AbFlowOpt_model.isMEANOptModel = models.AbFlow.AbFlowOpt_model.AbFlowOptModel
 
+def load_model_compat(ckpt_path, map_location='cpu'):
+    """
+    Compatible loader for AbFlow checkpoints saved as full model objects.
+
+    Some newer PyTorch versions support weights_only=False, while the
+    current dymean0 environment does not. We first try the newer API and
+    fall back to the old API when weights_only is unsupported.
+    """
+    try:
+        return torch.load(ckpt_path, map_location=map_location, weights_only=False)
+    except TypeError as e:
+        if 'weights_only' in str(e):
+            print_log(
+                '[Compatibility] This PyTorch does not support '
+                'torch.load(..., weights_only=False). Falling back to torch.load(...).'
+            )
+            return torch.load(ckpt_path, map_location=map_location)
+        raise
+
+
+def ensure_model_runtime_compat(model):
+    """
+    Runtime compatibility for old checkpoints loaded under newer AbFlow code.
+
+    Old AbFlow checkpoints were saved as full Python model objects. Loading them
+    under a modified AbFlowModel class does not re-run __init__, so newly added
+    attributes may be absent. We add safe defaults here.
+
+    For old non-ScoreFM checkpoints, use_scorefm defaults to False so inference
+    can keep the original AbFlow sampling behavior, provided AbFlowModel.sample
+    checks this flag.
+    """
+    if not hasattr(model, 'pep_seq'):
+        model.pep_seq = True
+    if not hasattr(model, 'pep_struct'):
+        model.pep_struct = True
+
+    if hasattr(model, '_ensure_scorefm_compat'):
+        model._ensure_scorefm_compat()
+
+    defaults = {
+        'use_scorefm': False,
+        'scorefm_min_sigma': 5e-2,
+        'scorefm_eps': 1e-8,
+        'scorefm_t_threshold': 0.50,
+        'scorefm_loss_weight': 5e-2,
+        'scorefm_velocity_weight': 1.0,
+        'scorefm_dsm_weight': 1.0,
+        'scorefm_x1_weight': 0.25,
+        'scorefm_local_dist_weight': 0.05,
+        'scorefm_interface_contact_weight': 0.05,
+        'scorefm_inter_clash_weight': 0.01,
+        'scorefm_intra_clash_weight': 0.005,
+        'scorefm_contact_cutoff': 8.0,
+        'scorefm_contact_temperature': 1.0,
+        'scorefm_inter_clash_cutoff': 2.0,
+        'scorefm_intra_clash_cutoff': 1.5,
+        'last_scorefm_losses': {},
+    }
+    for name, value in defaults.items():
+        if not hasattr(model, name):
+            setattr(model, name, value)
+
+    return model
 
 def to_cplx(ori_cplx, ab_x, ab_s) -> AgAbComplex:
     heavy_chain, light_chain = [], []
@@ -75,12 +139,12 @@ def to_cplx(ori_cplx, ab_x, ab_s) -> AgAbComplex:
 def generate(args):
 
     # load model
-    model = torch.load(args.ckpt, map_location='cpu', weights_only=False)
-    if not hasattr(model, 'pep_seq'):
-        model.pep_seq = True
-    if not hasattr(model, 'pep_struct'):
-        model.pep_struct = True
+    # load model
+    model = load_model_compat(args.ckpt, map_location='cpu')
+    model = ensure_model_runtime_compat(model)
+
     device = torch.device('cpu' if args.gpu == -1 else f'cuda:{args.gpu}')
+    
     model.to(device)
     model.eval()
 
@@ -109,15 +173,30 @@ def generate(args):
     
     idx = 0
     summary_items = []
-    for batch in tqdm(test_loader):
+    batch_pbar = tqdm(
+        test_loader,
+        total=len(test_loader),
+        desc='Generating batches',
+        dynamic_ncols=True
+    )
+
+    for batch_idx, batch in enumerate(batch_pbar):
+        batch_pbar.set_postfix(batch=f'{batch_idx + 1}/{len(test_loader)}')
         with torch.no_grad():
             # move data
             for k in batch:
                 if hasattr(batch[k], 'to'):
                     batch[k] = batch[k].to(device)
             # generate
-            del batch['xloss_mask']
-            X, S, pmets = model.sample(**batch)
+            if 'xloss_mask' in batch:
+                del batch['xloss_mask']
+
+            X, S, pmets = model.sample(
+                **batch,
+                n_steps=args.n_steps,
+                show_progress=args.show_sample_progress,
+                progress_desc=f'Batch {batch_idx + 1}/{len(test_loader)} ODE'
+            )
 
             X, S, pmets = X.tolist(), S.tolist(), pmets.tolist()
             X_list, S_list = [], []
@@ -174,7 +253,13 @@ def parse():
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of workers to use')
 
+    parser.add_argument('--n_steps', type=int, default=10,
+                        help='Number of flow sampling steps')
+    parser.add_argument('--show_sample_progress', action='store_true',
+                        help='Show inner progress bar for flow sampling steps')
+
     parser.add_argument('--gpu', type=int, default=-1, help='GPU to use, -1 for cpu')
+    
     parser.add_argument('--pep_file', type=str, nargs='?', const='all_data/RAbD/test.pkl', default=None)
     return parser.parse_args()
 
