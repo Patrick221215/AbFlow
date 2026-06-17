@@ -43,6 +43,10 @@ class AbFlowModel(nn.Module):
         self.keep_memory = keep_memory
         if self.backbone_only:
             n_channel = 4
+        # Effective coordinate channel number after backbone_only.
+        # Score-FM is defined directly on AbFlow full-atom Cartesian coordinates
+        # X ∈ R^{N x n_channel x 3}, so all coordinate losses must use this value.
+        self.n_channel = n_channel
         self.cdr_type = cdr_type
         self.paratope = paratope
 
@@ -106,6 +110,40 @@ class AbFlowModel(nn.Module):
 
         # training related cache
         self.batch_constants = {}
+
+        # =========================================================
+        # Coordinate Score-Factorized Flow Matching losses
+        # =========================================================
+        # We follow the AbX score-based principle at the level of AbFlow's
+        # coordinate path: the network predicts a clean endpoint X_1^theta,
+        # and the score is analytically induced from p_t(X_t | X_1^theta).
+        # No arbitrary score head is introduced here.
+        #
+        # Path:               X_t = (1 - t) X_0 + t X_1
+        # sigma_t:            sigma_t = 1 - t
+        # conditional score:  s_t(X_t | X_1) = -(X_t - t X_1) / sigma_t^2
+        self.scorefm_min_sigma = 5e-2
+        self.scorefm_eps = 1e-8
+        self.scorefm_t_threshold = 0.50
+
+        # Overall weight of the new objective. The component weights below are
+        # active by default; they are not placeholders. Keep the global weight
+        # conservative because AbFlow already has sequence, structure and docking losses.
+        self.scorefm_loss_weight = 5e-2
+        self.scorefm_velocity_weight = 1.0
+        self.scorefm_dsm_weight = 1.0
+        self.scorefm_x1_weight = 0.25
+        self.scorefm_local_dist_weight = 0.05
+        self.scorefm_interface_contact_weight = 0.05
+        self.scorefm_inter_clash_weight = 0.01
+        self.scorefm_intra_clash_weight = 0.005
+
+        # Geometry constants for auxiliary coordinate losses.
+        self.scorefm_contact_cutoff = 8.0
+        self.scorefm_contact_temperature = 1.0
+        self.scorefm_inter_clash_cutoff = 2.0
+        self.scorefm_intra_clash_cutoff = 1.5
+        self.last_scorefm_losses = {}
 
         # self.timing_stats = {
         #     'surface_processing': 0.0,
@@ -329,7 +367,257 @@ class AbFlowModel(nn.Module):
         is_binding = dist <= self.bind_dist_cutoff
         return is_binding
     
-    def _forward(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths, init_noise=None):
+    def _raw_interface_to_model_frame(self, interface_X, paratope_mask, batch_id):
+        """Convert raw paratope coordinates into AbFlow's internal shadow frame.
+
+        `_forward` centers the antigen/antibody and normalizes coordinates before
+        message passing. Shadow paratope coordinates are later uncentered with
+        `_type=4`, i.e. by adding the antigen center. Therefore an externally
+        supplied raw X_t must be represented internally as:
+
+            X_t_model = (X_t_raw - antigen_center) / std.
+        """
+        interface_batch_id = batch_id[paratope_mask]
+        ag_centers = self.normalizer.ag_centers[interface_batch_id]
+        return self.normalizer.normalize(interface_X - ag_centers.unsqueeze(1))
+
+    def _coord_score_from_clean(self, Xt, clean_X, t, sigma_t):
+        """Analytic coordinate score for AbFlow's conditional path.
+
+        Path:
+            X_t = (1 - t) X_0 + t X_1, sigma_t = 1 - t
+        Conditional density:
+            p_t(X | X_1) = N(t X_1, sigma_t^2 I)
+        Score:
+            s_t(X_t | X_1) = -(X_t - t X_1) / sigma_t^2
+        """
+        return -(Xt - t * clean_X) / (sigma_t ** 2 + self.scorefm_eps)
+
+    def _masked_residue_mse(self, diff, atom_mask, interface_batch_id):
+        """ABX-style normalized vector MSE for [N_int, C, 3] tensors.
+
+        We first sum over xyz, average valid atom channels in each residue,
+        average residues inside each complex, then average complexes. This avoids
+        biasing the loss toward residues or complexes with more valid atoms.
+        """
+        atom_mask_f = atom_mask.to(diff.dtype)
+        atom_sq = (diff ** 2).sum(dim=-1) * atom_mask_f  # [N_int, C]
+        per_res = atom_sq.sum(dim=-1) / atom_mask_f.sum(dim=-1).clamp_min(1.0)
+        per_graph = scatter_mean(per_res, interface_batch_id, dim=0)
+        return per_graph.mean()
+
+    def _masked_residue_smooth_l1(self, pred, target, atom_mask, interface_batch_id):
+        """ABX-style normalized SmoothL1 for coordinate tensors."""
+        atom_mask_f = atom_mask.to(pred.dtype)
+        err = F.smooth_l1_loss(pred, target, reduction='none').sum(dim=-1)  # [N_int, C]
+        err = err * atom_mask_f
+        per_res = err.sum(dim=-1) / atom_mask_f.sum(dim=-1).clamp_min(1.0)
+        per_graph = scatter_mean(per_res, interface_batch_id, dim=0)
+        return per_graph.mean()
+
+    def _local_ca_distance_loss(self, pred_X, true_X, interface_batch_id):
+        """Paratope internal C-alpha distance preservation.
+
+        This is a coordinate-level analogue of a distogram/FAPE stabilizer for
+        AbFlow, but it does not require adding a distogram head. It preserves the
+        local loop geometry of the generated paratope endpoint.
+        """
+        if pred_X.shape[0] <= 1:
+            return pred_X.new_tensor(0.0)
+        ca_idx = 1 if pred_X.shape[1] > 1 else 0
+        losses = []
+        for b in torch.unique(interface_batch_id):
+            mask = interface_batch_id == b
+            if mask.sum() <= 1:
+                continue
+            pred_ca = pred_X[mask, ca_idx]
+            true_ca = true_X[mask, ca_idx]
+            pred_d = torch.cdist(pred_ca, pred_ca)
+            true_d = torch.cdist(true_ca, true_ca)
+            tri = torch.triu(torch.ones_like(pred_d, dtype=torch.bool), diagonal=1)
+            if tri.any():
+                losses.append(F.smooth_l1_loss(pred_d[tri], true_d[tri]))
+        if len(losses) == 0:
+            return pred_X.new_tensor(0.0)
+        return torch.stack(losses).mean()
+
+    def _residue_min_dist(self, A, B, A_mask, B_mask):
+        """Minimum valid atom distance for every residue pair.
+
+        Args:
+            A: [Na, Ca, 3], B: [Nb, Cb, 3]
+            A_mask: [Na, Ca], B_mask: [Nb, Cb]
+        Returns:
+            min_d: [Na, Nb], valid_pair: [Na, Nb]
+        """
+        if A.shape[0] == 0 or B.shape[0] == 0:
+            return None, None
+        d = torch.norm(A[:, None, :, None, :] - B[None, :, None, :, :], dim=-1)  # [Na,Nb,Ca,Cb]
+        valid = A_mask[:, None, :, None] & B_mask[None, :, None, :]
+        d = d.masked_fill(~valid, 1e6)
+        min_d = d.flatten(2).min(dim=-1)[0]
+        valid_pair = valid.flatten(2).any(dim=-1)
+        return min_d, valid_pair
+
+    def _interface_contact_bce_loss(self, pred_X, true_interface_X, true_X, true_S,
+                                    paratope_mask, batch_id, segment_ids,
+                                    interface_batch_id, interface_atom_mask):
+        """Differentiable antigen-paratope contact recovery loss.
+
+        Ground-truth contacts are defined from native minimum atom distances,
+        and predictions use a smooth logit (cutoff - predicted_distance) / tau.
+        This directly targets interface contact quality without adding a new head.
+        """
+        atom_pos_full = self.aa_feature._construct_atom_pos(true_S)
+        atom_mask_full = atom_pos_full != self.aa_feature.atom_pos_pad_idx
+        ag_mask_full = segment_ids == self.aa_feature.ag_seg_id
+
+        losses = []
+        for b in torch.unique(interface_batch_id):
+            p_mask = interface_batch_id == b
+            a_mask = (batch_id == b) & ag_mask_full
+            if p_mask.sum() == 0 or a_mask.sum() == 0:
+                continue
+            pred_par = pred_X[p_mask]
+            true_par = true_interface_X[p_mask]
+            par_atom_mask = interface_atom_mask[p_mask]
+            ag_X = true_X[a_mask]
+            ag_atom_mask = atom_mask_full[a_mask]
+
+            pred_d, valid_pair = self._residue_min_dist(pred_par, ag_X, par_atom_mask, ag_atom_mask)
+            true_d, _ = self._residue_min_dist(true_par, ag_X, par_atom_mask, ag_atom_mask)
+            if pred_d is None or not valid_pair.any():
+                continue
+            label = (true_d < self.scorefm_contact_cutoff).to(pred_X.dtype)
+            logits = (self.scorefm_contact_cutoff - pred_d) / self.scorefm_contact_temperature
+            losses.append(F.binary_cross_entropy_with_logits(logits[valid_pair], label[valid_pair]))
+        if len(losses) == 0:
+            return pred_X.new_tensor(0.0)
+        return torch.stack(losses).mean()
+
+    def _interface_clash_loss(self, pred_X, true_X, true_S, batch_id, segment_ids,
+                              interface_batch_id, interface_atom_mask):
+        """Repel predicted paratope atoms from antigen atoms if they clash."""
+        atom_pos_full = self.aa_feature._construct_atom_pos(true_S)
+        atom_mask_full = atom_pos_full != self.aa_feature.atom_pos_pad_idx
+        ag_mask_full = segment_ids == self.aa_feature.ag_seg_id
+
+        losses = []
+        for b in torch.unique(interface_batch_id):
+            p_mask = interface_batch_id == b
+            a_mask = (batch_id == b) & ag_mask_full
+            if p_mask.sum() == 0 or a_mask.sum() == 0:
+                continue
+            p_atoms = pred_X[p_mask].reshape(-1, 3)
+            p_valid = interface_atom_mask[p_mask].reshape(-1)
+            a_atoms = true_X[a_mask].reshape(-1, 3)
+            a_valid = atom_mask_full[a_mask].reshape(-1)
+            p_atoms = p_atoms[p_valid]
+            a_atoms = a_atoms[a_valid]
+            if p_atoms.shape[0] == 0 or a_atoms.shape[0] == 0:
+                continue
+            d = torch.cdist(p_atoms, a_atoms)
+            losses.append(F.relu(self.scorefm_inter_clash_cutoff - d).pow(2).mean())
+        if len(losses) == 0:
+            return pred_X.new_tensor(0.0)
+        return torch.stack(losses).mean()
+
+    def _intra_paratope_clash_loss(self, pred_X, interface_atom_mask, interface_batch_id):
+        """Repel atoms from different paratope residues if they clash."""
+        losses = []
+        for b in torch.unique(interface_batch_id):
+            mask = interface_batch_id == b
+            if mask.sum() <= 1:
+                continue
+            Xb = pred_X[mask]
+            Mb = interface_atom_mask[mask]
+            n_res, n_ch = Mb.shape
+            atoms = Xb.reshape(-1, 3)
+            valid = Mb.reshape(-1)
+            res_ids = torch.arange(n_res, device=pred_X.device).repeat_interleave(n_ch)
+            atoms = atoms[valid]
+            res_ids = res_ids[valid]
+            if atoms.shape[0] <= 1:
+                continue
+            d = torch.cdist(atoms, atoms)
+            same_res = res_ids[:, None] == res_ids[None, :]
+            eye = torch.eye(d.shape[0], device=d.device, dtype=torch.bool)
+            valid_pair = ~(same_res | eye)
+            if valid_pair.any():
+                losses.append(F.relu(self.scorefm_intra_clash_cutoff - d[valid_pair]).pow(2).mean())
+        if len(losses) == 0:
+            return pred_X.new_tensor(0.0)
+        return torch.stack(losses).mean()
+
+    def _scorefm_loss(self, *, Xt, X0, X1, pred_clean_X, atom_mask,
+                      true_X, true_S, paratope_mask, batch_id, segment_ids,
+                      interface_batch_id, t, sigma_t):
+        """Complete coordinate Score-FM objective for AbFlow.
+
+        Components:
+          1) ABX-style scaled DSM on analytically induced coordinate scores.
+          2) Clean endpoint reconstruction for stability at high-noise states.
+          3) Velocity identity loss tying score matching back to flow matching.
+          4) Local C-alpha distance loss, a head-free distogram analogue.
+          5) Interface contact recovery loss.
+          6) Antigen-paratope and intra-paratope clash penalties.
+        """
+        gt_score = self._coord_score_from_clean(Xt, X1, t, sigma_t).detach()
+        pred_score = self._coord_score_from_clean(Xt, pred_clean_X, t, sigma_t)
+
+        # ABX-style score scaling: score_scaling = 1 / sigma_t.
+        score_scaling = 1.0 / sigma_t.clamp_min(self.scorefm_min_sigma)
+        dsm_diff = (pred_score - gt_score) / score_scaling
+        dsm_loss = self._masked_residue_mse(dsm_diff, atom_mask, interface_batch_id)
+
+        x1_loss = self._masked_residue_smooth_l1(pred_clean_X, X1, atom_mask, interface_batch_id)
+
+        # Hybrid DSM/x1 loss, analogous to AbX's thresholded trans score/x0 objective.
+        score_or_x1 = torch.where(
+            t.reshape(()) > pred_clean_X.new_tensor(self.scorefm_t_threshold),
+            dsm_loss,
+            x1_loss,
+        )
+
+        # Velocity identity for the same path: u_t = X_1 - X_0 = X_1 + sigma_t s_t.
+        pred_v = pred_clean_X + sigma_t * pred_score
+        true_v = X1 - X0
+        velocity_loss = self._masked_residue_smooth_l1(pred_v, true_v, atom_mask, interface_batch_id)
+
+        local_dist_loss = self._local_ca_distance_loss(pred_clean_X, X1, interface_batch_id)
+        interface_contact_loss = self._interface_contact_bce_loss(
+            pred_clean_X, X1, true_X, true_S, paratope_mask, batch_id,
+            segment_ids, interface_batch_id, atom_mask)
+        inter_clash_loss = self._interface_clash_loss(
+            pred_clean_X, true_X, true_S, batch_id, segment_ids,
+            interface_batch_id, atom_mask)
+        intra_clash_loss = self._intra_paratope_clash_loss(
+            pred_clean_X, atom_mask, interface_batch_id)
+
+        total = self.scorefm_loss_weight * (
+            self.scorefm_velocity_weight * velocity_loss
+            + self.scorefm_dsm_weight * score_or_x1
+            + self.scorefm_x1_weight * x1_loss
+            + self.scorefm_local_dist_weight * local_dist_loss
+            + self.scorefm_interface_contact_weight * interface_contact_loss
+            + self.scorefm_inter_clash_weight * inter_clash_loss
+            + self.scorefm_intra_clash_weight * intra_clash_loss
+        )
+
+        details = {
+            'scorefm_total': total.detach(),
+            'scorefm_dsm': dsm_loss.detach(),
+            'scorefm_x1': x1_loss.detach(),
+            'scorefm_hybrid': score_or_x1.detach(),
+            'scorefm_velocity': velocity_loss.detach(),
+            'scorefm_local_dist': local_dist_loss.detach(),
+            'scorefm_interface_contact': interface_contact_loss.detach(),
+            'scorefm_inter_clash': inter_clash_loss.detach(),
+            'scorefm_intra_clash': intra_clash_loss.detach(),
+        }
+        return total, details
+
+    def _forward(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths, init_noise=None, interface_init=None):
         
         batch_id = self.batch_constants['batch_id']
         # print(batch_id[paratope_mask].shape, residue_pos[paratope_mask].shape)
@@ -351,7 +639,15 @@ class AbFlowModel(nn.Module):
         X = self.aa_feature.update_global_coordinates(X, S)
 
         # prepare initial interface
-        interface_X, interface_S = self.init_interface(X, S, paratope_mask, batch_id, init_noise)
+        # For coordinate Score-FM, the network must see the exact current state X_t
+        # that defines the analytic score target. If interface_init is supplied, it
+        # is in raw coordinates and must be converted into the internal normalized
+        # antigen-centered shadow frame.
+        if interface_init is None:
+            interface_X, interface_S = self.init_interface(X, S, paratope_mask, batch_id, init_noise)
+        else:
+            interface_X = self._raw_interface_to_model_frame(interface_init, paratope_mask, batch_id)
+            interface_S = S[paratope_mask].clone()
         # initial interface is replaced by peptide
         # interface_X = X[paratope_mask]
 
@@ -405,6 +701,7 @@ class AbFlowModel(nn.Module):
         :param X: [N, n_channel, 3], Cartesian coordinates
         :param context_ratio: float, rate of context provided in masked sequence, should be [0, 1) and anneal to 0 in training
         '''
+        # import ipdb; ipdb.set_trace()
         if self.backbone_only:
             X, template = X[:, :4], template[:, :4]  # backbone
             xloss_mask = xloss_mask[:, :4]
@@ -425,14 +722,24 @@ class AbFlowModel(nn.Module):
         R, perm, interface_X_aligned = self.optimal_alignment(interface_X, gt_interface_X)
         interface_S_aligned = interface_S[torch.unique(perm // interface_X.shape[1])]
         
-        t = torch.rand(1, device=X.device)
-        Xt = (1-t) * interface_X_aligned + t * gt_interface_X
+        # Continuous flow time. Avoid sigma_t = 1 - t being too small because
+        # the analytic score contains 1 / sigma_t^2.
+        t = torch.rand(1, device=X.device) * (1.0 - self.scorefm_min_sigma)
+        sigma_t = (1.0 - t).clamp_min(self.scorefm_min_sigma)
+
+        # AbFlow coordinate path: X_t = (1 - t) X_0 + t X_1.
+        Xt = sigma_t * interface_X_aligned + t * gt_interface_X
         St = (1-t) * interface_S_aligned + t * gt_interface_S
         X[paratope_mask] = Xt.to(X.dtype)
         S[paratope_mask] = St.to(S.dtype)
 
         # get results
-        H, pred_S, r_pred_S_logits, pred_X, r_interface_X, r_edge_dist, prmsd = self._forward(X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths)
+        # IMPORTANT: pass interface_init=Xt. Otherwise _forward reinitializes the
+        # shadow interface and the score target no longer matches the model input.
+        H, pred_S, r_pred_S_logits, pred_X, r_interface_X, r_edge_dist, prmsd = self._forward(
+            X, S, cmask, smask, paratope_mask, X_pep, S_pep,
+            surface, residue_pos, template, lengths, interface_init=Xt
+        )
 
         # sequence negtive log likelihood
         snll, total = 0, 0
@@ -454,13 +761,26 @@ class AbFlowModel(nn.Module):
             r_interface_X[-1][interface_atom_mask],
             gt_interface_X[interface_atom_mask])
 
-        # flow loss
-        dX = r_interface_X[-1][interface_atom_mask] - interface_X_aligned[interface_atom_mask]
-        dS = pred_S[paratope_mask]
-        true_vx = gt_interface_X[interface_atom_mask] - interface_X_aligned[interface_atom_mask]
-        true_vh = gt_interface_S.float() - interface_S_aligned.float()
-        # flow_loss = F.smooth_l1_loss(dX, true_vx) + F.smooth_l1_loss(dS, true_vh)
-        flow_loss = 0.01 * F.smooth_l1_loss(dX, true_vx)
+        # complete coordinate Score-FM loss
+        # This replaces the old raw flow loss. It follows the score-based principle:
+        # predict a clean endpoint, analytically induce the score from the AbFlow
+        # path, then use ABX-style scaled DSM plus geometry/interface terms.
+        flow_loss, scorefm_details = self._scorefm_loss(
+            Xt=Xt,
+            X0=interface_X_aligned,
+            X1=gt_interface_X,
+            pred_clean_X=r_interface_X[-1],
+            atom_mask=interface_atom_mask,
+            true_X=true_X,
+            true_S=true_S,
+            paratope_mask=paratope_mask,
+            batch_id=batch_id,
+            segment_ids=self.batch_constants['segment_ids'],
+            interface_batch_id=self.batch_constants['interface_batch_id'],
+            t=t,
+            sigma_t=sigma_t,
+        )
+        self.last_scorefm_losses = scorefm_details
 
 
         # 2. edge dist loss
@@ -484,7 +804,7 @@ class AbFlowModel(nn.Module):
             pdev_loss, prmsd_loss = None, None
 
         # comprehensive loss
-        loss = snll + struct_loss + dock_loss + (0 if pdev_loss is None else pdev_loss)
+        loss = snll + struct_loss + dock_loss + flow_loss + (0 if pdev_loss is None else pdev_loss)
         # loss = snll + struct_loss + dock_loss + flow_loss + (0 if pdev_loss is None else pdev_loss)
 
         self._clean_batch_constants()
@@ -496,7 +816,7 @@ class AbFlowModel(nn.Module):
 
         return loss, (snll, aar), (struct_loss, *struct_loss_details), (dock_loss, interface_loss, ed_loss, r_ed_losses), (pdev_loss, prmsd_loss)
 
-    def sample(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths, n_steps=10, init_noise=None, return_hidden=False):
+    def sample(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths,n_steps=10, init_noise=None, return_hidden=False, show_progress=True, progress_desc=None):
         
         if self.backbone_only:
             X, template = X[:, :4], template[:, :4]  # backbone
@@ -527,8 +847,21 @@ class AbFlowModel(nn.Module):
         Xt = interface_X.clone()
         St = interface_S.clone()
         
-        for i in range(n_steps):
+        step_iter = range(n_steps)
+        if show_progress:
+            step_iter = tqdm(
+                step_iter,
+                total=n_steps,
+                desc=progress_desc or 'Sampling ODE',
+                leave=False,
+                dynamic_ncols=True
+            )
+
+        for i in step_iter:
             t = torch.tensor(i * dt, device=X.device)
+
+            if show_progress and hasattr(step_iter, 'set_postfix'):
+                step_iter.set_postfix(t=f'{float(t):.2f}')
             
             # 更新当前状态
             X_cur = X.clone()
@@ -539,11 +872,17 @@ class AbFlowModel(nn.Module):
             # 使用message passing获取速度场
             H, pred_S, r_pred_S_logits, pred_X, r_interface_X, r_edge_dist, prmsd = self._forward(
                 X_cur, S_cur, cmask, smask, paratope_mask, 
-                X_pep, S_pep, surface, residue_pos, template, lengths
+                X_pep, S_pep, surface, residue_pos, template, lengths,
+                interface_init=Xt
             )
 
-            # 计算速度场
-            dX = r_interface_X[-1] - Xt
+            # Score-factorized velocity. Given predicted clean endpoint Xhat_1,
+            # induced score s_theta = -(X_t - t Xhat_1) / sigma_t^2 and
+            # v_theta = Xhat_1 + sigma_t * s_theta = (Xhat_1 - X_t) / sigma_t.
+            sigma_t = (1.0 - t).clamp_min(self.scorefm_min_sigma)
+            pred_clean_X = r_interface_X[-1]
+            pred_score = self._coord_score_from_clean(Xt, pred_clean_X, t, sigma_t)
+            dX = pred_clean_X + sigma_t * pred_score
             if not self.struct_only:
                 cur_logits = r_pred_S_logits[-1][0][paratope_mask]
                 # 1. 数值稳定性处理
@@ -570,7 +909,12 @@ class AbFlowModel(nn.Module):
         for i in range(n_tries):
         
             # generate
-            H, pred_S, r_pred_S_logits, pred_X, r_interface_X, _, prmsd = self._forward(X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths, init_noise)
+            # Use the final ODE state Xt as shadow-interface input instead of
+            # reinitializing from noise.
+            H, pred_S, r_pred_S_logits, pred_X, r_interface_X, _, prmsd = self._forward(
+                X, S, cmask, smask, paratope_mask, X_pep, S_pep,
+                surface, residue_pos, template, lengths, interface_init=Xt
+            )
 
             # PPL or PRMSD
             if not self.struct_only:
@@ -685,7 +1029,7 @@ class AbFlowModel(nn.Module):
             return gen_X, gen_S, metric, H
         return gen_X, gen_S, metric
 
-    def sample_many(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths, n_samples=5, n_steps=20, return_hidden=False):
+    def sample_many(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths,n_samples=5, n_steps=20, return_hidden=False, show_progress=False):
         """
         Generate multiple samples in a single call
         
@@ -718,14 +1062,23 @@ class AbFlowModel(nn.Module):
             # Generate a sample
             if return_hidden:
                 gen_X, gen_S, metric, H = self.sample(
-                    X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, 
-                    template, lengths, n_steps=n_steps, init_noise=init_noise, return_hidden=True
+                    X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos,
+                    template, lengths,
+                    n_steps=n_steps,
+                    init_noise=init_noise,
+                    return_hidden=True,
+                    show_progress=show_progress,
+                    progress_desc=f'Sample {i + 1}/{n_samples} ODE'
                 )
                 list_H.append(H)
             else:
                 gen_X, gen_S, metric = self.sample(
-                    X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, 
-                    template, lengths, n_steps=n_steps, init_noise=init_noise
+                    X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos,
+                    template, lengths,
+                    n_steps=n_steps,
+                    init_noise=init_noise,
+                    show_progress=show_progress,
+                    progress_desc=f'Sample {i + 1}/{n_samples} ODE'
                 )
             
             # Store results
