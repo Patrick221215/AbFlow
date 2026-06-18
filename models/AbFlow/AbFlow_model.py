@@ -144,6 +144,7 @@ class AbFlowModel(nn.Module):
         self.scorefm_inter_clash_cutoff = 2.0
         self.scorefm_intra_clash_cutoff = 1.5
         self.last_scorefm_losses = {}
+        self.use_scorefm = True  # current Score-FM code path
 
         # self.timing_stats = {
         #     'surface_processing': 0.0,
@@ -470,7 +471,10 @@ class AbFlowModel(nn.Module):
         """
         atom_pos_full = self.aa_feature._construct_atom_pos(true_S)
         atom_mask_full = atom_pos_full != self.aa_feature.atom_pos_pad_idx
-        ag_mask_full = segment_ids == self.aa_feature.ag_seg_id
+        ag_mask_full = torch.logical_and(
+            segment_ids == self.aa_feature.ag_seg_id,
+            true_S != self.aa_feature.boa_idx
+        )
 
         losses = []
         for b in torch.unique(interface_batch_id):
@@ -500,7 +504,10 @@ class AbFlowModel(nn.Module):
         """Repel predicted paratope atoms from antigen atoms if they clash."""
         atom_pos_full = self.aa_feature._construct_atom_pos(true_S)
         atom_mask_full = atom_pos_full != self.aa_feature.atom_pos_pad_idx
-        ag_mask_full = segment_ids == self.aa_feature.ag_seg_id
+        ag_mask_full = torch.logical_and(
+            segment_ids == self.aa_feature.ag_seg_id,
+            true_S != self.aa_feature.boa_idx
+        )
 
         losses = []
         for b in torch.unique(interface_batch_id):
@@ -717,21 +724,22 @@ class AbFlowModel(nn.Module):
             not_ctx_mask = torch.rand_like(smask, dtype=torch.float) >= context_ratio
             smask = torch.logical_and(smask, not_ctx_mask)
         
-        gt_interface_X, gt_interface_S = true_X[paratope_mask], true_S[paratope_mask]
-        interface_X, interface_S = self.init_interface(X, S, paratope_mask, batch_id)
-        R, perm, interface_X_aligned = self.optimal_alignment(interface_X, gt_interface_X)
-        interface_S_aligned = interface_S[torch.unique(perm // interface_X.shape[1])]
+        gt_interface_X = true_X[paratope_mask]
+
+        # Sample X_0 from exactly the same initialization distribution used at
+        # inference. Do not align or permute X_0 with the native X_1, because
+        # the native structure is unavailable at generation time.
+        interface_X, _ = self.init_interface(X, S, paratope_mask, batch_id)
         
         # Continuous flow time. Avoid sigma_t = 1 - t being too small because
         # the analytic score contains 1 / sigma_t^2.
         t = torch.rand(1, device=X.device) * (1.0 - self.scorefm_min_sigma)
         sigma_t = (1.0 - t).clamp_min(self.scorefm_min_sigma)
 
-        # AbFlow coordinate path: X_t = (1 - t) X_0 + t X_1.
-        Xt = sigma_t * interface_X_aligned + t * gt_interface_X
-        St = (1-t) * interface_S_aligned + t * gt_interface_S
-        X[paratope_mask] = Xt.to(X.dtype)
-        S[paratope_mask] = St.to(S.dtype)
+        # Coordinate-only flow path: X_t = (1 - t) X_0 + t X_1.
+        # Sequence labels remain discrete and are handled by the CE loss; never
+        # linearly interpolate amino-acid indices.
+        Xt = sigma_t * interface_X + t * gt_interface_X
 
         # get results
         # IMPORTANT: pass interface_init=Xt. Otherwise _forward reinitializes the
@@ -767,7 +775,7 @@ class AbFlowModel(nn.Module):
         # path, then use ABX-style scaled DSM plus geometry/interface terms.
         flow_loss, scorefm_details = self._scorefm_loss(
             Xt=Xt,
-            X0=interface_X_aligned,
+            X0=interface_X,
             X1=gt_interface_X,
             pred_clean_X=r_interface_X[-1],
             atom_mask=interface_atom_mask,
@@ -816,7 +824,8 @@ class AbFlowModel(nn.Module):
 
         return loss, (snll, aar), (struct_loss, *struct_loss_details), (dock_loss, interface_loss, ed_loss, r_ed_losses), (pdev_loss, prmsd_loss)
 
-    def sample(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths,n_steps=10, init_noise=None, return_hidden=False, show_progress=True, progress_desc=None):
+    def sample(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths,
+               n_steps=10, init_noise=None, return_hidden=False, show_progress=False, progress_desc=None):
         
         if self.backbone_only:
             X, template = X[:, :4], template[:, :4]  # backbone
@@ -842,7 +851,9 @@ class AbFlowModel(nn.Module):
         best_metric = torch.ones(batch_size, dtype=torch.float, device=X.device) * 1e10
         interface_cmask = paratope_mask[cmask]
 
-        interface_X, interface_S = self.init_interface(X, S, paratope_mask, batch_id)
+        interface_X, interface_S = self.init_interface(
+            X, S, paratope_mask, batch_id, init_noise=init_noise
+        )
         dt = 1.0 / n_steps
         Xt = interface_X.clone()
         St = interface_S.clone()
@@ -859,7 +870,6 @@ class AbFlowModel(nn.Module):
 
         for i in step_iter:
             t = torch.tensor(i * dt, device=X.device)
-
             if show_progress and hasattr(step_iter, 'set_postfix'):
                 step_iter.set_postfix(t=f'{float(t):.2f}')
             
@@ -1029,7 +1039,8 @@ class AbFlowModel(nn.Module):
             return gen_X, gen_S, metric, H
         return gen_X, gen_S, metric
 
-    def sample_many(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths,n_samples=5, n_steps=20, return_hidden=False, show_progress=False):
+    def sample_many(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths,
+                    n_samples=5, n_steps=20, return_hidden=False, show_progress=False):
         """
         Generate multiple samples in a single call
         
@@ -1063,22 +1074,15 @@ class AbFlowModel(nn.Module):
             if return_hidden:
                 gen_X, gen_S, metric, H = self.sample(
                     X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos,
-                    template, lengths,
-                    n_steps=n_steps,
-                    init_noise=init_noise,
-                    return_hidden=True,
-                    show_progress=show_progress,
-                    progress_desc=f'Sample {i + 1}/{n_samples} ODE'
+                    template, lengths, n_steps=n_steps, init_noise=init_noise, return_hidden=True,
+                    show_progress=show_progress, progress_desc=f'Sample {i + 1}/{n_samples} ODE'
                 )
                 list_H.append(H)
             else:
                 gen_X, gen_S, metric = self.sample(
                     X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos,
-                    template, lengths,
-                    n_steps=n_steps,
-                    init_noise=init_noise,
-                    show_progress=show_progress,
-                    progress_desc=f'Sample {i + 1}/{n_samples} ODE'
+                    template, lengths, n_steps=n_steps, init_noise=init_noise,
+                    show_progress=show_progress, progress_desc=f'Sample {i + 1}/{n_samples} ODE'
                 )
             
             # Store results
