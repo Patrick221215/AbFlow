@@ -1,8 +1,34 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
+"""
+AbFlow training entry with reproducibility recording.
+
+This version keeps the original AbFlow training behavior, but adds an
+ABJE-style run directory and snapshot system:
+  - cfg_runtime.json: all args + git/env/python/torch/runtime information
+  - command.txt: exact command line
+  - env_abflow.json: important experiment environment variables
+  - data_manifest.json: file size/mtime/sha256 for train/valid/pep/surface files
+  - config_snapshot/: safe copies of small JSON/TXT/SH/PY config-like files
+  - code_snapshot/: train script + model/trainer source files when available
+
+The goal is to make every DTM/ScoreFM ablation reproducible.
+"""
+
 import os, sys
 import re
+import json
+import time
+import socket
+import shutil
+import hashlib
+import inspect
+import platform
 import argparse
+import subprocess
+from pathlib import Path
+from datetime import datetime
+
 import torch
 from torch.utils.data import DataLoader
 
@@ -14,6 +40,391 @@ setup_seed(SEED)
 from data.dataset import E2EDataset, VOCAB
 from trainer import TrainConfig
 
+
+# ============================================================
+# 0. Recording helpers
+# ============================================================
+
+def _is_main_rank(local_rank: int) -> bool:
+    return local_rank in (-1, 0)
+
+
+def _safe_makedirs(path: str):
+    if path:
+        os.makedirs(path, exist_ok=True)
+
+
+def _run_cmd(cmd, cwd=None):
+    try:
+        out = subprocess.check_output(cmd, cwd=cwd, stderr=subprocess.STDOUT, text=True)
+        return out.strip()
+    except Exception as e:
+        return f"<failed: {' '.join(cmd)} | {repr(e)}>"
+
+
+def _sha256_file(path: str, chunk_size: int = 1024 * 1024):
+    if not path or (not os.path.isfile(path)):
+        return None
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk_size)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _file_manifest(path: str):
+    """Return a JSON-serializable manifest for one file path."""
+    if not path:
+        return {"path": path, "exists": False, "reason": "empty"}
+    p = os.path.abspath(path)
+    if not os.path.exists(p):
+        return {"path": p, "exists": False, "reason": "not_found"}
+    if not os.path.isfile(p):
+        return {"path": p, "exists": True, "is_file": False}
+    st = os.stat(p)
+    return {
+        "path": p,
+        "exists": True,
+        "is_file": True,
+        "size_bytes": int(st.st_size),
+        "mtime": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
+        "sha256": _sha256_file(p),
+    }
+
+
+def _safe_copy_file(src: str, dst_dir: str, max_bytes: int, note_list=None):
+    """Copy small files into a snapshot directory; only record large files."""
+    if not src:
+        return None
+    src_abs = os.path.abspath(src)
+    if not os.path.isfile(src_abs):
+        return None
+
+    st = os.stat(src_abs)
+    record = _file_manifest(src_abs)
+    record["copied"] = False
+    record["copied_to"] = None
+
+    if st.st_size <= max_bytes:
+        _safe_makedirs(dst_dir)
+        dst = os.path.join(dst_dir, os.path.basename(src_abs))
+        # Avoid accidental overwrite if two files share the same basename.
+        if os.path.exists(dst):
+            stem = Path(src_abs).stem
+            suffix = Path(src_abs).suffix
+            digest = (record.get("sha256") or "unknown")[:8]
+            dst = os.path.join(dst_dir, f"{stem}.{digest}{suffix}")
+        try:
+            shutil.copy2(src_abs, dst)
+            record["copied"] = True
+            record["copied_to"] = dst
+        except Exception as e:
+            record["copy_error"] = repr(e)
+    else:
+        record["skip_copy_reason"] = f"file larger than snapshot_max_bytes={max_bytes}"
+
+    if note_list is not None:
+        note_list.append(record)
+    return record
+
+
+def _snapshot_source(obj, dst_dir: str, copied_records: list, max_bytes: int):
+    """Copy the source file of a class/function/module if Python can locate it."""
+    try:
+        src = inspect.getsourcefile(obj)
+    except Exception:
+        src = None
+    if src and os.path.isfile(src):
+        _safe_copy_file(src, dst_dir, max_bytes=max_bytes, note_list=copied_records)
+
+
+def _collect_env(prefixes=None):
+    if prefixes is None:
+        prefixes = [
+            "ABFLOW_", "CUDA", "NCCL", "MASTER_", "WORLD_", "LOCAL_", "RANK",
+            "OMP_", "OPENMM_", "PYTHON", "CONDA", "MAMBA", "MICROMAMBA"
+        ]
+    env = {}
+    for k, v in os.environ.items():
+        if any(k.startswith(p) for p in prefixes):
+            env[k] = v
+    return dict(sorted(env.items()))
+
+
+def _collect_git_info(project_dir: str):
+    return {
+        "project_dir": os.path.abspath(project_dir),
+        "commit": _run_cmd(["git", "rev-parse", "HEAD"], cwd=project_dir),
+        "branch": _run_cmd(["git", "branch", "--show-current"], cwd=project_dir),
+        "status_short": _run_cmd(["git", "status", "--short"], cwd=project_dir),
+        "remote": _run_cmd(["git", "remote", "-v"], cwd=project_dir),
+    }
+
+
+def _make_run_dir(args, local_rank: int):
+    """Create/resolve run directory while preserving old AbFlow behavior by default.
+
+    Original AbFlow uses args.save_dir directly. To avoid breaking existing scripts,
+    this function uses args.save_dir as the run directory unless --auto_run_name or
+    --run_name is provided.
+    """
+    save_root = os.path.abspath(args.save_dir)
+    if args.auto_run_name:
+        run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = os.path.join(save_root, run_name)
+    elif args.run_name:
+        run_dir = os.path.join(save_root, args.run_name)
+    else:
+        run_dir = save_root
+
+    if _is_main_rank(local_rank):
+        _safe_makedirs(run_dir)
+    return run_dir
+
+
+def _list_version_dirs(save_root: str):
+    """Return version-like directories created by the original AbFlow Trainer.
+
+    AbFlow's trainer usually creates a subdirectory such as version=7 or
+    version_7 under the configured save_dir. The exact spelling may vary across
+    code versions, so this function accepts several common forms.
+    """
+    root = os.path.abspath(save_root)
+    if not os.path.isdir(root):
+        return set()
+    version_dirs = set()
+    pat = re.compile(r"^version([=_-]?\d+)?$", re.IGNORECASE)
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        if os.path.isdir(path) and pat.match(name):
+            version_dirs.add(os.path.abspath(path))
+    return version_dirs
+
+
+def _looks_like_version_dir(path: str, save_root: str):
+    if not path:
+        return False
+    p = os.path.abspath(path)
+    root = os.path.abspath(save_root)
+    base = os.path.basename(p)
+    return (
+        os.path.isdir(p)
+        and p.startswith(root)
+        and p != root
+        and re.match(r"^version([=_-]?\d+)?$", base, flags=re.IGNORECASE) is not None
+    )
+
+
+def _candidate_paths_from_attr(value):
+    """Convert a trainer attribute value into plausible run-directory paths."""
+    if value is None:
+        return []
+    if isinstance(value, Path):
+        value = str(value)
+    if not isinstance(value, str):
+        return []
+    value = os.path.abspath(value)
+    cands = [value]
+    # If the attribute points to a file or a subfolder such as checkpoints/logs,
+    # its parent may be the actual version directory.
+    cands.append(os.path.dirname(value))
+    cands.append(os.path.dirname(os.path.dirname(value)))
+    # keep order while deduplicating
+    out = []
+    seen = set()
+    for c in cands:
+        if c and c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out
+
+
+def _infer_trainer_run_dir(trainer, save_root: str, before_version_dirs=None):
+    """Infer the real version directory created by the original AbFlow Trainer.
+
+    Why this is needed:
+    - train_abflow.py receives save_dir as the root, e.g.
+      datasets/RAbD/models_multi_cdr_design.
+    - The original Trainer creates a concrete version directory under it, e.g.
+      datasets/RAbD/models_multi_cdr_design/version=7.
+    - Reproducibility records must be stored in that concrete version directory,
+      not in the root save_dir.
+    """
+    root = os.path.abspath(save_root)
+    before_version_dirs = before_version_dirs or set()
+
+    # 1) Prefer explicit attributes if the Trainer exposes them.
+    objects = [trainer]
+    for attr in ("config", "cfg", "train_config"):
+        obj = getattr(trainer, attr, None)
+        if obj is not None:
+            objects.append(obj)
+
+    attr_names = [
+        "version_dir", "run_dir", "save_root", "save_dir", "log_dir",
+        "ckpt_dir", "model_dir", "checkpoint_dir", "tensorboard_dir"
+    ]
+    for obj in objects:
+        for attr in attr_names:
+            if hasattr(obj, attr):
+                try:
+                    val = getattr(obj, attr)
+                except Exception:
+                    continue
+                for cand in _candidate_paths_from_attr(val):
+                    if _looks_like_version_dir(cand, root):
+                        return os.path.abspath(cand)
+
+    # 2) If a new version directory appeared after Trainer construction, use it.
+    after = _list_version_dirs(root)
+    new_dirs = sorted(after - set(before_version_dirs), key=lambda x: os.path.getmtime(x))
+    if new_dirs:
+        return os.path.abspath(new_dirs[-1])
+
+    # 3) Otherwise use the latest version-like directory if any exists.
+    if after:
+        latest = sorted(after, key=lambda x: os.path.getmtime(x))[-1]
+        return os.path.abspath(latest)
+
+    # 4) Fallback: keep old behavior, but make the fallback explicit in logs.
+    return root
+
+
+def setup_experiment_record(args, *, local_rank: int, rank: int, world_size: int, stage: str = "pre_build", record_root: str = None):
+    """Write ABJE-style reproducibility records into the actual trainer run directory.
+
+    This is deliberately independent of the Trainer implementation. The trainer
+    only sees args.save_dir, which we set to the resolved run_dir before building
+    TrainConfig.
+    """
+    if not _is_main_rank(local_rank):
+        return None
+
+    run_dir = os.path.abspath(record_root or getattr(args, "actual_run_dir", args.save_dir))
+    _safe_makedirs(run_dir)
+
+    record_dir = os.path.join(run_dir, "record")
+    snap_dir = os.path.join(record_dir, "config_snapshot")
+    code_dir = os.path.join(record_dir, "code_snapshot")
+    _safe_makedirs(record_dir)
+    _safe_makedirs(snap_dir)
+    _safe_makedirs(code_dir)
+
+    project_dir = os.getcwd()
+    max_bytes = int(float(args.snapshot_max_mb) * 1024 * 1024)
+
+    # 1) exact command
+    command_text = " ".join([sys.executable] + sys.argv)
+    with open(os.path.join(record_dir, "command.txt"), "w", encoding="utf-8") as fw:
+        fw.write(command_text + "\n")
+
+    # 2) environment variables
+    env_abflow = _collect_env()
+    with open(os.path.join(record_dir, "env_abflow.json"), "w", encoding="utf-8") as fw:
+        json.dump(env_abflow, fw, indent=2, ensure_ascii=False)
+
+    # 3) input file manifests and safe snapshots
+    input_paths = {
+        "train_set": args.train_set,
+        "valid_set": args.valid_set,
+        "train_pep": args.train_pep,
+        "valid_pep": args.valid_pep,
+        "train_surf": args.train_surf,
+        "valid_surf": args.valid_surf,
+    }
+    manifests = {}
+    copied_inputs = []
+    if not args.no_snapshot:
+        for key, path in input_paths.items():
+            manifests[key] = _file_manifest(path) if path else {"path": path, "exists": False, "reason": "empty"}
+            # Copy small config-like files; large dataset/pkl files are only hashed.
+            if path and Path(path).suffix.lower() in {".json", ".jsonl", ".txt", ".idx", ".csv", ".tsv", ".yaml", ".yml"}:
+                _safe_copy_file(path, snap_dir, max_bytes=max_bytes, note_list=copied_inputs)
+    else:
+        for key, path in input_paths.items():
+            manifests[key] = _file_manifest(path) if path else {"path": path, "exists": False, "reason": "empty"}
+
+    with open(os.path.join(record_dir, "data_manifest.json"), "w", encoding="utf-8") as fw:
+        json.dump({"inputs": manifests, "copied_inputs": copied_inputs}, fw, indent=2, ensure_ascii=False)
+
+    # 4) code snapshot: this train file
+    copied_code = []
+    if not args.no_snapshot:
+        try:
+            _safe_copy_file(__file__, code_dir, max_bytes=max_bytes, note_list=copied_code)
+        except Exception:
+            pass
+
+    # 5) runtime config
+    runtime = {
+        "stage": stage,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "host": socket.gethostname(),
+        "platform": platform.platform(),
+        "python": sys.version,
+        "executable": sys.executable,
+        "cwd": os.getcwd(),
+        "argv": sys.argv,
+        "command": command_text,
+        "args": vars(args),
+        "rank": rank,
+        "local_rank": local_rank,
+        "world_size": world_size,
+        "torch": {
+            "version": torch.__version__,
+            "cuda_available": torch.cuda.is_available(),
+            "cuda_version": torch.version.cuda,
+            "device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        },
+        "git": _collect_git_info(project_dir),
+        "env_abflow": env_abflow,
+        "code_snapshot": copied_code,
+    }
+    with open(os.path.join(run_dir, "cfg_runtime.json"), "w", encoding="utf-8") as fw:
+        json.dump(runtime, fw, indent=2, ensure_ascii=False)
+
+    # Also keep a copy inside record/ for clarity.
+    with open(os.path.join(record_dir, "cfg_runtime.json"), "w", encoding="utf-8") as fw:
+        json.dump(runtime, fw, indent=2, ensure_ascii=False)
+
+    return record_dir
+
+
+def finalize_code_snapshot(args, model=None, trainer_cls=None):
+    """After model/trainer construction, snapshot their source files if possible."""
+    local_rank = getattr(args, "local_rank", -1)
+    if not _is_main_rank(local_rank) or args.no_snapshot:
+        return
+    run_dir = os.path.abspath(getattr(args, "actual_run_dir", args.save_dir))
+    code_dir = os.path.join(run_dir, "record", "code_snapshot")
+    _safe_makedirs(code_dir)
+    max_bytes = int(float(args.snapshot_max_mb) * 1024 * 1024)
+    records = []
+    try:
+        if model is not None:
+            _snapshot_source(model.__class__, code_dir, records, max_bytes=max_bytes)
+    except Exception as e:
+        records.append({"source": "model", "error": repr(e)})
+    try:
+        if trainer_cls is not None:
+            _snapshot_source(trainer_cls, code_dir, records, max_bytes=max_bytes)
+    except Exception as e:
+        records.append({"source": "trainer", "error": repr(e)})
+    try:
+        _snapshot_source(TrainConfig, code_dir, records, max_bytes=max_bytes)
+    except Exception as e:
+        records.append({"source": "TrainConfig", "error": repr(e)})
+
+    with open(os.path.join(run_dir, "record", "code_manifest.json"), "w", encoding="utf-8") as fw:
+        json.dump(records, fw, indent=2, ensure_ascii=False)
+
+
+# ============================================================
+# 1. Arguments
+# ============================================================
 
 def parse():
     parser = argparse.ArgumentParser(description='training')
@@ -33,17 +444,27 @@ def parse():
     parser.add_argument('--warmup', type=int, default=0, help='linear learning rate warmup')
     parser.add_argument('--max_epoch', type=int, default=10, help='max training epoch')
     parser.add_argument('--grad_clip', type=float, default=1.0, help='clip gradients with too big norm')
-    parser.add_argument('--save_dir', type=str, required=True, help='directory to save model and logs')
+    parser.add_argument('--save_dir', type=str, required=True, help='directory to save model, logs and experiment records')
     parser.add_argument('--batch_size', type=int, required=True, help='batch size')
     parser.add_argument('--patience', type=int, default=1000, help='patience before early stopping (set with a large number to turn off early stopping)')
     parser.add_argument('--save_topk', type=int, default=10, help='save topk checkpoint. -1 for saving all ckpt that has a better validation metric than its previous epoch')
     parser.add_argument('--shuffle', action='store_true', help='shuffle data')
     parser.add_argument('--num_workers', type=int, default=4)
 
+    # reproducibility recording
+    parser.add_argument('--run_name', type=str, default=None,
+                        help='Optional subdirectory name under save_dir. Useful for ablations such as e8_dtm_core.')
+    parser.add_argument('--auto_run_name', action='store_true',
+                        help='If set, create save_dir/<timestamp or run_name>. If unset and run_name is empty, use save_dir directly to preserve old behavior.')
+    parser.add_argument('--snapshot_max_mb', type=float, default=20.0,
+                        help='Max file size in MB for copying files into record/config_snapshot or record/code_snapshot. Larger files are only hashed.')
+    parser.add_argument('--no_snapshot', action='store_true',
+                        help='Disable copying snapshot files. Manifests and cfg_runtime.json are still written.')
+
     # device
     parser.add_argument('--gpus', type=int, nargs='+', required=True, help='gpu to use, -1 for cpu')
     parser.add_argument("--local_rank", type=int, default=-1,
-                        help="Local rank. Necessary for using the torch.distributed.launch utility.")
+                        help="Local rank. Necessary for using torch.distributed launch/torchrun.")
     
     # model
     parser.add_argument('--model_type', type=str, required=True, choices=['AbFlow', 'AbFlowStruct', 'AbFlowOpt'],
@@ -73,17 +494,59 @@ def parse():
     return parser.parse_args()
 
 
+# ============================================================
+# 2. Main training entry
+# ============================================================
+
 def main(args):
+    ########### DDP and run directory setup ###########
+    os.environ.setdefault('NCCL_TIMEOUT', '30')
+
+    # Robust DDP detection. This keeps old behavior for single GPU while also
+    # working with torchrun, where WORLD_SIZE/LOCAL_RANK/RANK are set by torch.
+    world_size = int(os.environ.get('WORLD_SIZE', str(len(args.gpus) if len(args.gpus) > 1 else 1)))
+    is_ddp = len(args.gpus) > 1 or world_size > 1
+
+    if is_ddp:
+        args.local_rank = int(os.environ.get('LOCAL_RANK', args.local_rank))
+        rank = int(os.environ.get('RANK', args.local_rank))
+        torch.cuda.set_device(args.local_rank)
+        if not torch.distributed.is_initialized():
+            # env:// is the safest for torchrun. If you use the old launcher,
+            # LOCAL_RANK/WORLD_SIZE/RANK are also normally provided.
+            torch.distributed.init_process_group(backend='nccl', init_method='env://')
+        train_sampler = None  # will be built after dataset is loaded
+    else:
+        args.local_rank = -1
+        rank = 0
+        world_size = 1
+        train_sampler = None
+
+    # Resolve run directory and redirect args.save_dir to it before TrainConfig.
+    run_dir = _make_run_dir(args, args.local_rank)
+    args.save_dir = run_dir
+
+    if is_ddp and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+    # The original AbFlow Trainer creates a concrete subdirectory such as
+    # version=7 under save_dir. We record the set before Trainer construction,
+    # then write records after Trainer has created/inferred that version dir.
+    version_dirs_before = _list_version_dirs(run_dir)
+
     ########### load your train / valid set ###########
-    os.environ['NCCL_TIMEOUT'] = '30'
-    if (len(args.gpus) > 1 and int(os.environ['LOCAL_RANK']) == 0) or len(args.gpus) == 1:
+    if _is_main_rank(args.local_rank):
         print_log(args)
+        print_log(f'Run dir: {args.save_dir}')
         print_log(f'CDR type: {args.cdr}')
         print_log(f'Paratope: {args.paratope}')
         print_log('structure only' if args.struct_only else 'sequence & structure codesign')
+        print_log('ABFLOW env: ' + json.dumps(_collect_env(prefixes=["ABFLOW_"]), ensure_ascii=False))
 
-    train_set = E2EDataset(args.train_set, pep_file=args.train_pep, surf_file=args.train_surf, cdr=args.cdr, paratope=args.paratope, num_verts=args.num_verts)
-    valid_set = E2EDataset(args.valid_set, pep_file=args.valid_pep, surf_file=args.valid_surf, cdr=args.cdr, paratope=args.paratope, num_verts=args.num_verts)
+    train_set = E2EDataset(args.train_set, pep_file=args.train_pep, surf_file=args.train_surf,
+                           cdr=args.cdr, paratope=args.paratope, num_verts=args.num_verts)
+    valid_set = E2EDataset(args.valid_set, pep_file=args.valid_pep, surf_file=args.valid_surf,
+                           cdr=args.cdr, paratope=args.paratope, num_verts=args.num_verts)
 
     ########## set your collate_fn ##########
     collate_fn = train_set.collate_fn
@@ -126,39 +589,67 @@ def main(args):
                    n_layers=args.n_layers, struct_only=args.struct_only,
                    fix_atom_weights=args.fix_channel_weights, cdr_type=args.cdr)
     else:
-        raise NotImplemented(f'model {args.model_type} not implemented')
+        raise NotImplementedError(f'model {args.model_type} not implemented')
 
     step_per_epoch = (len(train_set) + args.batch_size - 1) // args.batch_size
     config.add_parameter(step_per_epoch=step_per_epoch)
 
-    if len(args.gpus) > 1:
-        args.local_rank = int(os.environ['LOCAL_RANK'])
-        torch.cuda.set_device(args.local_rank)
-        torch.distributed.init_process_group(backend='nccl', world_size=len(args.gpus))
+    if is_ddp:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_set, shuffle=args.shuffle)
-        args.batch_size = int(args.batch_size / len(args.gpus))
-        
-        if args.local_rank == 0:
+        # Keep old AbFlow behavior: input batch_size is global, split across GPUs.
+        args.batch_size = max(1, int(args.batch_size / max(1, world_size)))
+        # TrainConfig was already built from original args; keep it consistent.
+        config.batch_size = args.batch_size
+        if _is_main_rank(args.local_rank):
             print_log(f'Batch size on a single GPU: {args.batch_size}')
     else:
-        args.local_rank = -1
         train_sampler = None
+
     config.local_rank = args.local_rank
 
-    if args.local_rank == 0 or args.local_rank == -1:
+    if _is_main_rank(args.local_rank):
         print_log(f'step per epoch: {step_per_epoch}')
+        print_log(f'world_size: {world_size}, rank: {rank}, local_rank: {args.local_rank}')
+
+    # DataLoader settings: persistent_workers is only valid when num_workers > 0.
+    persistent_workers = args.num_workers > 0
+    pin_memory = torch.cuda.is_available() and args.gpus[0] != -1
 
     train_loader = DataLoader(train_set, batch_size=args.batch_size,
                               num_workers=args.num_workers,
                               shuffle=(args.shuffle and train_sampler is None),
                               sampler=train_sampler,
-                              collate_fn=collate_fn)
+                              collate_fn=collate_fn,
+                              pin_memory=pin_memory,
+                              persistent_workers=persistent_workers)
     valid_loader = DataLoader(valid_set, batch_size=args.batch_size,
                               num_workers=args.num_workers,
-                              collate_fn=collate_fn)
+                              collate_fn=collate_fn,
+                              pin_memory=pin_memory,
+                              persistent_workers=persistent_workers)
     
     trainer = Trainer(model, train_loader, valid_loader, config)
+
+    # Now the original Trainer should have created or exposed its concrete
+    # version directory. Put record/ under that directory, e.g. version=7/record.
+    actual_run_dir = _infer_trainer_run_dir(trainer, args.save_dir, version_dirs_before)
+    args.actual_run_dir = actual_run_dir
+    if _is_main_rank(args.local_rank):
+        print_log(f'Actual trainer run dir: {actual_run_dir}')
+    setup_experiment_record(
+        args,
+        local_rank=args.local_rank,
+        rank=rank,
+        world_size=world_size,
+        stage="post_trainer_init",
+        record_root=actual_run_dir,
+    )
+    finalize_code_snapshot(args, model=model, trainer_cls=Trainer)
+
     trainer.train(args.gpus, args.local_rank)
+
+    if is_ddp and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == '__main__':
