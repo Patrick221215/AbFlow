@@ -1,3 +1,11 @@
+'''
+Author: Patrick221215 1427584833@qq.com
+Date: 2026-06-13 19:33:31
+LastEditors: Patrick221215 1427584833@qq.com
+LastEditTime: 2026-06-19 16:29:21
+FilePath: /cjm/project/AbFlow/trainer/AbFlow_trainer.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
 from math import cos, pi, log, exp
@@ -72,6 +80,13 @@ class AbFlowTrainer(Trainer):
         if pdev_loss is not None:
             self.log(f'PDev/PDevLoss/{log_type}', pdev_loss, batch_idx, val)
             self.log(f'PDev/PRMSDLoss/{log_type}', prmsd_loss, batch_idx, val)
+        
+        # Add this block
+        raw_model = self.model.module if hasattr(self.model, "module") else self.model
+        scorefm_losses = getattr(raw_model, "last_scorefm_losses", None)
+        if scorefm_losses:
+            for name, value in scorefm_losses.items():
+                self.log(f"DTM/{name}/{log_type}", value, batch_idx, val)
 
         if not val:
             lr = self.config.lr if self.scheduler is None else self.scheduler.get_last_lr()
