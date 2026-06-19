@@ -1,6 +1,6 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
-import math, time
+import math, time, os
 from tqdm import tqdm
 
 import torch
@@ -17,6 +17,27 @@ from evaluation.rmsd import kabsch_torch
 from ..modules.am_enc import AMEncoder
 from ..modules.am_egnn import AMEGNN
 
+
+
+def _env_str(name, default):
+    value = os.environ.get(name, None)
+    if value is None or value == "":
+        return default
+    return value
+
+
+def _env_float(name, default):
+    value = os.environ.get(name, None)
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
+def _env_flag(name, default=False):
+    value = os.environ.get(name, None)
+    if value is None or value == "":
+        return default
+    return value.lower() in {"1", "true", "yes", "y", "on"}
 
 class AbFlowModel(nn.Module):
     def __init__(self, embed_size, hidden_size, n_channel, num_classes, num_verts, 
@@ -151,6 +172,46 @@ class AbFlowModel(nn.Module):
         #     'sme_encoding': 0.0,
         #     'count': 0
         # }
+        
+        # =========================================================
+        # Ablation controls
+        # =========================================================
+        # Loss modes:
+        #   off        : no new DTM/ScoreFM objective, only base AbFlow losses
+        #   x1         : clean endpoint reconstruction only
+        #   dsm        : analytic score DSM only
+        #   hybrid     : thresholded DSM/x1 hybrid + x1
+        #   velocity   : velocity identity only
+        #   x1_vel     : x1 + velocity
+        #   dtm_core   : x1 + hybrid DSM/x1 + velocity, no geometry regularizers
+        #   geom_only  : local/contact/clash only
+        #   no_contact : full but contact loss disabled
+        #   no_clash   : full but clash losses disabled
+        #   no_geom    : same as dtm_core
+        #   full       : current full objective
+        self.scorefm_loss_mode = _env_str("ABFLOW_SCOREFM_LOSS_MODE", "full").lower()
+
+        # Sampler modes:
+        #   bridge        : dX = pred_clean_X + sigma_t * pred_score
+        #   residual      : dX = pred_clean_X - Xt
+        #   damped_bridge : dX = sigma_t^p * bridge_velocity
+        #   blend         : dX = (1-a) * residual + a * bridge
+        self.scorefm_sampler_mode = _env_str("ABFLOW_SCOREFM_SAMPLER_MODE", "bridge").lower()
+        self.scorefm_bridge_damping_power = _env_float("ABFLOW_SCOREFM_DAMPING_POWER", 0.0)
+        self.scorefm_bridge_blend = _env_float("ABFLOW_SCOREFM_BRIDGE_BLEND", 1.0)
+
+        # Allow component weights to be overridden from shell scripts.
+        self.scorefm_loss_weight = _env_float("ABFLOW_SCOREFM_LOSS_WEIGHT", self.scorefm_loss_weight)
+        self.scorefm_velocity_weight = _env_float("ABFLOW_SCOREFM_VELOCITY_WEIGHT", self.scorefm_velocity_weight)
+        self.scorefm_dsm_weight = _env_float("ABFLOW_SCOREFM_DSM_WEIGHT", self.scorefm_dsm_weight)
+        self.scorefm_x1_weight = _env_float("ABFLOW_SCOREFM_X1_WEIGHT", self.scorefm_x1_weight)
+        self.scorefm_local_dist_weight = _env_float("ABFLOW_SCOREFM_LOCAL_DIST_WEIGHT", self.scorefm_local_dist_weight)
+        self.scorefm_interface_contact_weight = _env_float("ABFLOW_SCOREFM_CONTACT_WEIGHT", self.scorefm_interface_contact_weight)
+        self.scorefm_inter_clash_weight = _env_float("ABFLOW_SCOREFM_INTER_CLASH_WEIGHT", self.scorefm_inter_clash_weight)
+        self.scorefm_intra_clash_weight = _env_float("ABFLOW_SCOREFM_INTRA_CLASH_WEIGHT", self.scorefm_intra_clash_weight)
+
+        if self.scorefm_loss_mode in {"off", "none", "base"}:
+            self.use_scorefm = False
 
 
     def init_mask(self, X, S, cmask, smask, template):
@@ -559,68 +620,171 @@ class AbFlowModel(nn.Module):
     def _scorefm_loss(self, *, Xt, X0, X1, pred_clean_X, atom_mask,
                       true_X, true_S, paratope_mask, batch_id, segment_ids,
                       interface_batch_id, t, sigma_t):
-        """Complete coordinate Score-FM objective for AbFlow.
+        """Ablation-aware coordinate DTM / ScoreFM objective.
 
-        Components:
-          1) ABX-style scaled DSM on analytically induced coordinate scores.
-          2) Clean endpoint reconstruction for stability at high-noise states.
-          3) Velocity identity loss tying score matching back to flow matching.
-          4) Local C-alpha distance loss, a head-free distogram analogue.
-          5) Interface contact recovery loss.
-          6) Antigen-paratope and intra-paratope clash penalties.
+        The goal is to identify which part of the new objective helps or hurts:
+          - x1: clean endpoint reconstruction
+          - dsm: analytically induced score matching
+          - velocity: score-to-velocity identity
+          - geometry: local distance/contact/clash feasibility terms
         """
+        mode = self.scorefm_loss_mode
+        zero = pred_clean_X.new_tensor(0.0)
+
+        # Fast exit for pure AbFlow baseline under the v4 code path.
+        if mode in {"off", "none", "base"} or (not self.use_scorefm) or self.scorefm_loss_weight == 0:
+            details = {
+                "scorefm_total": zero.detach(),
+                "scorefm_dsm": zero.detach(),
+                "scorefm_x1": zero.detach(),
+                "scorefm_hybrid": zero.detach(),
+                "scorefm_velocity": zero.detach(),
+                "scorefm_local_dist": zero.detach(),
+                "scorefm_interface_contact": zero.detach(),
+                "scorefm_inter_clash": zero.detach(),
+                "scorefm_intra_clash": zero.detach(),
+            }
+            return zero, details
+
+        # 1. Analytic scores induced by the same Gaussian coordinate path.
         gt_score = self._coord_score_from_clean(Xt, X1, t, sigma_t).detach()
         pred_score = self._coord_score_from_clean(Xt, pred_clean_X, t, sigma_t)
 
-        # ABX-style score scaling: score_scaling = 1 / sigma_t.
+        # 2. ABX-style scaled DSM.
+        # score_scaling = 1 / sigma_t, so (pred_score - gt_score) / score_scaling
+        # equals sigma_t * score residual. This avoids excessive late-time score scale.
         score_scaling = 1.0 / sigma_t.clamp_min(self.scorefm_min_sigma)
         dsm_diff = (pred_score - gt_score) / score_scaling
         dsm_loss = self._masked_residue_mse(dsm_diff, atom_mask, interface_batch_id)
 
+        # 3. Clean endpoint reconstruction.
         x1_loss = self._masked_residue_smooth_l1(pred_clean_X, X1, atom_mask, interface_batch_id)
 
-        # Hybrid DSM/x1 loss, analogous to AbX's thresholded trans score/x0 objective.
+        # 4. Hybrid DSM/x1 objective.
+        # For high t, score matching becomes meaningful; for low t, x1 is more stable.
         score_or_x1 = torch.where(
             t.reshape(()) > pred_clean_X.new_tensor(self.scorefm_t_threshold),
             dsm_loss,
             x1_loss,
         )
 
-        # Velocity identity for the same path: u_t = X_1 - X_0 = X_1 + sigma_t s_t.
+        # 5. Velocity identity for the same path:
+        # v_theta = Xhat_1 + sigma_t * s_theta
+        # true velocity for X_t = sigma_t X_0 + t X_1 is X_1 - X_0.
         pred_v = pred_clean_X + sigma_t * pred_score
         true_v = X1 - X0
         velocity_loss = self._masked_residue_smooth_l1(pred_v, true_v, atom_mask, interface_batch_id)
 
-        local_dist_loss = self._local_ca_distance_loss(pred_clean_X, X1, interface_batch_id)
-        interface_contact_loss = self._interface_contact_bce_loss(
-            pred_clean_X, X1, true_X, true_S, paratope_mask, batch_id,
-            segment_ids, interface_batch_id, atom_mask)
-        inter_clash_loss = self._interface_clash_loss(
-            pred_clean_X, true_X, true_S, batch_id, segment_ids,
-            interface_batch_id, atom_mask)
-        intra_clash_loss = self._intra_paratope_clash_loss(
-            pred_clean_X, atom_mask, interface_batch_id)
+        # 6. Geometry terms are only computed when needed.
+        need_geometry = mode in {
+            "full",
+            "geom_only",
+            "no_contact",
+            "no_clash",
+        }
 
-        total = self.scorefm_loss_weight * (
-            self.scorefm_velocity_weight * velocity_loss
-            + self.scorefm_dsm_weight * score_or_x1
-            + self.scorefm_x1_weight * x1_loss
-            + self.scorefm_local_dist_weight * local_dist_loss
-            + self.scorefm_interface_contact_weight * interface_contact_loss
-            + self.scorefm_inter_clash_weight * inter_clash_loss
-            + self.scorefm_intra_clash_weight * intra_clash_loss
-        )
+        if need_geometry:
+            local_dist_loss = self._local_ca_distance_loss(pred_clean_X, X1, interface_batch_id)
+            interface_contact_loss = self._interface_contact_bce_loss(
+                pred_clean_X, X1, true_X, true_S, paratope_mask, batch_id,
+                segment_ids, interface_batch_id, atom_mask)
+            inter_clash_loss = self._interface_clash_loss(
+                pred_clean_X, true_X, true_S, batch_id, segment_ids,
+                interface_batch_id, atom_mask)
+            intra_clash_loss = self._intra_paratope_clash_loss(
+                pred_clean_X, atom_mask, interface_batch_id)
+        else:
+            local_dist_loss = zero
+            interface_contact_loss = zero
+            inter_clash_loss = zero
+            intra_clash_loss = zero
+
+        # 7. Select objective according to ablation mode.
+        if mode == "x1":
+            objective = self.scorefm_x1_weight * x1_loss
+
+        elif mode == "dsm":
+            objective = self.scorefm_dsm_weight * dsm_loss
+
+        elif mode == "hybrid":
+            objective = (
+                self.scorefm_dsm_weight * score_or_x1
+                + self.scorefm_x1_weight * x1_loss
+            )
+
+        elif mode == "velocity":
+            objective = self.scorefm_velocity_weight * velocity_loss
+
+        elif mode == "x1_vel":
+            objective = (
+                self.scorefm_x1_weight * x1_loss
+                + self.scorefm_velocity_weight * velocity_loss
+            )
+
+        elif mode in {"dtm_core", "no_geom"}:
+            objective = (
+                self.scorefm_velocity_weight * velocity_loss
+                + self.scorefm_dsm_weight * score_or_x1
+                + self.scorefm_x1_weight * x1_loss
+            )
+
+        elif mode == "geom_only":
+            objective = (
+                self.scorefm_local_dist_weight * local_dist_loss
+                + self.scorefm_interface_contact_weight * interface_contact_loss
+                + self.scorefm_inter_clash_weight * inter_clash_loss
+                + self.scorefm_intra_clash_weight * intra_clash_loss
+            )
+
+        elif mode == "no_contact":
+            objective = (
+                self.scorefm_velocity_weight * velocity_loss
+                + self.scorefm_dsm_weight * score_or_x1
+                + self.scorefm_x1_weight * x1_loss
+                + self.scorefm_local_dist_weight * local_dist_loss
+                + self.scorefm_inter_clash_weight * inter_clash_loss
+                + self.scorefm_intra_clash_weight * intra_clash_loss
+            )
+
+        elif mode == "no_clash":
+            objective = (
+                self.scorefm_velocity_weight * velocity_loss
+                + self.scorefm_dsm_weight * score_or_x1
+                + self.scorefm_x1_weight * x1_loss
+                + self.scorefm_local_dist_weight * local_dist_loss
+                + self.scorefm_interface_contact_weight * interface_contact_loss
+            )
+
+        elif mode == "full":
+            objective = (
+                self.scorefm_velocity_weight * velocity_loss
+                + self.scorefm_dsm_weight * score_or_x1
+                + self.scorefm_x1_weight * x1_loss
+                + self.scorefm_local_dist_weight * local_dist_loss
+                + self.scorefm_interface_contact_weight * interface_contact_loss
+                + self.scorefm_inter_clash_weight * inter_clash_loss
+                + self.scorefm_intra_clash_weight * intra_clash_loss
+            )
+
+        else:
+            raise ValueError(
+                f"Unknown ABFLOW_SCOREFM_LOSS_MODE={mode}. "
+                "Choose from off, x1, dsm, hybrid, velocity, x1_vel, "
+                "dtm_core, geom_only, no_contact, no_clash, no_geom, full."
+            )
+
+        total = self.scorefm_loss_weight * objective
 
         details = {
-            'scorefm_total': total.detach(),
-            'scorefm_dsm': dsm_loss.detach(),
-            'scorefm_x1': x1_loss.detach(),
-            'scorefm_hybrid': score_or_x1.detach(),
-            'scorefm_velocity': velocity_loss.detach(),
-            'scorefm_local_dist': local_dist_loss.detach(),
-            'scorefm_interface_contact': interface_contact_loss.detach(),
-            'scorefm_inter_clash': inter_clash_loss.detach(),
-            'scorefm_intra_clash': intra_clash_loss.detach(),
+            "scorefm_total": total.detach(),
+            "scorefm_dsm": dsm_loss.detach(),
+            "scorefm_x1": x1_loss.detach(),
+            "scorefm_hybrid": score_or_x1.detach(),
+            "scorefm_velocity": velocity_loss.detach(),
+            "scorefm_local_dist": local_dist_loss.detach(),
+            "scorefm_interface_contact": interface_contact_loss.detach(),
+            "scorefm_inter_clash": inter_clash_loss.detach(),
+            "scorefm_intra_clash": intra_clash_loss.detach(),
         }
         return total, details
 
@@ -892,7 +1056,38 @@ class AbFlowModel(nn.Module):
             sigma_t = (1.0 - t).clamp_min(self.scorefm_min_sigma)
             pred_clean_X = r_interface_X[-1]
             pred_score = self._coord_score_from_clean(Xt, pred_clean_X, t, sigma_t)
-            dX = pred_clean_X + sigma_t * pred_score
+
+            # Sampler ablation:
+            # residual:      original conservative endpoint residual update
+            # bridge:        score-to-velocity bridge, v = Xhat_1 + sigma_t * score
+            # damped_bridge: bridge velocity damped by sigma_t^p
+            # blend:         interpolation between residual and bridge
+            raw_residual = pred_clean_X - Xt
+            bridge_velocity = pred_clean_X + sigma_t * pred_score
+
+            sampler_mode = self.scorefm_sampler_mode
+            if sampler_mode == "residual":
+                dX = raw_residual
+
+            elif sampler_mode == "bridge":
+                dX = bridge_velocity
+
+            elif sampler_mode == "damped_bridge":
+                damping = sigma_t.clamp_min(self.scorefm_min_sigma).pow(
+                    self.scorefm_bridge_damping_power
+                )
+                dX = damping * bridge_velocity
+
+            elif sampler_mode == "blend":
+                alpha = float(self.scorefm_bridge_blend)
+                alpha = max(0.0, min(1.0, alpha))
+                dX = (1.0 - alpha) * raw_residual + alpha * bridge_velocity
+
+            else:
+                raise ValueError(
+                    f"Unknown ABFLOW_SCOREFM_SAMPLER_MODE={sampler_mode}. "
+                    "Choose from residual, bridge, damped_bridge, blend."
+                )
             if not self.struct_only:
                 cur_logits = r_pred_S_logits[-1][0][paratope_mask]
                 # 1. 数值稳定性处理
