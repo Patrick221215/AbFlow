@@ -39,6 +39,37 @@ def _env_flag(name, default=False):
         return default
     return value.lower() in {"1", "true", "yes", "y", "on"}
 
+
+
+def get_timestep_embedding(timesteps, embedding_dim, max_positions=10000):
+    """Sinusoidal embedding for continuous flow time t in [0, 1].
+
+    This is the same style of time embedding used in diffusion models and in
+    the uploaded AbX Seqformer.  It lets AbFlow learn f_theta(X_t, t, c)
+    instead of forcing one network to average over all noise/flow times.
+
+    Args:
+        timesteps: [B] tensor with values in [0, 1].
+        embedding_dim: output channel dimension.
+        max_positions: frequency scale.
+    Returns:
+        [B, embedding_dim] sinusoidal embeddings.
+    """
+    if timesteps.dim() == 0:
+        timesteps = timesteps[None]
+    timesteps = timesteps.float() * max_positions
+    half_dim = embedding_dim // 2
+    if half_dim <= 1:
+        emb = timesteps[:, None]
+        return F.pad(emb, (0, max(0, embedding_dim - 1)))[:, :embedding_dim]
+    freq = math.log(max_positions) / (half_dim - 1)
+    freq = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=timesteps.device) * -freq)
+    emb = timesteps[:, None] * freq[None, :]
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+    if embedding_dim % 2 == 1:
+        emb = F.pad(emb, (0, 1), mode='constant')
+    return emb
+
 class AbFlowModel(nn.Module):
     def __init__(self, embed_size, hidden_size, n_channel, num_classes, num_verts, 
                  mask_id=VOCAB.get_mask_idx(), k_neighbors=9, bind_dist_cutoff=6,
@@ -191,6 +222,30 @@ class AbFlowModel(nn.Module):
         #   full       : current full objective
         self.scorefm_loss_mode = _env_str("ABFLOW_SCOREFM_LOSS_MODE", "full").lower()
 
+        # Path/time controls.
+        # ABFLOW_SCOREFM_PER_SAMPLE_T=on follows the AbX practice: every complex
+        # receives its own continuous time t instead of sharing one scalar for the
+        # whole batch. This reduces timestep-gradient variance and prevents a batch
+        # from being dominated by a single noise level.
+        self.scorefm_per_sample_t = _env_flag("ABFLOW_SCOREFM_PER_SAMPLE_T", True)
+
+        # t sampling schedule for the coordinate path:
+        #   uniform    : t ~ U(0, 1-sigma_min)
+        #   low_t      : t = (1-sigma_min) * u^2, biases training toward harder
+        #                low-t states that contain less native endpoint information
+        #   stratified : approximately covers the whole time interval in each batch
+        self.scorefm_t_sampling = _env_str("ABFLOW_SCOREFM_T_SAMPLING", "uniform").lower()
+
+        # Flow-time conditioning. When enabled, a sinusoidal embedding of t is
+        # added to the initial residue feature H_0 before the AbFlow encoder.
+        # This is the minimal AbFlow analogue of AbX's time-conditioned Seqformer.
+        self.scorefm_time_embed = _env_flag("ABFLOW_SCOREFM_TIME_EMBED", False)
+        self.flow_time_mlp = nn.Sequential(
+            nn.Linear(embed_size, embed_size),
+            nn.SiLU(),
+            nn.Linear(embed_size, embed_size),
+        )
+
         # Sampler modes:
         #   bridge        : dX = pred_clean_X + sigma_t * pred_score
         #   residual      : dX = pred_clean_X - Xt
@@ -280,9 +335,78 @@ class AbFlowModel(nn.Module):
         return R, perm, X0_aligned
         
 
-    def message_passing(self, X, S, residue_pos, interface_X, surf, paratope_mask, batch_id, t, memory_H=None, smooth_prob=None, smooth_mask=None):
+    def _sample_flow_times(self, batch_size, device, dtype=torch.float32):
+        """Sample continuous flow times for DTM/ScoreFM path training.
+
+        Returns:
+            t_graph: [B] if per-sample time is enabled, otherwise [1]. Values
+            are upper-bounded by 1 - sigma_min so analytic scores never divide
+            by a vanishing sigma_t.
+        """
+        n = int(batch_size) if getattr(self, 'scorefm_per_sample_t', False) else 1
+        max_t = 1.0 - float(getattr(self, 'scorefm_min_sigma', 5e-2))
+        mode = getattr(self, 'scorefm_t_sampling', 'uniform')
+        if mode == 'uniform':
+            u = torch.rand(n, device=device, dtype=dtype)
+            t = max_t * u
+        elif mode in {'low_t', 'low', 'square'}:
+            u = torch.rand(n, device=device, dtype=dtype)
+            t = max_t * (u ** 2)
+        elif mode in {'stratified', 'strat'}:
+            # Stratification is only meaningful for per-sample t. For n=1 it
+            # reduces to uniform sampling over the full interval.
+            if n == 1:
+                t = max_t * torch.rand(n, device=device, dtype=dtype)
+            else:
+                base = (torch.arange(n, device=device, dtype=dtype) + torch.rand(n, device=device, dtype=dtype)) / float(n)
+                # Randomly permute bins so graph order never correlates with t.
+                perm = torch.randperm(n, device=device)
+                t = max_t * base[perm]
+        else:
+            raise ValueError(
+                f"Unknown ABFLOW_SCOREFM_T_SAMPLING={mode}. "
+                "Choose from uniform, low_t, stratified."
+            )
+        return t.clamp(min=0.0, max=max_t)
+
+    def _time_for_interface(self, t_graph, interface_batch_id, ref_tensor):
+        """Broadcast graph-level time to [N_interface, 1, 1]."""
+        if t_graph is None:
+            return None
+        t_graph = torch.as_tensor(t_graph, device=ref_tensor.device, dtype=ref_tensor.dtype)
+        if t_graph.dim() == 0 or t_graph.numel() == 1:
+            return t_graph.reshape(1, 1, 1)
+        return t_graph[interface_batch_id].reshape(-1, 1, 1)
+
+    def _flow_time_embedding_for_residues(self, flow_t, batch_id, H_0):
+        """Create residue-wise time embeddings aligned with H_0."""
+        if flow_t is None or not getattr(self, 'scorefm_time_embed', False):
+            return None
+        flow_t = torch.as_tensor(flow_t, device=H_0.device, dtype=H_0.dtype)
+        if flow_t.dim() == 0 or flow_t.numel() == 1:
+            n_graph = int(batch_id.max().item()) + 1 if batch_id.numel() > 0 else 1
+            flow_t = flow_t.reshape(1).expand(n_graph)
+        if not hasattr(self, 'flow_time_mlp'):
+            raise RuntimeError(
+                "ABFLOW_SCOREFM_TIME_EMBED is enabled but this checkpoint/model "
+                "does not contain flow_time_mlp. Train with AbFlow_model_v7_dtm.py "
+                "from scratch, or instantiate the new model and load old weights with strict=False."
+            )
+        t_emb = get_timestep_embedding(flow_t, H_0.shape[-1]).to(dtype=H_0.dtype, device=H_0.device)
+        t_emb = self.flow_time_mlp(t_emb)
+        return t_emb[batch_id]
+
+    def message_passing(self, X, S, residue_pos, interface_X, surf, paratope_mask, batch_id, t, memory_H=None, smooth_prob=None, smooth_mask=None, flow_t=None):
         # embeddings, hidden state, (internal edges, external edges), (A : c * d, w : c * 1)
         H_0, (ctx_edges, inter_edges), (atom_embeddings, atom_weights) = self.aa_feature(X, S, batch_id, self.k_neighbors, residue_pos, smooth_prob=smooth_prob, smooth_mask=smooth_mask)
+
+        # Minimal AbFlow time conditioning. AbX injects batch['t'] into both
+        # sequence and pair features before its Seqformer; here we add an
+        # equivalent graph-level time signal to AbFlow's residue embeddings.
+        # This keeps the modification local and makes the ablation clean.
+        time_emb = self._flow_time_embedding_for_residues(flow_t, batch_id, H_0)
+        if time_emb is not None:
+            H_0 = H_0 + time_emb
 
         if not self.keep_memory:
             memory_H = None
@@ -452,7 +576,11 @@ class AbFlowModel(nn.Module):
             p_t(X | X_1) = N(t X_1, sigma_t^2 I)
         Score:
             s_t(X_t | X_1) = -(X_t - t X_1) / sigma_t^2
+
+        `t` and `sigma_t` can be scalars or [N_interface,1,1] tensors.
         """
+        t = torch.as_tensor(t, device=Xt.device, dtype=Xt.dtype)
+        sigma_t = torch.as_tensor(sigma_t, device=Xt.device, dtype=Xt.dtype)
         return -(Xt - t * clean_X) / (sigma_t ** 2 + self.scorefm_eps)
 
     def _masked_residue_mse(self, diff, atom_mask, interface_batch_id):
@@ -662,11 +790,11 @@ class AbFlowModel(nn.Module):
 
         # 4. Hybrid DSM/x1 objective.
         # For high t, score matching becomes meaningful; for low t, x1 is more stable.
-        score_or_x1 = torch.where(
-            t.reshape(()) > pred_clean_X.new_tensor(self.scorefm_t_threshold),
-            dsm_loss,
-            x1_loss,
-        )
+        # With per-sample t, use the fraction of high-t interface residues as a
+        # smooth mixture weight so the loss remains a scalar and remains stable.
+        t_tensor = torch.as_tensor(t, device=pred_clean_X.device, dtype=pred_clean_X.dtype)
+        high_t_weight = (t_tensor.reshape(-1) > pred_clean_X.new_tensor(self.scorefm_t_threshold)).to(pred_clean_X.dtype).mean()
+        score_or_x1 = high_t_weight * dsm_loss + (1.0 - high_t_weight) * x1_loss
 
         # 5. Velocity identity for the same path:
         # v_theta = Xhat_1 + sigma_t * s_theta
@@ -788,7 +916,7 @@ class AbFlowModel(nn.Module):
         }
         return total, details
 
-    def _forward(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths, init_noise=None, interface_init=None):
+    def _forward(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths, init_noise=None, interface_init=None, flow_t=None):
         
         batch_id = self.batch_constants['batch_id']
         # print(batch_id[paratope_mask].shape, residue_pos[paratope_mask].shape)
@@ -829,7 +957,10 @@ class AbFlowModel(nn.Module):
         memory_H = None
         # message passing
         for t in range(self.round):
-            pred_S_logits, pred_X, interface_X, H, edge_dist = self.message_passing(X, S, residue_pos, interface_X, surface, paratope_mask, batch_id, t, memory_H, pred_S_dist, smask)
+            pred_S_logits, pred_X, interface_X, H, edge_dist = self.message_passing(
+                X, S, residue_pos, interface_X, surface, paratope_mask, batch_id,
+                t, memory_H, pred_S_dist, smask, flow_t=flow_t
+            )
             memory_H = H
             r_interface_X.append(interface_X.clone())
             r_pred_S_logits.append((pred_S_logits, smask))
@@ -897,20 +1028,27 @@ class AbFlowModel(nn.Module):
         
         # Continuous flow time. Avoid sigma_t = 1 - t being too small because
         # the analytic score contains 1 / sigma_t^2.
-        t = torch.rand(1, device=X.device) * (1.0 - self.scorefm_min_sigma)
-        sigma_t = (1.0 - t).clamp_min(self.scorefm_min_sigma)
+        # Following AbX-style diffusion training, optionally sample one t per
+        # complex instead of one scalar for the whole batch. This is a clean
+        # ablation controlled by ABFLOW_SCOREFM_PER_SAMPLE_T.
+        batch_size = int(self.batch_constants['batch_size'].item()) if torch.is_tensor(self.batch_constants['batch_size']) else int(self.batch_constants['batch_size'])
+        interface_batch_id = self.batch_constants['interface_batch_id']
+        t_graph = self._sample_flow_times(batch_size, device=X.device, dtype=X.dtype)
+        sigma_graph = (1.0 - t_graph).clamp_min(self.scorefm_min_sigma)
+        t_int = self._time_for_interface(t_graph, interface_batch_id, interface_X)
+        sigma_int = self._time_for_interface(sigma_graph, interface_batch_id, interface_X)
 
         # Coordinate-only flow path: X_t = (1 - t) X_0 + t X_1.
         # Sequence labels remain discrete and are handled by the CE loss; never
         # linearly interpolate amino-acid indices.
-        Xt = sigma_t * interface_X + t * gt_interface_X
+        Xt = sigma_int * interface_X + t_int * gt_interface_X
 
         # get results
         # IMPORTANT: pass interface_init=Xt. Otherwise _forward reinitializes the
         # shadow interface and the score target no longer matches the model input.
         H, pred_S, r_pred_S_logits, pred_X, r_interface_X, r_edge_dist, prmsd = self._forward(
             X, S, cmask, smask, paratope_mask, X_pep, S_pep,
-            surface, residue_pos, template, lengths, interface_init=Xt
+            surface, residue_pos, template, lengths, interface_init=Xt, flow_t=t_graph
         )
 
         # sequence negtive log likelihood
@@ -949,8 +1087,8 @@ class AbFlowModel(nn.Module):
             batch_id=batch_id,
             segment_ids=self.batch_constants['segment_ids'],
             interface_batch_id=self.batch_constants['interface_batch_id'],
-            t=t,
-            sigma_t=sigma_t,
+            t=t_int,
+            sigma_t=sigma_int,
         )
         self.last_scorefm_losses = scorefm_details
 
@@ -1034,6 +1172,7 @@ class AbFlowModel(nn.Module):
 
         for i in step_iter:
             t = torch.tensor(i * dt, device=X.device)
+            flow_t_graph = t.reshape(1).expand(batch_size)
             if show_progress and hasattr(step_iter, 'set_postfix'):
                 step_iter.set_postfix(t=f'{float(t):.2f}')
             
@@ -1047,7 +1186,7 @@ class AbFlowModel(nn.Module):
             H, pred_S, r_pred_S_logits, pred_X, r_interface_X, r_edge_dist, prmsd = self._forward(
                 X_cur, S_cur, cmask, smask, paratope_mask, 
                 X_pep, S_pep, surface, residue_pos, template, lengths,
-                interface_init=Xt
+                interface_init=Xt, flow_t=flow_t_graph
             )
 
             # Score-factorized velocity. Given predicted clean endpoint Xhat_1,
@@ -1116,9 +1255,10 @@ class AbFlowModel(nn.Module):
             # generate
             # Use the final ODE state Xt as shadow-interface input instead of
             # reinitializing from noise.
+            final_flow_t_graph = torch.full((batch_size,), 1.0 - self.scorefm_min_sigma, device=X.device, dtype=X.dtype)
             H, pred_S, r_pred_S_logits, pred_X, r_interface_X, _, prmsd = self._forward(
                 X, S, cmask, smask, paratope_mask, X_pep, S_pep,
-                surface, residue_pos, template, lengths, interface_init=Xt
+                surface, residue_pos, template, lengths, interface_init=Xt, flow_t=final_flow_t_graph
             )
 
             # PPL or PRMSD
