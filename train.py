@@ -31,6 +31,7 @@ from datetime import datetime
 
 import torch
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 from utils.logger import print_log
 from utils.random_seed import setup_seed, SEED
@@ -204,18 +205,27 @@ def _list_version_dirs(save_root: str):
     return version_dirs
 
 
-def _looks_like_version_dir(path: str, save_root: str):
+def _looks_like_version_dir(path: str, save_root: str, must_exist: bool = False):
+    """Return True if path looks like the concrete Trainer version directory.
+
+    Important: the original AbFlow Trainer sets config.save_dir to
+    <save_root>/version_N during Trainer.__init__, but it creates the directory
+    later in Trainer.train(). Therefore we must NOT require the directory to
+    already exist when inferring from trainer.config.save_dir.
+    """
     if not path:
         return False
     p = os.path.abspath(path)
     root = os.path.abspath(save_root)
     base = os.path.basename(p)
-    return (
-        os.path.isdir(p)
-        and p.startswith(root)
+    ok = (
+        p.startswith(root + os.sep)
         and p != root
         and re.match(r"^version([=_-]?\d+)?$", base, flags=re.IGNORECASE) is not None
     )
+    if must_exist:
+        ok = ok and os.path.isdir(p)
+    return ok
 
 
 def _candidate_paths_from_attr(value):
@@ -245,18 +255,36 @@ def _candidate_paths_from_attr(value):
 def _infer_trainer_run_dir(trainer, save_root: str, before_version_dirs=None):
     """Infer the real version directory created by the original AbFlow Trainer.
 
-    Why this is needed:
-    - train_abflow.py receives save_dir as the root, e.g.
-      datasets/RAbD/models_multi_cdr_design.
-    - The original Trainer creates a concrete version directory under it, e.g.
-      datasets/RAbD/models_multi_cdr_design/version=7.
-    - Reproducibility records must be stored in that concrete version directory,
-      not in the root save_dir.
+    The original AbFlow Trainer does this in Trainer.__init__:
+        self.version = self._get_version()
+        self.config.save_dir = os.path.join(self.config.save_dir, f"version_{self.version}")
+        self.model_dir = os.path.join(self.config.save_dir, "checkpoint")
+
+    The directory itself is created later in Trainer.train(). Therefore the
+    correct source of truth is trainer.config.save_dir, not the latest existing
+    version directory on disk. Relying on existing directories causes records to
+    be written into version_{n-1}.
     """
     root = os.path.abspath(save_root)
     before_version_dirs = before_version_dirs or set()
 
-    # 1) Prefer explicit attributes if the Trainer exposes them.
+    # 1) Highest priority: original AbFlow Trainer mutates config.save_dir to
+    # the concrete version directory before the directory exists.
+    cfg = getattr(trainer, "config", None)
+    if cfg is not None and hasattr(cfg, "save_dir"):
+        cand = os.path.abspath(getattr(cfg, "save_dir"))
+        if _looks_like_version_dir(cand, root, must_exist=False):
+            return cand
+
+    # 2) model_dir usually points to <version_dir>/checkpoint. Its parent is the
+    # version directory. This also may not exist yet.
+    model_dir = getattr(trainer, "model_dir", None)
+    if model_dir is not None:
+        cand = os.path.abspath(os.path.dirname(str(model_dir)))
+        if _looks_like_version_dir(cand, root, must_exist=False):
+            return cand
+
+    # 3) Other explicit attributes, if available.
     objects = [trainer]
     for attr in ("config", "cfg", "train_config"):
         obj = getattr(trainer, attr, None)
@@ -275,21 +303,21 @@ def _infer_trainer_run_dir(trainer, save_root: str, before_version_dirs=None):
                 except Exception:
                     continue
                 for cand in _candidate_paths_from_attr(val):
-                    if _looks_like_version_dir(cand, root):
+                    if _looks_like_version_dir(cand, root, must_exist=False):
                         return os.path.abspath(cand)
 
-    # 2) If a new version directory appeared after Trainer construction, use it.
+    # 4) If a new version directory appeared after Trainer construction, use it.
     after = _list_version_dirs(root)
     new_dirs = sorted(after - set(before_version_dirs), key=lambda x: os.path.getmtime(x))
     if new_dirs:
         return os.path.abspath(new_dirs[-1])
 
-    # 3) Otherwise use the latest version-like directory if any exists.
+    # 5) Last resort: latest existing version directory. This should rarely be
+    # used because it can point to version_{n-1}; keep it only as fallback.
     if after:
         latest = sorted(after, key=lambda x: os.path.getmtime(x))[-1]
         return os.path.abspath(latest)
 
-    # 4) Fallback: keep old behavior, but make the fallback explicit in logs.
     return root
 
 
