@@ -174,7 +174,7 @@ class AbFlowModel(nn.Module):
         # Path:               X_t = (1 - t) X_0 + t X_1
         # sigma_t:            sigma_t = 1 - t
         # conditional score:  s_t(X_t | X_1) = -(X_t - t X_1) / sigma_t^2
-        self.scorefm_min_sigma = 5e-2
+        self.scorefm_min_sigma = 0e-2
         self.scorefm_eps = 1e-8
         self.scorefm_t_threshold = 0.50
 
@@ -255,6 +255,16 @@ class AbFlowModel(nn.Module):
         self.scorefm_bridge_damping_power = _env_float("ABFLOW_SCOREFM_DAMPING_POWER", 0.0)
         self.scorefm_bridge_blend = _env_float("ABFLOW_SCOREFM_BRIDGE_BLEND", 1.0)
 
+        # A single generative state is used for both global and shadow-interface
+        # paths. Peptide predictions may condition the initial distribution, but
+        # they never overwrite X_t/S_t inside _forward.
+        self.coord_pep_prior_weight = _env_float(
+            "ABFLOW_COORD_PEP_PRIOR_WEIGHT", 0.5
+        )
+        self.seq_pep_prior_weight = _env_float(
+            "ABFLOW_SEQ_PEP_PRIOR_WEIGHT", 0.5
+        )
+
         # Allow component weights to be overridden from shell scripts.
         self.scorefm_loss_weight = _env_float("ABFLOW_SCOREFM_LOSS_WEIGHT", self.scorefm_loss_weight)
         self.scorefm_velocity_weight = _env_float("ABFLOW_SCOREFM_VELOCITY_WEIGHT", self.scorefm_velocity_weight)
@@ -275,17 +285,92 @@ class AbFlowModel(nn.Module):
         X[cmask] = template
         return X, S
     
-    def replace_pep(self, X, S, paratope_mask, X_pep, S_pep):
-        if X_pep.abs().sum() == 0:
-            return X, S
-        pep_seq = getattr(self, 'pep_seq', True)
-        pep_struct = getattr(self, 'pep_struct', True)
-
-        if self.pep_seq:
+    def replace_pep(self, X, S, paratope_mask, X_pep, S_pep,
+                    replace_seq=True, replace_struct=True):
+        """Legacy endpoint conditioning used only when no explicit state exists."""
+        if (
+            replace_seq
+            and getattr(self, 'pep_seq', True)
+            and S_pep is not None
+            and S_pep.numel() == int(paratope_mask.sum().item())
+        ):
             S[paratope_mask] = S_pep
-        if self.pep_struct:
+        if (
+            replace_struct
+            and getattr(self, 'pep_struct', True)
+            and X_pep is not None
+            and X_pep.shape == X[paratope_mask].shape
+            and bool(torch.any(X_pep != 0))
+        ):
             X[paratope_mask] = X_pep
         return X, S
+
+    @torch.no_grad()
+    def _condition_initial_interface(self, interface_X, interface_S, X_pep, S_pep):
+        """Condition the base distribution without creating a second state path.
+
+        Coordinate prior:
+            X_0 <- (1-rho_x) X_noise + rho_x X_pep
+
+        Sequence prior:
+            pi_0 = (1-rho_s) Uniform + rho_s delta(S_pep)
+            S_0 ~ pi_0
+
+        The returned X_0/S_0 remain the only generative state consumed by the
+        network. Setting either weight to zero recovers the unconditioned base.
+        """
+        if (
+            getattr(self, 'pep_struct', True)
+            and X_pep is not None
+            and X_pep.shape == interface_X.shape
+            and bool(torch.any(X_pep != 0))
+        ):
+            rho_x = max(0.0, min(1.0, float(self.coord_pep_prior_weight)))
+            interface_X = (1.0 - rho_x) * interface_X + rho_x * X_pep.to(
+                device=interface_X.device, dtype=interface_X.dtype
+            )
+
+        if (
+            not self.struct_only
+            and getattr(self, 'pep_seq', True)
+            and S_pep is not None
+            and S_pep.shape == interface_S.shape
+        ):
+            rho_s = max(0.0, min(1.0, float(self.seq_pep_prior_weight)))
+            pep_S = S_pep.to(device=interface_S.device, dtype=torch.long)
+            valid = torch.logical_and(pep_S >= 0, pep_S < self.num_classes)
+            use_pep = torch.logical_and(
+                valid,
+                torch.rand(interface_S.shape, device=interface_S.device) < rho_s
+            )
+            interface_S = torch.where(use_pep, pep_S, interface_S)
+
+        return interface_X, interface_S
+
+    @torch.no_grad()
+    def _sample_categorical_path(self, clean_S, base_S, t_graph,
+                                 interface_batch_id, corrupt_mask=None):
+        """Sample a legal categorical interpolation q_t(S_t | S_1, S_0).
+
+        With the same time convention as the coordinate path, t=0 is the base
+        distribution and t=1 is clean. Each residue keeps the clean category
+        with probability t and otherwise keeps its sampled base category.
+        """
+        t_graph = torch.as_tensor(
+            t_graph, device=clean_S.device, dtype=torch.float32
+        )
+        if t_graph.dim() == 0 or t_graph.numel() == 1:
+            keep_prob = t_graph.reshape(1).expand_as(clean_S)
+        else:
+            keep_prob = t_graph[interface_batch_id]
+        keep_clean = torch.rand(
+            clean_S.shape, device=clean_S.device
+        ) < keep_prob.clamp(0.0, 1.0)
+        sampled = torch.where(keep_clean, clean_S, base_S).long()
+        if corrupt_mask is None:
+            return sampled
+        corrupt_mask = corrupt_mask.to(device=clean_S.device, dtype=torch.bool)
+        return torch.where(corrupt_mask, sampled, clean_S).long()
     
     def align_epi_ab(self, local_inter_edges, local_is_ab) : 
         aligned = torch.zeros_like(local_inter_edges)
@@ -432,18 +517,21 @@ class AbFlowModel(nn.Module):
         local_is_ab = self.batch_constants['local_is_ab']
         local_batch_id = self.batch_constants['local_batch_id']
         local_X = X[local_mask].clone()
+        # Replace the generated region before constructing any geometric KNN
+        # graph. This makes intra-paratope and paratope-antigen edges depend on
+        # the same current state X_t.
+        local_X[local_is_ab] = interface_X
         # prepare local complex edges
         local_ctx_edges = self.batch_constants['local_ctx_edges']  # [2, Ec]
         local_inter_edges = self.batch_constants['local_inter_edges']  # [2, Ei]
         atom_pos = self.aa_feature._construct_atom_pos(S[local_mask])
         offsets, max_n, gni2lni = self.batch_constants['local_edge_infos']
-        # for context edges, use edges in the native paratope
+        # Context and interaction edges are both derived from the current state.
         local_ctx_edges = _knn_edges(
             local_X, atom_pos, local_ctx_edges.T,
             self.aa_feature.atom_pos_pad_idx, self.k_neighbors,
             (offsets, local_batch_id, max_n, gni2lni))
-        # for interative edges, use edges derived from the predicted distance
-        local_X[local_is_ab] = interface_X
+        # For interaction edges, optionally use the learned distance predictor.
         if self.pred_edge_dist:
             local_H = edge_H[local_mask]
             src_H, dst_H = local_H[local_inter_edges[0]], local_H[local_inter_edges[1]]
@@ -916,18 +1004,29 @@ class AbFlowModel(nn.Module):
         }
         return total, details
 
-    def _forward(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths, init_noise=None, interface_init=None, flow_t=None):
+    def _forward(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep,
+                 surface, residue_pos, template, lengths, init_noise=None,
+                 interface_init=None, sequence_init=None, flow_t=None):
         
         batch_id = self.batch_constants['batch_id']
-        # print(batch_id[paratope_mask].shape, residue_pos[paratope_mask].shape)
-        
-        # print(X.shape, S.shape, cmask.shape, smask.shape, paratope_mask.shape, X_pep.shape, S_pep.shape, template.shape)
+        X = X.clone()
+        S = S.clone()
+        surface = surface.clone()
 
         # mask sequence and initialize coordinates with template
         X, S = self.init_mask(X, S, cmask, smask, template)
         
-        # replace paratope with peptide
-        X, S = self.replace_pep(X, S, paratope_mask, X_pep, S_pep)
+        # Peptide values are legacy conditioning only when a corresponding
+        # explicit state is absent. X_t/S_t always take precedence.
+        X, S = self.replace_pep(
+            X, S, paratope_mask, X_pep, S_pep,
+            replace_seq=sequence_init is None,
+            replace_struct=interface_init is None,
+        )
+        if interface_init is not None:
+            X[paratope_mask] = interface_init.to(device=X.device, dtype=X.dtype)
+        if sequence_init is not None:
+            S[paratope_mask] = sequence_init.to(device=S.device, dtype=torch.long)
 
         # normalize
         X = self.normalizer.centering(X, S, batch_id, self.aa_feature)
@@ -1006,6 +1105,7 @@ class AbFlowModel(nn.Module):
         # import ipdb; ipdb.set_trace()
         if self.backbone_only:
             X, template = X[:, :4], template[:, :4]  # backbone
+            X_pep = X_pep[:, :4]
             xloss_mask = xloss_mask[:, :4]
         # clone ground truth coordinates, sequence
         true_X, true_S = X.clone(), S.clone()
@@ -1024,7 +1124,12 @@ class AbFlowModel(nn.Module):
         # Sample X_0 from exactly the same initialization distribution used at
         # inference. Do not align or permute X_0 with the native X_1, because
         # the native structure is unavailable at generation time.
-        interface_X, _ = self.init_interface(X, S, paratope_mask, batch_id)
+        interface_X, interface_S = self.init_interface(
+            X, S, paratope_mask, batch_id
+        )
+        interface_X, interface_S = self._condition_initial_interface(
+            interface_X, interface_S, X_pep, S_pep
+        )
         
         # Continuous flow time. Avoid sigma_t = 1 - t being too small because
         # the analytic score contains 1 / sigma_t^2.
@@ -1042,13 +1147,17 @@ class AbFlowModel(nn.Module):
         # Sequence labels remain discrete and are handled by the CE loss; never
         # linearly interpolate amino-acid indices.
         Xt = sigma_int * interface_X + t_int * gt_interface_X
+        St = self._sample_categorical_path(
+            true_S[paratope_mask], interface_S, t_graph, interface_batch_id,
+            corrupt_mask=smask[paratope_mask],
+        )
 
         # get results
-        # IMPORTANT: pass interface_init=Xt. Otherwise _forward reinitializes the
-        # shadow interface and the score target no longer matches the model input.
+        # X_t and S_t are the actual state seen by every model branch.
         H, pred_S, r_pred_S_logits, pred_X, r_interface_X, r_edge_dist, prmsd = self._forward(
             X, S, cmask, smask, paratope_mask, X_pep, S_pep,
-            surface, residue_pos, template, lengths, interface_init=Xt, flow_t=t_graph
+            surface, residue_pos, template, lengths,
+            interface_init=Xt, sequence_init=St, flow_t=t_graph
         )
 
         # sequence negtive log likelihood
@@ -1131,6 +1240,7 @@ class AbFlowModel(nn.Module):
         
         if self.backbone_only:
             X, template = X[:, :4], template[:, :4]  # backbone
+            X_pep = X_pep[:, :4]
         
         # self.timing_stats = {
         #     'surface_processing': 0.0,
@@ -1155,6 +1265,9 @@ class AbFlowModel(nn.Module):
 
         interface_X, interface_S = self.init_interface(
             X, S, paratope_mask, batch_id, init_noise=init_noise
+        )
+        interface_X, interface_S = self._condition_initial_interface(
+            interface_X, interface_S, X_pep, S_pep
         )
         dt = 1.0 / n_steps
         Xt = interface_X.clone()
@@ -1186,7 +1299,7 @@ class AbFlowModel(nn.Module):
             H, pred_S, r_pred_S_logits, pred_X, r_interface_X, r_edge_dist, prmsd = self._forward(
                 X_cur, S_cur, cmask, smask, paratope_mask, 
                 X_pep, S_pep, surface, residue_pos, template, lengths,
-                interface_init=Xt, flow_t=flow_t_graph
+                interface_init=Xt, sequence_init=St, flow_t=flow_t_graph
             )
 
             # Score-factorized velocity. Given predicted clean endpoint Xhat_1,
@@ -1229,22 +1342,24 @@ class AbFlowModel(nn.Module):
                 )
             if not self.struct_only:
                 cur_logits = r_pred_S_logits[-1][0][paratope_mask]
-                # 1. 数值稳定性处理
                 cur_logits = cur_logits - cur_logits.max(dim=-1, keepdim=True)[0]
-                # 2. 计算当前概率
                 cur_probs = F.softmax(cur_logits, dim=-1)
-                # 3. 计算序列的速度场
-                dS = cur_probs - F.one_hot(St, num_classes=self.num_classes).float()
                 
-            # Euler步进
+            # Euler coordinate step.
             Xt = Xt + dX * dt
             if not self.struct_only:
-                next_probs = F.one_hot(St, num_classes=self.num_classes).float() + dS * dt
-                # 确保数值稳定性
-                next_probs = next_probs.clamp(min=1e-6)
-                next_probs = next_probs / next_probs.sum(dim=-1, keepdim=True)
-                # 从更新后的概率分布中采样
-                St = torch.multinomial(next_probs, num_samples=1).squeeze(-1)
+                # Categorical stochastic interpolation. For q_t =
+                # t*delta(clean)+(1-t)*pi_0, moving from t to t+dt refreshes a
+                # residue from the predicted clean distribution with
+                # probability dt/(1-t), otherwise retaining its current state.
+                refresh_prob = min(1.0, dt / max(1e-8, 1.0 - float(t)))
+                proposed_S = torch.multinomial(
+                    cur_probs.clamp_min(1e-8), num_samples=1
+                ).squeeze(-1)
+                refresh = torch.rand(
+                    St.shape, device=St.device
+                ) < refresh_prob
+                St = torch.where(refresh, proposed_S, St)
         
         X[paratope_mask] = Xt
         S[paratope_mask] = St
@@ -1258,7 +1373,9 @@ class AbFlowModel(nn.Module):
             final_flow_t_graph = torch.full((batch_size,), 1.0 - self.scorefm_min_sigma, device=X.device, dtype=X.dtype)
             H, pred_S, r_pred_S_logits, pred_X, r_interface_X, _, prmsd = self._forward(
                 X, S, cmask, smask, paratope_mask, X_pep, S_pep,
-                surface, residue_pos, template, lengths, interface_init=Xt, flow_t=final_flow_t_graph
+                surface, residue_pos, template, lengths,
+                interface_init=Xt, sequence_init=St,
+                flow_t=final_flow_t_graph
             )
 
             # PPL or PRMSD
@@ -1310,6 +1427,7 @@ class AbFlowModel(nn.Module):
         
         if self.backbone_only:
             X, template = X[:, :4], template[:, :4]  # backbone
+            X_pep = X_pep[:, :4]
         gen_X, gen_S = X.clone(), S.clone()
         
         # prepare constants
