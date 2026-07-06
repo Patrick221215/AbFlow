@@ -3,7 +3,7 @@
  # @Author: Patrick221215 1427584833@qq.com
  # @Date: 2026-06-13 19:33:31
  # @LastEditors: Patrick221215 1427584833@qq.com
- # @LastEditTime: 2026-06-17 19:55:08
+ # @LastEditTime: 2026-06-20 19:50:24
  # @FilePath: /cjm/project/AbFlow/scripts/test/test.sh
  # @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
 ### 
@@ -12,7 +12,7 @@ set -euo pipefail
 ########## adjust configs according to your needs ##########
 CODE_DIR=`realpath $(dirname "$0")/../..`
 NUM_WORKERS=8
-BATCH_SIZE="${BATCH_SIZE:-32}"
+BATCH_SIZE="${BATCH_SIZE:-20}"
 N_STEPS="${N_STEPS:-10}"
 SHOW_SAMPLE_PROGRESS="${SHOW_SAMPLE_PROGRESS:-1}"
 GPU="${GPU:-0}"
