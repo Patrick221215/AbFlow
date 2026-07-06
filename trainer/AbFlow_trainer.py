@@ -2,7 +2,7 @@
 Author: Patrick221215 1427584833@qq.com
 Date: 2026-06-13 19:33:31
 LastEditors: Patrick221215 1427584833@qq.com
-LastEditTime: 2026-06-19 16:29:21
+LastEditTime: 2026-07-06 11:32:39
 FilePath: /cjm/project/AbFlow/trainer/AbFlow_trainer.py
 Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
 '''
@@ -30,7 +30,7 @@ class AbFlowTrainer(Trainer):
 
     def get_scheduler(self, optimizer):
         log_alpha = self.log_alpha
-        lr_lambda = lambda step: exp(log_alpha * (step + 1))  # equal to alpha^{step}
+        lr_lambda = lambda step: exp(log_alpha * (step + 1))
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
         return {
             'scheduler': scheduler,
@@ -49,7 +49,7 @@ class AbFlowTrainer(Trainer):
 
     def get_context_ratio(self):
         step = self.global_step
-        ratio = 0.5 * (cos(step / self.max_step * pi) + 1) * 0.9  # scale to [0, 0.9]
+        ratio = 0.5 * (cos(step / self.max_step * pi) + 1) * 0.9
         return ratio
 
     def share_step(self, batch, batch_idx, val=False):
@@ -80,13 +80,17 @@ class AbFlowTrainer(Trainer):
         if pdev_loss is not None:
             self.log(f'PDev/PDevLoss/{log_type}', pdev_loss, batch_idx, val)
             self.log(f'PDev/PRMSDLoss/{log_type}', prmsd_loss, batch_idx, val)
-        
-        # Add this block
+
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
         scorefm_losses = getattr(raw_model, "last_scorefm_losses", None)
         if scorefm_losses:
             for name, value in scorefm_losses.items():
                 self.log(f"DTM/{name}/{log_type}", value, batch_idx, val)
+
+        abflow_diagnostics = getattr(raw_model, "last_abflow_diagnostics", None)
+        if abflow_diagnostics:
+            for name, value in abflow_diagnostics.items():
+                self.log(f"AbFlowDiag/{name}/{log_type}", value, batch_idx, val)
 
         if not val:
             lr = self.config.lr if self.scheduler is None else self.scheduler.get_last_lr()
