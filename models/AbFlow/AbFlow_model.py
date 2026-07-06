@@ -174,9 +174,9 @@ class AbFlowModel(nn.Module):
         # Path:               X_t = (1 - t) X_0 + t X_1
         # sigma_t:            sigma_t = 1 - t
         # conditional score:  s_t(X_t | X_1) = -(X_t - t X_1) / sigma_t^2
-        self.scorefm_min_sigma = 0e-2
+        self.scorefm_min_sigma = 5e-2
         self.scorefm_eps = 1e-8
-        self.scorefm_t_threshold = 0.50
+        self.scorefm_t_threshold = 0.2
 
         # Overall weight of the new objective. The component weights below are
         # active by default; they are not placeholders. Keep the global weight
@@ -246,11 +246,18 @@ class AbFlowModel(nn.Module):
             nn.Linear(embed_size, embed_size),
         )
 
-        # Sampler modes:
-        #   bridge        : dX = pred_clean_X + sigma_t * pred_score
-        #   residual      : dX = pred_clean_X - Xt
-        #   damped_bridge : dX = sigma_t^p * bridge_velocity
-        #   blend         : dX = (1-a) * residual + a * bridge
+        # bridge:
+        #     dX = pred_clean_X + sigma_t * pred_score
+        #        = (pred_clean_X - X_t) / sigma_t
+        #     This recovers the FM velocity X_1 - X_0 when pred_clean_X = X_1.
+        # residual:
+        #     dX = pred_clean_X - X_t
+        #     Conservative endpoint residual, not the exact FM velocity.
+        # damped_bridge:
+        #     dX = sigma_t^p * bridge_velocity
+        #     Reduces bridge magnitude near late time if p > 0.
+        # blend:
+        #     Interpolates between residual and bridge velocity.
         self.scorefm_sampler_mode = _env_str("ABFLOW_SCOREFM_SAMPLER_MODE", "bridge").lower()
         self.scorefm_bridge_damping_power = _env_float("ABFLOW_SCOREFM_DAMPING_POWER", 0.0)
         self.scorefm_bridge_blend = _env_float("ABFLOW_SCOREFM_BRIDGE_BLEND", 1.0)
@@ -264,6 +271,18 @@ class AbFlowModel(nn.Module):
         self.seq_pep_prior_weight = _env_float(
             "ABFLOW_SEQ_PEP_PRIOR_WEIGHT", 0.5
         )
+        # state: use the sampled categorical state S_t as the sequence input.
+        # pep_condition: emulate original AbFlow persistent peptide conditioning;
+        #                S_pep is visible at every _forward call even when S_t
+        #                exists. This intentionally breaks pure state-only input.
+        self.seq_input_mode = _env_str("ABFLOW_SEQ_INPUT_MODE", "state").lower()
+        if self.seq_input_mode not in {"state", "pep_condition"}:
+            raise ValueError(
+                "Unknown ABFLOW_SEQ_INPUT_MODE="
+                f"{self.seq_input_mode}. Choose from state, pep_condition."
+            )
+        self.seq_ce_weight = _env_float("ABFLOW_SEQ_CE_WEIGHT", 1.0)
+        self.last_abflow_diagnostics = {}
 
         # Allow component weights to be overridden from shell scripts.
         self.scorefm_loss_weight = _env_float("ABFLOW_SCOREFM_LOSS_WEIGHT", self.scorefm_loss_weight)
@@ -638,8 +657,6 @@ class AbFlowModel(nn.Module):
         dist = dist + pos_pad * 1e10  # [Ef, n_channel, n_channel]
         dist = torch.min(dist.reshape(dist.shape[0], -1), dim=1)[0]  # [Ef]
         return dist
-        is_binding = dist <= self.bind_dist_cutoff
-        return is_binding
     
     def _raw_interface_to_model_frame(self, interface_X, paratope_mask, batch_id):
         """Convert raw paratope coordinates into AbFlow's internal shadow frame.
@@ -1016,16 +1033,20 @@ class AbFlowModel(nn.Module):
         # mask sequence and initialize coordinates with template
         X, S = self.init_mask(X, S, cmask, smask, template)
         
-        # Peptide values are legacy conditioning only when a corresponding
-        # explicit state is absent. X_t/S_t always take precedence.
+        # Peptide coordinates are legacy conditioning only when X_t is absent.
+        # Sequence conditioning is controlled separately:
+        #   state         -> model sees the sampled categorical state S_t
+        #   pep_condition -> model sees S_pep persistently, matching original AbFlow
         X, S = self.replace_pep(
             X, S, paratope_mask, X_pep, S_pep,
-            replace_seq=sequence_init is None,
+            replace_seq=(
+                sequence_init is None or self.seq_input_mode == "pep_condition"
+            ),
             replace_struct=interface_init is None,
         )
         if interface_init is not None:
             X[paratope_mask] = interface_init.to(device=X.device, dtype=X.dtype)
-        if sequence_init is not None:
+        if sequence_init is not None and self.seq_input_mode == "state":
             S[paratope_mask] = sequence_init.to(device=S.device, dtype=torch.long)
 
         # normalize
@@ -1223,15 +1244,43 @@ class AbFlowModel(nn.Module):
             pdev_loss, prmsd_loss = None, None
 
         # comprehensive loss
-        loss = snll + struct_loss + dock_loss + flow_loss + (0 if pdev_loss is None else pdev_loss)
+        loss = self.seq_ce_weight * snll + struct_loss + dock_loss + flow_loss + (0 if pdev_loss is None else pdev_loss)
         # loss = snll + struct_loss + dock_loss + flow_loss + (0 if pdev_loss is None else pdev_loss)
 
         self._clean_batch_constants()
 
-        # AAR
+        # AAR and sequence-conditioning diagnostics.
         with torch.no_grad():
             aa_hit = pred_S[smask] == true_S[smask]
             aar = aa_hit.long().sum() / aa_hit.shape[0]
+            diag = {
+                "seq_ce_weight": torch.as_tensor(self.seq_ce_weight, device=X.device),
+                "seq_input_mode_state": torch.as_tensor(
+                    1.0 if self.seq_input_mode == "state" else 0.0, device=X.device
+                ),
+                "seq_input_mode_pep_condition": torch.as_tensor(
+                    1.0 if self.seq_input_mode == "pep_condition" else 0.0, device=X.device
+                ),
+                "t_mean": t_graph.detach().float().mean(),
+                "t_min": t_graph.detach().float().min(),
+                "t_max": t_graph.detach().float().max(),
+            }
+            valid_pep = (
+                S_pep is not None
+                and S_pep.numel() == int(paratope_mask.sum().item())
+            )
+            if valid_pep and smask[paratope_mask].any():
+                pep_full = torch.empty_like(S)
+                pep_full.copy_(S)
+                pep_full[paratope_mask] = S_pep.to(device=S.device, dtype=torch.long)
+                pep_mask = smask
+                pred_pep_hit = pred_S[pep_mask] == pep_full[pep_mask]
+                pep_native_hit = pep_full[pep_mask] == true_S[pep_mask]
+                diag["seq_pred_vs_pep_aar"] = pred_pep_hit.float().mean()
+                diag["seq_pep_vs_native_aar"] = pep_native_hit.float().mean()
+            self.last_abflow_diagnostics = {
+                k: v.detach() if torch.is_tensor(v) else v for k, v in diag.items()
+            }
 
         return loss, (snll, aar), (struct_loss, *struct_loss_details), (dock_loss, interface_loss, ed_loss, r_ed_losses), (pdev_loss, prmsd_loss)
 
