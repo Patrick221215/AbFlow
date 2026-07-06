@@ -268,6 +268,25 @@ class AbFlowModel(nn.Module):
         self.coord_pep_prior_weight = _env_float(
             "ABFLOW_COORD_PEP_PRIOR_WEIGHT", 0.5
         )
+        # Coordinate prior mode:
+        #   blend:
+        #       Existing behavior. X0 <- (1-rho) X_noise + rho X_pep.
+        #       With rho=1, this becomes the deterministic hard prior X0=X_pep.
+        #   conditional_gaussian:
+        #       Peptide-informed Gaussian base. X0 <- X_pep + sigma_pep * eps.
+        #       This keeps stochasticity while centering the base distribution
+        #       around the paratope prior.
+        self.coord_pep_prior_mode = _env_str(
+            "ABFLOW_COORD_PEP_PRIOR_MODE", "blend"
+        ).lower()
+        if self.coord_pep_prior_mode not in {"blend", "conditional_gaussian"}:
+            raise ValueError(
+                "Unknown ABFLOW_COORD_PEP_PRIOR_MODE="
+                f"{self.coord_pep_prior_mode}. Choose from blend, conditional_gaussian."
+            )
+        self.coord_pep_prior_sigma = _env_float(
+            "ABFLOW_COORD_PEP_PRIOR_SIGMA", 1.0
+        )
         self.seq_pep_prior_weight = _env_float(
             "ABFLOW_SEQ_PEP_PRIOR_WEIGHT", 0.5
         )
@@ -330,6 +349,8 @@ class AbFlowModel(nn.Module):
 
         Coordinate prior:
             X_0 <- (1-rho_x) X_noise + rho_x X_pep
+        or, when ABFLOW_COORD_PEP_PRIOR_MODE=conditional_gaussian:
+            X_0 <- X_pep + sigma_pep * eps
 
         Sequence prior:
             pi_0 = (1-rho_s) Uniform + rho_s delta(S_pep)
@@ -344,10 +365,13 @@ class AbFlowModel(nn.Module):
             and X_pep.shape == interface_X.shape
             and bool(torch.any(X_pep != 0))
         ):
-            rho_x = max(0.0, min(1.0, float(self.coord_pep_prior_weight)))
-            interface_X = (1.0 - rho_x) * interface_X + rho_x * X_pep.to(
-                device=interface_X.device, dtype=interface_X.dtype
-            )
+            pep_X = X_pep.to(device=interface_X.device, dtype=interface_X.dtype)
+            if self.coord_pep_prior_mode == "conditional_gaussian":
+                sigma = max(0.0, float(self.coord_pep_prior_sigma))
+                interface_X = pep_X + sigma * torch.randn_like(interface_X)
+            else:
+                rho_x = max(0.0, min(1.0, float(self.coord_pep_prior_weight)))
+                interface_X = (1.0 - rho_x) * interface_X + rho_x * pep_X
 
         if (
             not self.struct_only
@@ -1255,6 +1279,15 @@ class AbFlowModel(nn.Module):
             aar = aa_hit.long().sum() / aa_hit.shape[0]
             diag = {
                 "seq_ce_weight": torch.as_tensor(self.seq_ce_weight, device=X.device),
+                "coord_prior_mode_blend": torch.as_tensor(
+                    1.0 if self.coord_pep_prior_mode == "blend" else 0.0, device=X.device
+                ),
+                "coord_prior_mode_conditional_gaussian": torch.as_tensor(
+                    1.0 if self.coord_pep_prior_mode == "conditional_gaussian" else 0.0, device=X.device
+                ),
+                "coord_pep_prior_sigma": torch.as_tensor(
+                    self.coord_pep_prior_sigma, device=X.device
+                ),
                 "seq_input_mode_state": torch.as_tensor(
                     1.0 if self.seq_input_mode == "state" else 0.0, device=X.device
                 ),
