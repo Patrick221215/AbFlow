@@ -194,8 +194,7 @@ def generate(args):
             X, S, pmets = model.sample(
                 **batch,
                 n_steps=args.n_steps,
-                show_progress=args.show_sample_progress,
-                progress_desc=f'Batch {batch_idx + 1}/{len(test_loader)} ODE'
+                show_progress=args.show_sample_progress
             )
 
             X, S, pmets = X.tolist(), S.tolist(), pmets.tolist()
