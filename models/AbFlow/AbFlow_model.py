@@ -465,39 +465,38 @@ class AbFlowModel(nn.Module):
         
 
     def _sample_flow_times(self, batch_size, device, dtype=torch.float32):
-        """Sample continuous flow times for DTM/ScoreFM path training.
+        """Sample continuous flow times for training.
 
-        Returns:
-            t_graph: [B] if per-sample time is enabled, otherwise [1]. Values
-            are upper-bounded by 1 - sigma_min so analytic scores never divide
-            by a vanishing sigma_t.
+        t is a real path time in [0, 1]. We do not shrink the endpoint here.
+        Numerical stability is handled separately by sigma_score=max(1-t, sigma_min).
         """
         n = int(batch_size) if getattr(self, 'scorefm_per_sample_t', False) else 1
-        max_t = 1.0 - float(getattr(self, 'scorefm_min_sigma', 5e-2))
         mode = getattr(self, 'scorefm_t_sampling', 'uniform')
+
         if mode == 'uniform':
-            u = torch.rand(n, device=device, dtype=dtype)
-            t = max_t * u
+            t = torch.rand(n, device=device, dtype=dtype)
+
         elif mode in {'low_t', 'low', 'square'}:
             u = torch.rand(n, device=device, dtype=dtype)
-            t = max_t * (u ** 2)
+            t = u ** 2
+
         elif mode in {'stratified', 'strat'}:
-            # Stratification is only meaningful for per-sample t. For n=1 it
-            # reduces to uniform sampling over the full interval.
-            if n == 1:
-                t = max_t * torch.rand(n, device=device, dtype=dtype)
+            if n <= 1:
+                t = torch.rand(n, device=device, dtype=dtype)
             else:
-                base = (torch.arange(n, device=device, dtype=dtype) + torch.rand(n, device=device, dtype=dtype)) / float(n)
-                # Randomly permute bins so graph order never correlates with t.
+                base = (torch.arange(n, device=device, dtype=dtype) +
+                        torch.rand(n, device=device, dtype=dtype)) / float(n)
                 perm = torch.randperm(n, device=device)
-                t = max_t * base[perm]
+                t = base[perm]
+
         else:
             raise ValueError(
                 f"Unknown ABFLOW_SCOREFM_T_SAMPLING={mode}. "
                 "Choose from uniform, low_t, stratified."
             )
-        return t.clamp(min=0.0, max=max_t)
 
+        return t.clamp(min=0.0, max=1.0)
+    
     def _time_for_interface(self, t_graph, interface_batch_id, ref_tensor):
         """Broadcast graph-level time to [N_interface, 1, 1]."""
         if t_graph is None:
@@ -515,6 +514,7 @@ class AbFlowModel(nn.Module):
         if flow_t.dim() == 0 or flow_t.numel() == 1:
             n_graph = int(batch_id.max().item()) + 1 if batch_id.numel() > 0 else 1
             flow_t = flow_t.reshape(1).expand(n_graph)
+
         t_emb = get_timestep_embedding(flow_t, H_0.shape[-1]).to(dtype=H_0.dtype, device=H_0.device)
         t_emb = self.flow_time_mlp(t_emb)
         return t_emb[batch_id]
@@ -1178,15 +1178,22 @@ class AbFlowModel(nn.Module):
         # ablation controlled by ABFLOW_SCOREFM_PER_SAMPLE_T.
         batch_size = int(self.batch_constants['batch_size'].item()) if torch.is_tensor(self.batch_constants['batch_size']) else int(self.batch_constants['batch_size'])
         interface_batch_id = self.batch_constants['interface_batch_id']
+        
         t_graph = self._sample_flow_times(batch_size, device=X.device, dtype=X.dtype)
-        sigma_graph = (1.0 - t_graph).clamp_min(self.scorefm_min_sigma)
-        t_int = self._time_for_interface(t_graph, interface_batch_id, interface_X)
-        sigma_int = self._time_for_interface(sigma_graph, interface_batch_id, interface_X)
 
-        # Coordinate-only flow path: X_t = (1 - t) X_0 + t X_1.
-        # Sequence labels remain discrete and are handled by the CE loss; never
-        # linearly interpolate amino-acid indices.
-        Xt = sigma_int * interface_X + t_int * gt_interface_X
+        # Real path weight: must use the true endpoint geometry.
+        # X_t = (1 - t) X_0 + t X_1 reaches exactly X_1 at t=1.
+        base_weight_graph = 1.0 - t_graph
+
+        # Score denominator: numerically protected only for score/velocity loss.
+        sigma_score_graph = base_weight_graph.clamp_min(self.scorefm_min_sigma)
+
+        t_int = self._time_for_interface(t_graph, interface_batch_id, interface_X)
+        base_weight_int = self._time_for_interface(base_weight_graph, interface_batch_id, interface_X)
+        sigma_score_int = self._time_for_interface(sigma_score_graph, interface_batch_id, interface_X)
+
+        Xt = base_weight_int * interface_X + t_int * gt_interface_X
+        
         St = self._sample_categorical_path(
             true_S[paratope_mask], interface_S, t_graph, interface_batch_id,
             corrupt_mask=smask[paratope_mask],
@@ -1237,7 +1244,7 @@ class AbFlowModel(nn.Module):
             segment_ids=self.batch_constants['segment_ids'],
             interface_batch_id=self.batch_constants['interface_batch_id'],
             t=t_int,
-            sigma_t=sigma_int,
+            sigma_t=sigma_score_int,
         )
         self.last_scorefm_losses = scorefm_details
 
@@ -1312,6 +1319,18 @@ class AbFlowModel(nn.Module):
 
         return loss, (snll, aar), (struct_loss, *struct_loss_details), (dock_loss, interface_loss, ed_loss, r_ed_losses), (pdev_loss, prmsd_loss)
 
+
+    def _sampling_time_grid(self, n_steps, device, dtype):
+        """Inference time grid with real endpoint t=1.
+
+        We return interval boundaries [0, ..., 1]. The sampler performs n_steps
+        updates from t_i to t_{i+1}. The model is queried at the left endpoint
+        t_i for velocity updates, and the final readout is queried at t=1.
+        """
+        n_steps = max(1, int(n_steps))
+        t_grid = torch.linspace(0.0, 1.0, steps=n_steps + 1, device=device, dtype=dtype)
+        return t_grid
+    
     def sample(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths,
                n_steps=10, init_noise=None, return_hidden=False, show_progress=False, progress_desc=None):
         
@@ -1346,7 +1365,11 @@ class AbFlowModel(nn.Module):
         interface_X, interface_S = self._condition_initial_interface(
             interface_X, interface_S, X_pep, S_pep
         )
-        dt = 1.0 / n_steps
+        
+        time_grid = self._sampling_time_grid(
+            n_steps, device=X.device, dtype=X.dtype
+        )
+        
         Xt = interface_X.clone()
         St = interface_S.clone()
         
@@ -1361,8 +1384,11 @@ class AbFlowModel(nn.Module):
             )
 
         for i in step_iter:
-            t = torch.tensor(i * dt, device=X.device)
+            t = time_grid[i]
+            t_next = time_grid[i + 1]
+            dt = t_next - t
             flow_t_graph = t.reshape(1).expand(batch_size)
+            
             if show_progress and hasattr(step_iter, 'set_postfix'):
                 step_iter.set_postfix(t=f'{float(t):.2f}')
             
@@ -1429,7 +1455,10 @@ class AbFlowModel(nn.Module):
                 # t*delta(clean)+(1-t)*pi_0, moving from t to t+dt refreshes a
                 # residue from the predicted clean distribution with
                 # probability dt/(1-t), otherwise retaining its current state.
-                refresh_prob = min(1.0, dt / max(1e-8, 1.0 - float(t)))
+                refresh_prob = min(
+                    1.0,
+                    float(dt) / max(1e-8, 1.0 - float(t))
+                )
                 proposed_S = torch.multinomial(
                     cur_probs.clamp_min(1e-8), num_samples=1
                 ).squeeze(-1)
@@ -1447,7 +1476,8 @@ class AbFlowModel(nn.Module):
             # generate
             # Use the final ODE state Xt as shadow-interface input instead of
             # reinitializing from noise.
-            final_flow_t_graph = torch.full((batch_size,), 1.0 - self.scorefm_min_sigma, device=X.device, dtype=X.dtype)
+            final_t = time_grid[-1].detach()
+            final_flow_t_graph = final_t.reshape(1).expand(batch_size)
             H, pred_S, r_pred_S_logits, pred_X, r_interface_X, _, prmsd = self._forward(
                 X, S, cmask, smask, paratope_mask, X_pep, S_pep,
                 surface, residue_pos, template, lengths,
