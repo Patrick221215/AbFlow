@@ -70,7 +70,7 @@ def ensure_model_runtime_compat(model):
 
     defaults = {
         'use_scorefm': False,
-        'scorefm_min_sigma': 5e-2,
+        'scorefm_min_sigma': 1e-2,
         'scorefm_eps': 1e-8,
         'scorefm_t_threshold': 0.50,
         'scorefm_loss_weight': 5e-2,

@@ -174,7 +174,7 @@ class AbFlowModel(nn.Module):
         # Path:               X_t = (1 - t) X_0 + t X_1
         # sigma_t:            sigma_t = 1 - t
         # conditional score:  s_t(X_t | X_1) = -(X_t - t X_1) / sigma_t^2
-        self.scorefm_min_sigma = 5e-2
+        self.scorefm_min_sigma = 1e-2
         self.scorefm_eps = 1e-8
         self.scorefm_t_threshold = 0.2
 
