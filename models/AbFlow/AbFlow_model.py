@@ -425,7 +425,8 @@ class AbFlowModel(nn.Module):
                     aligned[0, i] = local_inter_edges[1][i]
                     aligned[1, i] = local_inter_edges[0][i]
         except Exception as e : 
-            print(e)
+            #print(e)
+            raise RuntimeError("Failed to align epitope-antibody edges.") from e
         
         epi_index = torch.nonzero(~local_is_ab).squeeze()
         return aligned, epi_index
