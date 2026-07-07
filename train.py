@@ -478,6 +478,16 @@ def parse():
     parser.add_argument('--save_topk', type=int, default=10, help='save topk checkpoint. -1 for saving all ckpt that has a better validation metric than its previous epoch')
     parser.add_argument('--shuffle', action='store_true', help='shuffle data')
     parser.add_argument('--num_workers', type=int, default=4)
+    
+    parser.add_argument('--save_interval', type=int, default=1,
+                    help='Save full training-state checkpoint every N completed epochs. Set <=0 to disable periodic last checkpoint saves.')
+    parser.add_argument('--resume_checkpoint', type=str, default='',
+                        help='Path to a full training-state checkpoint. Empty means train from scratch.')
+    parser.add_argument('--use_ema', action='store_true',
+                        help='Enable EMA for training and validation. Keep disabled for first clean S3/S3CG retrain.')
+    parser.add_argument('--ema_decay', type=float, default=0.999,
+                        help='EMA decay. Only used when --use_ema is set.')
+    
 
     # reproducibility recording
     parser.add_argument('--run_name', type=str, default=None,

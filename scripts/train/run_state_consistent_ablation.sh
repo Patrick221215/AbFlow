@@ -137,12 +137,31 @@ mkdir -p "$RUN_DIR" "$CONFIG_DIR"
 
 python - "$BASE_CONFIG" "$RUN_CONFIG" "$RUN_DIR" <<'PY'
 import json
+import os
 import sys
 
 src, dst, save_dir = sys.argv[1:4]
+
 with open(src, "r", encoding="utf-8") as f:
     cfg = json.load(f)
+
 cfg["save_dir"] = save_dir
+
+# Priority:
+# 1. ABFLOW_RESUME_CKPT environment variable
+# 2. resume_checkpoint already written in base config
+# 3. empty string means train from scratch
+resume_from_env = os.environ.get("ABFLOW_RESUME_CKPT", "").strip()
+resume_from_cfg = str(cfg.get("resume_checkpoint", "")).strip()
+resume_ckpt = resume_from_env or resume_from_cfg
+
+if resume_ckpt:
+    if not os.path.isfile(resume_ckpt):
+        raise FileNotFoundError(f"resume_checkpoint does not exist: {resume_ckpt}")
+    cfg["resume_checkpoint"] = resume_ckpt
+else:
+    cfg["resume_checkpoint"] = ""
+
 with open(dst, "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
     f.write("\n")
@@ -163,6 +182,15 @@ echo "COORD_PRIOR_SIGMA=$COORD_PRIOR_SIGMA"
 echo "SEQ_PRIOR=$SEQ_PRIOR"
 echo "SEQ_INPUT_MODE=$SEQ_INPUT_MODE"
 echo "SEQ_CE_WEIGHT=$SEQ_CE_WEIGHT"
+EFFECTIVE_RESUME_CKPT=$(python - "$RUN_CONFIG" <<'PY'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+print(cfg.get("resume_checkpoint", ""))
+PY
+)
+echo "resume_checkpoint=$EFFECTIVE_RESUME_CKPT"
 
 if [[ "${ABFLOW_DRY_RUN:-0}" == "1" ]]; then
   echo "ABFLOW_DRY_RUN=1: configuration generated; training was not started."
