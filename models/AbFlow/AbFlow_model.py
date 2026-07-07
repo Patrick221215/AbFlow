@@ -515,12 +515,6 @@ class AbFlowModel(nn.Module):
         if flow_t.dim() == 0 or flow_t.numel() == 1:
             n_graph = int(batch_id.max().item()) + 1 if batch_id.numel() > 0 else 1
             flow_t = flow_t.reshape(1).expand(n_graph)
-        if not hasattr(self, 'flow_time_mlp'):
-            raise RuntimeError(
-                "ABFLOW_SCOREFM_TIME_EMBED is enabled but this checkpoint/model "
-                "does not contain flow_time_mlp. Train with AbFlow_model_v7_dtm.py "
-                "from scratch, or instantiate the new model and load old weights with strict=False."
-            )
         t_emb = get_timestep_embedding(flow_t, H_0.shape[-1]).to(dtype=H_0.dtype, device=H_0.device)
         t_emb = self.flow_time_mlp(t_emb)
         return t_emb[batch_id]
