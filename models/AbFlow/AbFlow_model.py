@@ -190,11 +190,24 @@ class AbFlowModel(nn.Module):
         self.scorefm_inter_clash_weight = 0.01
         self.scorefm_intra_clash_weight = 0.005
 
-        # Geometry constants for auxiliary coordinate losses.
-        self.scorefm_contact_cutoff = 8.0
-        self.scorefm_contact_temperature = 1.0
-        self.scorefm_inter_clash_cutoff = 2.0
-        self.scorefm_intra_clash_cutoff = 1.5
+        # Interface contact-map loss.
+        # cutoff: native residue pair is considered contact around this min-atom distance.
+        # pred_tau: converts predicted distance into a differentiable contact logit.
+        # label_tau: softens the hard native contact boundary.
+        # neg_cutoff: ignore extremely far native/predicted pairs to avoid overwhelming
+        # the loss with trivial negatives.
+        # time gate: contact supervision is more meaningful near clean/high-t states.
+        self.scorefm_contact_cutoff = _env_float("ABFLOW_SCOREFM_CONTACT_CUTOFF", 8.0)
+        self.scorefm_contact_temperature = _env_float("ABFLOW_SCOREFM_CONTACT_TAU", 1.0)
+        self.scorefm_contact_label_temperature = _env_float("ABFLOW_SCOREFM_CONTACT_LABEL_TAU", 1.0)
+        self.scorefm_contact_neg_cutoff = _env_float("ABFLOW_SCOREFM_CONTACT_NEG_CUTOFF", 12.0)
+        self.scorefm_contact_time_threshold = _env_float("ABFLOW_SCOREFM_CONTACT_T_THRESHOLD", 0.5)
+        self.scorefm_contact_time_gate_k = _env_float("ABFLOW_SCOREFM_CONTACT_TIME_GATE_K", 4.0)
+
+        self.scorefm_inter_clash_cutoff = _env_float("ABFLOW_SCOREFM_INTER_CLASH_CUTOFF", 2.0)
+        self.scorefm_intra_clash_cutoff = _env_float("ABFLOW_SCOREFM_INTRA_CLASH_CUTOFF", 1.5)
+        
+        
         self.last_scorefm_losses = {}
         self.use_scorefm = True  # current Score-FM code path
 
@@ -557,9 +570,7 @@ class AbFlowModel(nn.Module):
         local_is_ab = self.batch_constants['local_is_ab']
         local_batch_id = self.batch_constants['local_batch_id']
         local_X = X[local_mask].clone()
-        # Replace the generated region before constructing any geometric KNN
-        # graph. This makes intra-paratope and paratope-antigen edges depend on
-        # the same current state X_t.
+        
         local_X[local_is_ab] = interface_X
         # prepare local complex edges
         local_ctx_edges = self.batch_constants['local_ctx_edges']  # [2, Ec]
@@ -652,8 +663,13 @@ class AbFlowModel(nn.Module):
         # interface local edges
         (row, col), (offsets, max_n, gni2lni) = self.aa_feature.edge_constructor.get_batch_edges(local_batch_id)
         row_segment_ids, col_segment_ids = local_segment_ids[row], local_segment_ids[col]
-        is_ctx = row_segment_ids == col_segment_ids
-        is_inter = torch.logical_not(is_ctx)
+        # is_ctx = row_segment_ids == col_segment_ids
+        # is_inter = torch.logical_not(is_ctx)
+        
+        row_is_ag = row_segment_ids == self.aa_feature.ag_seg_id
+        col_is_ag = col_segment_ids == self.aa_feature.ag_seg_id
+        is_inter = torch.logical_xor(row_is_ag, col_is_ag)
+        is_ctx = torch.logical_not(is_inter)
 
         self.batch_constants['local_ctx_edges'] = torch.stack([row[is_ctx], col[is_ctx]])  # [2, Ec]
         self.batch_constants['local_inter_edges'] = torch.stack([row[is_inter], col[is_inter]])  # [2, Ei]
@@ -680,7 +696,7 @@ class AbFlowModel(nn.Module):
         return dist
     
     def _raw_interface_to_model_frame(self, interface_X, paratope_mask, batch_id):
-        """Convert raw paratope coordinates into AbFlow's internal shadow frame.
+        """Convert raw paratope coordinates into internal shadow frame.
 
         `_forward` centers the antigen/antibody and normalizes coordinates before
         message passing. Shadow paratope coordinates are later uncentered with
@@ -694,16 +710,18 @@ class AbFlowModel(nn.Module):
         return self.normalizer.normalize(interface_X - ag_centers.unsqueeze(1))
 
     def _coord_score_from_clean(self, Xt, clean_X, t, sigma_t):
-        """Analytic coordinate score for AbFlow's conditional path.
+        """Analytic coordinate score under the zero-mean isotropic base assumption.
 
         Path:
-            X_t = (1 - t) X_0 + t X_1, sigma_t = 1 - t
-        Conditional density:
-            p_t(X | X_1) = N(t X_1, sigma_t^2 I)
-        Score:
-            s_t(X_t | X_1) = -(X_t - t X_1) / sigma_t^2
+            X_t = sigma_t X_0 + t X_1.
 
-        `t` and `sigma_t` can be scalars or [N_interface,1,1] tensors.
+        If X_0 ~ N(0, I) in the same normalized coordinate frame, then:
+            p_t(X_t | X_1) = N(t X_1, sigma_t^2 I),
+            s_t(X_t | X_1) = -(X_t - t X_1) / sigma_t^2.
+
+        In AbFlow, the actual base can be antigen-centered and atom-correlated, so this
+        formula should be understood as the standard Gaussian-path approximation unless
+        the base has been normalized/whitened to N(0, I).
         """
         t = torch.as_tensor(t, device=Xt.device, dtype=Xt.dtype)
         sigma_t = torch.as_tensor(sigma_t, device=Xt.device, dtype=Xt.dtype)
@@ -775,14 +793,21 @@ class AbFlowModel(nn.Module):
         valid_pair = valid.flatten(2).any(dim=-1)
         return min_d, valid_pair
 
+
     def _interface_contact_bce_loss(self, pred_X, true_interface_X, true_X, true_S,
                                     paratope_mask, batch_id, segment_ids,
-                                    interface_batch_id, interface_atom_mask):
-        """Differentiable antigen-paratope contact recovery loss.
+                                    interface_batch_id, interface_atom_mask,
+                                    t=None):
+        """Balanced soft antigen-paratope contact recovery loss.
 
-        Ground-truth contacts are defined from native minimum atom distances,
-        and predictions use a smooth logit (cutoff - predicted_distance) / tau.
-        This directly targets interface contact quality without adding a new head.
+        Why not naive BCE over all residue pairs?
+        Paratope-antigen pair labels are extremely imbalanced: true contacts are
+        sparse, while trivial far-away non-contacts dominate. A naive mean BCE
+        therefore encourages the model to avoid contacts. We use:
+          1) soft native contact labels;
+          2) local/hard-negative pair filtering;
+          3) per-complex positive/negative balancing;
+          4) optional high-t gating, following the spirit of AbX energy time gating.
         """
         atom_pos_full = self.aa_feature._construct_atom_pos(true_S)
         atom_mask_full = atom_pos_full != self.aa_feature.atom_pos_pad_idx
@@ -797,23 +822,84 @@ class AbFlowModel(nn.Module):
             a_mask = (batch_id == b) & ag_mask_full
             if p_mask.sum() == 0 or a_mask.sum() == 0:
                 continue
+
             pred_par = pred_X[p_mask]
             true_par = true_interface_X[p_mask]
             par_atom_mask = interface_atom_mask[p_mask]
             ag_X = true_X[a_mask]
             ag_atom_mask = atom_mask_full[a_mask]
 
-            pred_d, valid_pair = self._residue_min_dist(pred_par, ag_X, par_atom_mask, ag_atom_mask)
-            true_d, _ = self._residue_min_dist(true_par, ag_X, par_atom_mask, ag_atom_mask)
+            pred_d, valid_pair = self._residue_min_dist(
+                pred_par, ag_X, par_atom_mask, ag_atom_mask
+            )
+            true_d, _ = self._residue_min_dist(
+                true_par, ag_X, par_atom_mask, ag_atom_mask
+            )
             if pred_d is None or not valid_pair.any():
                 continue
-            label = (true_d < self.scorefm_contact_cutoff).to(pred_X.dtype)
-            logits = (self.scorefm_contact_cutoff - pred_d) / self.scorefm_contact_temperature
-            losses.append(F.binary_cross_entropy_with_logits(logits[valid_pair], label[valid_pair]))
+
+            cutoff = pred_X.new_tensor(float(self.scorefm_contact_cutoff))
+            pred_tau = max(float(self.scorefm_contact_temperature), 1e-6)
+            label_tau = max(float(self.scorefm_contact_label_temperature), 1e-6)
+            neg_cutoff = pred_X.new_tensor(float(self.scorefm_contact_neg_cutoff))
+
+            # Soft contact label from native distance. Near cutoff is uncertain
+            # instead of being forced into a hard 0/1 boundary.
+            soft_label = torch.sigmoid((cutoff - true_d) / label_tau)
+
+            # Prediction logit. Smaller predicted distance means higher contact probability.
+            logits = (cutoff - pred_d) / pred_tau
+
+            # Keep native contacts and local/hard negatives.
+            # This avoids thousands of trivial far-away negatives dominating the BCE.
+            hard_pos = true_d < cutoff
+            local_or_hard_neg = torch.logical_or(true_d < neg_cutoff, pred_d.detach() < neg_cutoff)
+            pair_mask = valid_pair & (hard_pos | local_or_hard_neg)
+
+            if not pair_mask.any():
+                continue
+
+            logits_i = logits[pair_mask]
+            label_i = soft_label[pair_mask]
+            pos_i = hard_pos[pair_mask]
+
+            bce_i = F.binary_cross_entropy_with_logits(
+                logits_i, label_i, reduction='none'
+            )
+
+            n_pos = pos_i.sum().to(dtype=pred_X.dtype)
+            n_neg = (~pos_i).sum().to(dtype=pred_X.dtype)
+
+            if n_pos > 0 and n_neg > 0:
+                weights = torch.empty_like(bce_i)
+                weights[pos_i] = 0.5 / n_pos.clamp_min(1.0)
+                weights[~pos_i] = 0.5 / n_neg.clamp_min(1.0)
+                loss_b = (bce_i * weights).sum()
+            else:
+                # Rare case: only positives or only negatives. Fall back to mean.
+                loss_b = bce_i.mean()
+
+            # Time gating: interface contact supervision is most reliable when
+            # the state is close enough to the clean endpoint. This follows the
+            # same principle as AbX energy time-gating.
+            if t is not None:
+                t_tensor = torch.as_tensor(t, device=pred_X.device, dtype=pred_X.dtype)
+                if t_tensor.numel() == pred_X.shape[0]:
+                    t_b = t_tensor.reshape(-1)[p_mask].mean()
+                else:
+                    t_b = t_tensor.reshape(-1).mean()
+                gate = torch.sigmoid(
+                    pred_X.new_tensor(float(self.scorefm_contact_time_gate_k)) *
+                    (t_b - pred_X.new_tensor(float(self.scorefm_contact_time_threshold)))
+                )
+                loss_b = gate * loss_b
+
+            losses.append(loss_b)
+
         if len(losses) == 0:
             return pred_X.new_tensor(0.0)
         return torch.stack(losses).mean()
-
+    
     def _interface_clash_loss(self, pred_X, true_X, true_S, batch_id, segment_ids,
                               interface_batch_id, interface_atom_mask):
         """Repel predicted paratope atoms from antigen atoms if they clash."""
@@ -941,7 +1027,7 @@ class AbFlowModel(nn.Module):
             local_dist_loss = self._local_ca_distance_loss(pred_clean_X, X1, interface_batch_id)
             interface_contact_loss = self._interface_contact_bce_loss(
                 pred_clean_X, X1, true_X, true_S, paratope_mask, batch_id,
-                segment_ids, interface_batch_id, atom_mask)
+                segment_ids, interface_batch_id, atom_mask, t=t)
             inter_clash_loss = self._interface_clash_loss(
                 pred_clean_X, true_X, true_S, batch_id, segment_ids,
                 interface_batch_id, atom_mask)
