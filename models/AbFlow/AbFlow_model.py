@@ -519,14 +519,16 @@ class AbFlowModel(nn.Module):
         t_emb = self.flow_time_mlp(t_emb)
         return t_emb[batch_id]
 
-    def message_passing(self, X, S, residue_pos, interface_X, surf, paratope_mask, batch_id, t, memory_H=None, smooth_prob=None, smooth_mask=None, flow_t=None):
-        # embeddings, hidden state, (internal edges, external edges), (A : c * d, w : c * 1)
-        H_0, (ctx_edges, inter_edges), (atom_embeddings, atom_weights) = self.aa_feature(X, S, batch_id, self.k_neighbors, residue_pos, smooth_prob=smooth_prob, smooth_mask=smooth_mask)
 
-        # Minimal AbFlow time conditioning. AbX injects batch['t'] into both
-        # sequence and pair features before its Seqformer; here we add an
-        # equivalent graph-level time signal to AbFlow's residue embeddings.
-        # This keeps the modification local and makes the ablation clean.
+    def message_passing(self, X, S, residue_pos, interface_X, surf, paratope_mask,
+                        batch_id, round_idx, memory_H=None, smooth_prob=None,
+                        smooth_mask=None, flow_t=None):
+        # embeddings, hidden state, (internal edges, external edges), (A : c * d, w : c * 1)
+        H_0, (ctx_edges, inter_edges), (atom_embeddings, atom_weights) = self.aa_feature(
+            X, S, batch_id, self.k_neighbors, residue_pos,
+            smooth_prob=smooth_prob, smooth_mask=smooth_mask
+        )
+
         time_emb = self._flow_time_embedding_for_residues(flow_t, batch_id, H_0)
         if time_emb is not None:
             H_0 = H_0 + time_emb
@@ -1095,10 +1097,10 @@ class AbFlowModel(nn.Module):
         r_edge_dist = []
         memory_H = None
         # message passing
-        for t in range(self.round):
+        for round_idx in range(self.round):
             pred_S_logits, pred_X, interface_X, H, edge_dist = self.message_passing(
                 X, S, residue_pos, interface_X, surface, paratope_mask, batch_id,
-                t, memory_H, pred_S_dist, smask, flow_t=flow_t
+                round_idx, memory_H, pred_S_dist, smask, flow_t=flow_t
             )
             memory_H = H
             r_interface_X.append(interface_X.clone())
@@ -1112,7 +1114,7 @@ class AbFlowModel(nn.Module):
             if not self.struct_only:
                 # 2. update S
                 S = S.clone()
-                if t == self.round - 1:
+                if round_idx == self.round - 1:
                     S[smask] = torch.argmax(pred_S_logits[smask], dim=-1)
                 else:
                     pred_S_dist = torch.softmax(pred_S_logits[smask], dim=-1)
