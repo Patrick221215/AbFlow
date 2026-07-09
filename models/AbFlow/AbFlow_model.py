@@ -299,44 +299,49 @@ class AbFlowModel(nn.Module):
         self.scorefm_bridge_damping_power = _env_float("ABFLOW_SCOREFM_DAMPING_POWER", 0.0)
         self.scorefm_bridge_blend = _env_float("ABFLOW_SCOREFM_BRIDGE_BLEND", 1.0)
 
-        # A single generative state is used for both global and shadow-interface
-        # paths. Peptide predictions may condition the initial distribution, but
-        # they never overwrite X_t/S_t inside _forward.
-        self.coord_pep_prior_weight = _env_float(
-            "ABFLOW_COORD_PEP_PRIOR_WEIGHT", 0.5
+        # =========================================================
+        # Clean source / condition policy
+        # =========================================================
+        # First-principle rule:
+        #   X_0/S_0 are generated states and must come from the reference/base
+        #   distribution. Peptide-derived information must not overwrite X_0/S_0
+        #   and must not be mixed into them with heuristic weights.
+        #
+        # Allowed peptide use in this clean version:
+        #   1) coordinate condition: X_pep is encoded as residue-level condition;
+        #   2) sequence condition: S_pep is encoded as residue-level condition.
+        #
+        # This clean implementation has no peptide-prior state overwrite and no
+        # peptide-prior weighting mechanism.
+        self.coord_pep_as_condition = _env_flag(
+            "ABFLOW_COORD_PEP_AS_CONDITION", False
         )
-        # Coordinate prior mode:
-        #   blend:
-        #       Existing behavior. X0 <- (1-rho) X_noise + rho X_pep.
-        #       With rho=1, this becomes the deterministic hard prior X0=X_pep.
-        #   conditional_gaussian:
-        #       Peptide-informed Gaussian base. X0 <- X_pep + sigma_pep * eps.
-        #       This keeps stochasticity while centering the base distribution
-        #       around the paratope prior.
-        self.coord_pep_prior_mode = _env_str(
-            "ABFLOW_COORD_PEP_PRIOR_MODE", "blend"
-        ).lower()
-        if self.coord_pep_prior_mode not in {"blend", "conditional_gaussian"}:
-            raise ValueError(
-                "Unknown ABFLOW_COORD_PEP_PRIOR_MODE="
-                f"{self.coord_pep_prior_mode}. Choose from blend, conditional_gaussian."
+        if self.coord_pep_as_condition:
+            self.coord_pep_condition_mlp = nn.Sequential(
+                nn.Linear(4, embed_size),
+                nn.SiLU(),
+                nn.Linear(embed_size, embed_size),
             )
-        self.coord_pep_prior_sigma = _env_float(
-            "ABFLOW_COORD_PEP_PRIOR_SIGMA", 1.0
-        )
-        self.seq_pep_prior_weight = _env_float(
-            "ABFLOW_SEQ_PEP_PRIOR_WEIGHT", 0.5
-        )
-        # state: use the sampled categorical state S_t as the sequence input.
-        # pep_condition: emulate original AbFlow persistent peptide conditioning;
-        #                S_pep is visible at every _forward call even when S_t
-        #                exists. This intentionally breaks pure state-only input.
+        else:
+            self.coord_pep_condition_mlp = None
+
+        # Sequence input policy.
+        #   state:
+        #       The model sees only the sampled categorical state S_t.
+        #   pep_condition:
+        #       S_t is still the generated state; S_pep is added only as a
+        #       separate condition embedding, analogous to AbX-style priors.
         self.seq_input_mode = _env_str("ABFLOW_SEQ_INPUT_MODE", "state").lower()
         if self.seq_input_mode not in {"state", "pep_condition"}:
             raise ValueError(
                 "Unknown ABFLOW_SEQ_INPUT_MODE="
                 f"{self.seq_input_mode}. Choose from state, pep_condition."
             )
+        if self.seq_input_mode == "pep_condition":
+            self.seq_pep_condition_embedding = nn.Embedding(num_classes, embed_size)
+        else:
+            self.seq_pep_condition_embedding = None
+
         self.seq_ce_weight = _env_float("ABFLOW_SEQ_CE_WEIGHT", 1.0)
         self.last_abflow_diagnostics = {}
 
@@ -353,6 +358,14 @@ class AbFlowModel(nn.Module):
         if self.scorefm_loss_mode in {"off", "none", "base"}:
             self.use_scorefm = False
 
+        # Separate the state path from the auxiliary Score-FM loss.
+        # This makes LOSS_MODE=off a true loss ablation: users can still enable
+        # X_t/S_t/t input explicitly with ABFLOW_SCOREFM_STATE_PATH=on.
+        self.scorefm_state_path = _env_flag(
+            "ABFLOW_SCOREFM_STATE_PATH",
+            self.use_scorefm
+        )
+
 
     def init_mask(self, X, S, cmask, smask, template):
         if not self.struct_only:
@@ -360,73 +373,6 @@ class AbFlowModel(nn.Module):
         X[cmask] = template
         return X, S
     
-    def replace_pep(self, X, S, paratope_mask, X_pep, S_pep,
-                    replace_seq=True, replace_struct=True):
-        """Legacy endpoint conditioning used only when no explicit state exists."""
-        if (
-            replace_seq
-            and getattr(self, 'pep_seq', True)
-            and S_pep is not None
-            and S_pep.numel() == int(paratope_mask.sum().item())
-        ):
-            S[paratope_mask] = S_pep
-        if (
-            replace_struct
-            and getattr(self, 'pep_struct', True)
-            and X_pep is not None
-            and X_pep.shape == X[paratope_mask].shape
-            and bool(torch.any(X_pep != 0))
-        ):
-            X[paratope_mask] = X_pep
-        return X, S
-
-    @torch.no_grad()
-    def _condition_initial_interface(self, interface_X, interface_S, X_pep, S_pep):
-        """Condition the base distribution without creating a second state path.
-
-        Coordinate prior:
-            X_0 <- (1-rho_x) X_noise + rho_x X_pep
-        or, when ABFLOW_COORD_PEP_PRIOR_MODE=conditional_gaussian:
-            X_0 <- X_pep + sigma_pep * eps
-
-        Sequence prior:
-            pi_0 = (1-rho_s) Uniform + rho_s delta(S_pep)
-            S_0 ~ pi_0
-
-        The returned X_0/S_0 remain the only generative state consumed by the
-        network. Setting either weight to zero recovers the unconditioned base.
-        """
-        if (
-            getattr(self, 'pep_struct', True)
-            and X_pep is not None
-            and X_pep.shape == interface_X.shape
-            and bool(torch.any(X_pep != 0))
-        ):
-            pep_X = X_pep.to(device=interface_X.device, dtype=interface_X.dtype)
-            if self.coord_pep_prior_mode == "conditional_gaussian":
-                sigma = max(0.0, float(self.coord_pep_prior_sigma))
-                interface_X = pep_X + sigma * torch.randn_like(interface_X)
-            else:
-                rho_x = max(0.0, min(1.0, float(self.coord_pep_prior_weight)))
-                interface_X = (1.0 - rho_x) * interface_X + rho_x * pep_X
-
-        if (
-            not self.struct_only
-            and getattr(self, 'pep_seq', True)
-            and S_pep is not None
-            and S_pep.shape == interface_S.shape
-        ):
-            rho_s = max(0.0, min(1.0, float(self.seq_pep_prior_weight)))
-            pep_S = S_pep.to(device=interface_S.device, dtype=torch.long)
-            valid = torch.logical_and(pep_S >= 0, pep_S < self.num_classes)
-            use_pep = torch.logical_and(
-                valid,
-                torch.rand(interface_S.shape, device=interface_S.device) < rho_s
-            )
-            interface_S = torch.where(use_pep, pep_S, interface_S)
-
-        return interface_X, interface_S
-
     @torch.no_grad()
     def _sample_categorical_path(self, clean_S, base_S, t_graph,
                                  interface_batch_id, corrupt_mask=None):
@@ -557,9 +503,82 @@ class AbFlowModel(nn.Module):
         return t_emb[batch_id]
 
 
+    def _build_coord_pep_condition_for_residues(
+            self, X_pep, paratope_mask, batch_id, interface_X):
+        """Build residue-level coordinate condition from X_pep.
+
+        X_pep is a condition, not a generated state.  For each paratope residue,
+        encode the CA displacement from the current state X_t to the peptide
+        proposal X_pep:
+
+            [dx, dy, dz, ||d||]
+
+        The generated coordinates are never overwritten by this feature.  This is
+        the coordinate analogue of using ESM/context features as conditions in
+        AbX rather than adding them to the noisy state.
+        """
+        if (
+            not getattr(self, "coord_pep_as_condition", False)
+            or self.coord_pep_condition_mlp is None
+            or X_pep is None
+            or X_pep.shape != interface_X.shape
+            or not bool(torch.any(X_pep != 0))
+        ):
+            return None, None
+
+        pep_X = X_pep.to(device=interface_X.device, dtype=interface_X.dtype)
+        pep_X_model = self._raw_interface_to_model_frame(
+            pep_X, paratope_mask, batch_id
+        )
+
+        # CA channel is index 1 in the current AbFlow atom layout.
+        delta_ca = pep_X_model[:, 1] - interface_X[:, 1]
+        dist_ca = torch.norm(delta_ca, dim=-1, keepdim=True)
+        prior_feat_int = torch.cat([delta_ca, dist_ca], dim=-1)
+
+        n_res = int(paratope_mask.shape[0])
+        prior_feat = interface_X.new_zeros((n_res, 4))
+        prior_mask = torch.zeros(n_res, device=interface_X.device, dtype=torch.bool)
+        prior_feat[paratope_mask] = prior_feat_int
+        prior_mask[paratope_mask] = True
+        return prior_feat, prior_mask
+
+    def _build_seq_pep_condition_for_residues(self, S_pep, paratope_mask, ref_tensor):
+        """Build residue-level sequence condition from S_pep.
+
+        S_pep is not written into S_t.  It is embedded as an additional condition
+        on paratope residues, preserving the separation between generated state
+        and conditioning information.
+        """
+        if (
+            self.seq_pep_condition_embedding is None
+            or S_pep is None
+            or S_pep.numel() != int(paratope_mask.sum().item())
+        ):
+            return None, None
+
+        pep_S = S_pep.to(device=ref_tensor.device, dtype=torch.long).reshape(-1)
+        valid_int = torch.logical_and(pep_S >= 0, pep_S < self.num_classes)
+        if not valid_int.any():
+            return None, None
+
+        n_res = int(paratope_mask.shape[0])
+        cond_emb = ref_tensor.new_zeros((n_res, ref_tensor.shape[-1]))
+        cond_mask = torch.zeros(n_res, device=ref_tensor.device, dtype=torch.bool)
+
+        par_idx = paratope_mask.nonzero(as_tuple=False).reshape(-1)
+        valid_idx = par_idx[valid_int]
+        cond_emb[valid_idx] = self.seq_pep_condition_embedding(pep_S[valid_int]).to(
+            device=ref_tensor.device, dtype=ref_tensor.dtype
+        )
+        cond_mask[valid_idx] = True
+        return cond_emb, cond_mask
+
     def message_passing(self, X, S, residue_pos, interface_X, surf, paratope_mask,
                         batch_id, round_idx, memory_H=None, smooth_prob=None,
-                        smooth_mask=None, flow_t=None):
+                        smooth_mask=None, flow_t=None,
+                        coord_pep_condition=None, coord_pep_condition_mask=None,
+                        seq_pep_condition=None, seq_pep_condition_mask=None):
         # embeddings, hidden state, (internal edges, external edges), (A : c * d, w : c * 1)
         H_0, (ctx_edges, inter_edges), (atom_embeddings, atom_weights) = self.aa_feature(
             X, S, batch_id, self.k_neighbors, residue_pos,
@@ -569,6 +588,21 @@ class AbFlowModel(nn.Module):
         time_emb = self._flow_time_embedding_for_residues(flow_t, batch_id, H_0)
         if time_emb is not None:
             H_0 = H_0 + time_emb
+
+        if (
+            coord_pep_condition is not None
+            and coord_pep_condition_mask is not None
+            and self.coord_pep_condition_mlp is not None
+        ):
+            cond_feat = coord_pep_condition.to(device=H_0.device, dtype=H_0.dtype)
+            cond_mask = coord_pep_condition_mask.to(device=H_0.device, dtype=torch.bool)
+            cond_emb = self.coord_pep_condition_mlp(cond_feat)
+            H_0 = H_0 + cond_emb * cond_mask.unsqueeze(-1).to(H_0.dtype)
+
+        if seq_pep_condition is not None and seq_pep_condition_mask is not None:
+            seq_cond = seq_pep_condition.to(device=H_0.device, dtype=H_0.dtype)
+            seq_mask = seq_pep_condition_mask.to(device=H_0.device, dtype=torch.bool)
+            H_0 = H_0 + seq_cond * seq_mask.unsqueeze(-1).to(H_0.dtype)
 
         if not self.keep_memory:
             memory_H = None
@@ -1551,11 +1585,10 @@ class AbFlowModel(nn.Module):
 
         Important semantics:
           - interface_init is an explicit raw-coordinate paratope state X_t.
-            If provided, legacy peptide coordinates must not overwrite it.
+            If provided, peptide coordinates never overwrite it.
           - sequence_init is an explicit categorical state S_t.
-            It is used only when seq_input_mode == "state".
-          - seq_input_mode == "pep_condition" intentionally keeps S_pep visible
-            to the model, matching original AbFlow / S3 behavior.
+          - seq_input_mode == "pep_condition" adds S_pep only through a condition embedding;
+            it does not overwrite S_t.
           - flow_t is the continuous graph-level time used for time embedding.
         """
         batch_id = self.batch_constants['batch_id']
@@ -1572,18 +1605,9 @@ class AbFlowModel(nn.Module):
         # then overwrite the paratope part if has_interface_state is True.
         X, S = self.init_mask(X, S, cmask, smask, template)
 
-        # 2. Legacy peptide conditioning.
-        # Structure: only use X_pep when no explicit X_t is supplied.
-        # Sequence:
-        #   - state mode: use sequence_init when available;
-        #   - pep_condition mode: intentionally use S_pep as persistent condition.
-        X, S = self.replace_pep(
-            X, S, paratope_mask, X_pep, S_pep,
-            replace_seq=(
-                (not has_sequence_state) or self.seq_input_mode == "pep_condition"
-            ),
-            replace_struct=(not has_interface_state),
-        )
+        # 2. Clean state semantics.
+        # Do not overwrite X/S with X_pep/S_pep. Peptide-derived information can
+        # only enter through explicit condition embeddings in message_passing().
 
         # 3. Inject explicit coordinate state X_t.
         if has_interface_state:
@@ -1595,8 +1619,8 @@ class AbFlowModel(nn.Module):
                 )
             X[paratope_mask] = interface_init.to(device=X.device, dtype=X.dtype)
 
-        # 4. Inject explicit categorical state S_t only in state mode.
-        if has_sequence_state and self.seq_input_mode == "state":
+        # 4. Inject explicit categorical state S_t.
+        if has_sequence_state:
             expected_shape = S[paratope_mask].shape
             if sequence_init.shape != expected_shape:
                 raise ValueError(
@@ -1626,6 +1650,27 @@ class AbFlowModel(nn.Module):
                 X, S, paratope_mask, batch_id, init_noise
             )
 
+        coord_pep_condition, coord_pep_condition_mask = (
+            self._build_coord_pep_condition_for_residues(
+                X_pep, paratope_mask, batch_id, interface_X
+            )
+        )
+        # Sequence peptide condition lives in residue hidden space, not coordinate
+        # space. interface_X has last dimension 3, so it must not be used as the
+        # reference tensor for sequence condition embeddings.
+        if self.seq_pep_condition_embedding is not None:
+            seq_ref_tensor = interface_X.new_zeros(
+                (paratope_mask.shape[0], self.seq_pep_condition_embedding.embedding_dim)
+            )
+        else:
+            seq_ref_tensor = interface_X.new_zeros((paratope_mask.shape[0], 1))
+
+        seq_pep_condition, seq_pep_condition_mask = (
+            self._build_seq_pep_condition_for_residues(
+                S_pep, paratope_mask, seq_ref_tensor
+            )
+        )
+
         # 8. Iterative message passing.
         r_pred_S_logits, pred_S_dist = [], None
         r_interface_X = [interface_X.clone()]
@@ -1635,7 +1680,11 @@ class AbFlowModel(nn.Module):
         for round_idx in range(self.round):
             pred_S_logits, pred_X, interface_X, H, edge_dist = self.message_passing(
                 X, S, residue_pos, interface_X, surface, paratope_mask, batch_id,
-                round_idx, memory_H, pred_S_dist, smask, flow_t=flow_t
+                round_idx, memory_H, pred_S_dist, smask, flow_t=flow_t,
+                coord_pep_condition=coord_pep_condition,
+                coord_pep_condition_mask=coord_pep_condition_mask,
+                seq_pep_condition=seq_pep_condition,
+                seq_pep_condition_mask=seq_pep_condition_mask,
             )
 
             memory_H = H
@@ -1686,7 +1735,8 @@ class AbFlowModel(nn.Module):
         # import ipdb; ipdb.set_trace()
         if self.backbone_only:
             X, template = X[:, :4], template[:, :4]  # backbone
-            X_pep = X_pep[:, :4]
+            if X_pep is not None:
+                X_pep = X_pep[:, :4]
             xloss_mask = xloss_mask[:, :4]
         # clone ground truth coordinates, sequence
         true_X, true_S = X.clone(), S.clone()
@@ -1701,66 +1751,74 @@ class AbFlowModel(nn.Module):
             smask = torch.logical_and(smask, not_ctx_mask)
         
         gt_interface_X = true_X[paratope_mask]
-
-        # Sample X_0 from exactly the same initialization distribution used at
-        # inference. 
-        interface_X, interface_S = self.init_interface(
-            X, S, paratope_mask, batch_id
-        )
-        interface_X, interface_S = self._condition_initial_interface(
-            interface_X, interface_S, X_pep, S_pep
-        )
-        
-        # Continuous flow time. Avoid sigma_t = 1 - t being too small because
-        # the analytic score contains 1 / sigma_t^2.
         batch_size = int(self.batch_constants['batch_size'].item()) if torch.is_tensor(self.batch_constants['batch_size']) else int(self.batch_constants['batch_size'])
         interface_batch_id = self.batch_constants['interface_batch_id']
-        
-        t_graph = self._sample_flow_times(batch_size, device=X.device, dtype=X.dtype)
+        state_path = bool(getattr(self, "scorefm_state_path", self.use_scorefm))
 
-        # Real path weight: must use the true endpoint geometry.
-        # X_t = (1 - t) X_0 + t X_1 reaches exactly X_1 at t=1.
-        base_weight_graph = 1.0 - t_graph
-
-        # Score denominator: numerically protected only for score/velocity loss.
-        sigma_score_graph = base_weight_graph.clamp_min(self.scorefm_min_sigma)
-
-        t_int = self._time_for_interface(t_graph, interface_batch_id, interface_X)
-        base_weight_int = self._time_for_interface(base_weight_graph, interface_batch_id, interface_X)
-        sigma_score_int = self._time_for_interface(sigma_score_graph, interface_batch_id, interface_X)
-
-        Xt = base_weight_int * interface_X + t_int * gt_interface_X
-        
-        if (not self.struct_only) and self.seq_input_mode == "state":
-            St = self._sample_categorical_path(
-                true_S[paratope_mask], interface_S, t_graph, interface_batch_id,
-                corrupt_mask=smask[paratope_mask],
+        if state_path:
+            # Sample X_0/S_0 from the reference initialization used at inference.
+            # Peptide-derived information never overwrites this generated state.
+            interface_X, interface_S = self.init_interface(
+                X, S, paratope_mask, batch_id
             )
-            sequence_state_for_model = St
+
+            # Continuous flow time. Avoid sigma_t = 1 - t being too small because
+            # the analytic score contains 1 / sigma_t^2.
+            t_graph = self._sample_flow_times(batch_size, device=X.device, dtype=X.dtype)
+
+            # Real path weight: must use the true endpoint geometry.
+            # X_t = (1 - t) X_0 + t X_1 reaches exactly X_1 at t=1.
+            base_weight_graph = 1.0 - t_graph
+
+            # Score denominator: numerically protected only for score/velocity loss.
+            sigma_score_graph = base_weight_graph.clamp_min(self.scorefm_min_sigma)
+
+            t_int = self._time_for_interface(t_graph, interface_batch_id, interface_X)
+            base_weight_int = self._time_for_interface(base_weight_graph, interface_batch_id, interface_X)
+            sigma_score_int = self._time_for_interface(sigma_score_graph, interface_batch_id, interface_X)
+
+            Xt = base_weight_int * interface_X + t_int * gt_interface_X
+
+            if not self.struct_only:
+                St = self._sample_categorical_path(
+                    true_S[paratope_mask], interface_S, t_graph, interface_batch_id,
+                    corrupt_mask=smask[paratope_mask],
+                )
+                sequence_state_for_model = St
+            else:
+                St = interface_S
+                sequence_state_for_model = None
         else:
-            # In pep_condition mode, the network intentionally sees S_pep rather
-            # than S_t. This matches the original AbFlow/S3 conditioning design.
-            St = interface_S
+            # Non-state evaluator: no explicit X_t/S_t/t is injected.
+            interface_X = None
+            interface_S = None
+            Xt = None
+            St = None
+            t_int = None
+            sigma_score_int = None
+            t_graph = X.new_zeros(1)
             sequence_state_for_model = None
 
         # get results
-        # X_t is always the coordinate state seen by the model.
-        # S_t is seen only in seq_input_mode == "state"; otherwise S_pep is used.
         H, pred_S, r_pred_S_logits, pred_X, r_interface_X, r_edge_dist, prmsd = self._forward(
             X, S, cmask, smask, paratope_mask, X_pep, S_pep,
             surface, residue_pos, template, lengths,
-            interface_init=Xt,
-            sequence_init=sequence_state_for_model,
-            flow_t=t_graph
+            interface_init=Xt if state_path else None,
+            sequence_init=sequence_state_for_model if state_path else None,
+            flow_t=t_graph if state_path else None
         )
 
         # sequence negative log likelihood
-        snll, total = 0, 0
+        snll = X.new_tensor(0.0)
+        total = X.new_tensor(0.0)
         if not self.struct_only:
             for logits, mask in r_pred_S_logits:
-                snll = snll + F.cross_entropy(logits[mask], true_S[mask], reduction='sum')
-                total = total + mask.sum()
-            snll = snll / total
+                if mask.any():
+                    snll = snll + F.cross_entropy(
+                        logits[mask], true_S[mask], reduction='sum'
+                    )
+                    total = total + mask.sum()
+            snll = snll / total.clamp_min(1.0)
 
         # structure loss
         struct_loss, struct_loss_details, bb_rmsd, ops = self.protein_feature.structure_loss(pred_X, true_X, true_S, cmask, batch_id, xloss_mask, self.aa_feature)
@@ -1775,22 +1833,38 @@ class AbFlowModel(nn.Module):
             gt_interface_X[interface_atom_mask])
 
         # complete coordinate Score-FM loss
-        flow_loss, scorefm_details = self._scorefm_loss(
-            Xt=Xt,
-            X0=interface_X,
-            X1=gt_interface_X,
-            pred_clean_X=r_interface_X[-1],
-            atom_mask=interface_atom_mask,
-            true_X=true_X,
-            true_S=true_S,
-            paratope_mask=paratope_mask,
-            batch_id=batch_id,
-            segment_ids=self.batch_constants['segment_ids'],
-            interface_batch_id=self.batch_constants['interface_batch_id'],
-            t=t_int,
-            sigma_t=sigma_score_int,
-            interface_residue_pos=residue_pos[paratope_mask],
-        )
+        if state_path:
+            flow_loss, scorefm_details = self._scorefm_loss(
+                Xt=Xt,
+                X0=interface_X,
+                X1=gt_interface_X,
+                pred_clean_X=r_interface_X[-1],
+                atom_mask=interface_atom_mask,
+                true_X=true_X,
+                true_S=true_S,
+                paratope_mask=paratope_mask,
+                batch_id=batch_id,
+                segment_ids=self.batch_constants['segment_ids'],
+                interface_batch_id=self.batch_constants['interface_batch_id'],
+                t=t_int,
+                sigma_t=sigma_score_int,
+                interface_residue_pos=residue_pos[paratope_mask],
+            )
+        else:
+            flow_loss = pred_X.new_tensor(0.0)
+            zero = flow_loss.detach()
+            scorefm_details = {
+                "scorefm_total": zero,
+                "scorefm_dsm": zero,
+                "scorefm_x1": zero,
+                "scorefm_hybrid": zero,
+                "scorefm_velocity": zero,
+                "scorefm_high_t_rate": zero,
+                "scorefm_local_dist": zero,
+                "scorefm_interface_contact": zero,
+                "scorefm_inter_clash": zero,
+                "scorefm_intra_clash": zero,
+            }
         self.last_scorefm_losses = scorefm_details
 
 
@@ -1820,20 +1894,22 @@ class AbFlowModel(nn.Module):
 
         self._clean_batch_constants()
 
-        # AAR and sequence-conditioning diagnostics.
+        # AAR and conditioning diagnostics.
         with torch.no_grad():
-            aa_hit = pred_S[smask] == true_S[smask]
-            aar = aa_hit.long().sum() / aa_hit.shape[0]
+            if smask.any():
+                aa_hit = pred_S[smask] == true_S[smask]
+                aar = aa_hit.float().mean()
+            else:
+                aar = X.new_tensor(0.0)
+
             diag = {
                 "seq_ce_weight": torch.as_tensor(self.seq_ce_weight, device=X.device),
-                "coord_prior_mode_blend": torch.as_tensor(
-                    1.0 if self.coord_pep_prior_mode == "blend" else 0.0, device=X.device
+                "scorefm_state_path": torch.as_tensor(
+                    1.0 if state_path else 0.0, device=X.device
                 ),
-                "coord_prior_mode_conditional_gaussian": torch.as_tensor(
-                    1.0 if self.coord_pep_prior_mode == "conditional_gaussian" else 0.0, device=X.device
-                ),
-                "coord_pep_prior_sigma": torch.as_tensor(
-                    self.coord_pep_prior_sigma, device=X.device
+                "coord_pep_as_condition": torch.as_tensor(
+                    1.0 if getattr(self, "coord_pep_as_condition", False) else 0.0,
+                    device=X.device
                 ),
                 "seq_input_mode_state": torch.as_tensor(
                     1.0 if self.seq_input_mode == "state" else 0.0, device=X.device
@@ -1879,9 +1955,18 @@ class AbFlowModel(nn.Module):
     def sample(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths,
                n_steps=10, init_noise=None, return_hidden=False, show_progress=False, progress_desc=None):
         
+        if not bool(getattr(self, "scorefm_state_path", True)):
+            return self.struct_sample(
+                X, S, cmask, smask, paratope_mask, X_pep, S_pep,
+                surface, residue_pos, template, lengths,
+                init_noise=init_noise,
+                return_hidden=return_hidden,
+            )
+
         if self.backbone_only:
             X, template = X[:, :4], template[:, :4]  # backbone
-            X_pep = X_pep[:, :4]
+            if X_pep is not None:
+                X_pep = X_pep[:, :4]
         
         # self.timing_stats = {
         #     'surface_processing': 0.0,
@@ -1896,6 +1981,7 @@ class AbFlowModel(nn.Module):
 
         batch_id = self.batch_constants['batch_id']
         batch_size = self.batch_constants['batch_size']
+        batch_size = int(batch_size.item()) if torch.is_tensor(batch_size) else int(batch_size)
         segment_ids = self.batch_constants['segment_ids']
         interface_batch_id = self.batch_constants['interface_batch_id']
         is_ab = segment_ids != self.aa_feature.ag_seg_id
@@ -1906,9 +1992,6 @@ class AbFlowModel(nn.Module):
 
         interface_X, interface_S = self.init_interface(
             X, S, paratope_mask, batch_id, init_noise=init_noise
-        )
-        interface_X, interface_S = self._condition_initial_interface(
-            interface_X, interface_S, X_pep, S_pep
         )
         
         time_grid = self._sampling_time_grid(
@@ -1940,9 +2023,7 @@ class AbFlowModel(nn.Module):
             # Use the explicit state interface_init/sequence_init pathway.
             # No need to first write Xt/St into X/S because _forward will do it
             # after applying the standard template/mask logic.
-            sequence_state_for_model = (
-                St if (not self.struct_only and self.seq_input_mode == "state") else None
-            )
+            sequence_state_for_model = St if not self.struct_only else None
 
             H, pred_S, r_pred_S_logits, pred_X, r_interface_X, r_edge_dist, prmsd = self._forward(
                 X, S, cmask, smask, paratope_mask,
@@ -1990,9 +2071,7 @@ class AbFlowModel(nn.Module):
                     f"Unknown ABFLOW_SCOREFM_SAMPLER_MODE={sampler_mode}. "
                     "Choose from residual, bridge, damped_bridge, blend."
                 )
-            update_sequence_state = (
-                (not self.struct_only) and self.seq_input_mode == "state"
-            )
+            update_sequence_state = not self.struct_only
             if update_sequence_state:
                 cur_logits = r_pred_S_logits[-1][0][paratope_mask]
                 cur_logits = cur_logits - cur_logits.max(dim=-1, keepdim=True)[0]
@@ -2015,6 +2094,7 @@ class AbFlowModel(nn.Module):
                 refresh = torch.rand(
                     St.shape, device=St.device
                 ) < refresh_prob
+                refresh = refresh & smask[paratope_mask]
                 St = torch.where(refresh, proposed_S, St)
         
         X[paratope_mask] = Xt
@@ -2028,9 +2108,7 @@ class AbFlowModel(nn.Module):
             # reinitializing from noise.
             final_t = time_grid[-1].detach()
             final_flow_t_graph = final_t.reshape(1).expand(batch_size)
-            sequence_state_for_model = (
-                St if (not self.struct_only and self.seq_input_mode == "state") else None
-            )
+            sequence_state_for_model = St if not self.struct_only else None
 
             H, pred_S, r_pred_S_logits, pred_X, r_interface_X, _, prmsd = self._forward(
                 X, S, cmask, smask, paratope_mask, X_pep, S_pep,
@@ -2045,9 +2123,9 @@ class AbFlowModel(nn.Module):
                 S_logits = r_pred_S_logits[-1][0][smask]
                 S_probs = torch.max(torch.softmax(S_logits, dim=-1), dim=-1)[0]
                 nlls = -torch.log(S_probs)
-                metric = scatter_mean(nlls, s_batch_id)  # [batch_size]
+                metric = scatter_mean(nlls, s_batch_id, dim=0, dim_size=batch_size)  # [batch_size]
             else:
-                metric = scatter_mean(prmsd[interface_cmask], interface_batch_id)  # [batch_size]
+                metric = scatter_mean(prmsd[interface_cmask], interface_batch_id, dim=0, dim_size=batch_size)  # [batch_size]
 
             update = metric < best_metric
             cupdate = cmask & update[batch_id]
@@ -2082,14 +2160,15 @@ class AbFlowModel(nn.Module):
         # self.timing_stats['count'] += 1
 
         if return_hidden:
-            return gen_X, gen_S, metric, H
-        return gen_X, gen_S, metric
+            return gen_X, gen_S, best_metric, H
+        return gen_X, gen_S, best_metric
     
     def struct_sample(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths, init_noise=None, return_hidden=False):
         
         if self.backbone_only:
             X, template = X[:, :4], template[:, :4]  # backbone
-            X_pep = X_pep[:, :4]
+            if X_pep is not None:
+                X_pep = X_pep[:, :4]
         gen_X, gen_S = X.clone(), S.clone()
         
         # prepare constants
@@ -2097,6 +2176,7 @@ class AbFlowModel(nn.Module):
 
         batch_id = self.batch_constants['batch_id']
         batch_size = self.batch_constants['batch_size']
+        batch_size = int(batch_size.item()) if torch.is_tensor(batch_size) else int(batch_size)
         segment_ids = self.batch_constants['segment_ids']
         interface_batch_id = self.batch_constants['interface_batch_id']
         is_ab = segment_ids != self.aa_feature.ag_seg_id
@@ -2116,9 +2196,9 @@ class AbFlowModel(nn.Module):
                 S_logits = r_pred_S_logits[-1][0][smask]
                 S_probs = torch.max(torch.softmax(S_logits, dim=-1), dim=-1)[0]
                 nlls = -torch.log(S_probs)
-                metric = scatter_mean(nlls, s_batch_id)  # [batch_size]
+                metric = scatter_mean(nlls, s_batch_id, dim=0, dim_size=batch_size)  # [batch_size]
             else:
-                metric = scatter_mean(prmsd[interface_cmask], interface_batch_id)  # [batch_size]
+                metric = scatter_mean(prmsd[interface_cmask], interface_batch_id, dim=0, dim_size=batch_size)  # [batch_size]
 
             update = metric < best_metric
             cupdate = cmask & update[batch_id]
@@ -2151,8 +2231,8 @@ class AbFlowModel(nn.Module):
         self._clean_batch_constants()
 
         if return_hidden:
-            return gen_X, gen_S, metric, H
-        return gen_X, gen_S, metric
+            return gen_X, gen_S, best_metric, H
+        return gen_X, gen_S, best_metric
 
     def sample_many(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths,
                     n_samples=5, n_steps=20, return_hidden=False, show_progress=False):
