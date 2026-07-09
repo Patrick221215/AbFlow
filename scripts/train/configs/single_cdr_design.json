@@ -8,8 +8,8 @@
   "valid_surf": "./datasets/RAbD/valid_surf.pkl",
   "cdr": "H3",
   "max_epoch": 200,
-  "save_topk": 10,
-  "batch_size": 32,
+  "save_topk": 5,
+  "batch_size": 64,
   "shuffle": true,
   "model_type": "AbFlow",
   "embed_dim": 64,
@@ -20,5 +20,9 @@
   "iter_round": 3,
   "pep_seq": true,
   "pep_struct": true,
-  "bind_dist_cutoff": 6.6
+  "bind_dist_cutoff": 6.6,
+  "save_interval": 25,
+  "resume_checkpoint": "",
+  "use_ema": false,
+  "ema_decay": 0.999
 }
