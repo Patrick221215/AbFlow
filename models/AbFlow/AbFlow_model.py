@@ -176,7 +176,17 @@ class AbFlowModel(nn.Module):
         # conditional score:  s_t(X_t | X_1) = -(X_t - t X_1) / sigma_t^2
         self.scorefm_min_sigma = 1e-2
         self.scorefm_eps = 1e-8
-        self.scorefm_t_threshold = 0.2
+
+        # Threshold for choosing score/DSM-style supervision versus endpoint
+        # x1 supervision in the hybrid objective.
+        # This must be applied per complex, not at batch level.
+        self.scorefm_t_threshold = _env_float("ABFLOW_SCOREFM_T_THRESHOLD", 0.2)
+
+        # AbX-style per-sample hybrid mixing.
+        # hard:  use DSM if t > threshold, otherwise x1.
+        # soft:  use sigmoid gate around threshold.
+        self.scorefm_hybrid_mix_mode = _env_str("ABFLOW_SCOREFM_HYBRID_MIX_MODE", "hard").lower()
+        self.scorefm_hybrid_gate_k = _env_float("ABFLOW_SCOREFM_HYBRID_GATE_K", 12.0)
 
         # Overall weight of the new objective. The component weights below are
         # active by default; they are not placeholders. Keep the global weight
@@ -739,29 +749,73 @@ class AbFlowModel(nn.Module):
         sigma_t = torch.as_tensor(sigma_t, device=Xt.device, dtype=Xt.dtype)
         return -(Xt - t * clean_X) / (sigma_t ** 2 + self.scorefm_eps)
 
-    def _masked_residue_mse(self, diff, atom_mask, interface_batch_id):
-        """ABX-style normalized vector MSE for [N_int, C, 3] tensors.
+    def _interface_valid_graph_mask(self, interface_batch_id, n_graph, device):
+        """Return graph-valid mask for interface-level tensors."""
+        valid = torch.zeros(n_graph, device=device, dtype=torch.bool)
+        if interface_batch_id.numel() > 0:
+            valid[torch.unique(interface_batch_id)] = True
+        return valid
 
-        We first sum over xyz, average valid atom channels in each residue,
-        average residues inside each complex, then average complexes. This avoids
-        biasing the loss toward residues or complexes with more valid atoms.
+    def _masked_residue_mse_per_graph(self, diff, atom_mask, interface_batch_id):
+        """Per-complex normalized vector MSE for [N_int, C, 3] tensors.
+
+        Normalization order:
+            atom channels -> residues -> complex
+
+        Returning per-complex values is essential for per-sample time mixing.
         """
+        if interface_batch_id.numel() == 0:
+            zero = diff.new_zeros(1)
+            valid = torch.zeros(1, device=diff.device, dtype=torch.bool)
+            return zero, valid
+
+        n_graph = int(interface_batch_id.max().item()) + 1
+
         atom_mask_f = atom_mask.to(diff.dtype)
         atom_sq = (diff ** 2).sum(dim=-1) * atom_mask_f  # [N_int, C]
-        per_res = atom_sq.sum(dim=-1) / atom_mask_f.sum(dim=-1).clamp_min(1.0)
-        per_graph = scatter_mean(per_res, interface_batch_id, dim=0)
-        return per_graph.mean()
 
-    def _masked_residue_smooth_l1(self, pred, target, atom_mask,
-                                  interface_batch_id, residue_weight=None):
-        """Normalized SmoothL1 for coordinate tensors.
+        per_res = atom_sq.sum(dim=-1) / atom_mask_f.sum(dim=-1).clamp_min(1.0)
+
+        per_graph = scatter_mean(
+            per_res,
+            interface_batch_id,
+            dim=0,
+            dim_size=n_graph
+        )
+
+        valid_graph = self._interface_valid_graph_mask(
+            interface_batch_id, n_graph, diff.device
+        )
+
+        return per_graph, valid_graph
+
+    def _masked_residue_mse(self, diff, atom_mask, interface_batch_id):
+        """Batch scalar wrapper for normalized vector MSE."""
+        per_graph, valid_graph = self._masked_residue_mse_per_graph(
+            diff, atom_mask, interface_batch_id
+        )
+        if valid_graph.any():
+            return per_graph[valid_graph].mean()
+        return diff.new_tensor(0.0)
+
+    def _masked_residue_smooth_l1_per_graph(self, pred, target, atom_mask,
+                                            interface_batch_id, residue_weight=None):
+        """Per-complex normalized SmoothL1 for coordinate tensors.
 
         pred/target: [N_int, C, 3]
         atom_mask:   [N_int, C]
-        residue_weight: optional [N_int] or broadcastable residue-level weights.
+        residue_weight: optional [N_int]
 
-        This keeps the AbX-style normalization: atom -> residue -> complex -> batch.
+        This mirrors AbX's principle: normalize locally first, then aggregate
+        per sample, then reduce across the batch.
         """
+        if interface_batch_id.numel() == 0:
+            zero = pred.new_zeros(1)
+            valid = torch.zeros(1, device=pred.device, dtype=torch.bool)
+            return zero, valid
+
+        n_graph = int(interface_batch_id.max().item()) + 1
+
         atom_mask_f = atom_mask.to(pred.dtype)
         err = F.smooth_l1_loss(pred, target, reduction='none').sum(dim=-1)  # [N_int, C]
         err = err * atom_mask_f
@@ -770,17 +824,45 @@ class AbFlowModel(nn.Module):
 
         if residue_weight is not None:
             residue_weight = torch.as_tensor(
-                residue_weight, device=pred.device, dtype=pred.dtype
+                residue_weight,
+                device=pred.device,
+                dtype=pred.dtype
             ).reshape(-1)
+
+            if residue_weight.numel() == 1:
+                residue_weight = residue_weight.expand_as(per_res)
+
             if residue_weight.numel() != per_res.numel():
                 raise ValueError(
                     f"residue_weight must have {per_res.numel()} values, "
                     f"got {residue_weight.numel()}."
                 )
+
             per_res = per_res * residue_weight
 
-        per_graph = scatter_mean(per_res, interface_batch_id, dim=0)
-        return per_graph.mean()
+        per_graph = scatter_mean(
+            per_res,
+            interface_batch_id,
+            dim=0,
+            dim_size=n_graph
+        )
+
+        valid_graph = self._interface_valid_graph_mask(
+            interface_batch_id, n_graph, pred.device
+        )
+
+        return per_graph, valid_graph
+
+    def _masked_residue_smooth_l1(self, pred, target, atom_mask,
+                                  interface_batch_id, residue_weight=None):
+        """Batch scalar wrapper for normalized SmoothL1."""
+        per_graph, valid_graph = self._masked_residue_smooth_l1_per_graph(
+            pred, target, atom_mask, interface_batch_id,
+            residue_weight=residue_weight
+        )
+        if valid_graph.any():
+            return per_graph[valid_graph].mean()
+        return pred.new_tensor(0.0)
 
     def _x1_time_weight_for_interface(self, t, interface_batch_id, ref_tensor):
         """Residue-level time weight for endpoint reconstruction.
@@ -831,6 +913,61 @@ class AbFlowModel(nn.Module):
 
         return (min_w + (1.0 - min_w) * torch.pow(t_res, power)).detach()
 
+
+    def _scorefm_time_per_graph(self, t, interface_batch_id, ref_tensor):
+        """Convert scalar / graph-level / interface-level t into graph-level t.
+
+        Valid inputs:
+          1) scalar t;
+          2) graph-level t: [B];
+          3) interface-level t: [N_int], [N_int, 1], or [N_int, 1, 1].
+
+        This function is needed because ScoreFM hybrid mixing must be done
+        per complex, following the AbX per-sample loss aggregation principle.
+        """
+        if interface_batch_id.numel() == 0:
+            return ref_tensor.new_zeros(1), torch.zeros(
+                1, device=ref_tensor.device, dtype=torch.bool
+            )
+
+        n_graph = int(interface_batch_id.max().item()) + 1
+        valid_graph = self._interface_valid_graph_mask(
+            interface_batch_id, n_graph, ref_tensor.device
+        )
+
+        t_tensor = torch.as_tensor(
+            t,
+            device=ref_tensor.device,
+            dtype=ref_tensor.dtype
+        )
+
+        if t_tensor.dim() == 0 or t_tensor.numel() == 1:
+            t_graph = t_tensor.reshape(1).expand(n_graph)
+
+        else:
+            t_flat = t_tensor.reshape(-1)
+
+            if t_flat.numel() == n_graph:
+                t_graph = t_flat
+
+            elif t_flat.numel() == interface_batch_id.numel():
+                # Interface-level t. Average it back to graph-level.
+                t_graph = scatter_mean(
+                    t_flat,
+                    interface_batch_id,
+                    dim=0,
+                    dim_size=n_graph
+                )
+
+            else:
+                raise ValueError(
+                    f"t must be scalar, graph-level [B], or interface-level [N_int]. "
+                    f"Got {t_flat.numel()} values for {n_graph} graphs and "
+                    f"{interface_batch_id.numel()} interface residues."
+                )
+
+        return t_graph.clamp(0.0, 1.0), valid_graph
+    
     def _local_ca_distance_loss(self, pred_X, true_X, interface_batch_id):
         """Paratope internal C-alpha distance preservation.
 
@@ -1184,6 +1321,7 @@ class AbFlowModel(nn.Module):
                 "scorefm_x1": zero.detach(),
                 "scorefm_hybrid": zero.detach(),
                 "scorefm_velocity": zero.detach(),
+                "scorefm_high_t_rate": zero.detach(),
                 "scorefm_local_dist": zero.detach(),
                 "scorefm_interface_contact": zero.detach(),
                 "scorefm_inter_clash": zero.detach(),
@@ -1195,7 +1333,7 @@ class AbFlowModel(nn.Module):
         gt_score = self._coord_score_from_clean(Xt, X1, t, sigma_t).detach()
         pred_score = self._coord_score_from_clean(Xt, pred_clean_X, t, sigma_t)
 
-        # 2. ABX-style scaled DSM.
+        # 2. scaled DSM.
         # score_scaling = 1 / sigma_t, so (pred_score - gt_score) / score_scaling
         # equals sigma_t * score residual. This avoids excessive late-time score scale.
         score_scaling = 1.0 / sigma_t.clamp_min(self.scorefm_min_sigma)
@@ -1206,28 +1344,85 @@ class AbFlowModel(nn.Module):
         # x1 is an endpoint denoising regularizer, not the main transport objective.
         # Low-t states contain less endpoint information, so we use a bounded
         # time weight w(t)=0.25+0.75t.
+        # 1. Analytic scores induced by the same Gaussian coordinate path.
+        gt_score = self._coord_score_from_clean(Xt, X1, t, sigma_t).detach()
+        pred_score = self._coord_score_from_clean(Xt, pred_clean_X, t, sigma_t)
+
+        # 2. Scaled DSM.
+        # score_scaling = 1 / sigma_t, so (pred_score - gt_score) / score_scaling
+        # equals sigma_t * score residual. This avoids excessive late-time score scale.
+        score_scaling = 1.0 / sigma_t.clamp_min(self.scorefm_min_sigma)
+        dsm_diff = (pred_score - gt_score) / score_scaling
+
+        dsm_per_graph, dsm_valid = self._masked_residue_mse_per_graph(
+            dsm_diff, atom_mask, interface_batch_id
+        )
+
+        # 3. Time-aware clean endpoint reconstruction.
         x1_time_weight = self._x1_time_weight_for_interface(
             t, interface_batch_id, pred_clean_X
         )
-        x1_loss = self._masked_residue_smooth_l1(
+
+        x1_per_graph, x1_valid = self._masked_residue_smooth_l1_per_graph(
             pred_clean_X, X1, atom_mask, interface_batch_id,
             residue_weight=x1_time_weight
         )
 
-        # 4. Hybrid DSM/x1 objective.
-        # For high t, score matching becomes meaningful; for low t, x1 is more stable.
-        # With per-sample t, use the fraction of high-t interface residues as a
-        # smooth mixture weight so the loss remains a scalar and remains stable.
-        t_tensor = torch.as_tensor(t, device=pred_clean_X.device, dtype=pred_clean_X.dtype)
-        high_t_weight = (t_tensor.reshape(-1) > pred_clean_X.new_tensor(self.scorefm_t_threshold)).to(pred_clean_X.dtype).mean()
-        score_or_x1 = high_t_weight * dsm_loss + (1.0 - high_t_weight) * x1_loss
-
-        # 5. Velocity identity for the same path:
+        # 4. Velocity identity for the same path:
         # v_theta = Xhat_1 + sigma_t * s_theta
         # true velocity for X_t = sigma_t X_0 + t X_1 is X_1 - X_0.
         pred_v = pred_clean_X + sigma_t * pred_score
         true_v = X1 - X0
-        velocity_loss = self._masked_residue_smooth_l1(pred_v, true_v, atom_mask, interface_batch_id)
+
+        velocity_per_graph, velocity_valid = self._masked_residue_smooth_l1_per_graph(
+            pred_v, true_v, atom_mask, interface_batch_id
+        )
+
+        # 5. Per-complex hybrid DSM/x1 mixing.
+        # This fixes the previous batch-level mixing bug:
+        #   old: score_or_x1 = batch_high_t_ratio * mean(DSM) + ...
+        #   new: score_or_x1_b = gate(t_b) * DSM_b + (1-gate(t_b)) * x1_b
+        t_graph, t_valid = self._scorefm_time_per_graph(
+            t, interface_batch_id, pred_clean_X
+        )
+
+        core_valid = dsm_valid & x1_valid & velocity_valid & t_valid
+
+        if dsm_valid.any():
+            dsm_loss = dsm_per_graph[dsm_valid].mean()
+        else:
+            dsm_loss = zero
+
+        if x1_valid.any():
+            x1_loss = x1_per_graph[x1_valid].mean()
+        else:
+            x1_loss = zero
+
+        if velocity_valid.any():
+            velocity_loss = velocity_per_graph[velocity_valid].mean()
+        else:
+            velocity_loss = zero
+
+        if core_valid.any():
+            if getattr(self, "scorefm_hybrid_mix_mode", "hard") == "soft":
+                gate_k = pred_clean_X.new_tensor(float(self.scorefm_hybrid_gate_k))
+                threshold = pred_clean_X.new_tensor(float(self.scorefm_t_threshold))
+                hybrid_gate = torch.sigmoid(gate_k * (t_graph - threshold))
+            else:
+                hybrid_gate = (
+                    t_graph > pred_clean_X.new_tensor(float(self.scorefm_t_threshold))
+                ).to(pred_clean_X.dtype)
+
+            score_or_x1_per_graph = (
+                hybrid_gate * dsm_per_graph
+                + (1.0 - hybrid_gate) * x1_per_graph
+            )
+
+            score_or_x1 = score_or_x1_per_graph[core_valid].mean()
+            high_t_weight = hybrid_gate[core_valid].mean()
+        else:
+            score_or_x1 = zero
+            high_t_weight = zero
 
         # 6. Geometry terms are only computed when needed.
         need_geometry = mode in {
@@ -1353,6 +1548,7 @@ class AbFlowModel(nn.Module):
             "scorefm_x1": x1_loss.detach(),
             "scorefm_hybrid": score_or_x1.detach(),
             "scorefm_velocity": velocity_loss.detach(),
+            "scorefm_high_t_rate": high_t_weight.detach(),
             "scorefm_local_dist": local_dist_loss.detach(),
             "scorefm_interface_contact": interface_contact_loss.detach(),
             "scorefm_inter_clash": inter_clash_loss.detach(),
