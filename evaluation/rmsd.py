@@ -114,42 +114,108 @@ def kabsch_torch(A, B, requires_grad=False):
         >>> rmsd
         tensor(3.7064e-07)
     """
-    a_mean = A.mean(axis=0)
-    b_mean = B.mean(axis=0)
-    A_c = A - a_mean
-    B_c = B - b_mean
-    # Covariance matrix
-    H = A_c.T.mm(B_c)
-    # U, S, V = torch.svd(H)
-    if requires_grad:  # try more times to find a stable solution
-        assert not torch.isnan(H).any()
-        U, S, Vt = torch.linalg.svd(H)
-        num_it = 0
-        while torch.min(S) < 1e-3 or torch.min(torch.abs((S**2).view(1,3) - (S**2).view(3,1) + torch.eye(3).to(S.device))) < 1e-2:
-            H = H + torch.rand(3,3).to(H.device) * torch.eye(3).to(H.device)
-            U, S, Vt = torch.linalg.svd(H)
-            num_it += 1
+    device = A.device
 
-            if num_it > 10:
-                raise RuntimeError('SVD consistently numerically unstable! Exitting ... ')
-    else:
-        U, S, Vt = torch.linalg.svd(H)
-    V = Vt.T
-    # rms
-    d = (torch.linalg.det(U) * torch.linalg.det(V)) < 0.0
-    if d:
-        SS = torch.diag(torch.tensor([1. for _ in range(len(U) - 1)] + [-1.], device=U.device, dtype=U.dtype))
-        U = U @ SS
-        # U[:, -1] = -U[:, -1]
-    # Rotation matrix
-    R = V.mm(U.T)
-    # Translation vector
-    t = b_mean[None, :] - R.mm(a_mean[None, :].T).T
-    t = (t.T).squeeze()
-    return R.mm(A.T).T + t, R, t
+    with torch.cuda.amp.autocast(enabled=False):
+        A_f = A.float()
+        B_f = B.float()
+
+        a_mean = A_f.mean(dim=0)
+        b_mean = B_f.mean(dim=0)
+        A_c = A_f - a_mean
+        B_c = B_f - b_mean
+
+        H = A_c.T.mm(B_c)
+        H = torch.nan_to_num(H, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if requires_grad:
+            assert not torch.isnan(H).any()
+            U, S, Vt = torch.linalg.svd(H)
+            num_it = 0
+            eye3 = torch.eye(3, device=device, dtype=torch.float32)
+            while (
+                torch.min(S) < 1e-3
+                or torch.min(
+                    torch.abs(
+                        (S ** 2).view(1, 3)
+                        - (S ** 2).view(3, 1)
+                        + eye3
+                    )
+                ) < 1e-2
+            ):
+                H = H + torch.rand(
+                    3, 3, device=device, dtype=torch.float32
+                ) * eye3
+                U, S, Vt = torch.linalg.svd(H)
+                num_it += 1
+
+                if num_it > 10:
+                    raise RuntimeError(
+                        "SVD consistently numerically unstable! Exiting ..."
+                    )
+        else:
+            U, S, Vt = torch.linalg.svd(H)
+
+        V = Vt.T
+
+        d = (torch.linalg.det(U) * torch.linalg.det(V)) < 0.0
+        if bool(d.detach().cpu().item()):
+            SS = torch.diag(
+                torch.tensor(
+                    [1.0 for _ in range(len(U) - 1)] + [-1.0],
+                    device=device,
+                    dtype=torch.float32,
+                )
+            )
+            U = U @ SS
+
+        R = V.mm(U.T)
+        t = b_mean[None, :] - R.mm(a_mean[None, :].T).T
+        t = t.T.squeeze()
+        A_aligned = R.mm(A_f.T).T + t
+
+    return A_aligned, R, t
 
 
 def batch_kabsch_torch(A, B):
+    """AMP-safe batched Kabsch alignment.
+
+    A: [B, N, 3]
+    B: [B, N, 3]
+    """
+    with torch.cuda.amp.autocast(enabled=False):
+        A_f = A.float()
+        B_f = B.float()
+
+        a_mean = A_f.mean(dim=1, keepdims=True)
+        b_mean = B_f.mean(dim=1, keepdims=True)
+        A_c = A_f - a_mean
+        B_c = B_f - b_mean
+
+        H = torch.bmm(A_c.transpose(1, 2), B_c)
+        H = torch.nan_to_num(H, nan=0.0, posinf=0.0, neginf=0.0)
+
+        U, S, Vt = torch.linalg.svd(H)
+        V = Vt.transpose(1, 2)
+
+        d = ((torch.linalg.det(U) * torch.linalg.det(V)) < 0.0).long()
+        n_batch = A_f.shape[0]
+        eye = torch.eye(3, device=A_f.device, dtype=torch.float32)
+        nSS = eye.unsqueeze(0).expand(n_batch, -1, -1).clone()
+        SS = nSS.clone()
+        SS[:, -1, -1] = -1.0
+        bSS = torch.stack([nSS, SS], dim=1)[
+            torch.arange(n_batch, device=A_f.device), d
+        ]
+
+        U = torch.bmm(U, bSS)
+
+        R = torch.bmm(V, U.transpose(1, 2))
+        t = b_mean - torch.bmm(R, a_mean.transpose(1, 2)).transpose(1, 2)
+        A_aligned = torch.bmm(R, A_f.transpose(1, 2)).transpose(1, 2) + t
+
+    return A_aligned, R, t
+
     '''
     A: [B, N, 3]
     B: [B, N, 3]

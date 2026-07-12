@@ -319,7 +319,15 @@ class AbFlowModel(nn.Module):
         self.seq_ce_weight = _env_float("ABFLOW_SEQ_CE_WEIGHT", 1.0)
         self.last_scorefm_losses = {}
         self.last_abflow_diagnostics = {}
-        # Detached condition-strength diagnostics. These do not affect training.
+        # Detached condition-strength diagnostics. They are useful for debugging
+        # but require GPU reductions and occasional synchronizations, so they are
+        # disabled by default for expensive training runs.
+        self.condition_diagnostics_enabled = _env_flag(
+            "ABFLOW_CONDITION_DIAGNOSTICS", False
+        )
+        # Expensive safety checks that force GPU->CPU synchronization are off in
+        # normal training. Enable only when debugging malformed edge tensors.
+        self.runtime_checks = _env_flag("ABFLOW_RUNTIME_CHECKS", False)
         self._last_condition_diagnostics = {}
         self._latest_condition_diagnostics = {}
 
@@ -355,22 +363,49 @@ class AbFlowModel(nn.Module):
         corrupt_mask = corrupt_mask.to(device=clean_S.device, dtype=torch.bool)
         return torch.where(corrupt_mask, sampled, clean_S).long()
     
-    def align_epi_ab(self, local_inter_edges, local_is_ab) : 
-        aligned = torch.zeros_like(local_inter_edges)
-        try : 
-            for i in range(local_inter_edges.shape[1]) : 
-                if local_is_ab[local_inter_edges[0][i]] == False and local_is_ab[local_inter_edges[1][i]] == True : 
-                    aligned[:, i] = local_inter_edges[:, i]
-                elif local_is_ab[local_inter_edges[0][i]] == True and local_is_ab[local_inter_edges[1][i]] == False : 
-                    aligned[0, i] = local_inter_edges[1][i]
-                    aligned[1, i] = local_inter_edges[0][i]
-        except Exception as e : 
-            #print(e)
-            raise RuntimeError("Failed to align epitope-antibody edges.") from e
-        
-        epi_index = torch.nonzero(~local_is_ab).squeeze()
+    def align_epi_ab(self, local_inter_edges, local_is_ab):
+        """Orient every cross-interface edge as antigen -> antibody.
+
+        Previous versions used a Python loop over edges. That forced thousands
+        of small CPU-controlled tensor writes per batch and easily lowered GPU
+        utilization.  This vectorized version performs the same orientation with
+        boolean masks on the current device.
+
+        Input:
+            local_inter_edges: [2, E] local edges after KNN selection.
+            local_is_ab:       [N_local] True for antibody/paratope nodes.
+
+        Output:
+            aligned:   [2, E], every edge is epitope/antigen -> antibody.
+            epi_index: local indices of antigen/epitope nodes.
+        """
+        if local_inter_edges.dim() != 2 or local_inter_edges.shape[0] != 2:
+            raise ValueError(
+                "local_inter_edges must have shape [2, E], got "
+                f"{tuple(local_inter_edges.shape)}."
+            )
+
+        row, col = local_inter_edges[0], local_inter_edges[1]
+        row_is_ab = local_is_ab[row]
+        col_is_ab = local_is_ab[col]
+
+        if self.runtime_checks:
+            valid_cross = torch.logical_xor(row_is_ab, col_is_ab)
+            if not bool(valid_cross.all()):
+                bad = int((~valid_cross).sum().detach().cpu().item())
+                raise RuntimeError(
+                    f"Found {bad} non-cross edges in local_inter_edges."
+                )
+
+        # If row is antibody and col is antigen, swap so row=antigen, col=antibody.
+        swap = row_is_ab & (~col_is_ab)
+        aligned = local_inter_edges.clone()
+        aligned[0, swap] = col[swap]
+        aligned[1, swap] = row[swap]
+
+        epi_index = torch.nonzero(~local_is_ab, as_tuple=False).reshape(-1)
         return aligned, epi_index
-    
+
     def optimal_alignment(self, X0, target_X):
         """
         计算X0到target_X的最优旋转和排序
@@ -710,103 +745,117 @@ class AbFlowModel(nn.Module):
 
         # Reset detached condition-strength diagnostics for this refinement round.
         zero_diag = H_0.detach().new_tensor(0.0)
-        self._last_condition_diagnostics = {
-            "coord_condition_residual_ratio": zero_diag,
-            "seq_condition_residual_ratio": zero_diag,
-            "coord_condition_valid_rate": zero_diag,
-            "seq_condition_valid_rate": zero_diag,
-        }
+        if self.condition_diagnostics_enabled:
+            self._last_condition_diagnostics = {
+                "coord_condition_residual_ratio": zero_diag,
+                "seq_condition_residual_ratio": zero_diag,
+                "coord_condition_valid_rate": zero_diag,
+                "seq_condition_valid_rate": zero_diag,
+            }
+        else:
+            self._last_condition_diagnostics = {}
 
         # Coordinate proposal enters only through a zero-start residual feature
         # adapter.  H_0 already contains the current state and time embedding,
         # making the fusion residue-, context-, and time-dependent.
-        if (
-            coord_pep_condition is not None
-            and coord_pep_condition_mask is not None
-            and self.coord_pep_condition_adapter is not None
-        ):
-            cond_feat = coord_pep_condition.to(
-                device=H_0.device, dtype=H_0.dtype
-            )
-            if cond_feat.shape != (
-                H_0.shape[0], self.coord_pep_condition_dim
-            ):
-                raise ValueError(
-                    "coordinate condition shape mismatch: expected "
-                    f"{(H_0.shape[0], self.coord_pep_condition_dim)}, "
-                    f"got {tuple(cond_feat.shape)}."
+        if self.coord_pep_condition_adapter is not None:
+            if coord_pep_condition is not None and coord_pep_condition_mask is not None:
+                cond_feat = coord_pep_condition.to(
+                    device=H_0.device, dtype=H_0.dtype
                 )
-            cond_mask = coord_pep_condition_mask.to(
-                device=H_0.device, dtype=torch.bool
-            )
-            coord_residual = self.coord_pep_condition_adapter(
-                torch.cat([H_0, cond_feat], dim=-1)
-            )
-            coord_mask_f = cond_mask.unsqueeze(-1).to(H_0.dtype)
-            masked_coord_residual = coord_residual * coord_mask_f
-
-            with torch.no_grad():
-                if cond_mask.any():
-                    base_rms = torch.sqrt(
-                        (H_0[cond_mask].detach() ** 2).mean()
-                        + self.scorefm_eps
+                if cond_feat.shape != (
+                    H_0.shape[0], self.coord_pep_condition_dim
+                ):
+                    raise ValueError(
+                        "coordinate condition shape mismatch: expected "
+                        f"{(H_0.shape[0], self.coord_pep_condition_dim)}, "
+                        f"got {tuple(cond_feat.shape)}."
                     )
-                    residual_rms = torch.sqrt(
-                        (coord_residual[cond_mask].detach() ** 2).mean()
-                        + self.scorefm_eps
-                    )
-                    self._last_condition_diagnostics[
-                        "coord_condition_residual_ratio"
-                    ] = residual_rms / base_rms.clamp_min(self.scorefm_eps)
-                    self._last_condition_diagnostics[
-                        "coord_condition_valid_rate"
-                    ] = cond_mask.float().mean()
+                cond_mask = coord_pep_condition_mask.to(
+                    device=H_0.device, dtype=torch.bool
+                )
+                coord_residual = self.coord_pep_condition_adapter(
+                    torch.cat([H_0, cond_feat], dim=-1)
+                )
+                H_0 = H_0 + (
+                    coord_residual
+                    * cond_mask.unsqueeze(-1).to(H_0.dtype)
+                )
 
-            H_0 = H_0 + masked_coord_residual
+                if self.condition_diagnostics_enabled:
+                    with torch.no_grad():
+                        # This branch is intentionally optional because the
+                        # reductions below can synchronize GPU work.
+                        if bool(cond_mask.any()):
+                            base_rms = torch.sqrt(
+                                (H_0[cond_mask].detach() ** 2).mean()
+                                + self.scorefm_eps
+                            )
+                            residual_rms = torch.sqrt(
+                                (coord_residual[cond_mask].detach() ** 2).mean()
+                                + self.scorefm_eps
+                            )
+                            self._last_condition_diagnostics[
+                                "coord_condition_residual_ratio"
+                            ] = residual_rms / base_rms.clamp_min(self.scorefm_eps)
+                            self._last_condition_diagnostics[
+                                "coord_condition_valid_rate"
+                            ] = cond_mask.float().mean()
+            else:
+                # DDP safety when the adapter exists but this batch has no valid
+                # coordinate proposal.  The zero-valued term marks the parameters
+                # as used without changing the forward value.
+                dummy = sum(p.sum() for p in self.coord_pep_condition_adapter.parameters())
+                H_0 = H_0 + 0.0 * dummy
 
         # Sequence proposal is fused through a residue- and time-dependent
         # zero-start adapter, rather than a single global scalar shared by all
         # samples, residues and times.
-        if (
-            seq_pep_condition is not None
-            and seq_pep_condition_mask is not None
-            and self.seq_pep_condition_adapter is not None
-        ):
-            seq_cond = seq_pep_condition.to(
-                device=H_0.device, dtype=H_0.dtype
-            )
-            if seq_cond.shape != H_0.shape:
-                raise ValueError(
-                    "sequence condition shape mismatch: expected "
-                    f"{tuple(H_0.shape)}, got {tuple(seq_cond.shape)}."
+        if self.seq_pep_condition_adapter is not None:
+            if seq_pep_condition is not None and seq_pep_condition_mask is not None:
+                seq_cond = seq_pep_condition.to(
+                    device=H_0.device, dtype=H_0.dtype
                 )
-            seq_mask = seq_pep_condition_mask.to(
-                device=H_0.device, dtype=torch.bool
-            )
-            seq_residual = self.seq_pep_condition_adapter(
-                torch.cat([H_0, seq_cond], dim=-1)
-            )
-            seq_mask_f = seq_mask.unsqueeze(-1).to(H_0.dtype)
-            masked_seq_residual = seq_residual * seq_mask_f
-
-            with torch.no_grad():
-                if seq_mask.any():
-                    base_rms = torch.sqrt(
-                        (H_0[seq_mask].detach() ** 2).mean()
-                        + self.scorefm_eps
+                if seq_cond.shape != H_0.shape:
+                    raise ValueError(
+                        "sequence condition shape mismatch: expected "
+                        f"{tuple(H_0.shape)}, got {tuple(seq_cond.shape)}."
                     )
-                    residual_rms = torch.sqrt(
-                        (seq_residual[seq_mask].detach() ** 2).mean()
-                        + self.scorefm_eps
-                    )
-                    self._last_condition_diagnostics[
-                        "seq_condition_residual_ratio"
-                    ] = residual_rms / base_rms.clamp_min(self.scorefm_eps)
-                    self._last_condition_diagnostics[
-                        "seq_condition_valid_rate"
-                    ] = seq_mask.float().mean()
+                seq_mask = seq_pep_condition_mask.to(
+                    device=H_0.device, dtype=torch.bool
+                )
+                seq_residual = self.seq_pep_condition_adapter(
+                    torch.cat([H_0, seq_cond], dim=-1)
+                )
+                H_0 = H_0 + (
+                    seq_residual
+                    * seq_mask.unsqueeze(-1).to(H_0.dtype)
+                )
 
-            H_0 = H_0 + masked_seq_residual
+                if self.condition_diagnostics_enabled:
+                    with torch.no_grad():
+                        if bool(seq_mask.any()):
+                            base_rms = torch.sqrt(
+                                (H_0[seq_mask].detach() ** 2).mean()
+                                + self.scorefm_eps
+                            )
+                            residual_rms = torch.sqrt(
+                                (seq_residual[seq_mask].detach() ** 2).mean()
+                                + self.scorefm_eps
+                            )
+                            self._last_condition_diagnostics[
+                                "seq_condition_residual_ratio"
+                            ] = residual_rms / base_rms.clamp_min(self.scorefm_eps)
+                            self._last_condition_diagnostics[
+                                "seq_condition_valid_rate"
+                            ] = seq_mask.float().mean()
+            else:
+                dummy = sum(p.sum() for p in self.seq_pep_condition_adapter.parameters())
+                if self.seq_pep_condition_embedding is not None:
+                    dummy = dummy + sum(
+                        p.sum() for p in self.seq_pep_condition_embedding.parameters()
+                    )
+                H_0 = H_0 + 0.0 * dummy
 
         if not self.keep_memory:
             memory_H = None
@@ -1351,7 +1400,7 @@ class AbFlowModel(nn.Module):
         r_interface_X = [interface_X.clone()]
         r_edge_dist = []
         memory_H = None
-        condition_diag_rounds = []
+        condition_diag_rounds = [] if self.condition_diagnostics_enabled else None
 
         for round_idx in range(self.round):
             (
@@ -1374,10 +1423,11 @@ class AbFlowModel(nn.Module):
                 seq_pep_condition_mask=seq_pep_condition_mask,
             )
 
-            condition_diag_rounds.append({
-                key: value.detach()
-                for key, value in self._last_condition_diagnostics.items()
-            })
+            if condition_diag_rounds is not None:
+                condition_diag_rounds.append({
+                    key: value.detach()
+                    for key, value in self._last_condition_diagnostics.items()
+                })
 
             memory_H = H
             r_interface_X.append(interface_X.clone())

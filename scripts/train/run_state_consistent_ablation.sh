@@ -6,7 +6,7 @@ EXP_ID=${2:-}
 GPU_ID=${3:-0}
 
 # ============================================================
-# AbFlow v26 condition-final training ablations
+# AbFlow v28 condition-speed-final training ablations
 # ============================================================
 # 1. X_0/S_0 always come from the reference distribution.
 # 2. X_pep/S_pep are conditions only; they never overwrite X_t/S_t.
@@ -30,6 +30,18 @@ DSM_T_MAX=${ABFLOW_SCOREFM_DSM_T_MAX:-0.8}
 COORD_PEP_AS_CONDITION=off
 SEQ_INPUT_MODE=state
 SEQ_CE_WEIGHT=${ABFLOW_SEQ_CE_WEIGHT:-1.0}
+
+# Speed / utilization controls.  These affect training efficiency only; they do
+# not change the source/condition semantics.
+AMP=${ABFLOW_AMP:-on}
+AMP_DTYPE=${ABFLOW_AMP_DTYPE:-bf16}
+ALLOW_TF32=${ABFLOW_ALLOW_TF32:-on}
+NUM_WORKERS=${ABFLOW_NUM_WORKERS:-12}
+PREFETCH_FACTOR=${ABFLOW_PREFETCH_FACTOR:-4}
+LOG_INTERVAL=${ABFLOW_LOG_INTERVAL:-20}
+TQDM_MININTERVAL=${ABFLOW_TQDM_MININTERVAL:-5.0}
+SAVE_INTERVAL=${ABFLOW_SAVE_INTERVAL:-10}
+CONDITION_DIAGNOSTICS=${ABFLOW_CONDITION_DIAGNOSTICS:-off}
 
 case "$EXP_ID" in
   # Pure reference-state endpoint FM.
@@ -87,6 +99,7 @@ run_with_env() {
   ABFLOW_COORD_PEP_AS_CONDITION="$COORD_PEP_AS_CONDITION" \
   ABFLOW_SEQ_INPUT_MODE="$SEQ_INPUT_MODE" \
   ABFLOW_SEQ_CE_WEIGHT="$SEQ_CE_WEIGHT" \
+  ABFLOW_CONDITION_DIAGNOSTICS="$CONDITION_DIAGNOSTICS" \
   GPU="$GPU_ID" \
   "$@"
 }
@@ -106,6 +119,15 @@ print_settings() {
   echo "COORD_PEP_AS_CONDITION=$COORD_PEP_AS_CONDITION"
   echo "SEQ_INPUT_MODE=$SEQ_INPUT_MODE"
   echo "SEQ_CE_WEIGHT=$SEQ_CE_WEIGHT"
+  echo "AMP=$AMP"
+  echo "AMP_DTYPE=$AMP_DTYPE"
+  echo "ALLOW_TF32=$ALLOW_TF32"
+  echo "NUM_WORKERS=$NUM_WORKERS"
+  echo "PREFETCH_FACTOR=$PREFETCH_FACTOR"
+  echo "LOG_INTERVAL=$LOG_INTERVAL"
+  echo "TQDM_MININTERVAL=$TQDM_MININTERVAL"
+  echo "SAVE_INTERVAL=$SAVE_INTERVAL"
+  echo "CONDITION_DIAGNOSTICS=$CONDITION_DIAGNOSTICS"
 }
 
 if [[ "$MODE" != "train" ]]; then
@@ -144,6 +166,29 @@ if resume_ckpt and not os.path.isfile(resume_ckpt):
     raise FileNotFoundError(
         f"ABFLOW_RESUME_CKPT does not exist: {resume_ckpt}"
     )
+
+def _env_on(name, default="off"):
+    return os.environ.get(name, default).strip().lower() in {
+        "1", "true", "yes", "y", "on"
+    }
+
+# Training-speed controls.  These fields are accepted by train.py in v28.
+cfg["num_workers"] = int(os.environ.get("ABFLOW_NUM_WORKERS", "12"))
+cfg["prefetch_factor"] = int(os.environ.get("ABFLOW_PREFETCH_FACTOR", "4"))
+cfg["log_interval"] = int(os.environ.get("ABFLOW_LOG_INTERVAL", "20"))
+cfg["tqdm_mininterval"] = float(os.environ.get("ABFLOW_TQDM_MININTERVAL", "5.0"))
+cfg["save_interval"] = int(os.environ.get("ABFLOW_SAVE_INTERVAL", "10"))
+cfg["amp_dtype"] = os.environ.get("ABFLOW_AMP_DTYPE", "bf16").strip().lower()
+if cfg["amp_dtype"] not in {"bf16", "fp16"}:
+    raise ValueError("ABFLOW_AMP_DTYPE must be bf16 or fp16.")
+if _env_on("ABFLOW_AMP", "on"):
+    cfg["amp"] = True
+else:
+    cfg.pop("amp", None)
+if _env_on("ABFLOW_ALLOW_TF32", "on"):
+    cfg["allow_tf32"] = True
+else:
+    cfg.pop("allow_tf32", None)
 
 # Remove obsolete weighted-prior and redundant objective controls.
 obsolete_exact = {
@@ -192,6 +237,14 @@ runtime = {
     ),
     "seq_input_mode": os.environ.get("ABFLOW_SEQ_INPUT_MODE", ""),
     "seq_ce_weight": os.environ.get("ABFLOW_SEQ_CE_WEIGHT", ""),
+    "amp": os.environ.get("ABFLOW_AMP", "on"),
+    "amp_dtype": os.environ.get("ABFLOW_AMP_DTYPE", "bf16"),
+    "allow_tf32": os.environ.get("ABFLOW_ALLOW_TF32", "on"),
+    "num_workers": os.environ.get("ABFLOW_NUM_WORKERS", "12"),
+    "prefetch_factor": os.environ.get("ABFLOW_PREFETCH_FACTOR", "4"),
+    "log_interval": os.environ.get("ABFLOW_LOG_INTERVAL", "20"),
+    "save_interval": os.environ.get("ABFLOW_SAVE_INTERVAL", "10"),
+    "condition_diagnostics": os.environ.get("ABFLOW_CONDITION_DIAGNOSTICS", "off"),
     "clean_reference_state": "true",
     "peptide_state_injection": "false",
     "peptide_prior_weighting": "false",

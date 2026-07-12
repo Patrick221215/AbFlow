@@ -3,7 +3,7 @@
  # @Author: Patrick221215 1427584833@qq.com
  # @Date: 2026-06-13 19:33:31
  # @LastEditors: Patrick221215 1427584833@qq.com
- # @LastEditTime: 2026-07-09 21:28:41
+ # @LastEditTime: 2026-07-12 10:55:10
  # @FilePath: /cjm/project/AbFlow/scripts/train/train.sh
  # @Description: AbFlow training launcher with automatic master-port retry.
 ###
@@ -120,7 +120,11 @@ is_port_error_log() {
 
 run_single_process() {
     cd "$CODE_DIR" || exit 1
-    CUDA_LAUNCH_BLOCKING=1 python train.py --gpus "${TRAIN_GPUS[@]}" ${CONFIG}
+    if [ "${ABFLOW_DEBUG_CUDA_SYNC:-0}" = "1" ]; then
+        CUDA_LAUNCH_BLOCKING=1 python train.py --gpus "${TRAIN_GPUS[@]}" ${CONFIG}
+    else
+        python train.py --gpus "${TRAIN_GPUS[@]}" ${CONFIG}
+    fi
 }
 
 run_distributed_with_auto_port() {
@@ -145,7 +149,13 @@ run_distributed_with_auto_port() {
         tmp_log=$(mktemp "/tmp/abflow_torchrun_${current_port}_XXXX.log")
 
         set +e
-        CUDA_LAUNCH_BLOCKING=1 torchrun \
+        if [ "${ABFLOW_DEBUG_CUDA_SYNC:-0}" = "1" ]; then
+            export CUDA_LAUNCH_BLOCKING=1
+        else
+            unset CUDA_LAUNCH_BLOCKING
+        fi
+
+        torchrun \
             --nproc_per_node="${#GPU_ARR[@]}" \
             --rdzv_backend=c10d \
             --rdzv_endpoint="${MASTER_ADDR}:${current_port}" \

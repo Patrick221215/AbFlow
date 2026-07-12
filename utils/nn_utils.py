@@ -705,27 +705,73 @@ class ProteinFeature:
         return cosD, cosA
 
     def coord_loss(self, pred_X, true_X, batch_id, atom_mask, reference=None):
-        pred_bb, true_bb = pred_X[:, :4], true_X[:, :4]
+        """
+        Kabsch/SVD and coordinate geometry losses are computed in float32
+        because CUDA SVD does not support bfloat16 and rigid alignment is
+        numerically sensitive. Gradients still flow to pred_X through the
+        differentiable float() cast.
+        """
+        pred_bb = pred_X[:, :4]
+        true_bb = true_X[:, :4]
         bb_mask = atom_mask[:, :4]
-        true_X = true_X.clone()
-        ops = []
+
+        pred_X_f = pred_X.float()
+        true_X_aligned = true_X.float().clone()
+        true_bb_f = true_bb.float()
 
         align_obj = pred_bb if reference is None else reference[:, :4]
+        align_obj_f = align_obj.float()
 
-        for i in range(torch.max(batch_id) + 1):
+        ops = []
+        n_graph = int(torch.max(batch_id).detach().cpu().item()) + 1
+
+        for i in range(n_graph):
             is_cur_graph = batch_id == i
             cur_bb_mask = bb_mask[is_cur_graph]
-            _, R, t = kabsch_torch(
-                true_bb[is_cur_graph][cur_bb_mask],
-                align_obj[is_cur_graph][cur_bb_mask],
-                requires_grad=True)
-            true_X[is_cur_graph] = torch.matmul(true_X[is_cur_graph], R.T) + t
+
+            if not bool(cur_bb_mask.any().detach().cpu().item()):
+                eye = torch.eye(
+                    3,
+                    device=pred_X.device,
+                    dtype=torch.float32,
+                )
+                zero = torch.zeros(
+                    3,
+                    device=pred_X.device,
+                    dtype=torch.float32,
+                )
+                ops.append((eye.detach(), zero.detach()))
+                continue
+
+            with torch.cuda.amp.autocast(enabled=False):
+                _, R, t = kabsch_torch(
+                    true_bb_f[is_cur_graph][cur_bb_mask],
+                    align_obj_f[is_cur_graph][cur_bb_mask],
+                    requires_grad=True,
+                )
+                aligned_true = (
+                    torch.matmul(true_X_aligned[is_cur_graph], R.T)
+                    + t
+                )
+
+            true_X_aligned[is_cur_graph] = aligned_true.to(
+                dtype=true_X_aligned.dtype
+            )
             ops.append((R.detach(), t.detach()))
 
+        atom_mask_sum = atom_mask.sum().clamp_min(1)
         xloss = F.smooth_l1_loss(
-            pred_X[atom_mask], true_X[atom_mask],
-            reduction='sum') / atom_mask.sum()  # atom-level loss
-        bb_rmsd = torch.sqrt(((pred_X[:, :4] - true_X[:, :4]) ** 2).sum(-1).mean(-1))  # [N]
+            pred_X_f[atom_mask],
+            true_X_aligned[atom_mask],
+            reduction='sum',
+        ) / atom_mask_sum
+
+        bb_rmsd = torch.sqrt(
+            (
+                (pred_X_f[:, :4] - true_X_aligned[:, :4]) ** 2
+            ).sum(-1).mean(-1).clamp_min(0.0)
+        )
+
         return xloss, bb_rmsd, ops
 
     def structure_loss(self, pred_X, true_X, S, cmask, batch_id, xloss_mask, aa_feature, full_profile=False, reference=None):

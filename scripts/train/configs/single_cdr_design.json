@@ -24,5 +24,12 @@
   "save_interval": 25,
   "resume_checkpoint": "",
   "use_ema": false,
-  "ema_decay": 0.999
+  "ema_decay": 0.999,
+  "num_workers": 12,
+  "prefetch_factor": 4,
+  "amp": true,
+  "amp_dtype": "bf16",
+  "allow_tf32": true,
+  "log_interval": 20,
+  "tqdm_mininterval": 5.0
 }

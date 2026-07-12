@@ -99,6 +99,16 @@ class Trainer:
             self.last_state_path = resume_checkpoint
         self.ema = None
 
+        # Training-speed controls.  AMP is opt-in through config/env and is
+        # implemented here so all project trainers inherit the same behavior.
+        self.use_amp = bool(getattr(self.config, "amp", False))
+        self.amp_dtype = str(getattr(self.config, "amp_dtype", "bf16")).lower()
+        self.log_interval = max(1, int(getattr(self.config, "log_interval", 20) or 20))
+
+        # GradScaler is only needed for fp16.  bf16 has a wider exponent range
+        # and normally does not require scaling.
+        self.grad_scaler = None
+
     @classmethod
     def to_device(cls, data, device):
         if isinstance(data, dict):
@@ -106,9 +116,27 @@ class Trainer:
                 data[key] = cls.to_device(data[key], device)
         elif isinstance(data, list) or isinstance(data, tuple):
             data = type(data)([cls.to_device(item, device) for item in data])
+        elif torch.is_tensor(data):
+            data = data.to(device, non_blocking=True)
         elif hasattr(data, 'to'):
             data = data.to(device)
         return data
+
+    def _amp_autocast(self, device):
+        enabled = (
+            bool(getattr(self, "use_amp", False))
+            and device.type == "cuda"
+        )
+        if self.amp_dtype in {"bf16", "bfloat16"}:
+            dtype = torch.bfloat16
+        elif self.amp_dtype in {"fp16", "float16", "half"}:
+            dtype = torch.float16
+        else:
+            dtype = torch.bfloat16
+        return torch.cuda.amp.autocast(enabled=enabled, dtype=dtype)
+
+    def _should_log_step(self, step):
+        return self._is_main_proc() and (int(step) % self.log_interval == 0)
 
     def _is_main_proc(self):
         return self.local_rank == 0 or self.local_rank == -1
@@ -143,28 +171,50 @@ class Trainer:
         if self.train_loader.sampler is not None and self.local_rank != -1:
             self.train_loader.sampler.set_epoch(self.epoch)
 
-        t_iter = tqdm(self.train_loader) if self._is_main_proc() else self.train_loader
+        t_iter = tqdm(
+            self.train_loader,
+            dynamic_ncols=True,
+            mininterval=float(getattr(self.config, "tqdm_mininterval", 5.0)),
+            leave=False,
+        ) if self._is_main_proc() else self.train_loader
 
         for batch in t_iter:
             batch = self.to_device(batch, device)
-            loss = self.train_step(batch, self.global_step)
 
-            self.optimizer.zero_grad()
-            loss.backward()
+            self.optimizer.zero_grad(set_to_none=True)
 
-            if self.config.grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+            with self._amp_autocast(device):
+                loss = self.train_step(batch, self.global_step)
 
-            self.optimizer.step()
+            if self.grad_scaler is not None:
+                self.grad_scaler.scale(loss).backward()
+                if self.config.grad_clip is not None:
+                    self.grad_scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.config.grad_clip
+                    )
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
+            else:
+                loss.backward()
+                if self.config.grad_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.config.grad_clip
+                    )
+                self.optimizer.step()
+
             after_optimizer_step(self)
+
+            if self._should_log_step(self.global_step) and hasattr(t_iter, 'set_postfix'):
+                t_iter.set_postfix(
+                    loss=float(loss.detach().cpu()),
+                    version=self.version,
+                )
 
             self.global_step += 1
 
             if self.sched_freq == 'batch':
                 self.scheduler.step()
-
-            if hasattr(t_iter, 'set_postfix'):
-                t_iter.set_postfix(loss=loss.item(), version=self.version)
 
         if self.sched_freq == 'epoch':
             self.scheduler.step()
@@ -178,11 +228,17 @@ class Trainer:
         self.model.eval()
         with validation_ema(self):
             with torch.no_grad():
-                t_iter = tqdm(self.valid_loader) if self._is_main_proc() else self.valid_loader
+                t_iter = tqdm(
+                    self.valid_loader,
+                    dynamic_ncols=True,
+                    mininterval=float(getattr(self.config, "tqdm_mininterval", 5.0)),
+                    leave=False,
+                ) if self._is_main_proc() else self.valid_loader
                 for batch in t_iter:
                     batch = self.to_device(batch, device)
-                    metric = self.valid_step(batch, self.valid_global_step)
-                    metric_arr.append(metric.cpu().item())
+                    with self._amp_autocast(device):
+                        metric = self.valid_step(batch, self.valid_global_step)
+                    metric_arr.append(float(metric.detach().cpu()))
                     self.valid_global_step += 1
 
             valid_metric = float(np.mean(metric_arr))
@@ -279,6 +335,15 @@ class Trainer:
 
         self.model.to(device)
 
+        if (
+            self.use_amp
+            and device.type == "cuda"
+            and self.amp_dtype in {"fp16", "float16", "half"}
+        ):
+            self.grad_scaler = torch.cuda.amp.GradScaler(enabled=True)
+        else:
+            self.grad_scaler = None
+
         init_resume_ema(self)
         maybe_resume(self, device)
         
@@ -288,7 +353,10 @@ class Trainer:
         if local_rank != -1:
             print_log(f'Using data parallel, local rank {local_rank}, all {device_ids}')
             self.model = torch.nn.parallel.DistributedDataParallel(
-                self.model, device_ids=[local_rank], output_device=local_rank
+                self.model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                gradient_as_bucket_view=True,
             )
         else:
             print_log(f'training on {device_ids}')
@@ -312,15 +380,23 @@ class Trainer:
                 break
 
     def log(self, name, value, step, val=False):
-        if self._is_main_proc():
-            if isinstance(value, torch.Tensor):
-                value = value.cpu().item()
-            if val:
-                if name not in self.writer_buffer:
-                    self.writer_buffer[name] = []
-                self.writer_buffer[name].append(value)
-            else:
-                self.writer.add_scalar(name, value, step)
+        if not self._is_main_proc():
+            return
+
+        # Training scalar logging can synchronize CUDA if every tensor is
+        # converted to a Python float every step.  Log at a fixed interval to keep
+        # TensorBoard useful without throttling the GPU.
+        if not val and (int(step) % self.log_interval != 0):
+            return
+
+        if isinstance(value, torch.Tensor):
+            value = float(value.detach().cpu())
+        if val:
+            if name not in self.writer_buffer:
+                self.writer_buffer[name] = []
+            self.writer_buffer[name].append(value)
+        else:
+            self.writer.add_scalar(name, value, step)
 
     def get_optimizer(self):
         return torch.optim.Adam(self.model.parameters(), lr=self.config.lr)

@@ -478,6 +478,19 @@ def parse():
     parser.add_argument('--save_topk', type=int, default=10, help='save topk checkpoint. -1 for saving all ckpt that has a better validation metric than its previous epoch')
     parser.add_argument('--shuffle', action='store_true', help='shuffle data')
     parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--prefetch_factor', type=int, default=4,
+                        help='DataLoader prefetch factor when num_workers > 0.')
+    parser.add_argument('--amp', action='store_true',
+                        help='Enable CUDA automatic mixed precision training.')
+    parser.add_argument('--amp_dtype', type=str, default='bf16',
+                        choices=['bf16', 'fp16'],
+                        help='AMP dtype. bf16 is preferred on Ampere/A6000 for stability.')
+    parser.add_argument('--log_interval', type=int, default=20,
+                        help='Write training scalar logs every N steps to reduce CUDA sync.')
+    parser.add_argument('--tqdm_mininterval', type=float, default=5.0,
+                        help='Minimum seconds between tqdm screen refreshes.')
+    parser.add_argument('--allow_tf32', action='store_true',
+                        help='Allow TF32 matmul/cudnn on Ampere GPUs.')
     
     parser.add_argument('--save_interval', type=int, default=1,
                     help='Save full training-state checkpoint every N completed epochs. Set <=0 to disable periodic last checkpoint saves.')
@@ -539,6 +552,17 @@ def parse():
 def main(args):
     ########### DDP and run directory setup ###########
     os.environ.setdefault('NCCL_TIMEOUT', '30')
+
+    if bool(getattr(args, "allow_tf32", False)) and torch.cuda.is_available():
+        # Ampere/A6000 speed path.  TF32 affects matmul/conv kernels, not tensor
+        # semantics or model architecture. It is safe to disable from config if
+        # exact FP32 reproducibility is needed.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
 
     # Robust DDP detection. This keeps old behavior for single GPU while also
     # working with torchrun, where WORLD_SIZE/LOCAL_RANK/RANK are set by torch.
@@ -652,22 +676,33 @@ def main(args):
         print_log(f'step per epoch: {step_per_epoch}')
         print_log(f'world_size: {world_size}, rank: {rank}, local_rank: {args.local_rank}')
 
-    # DataLoader settings: persistent_workers is only valid when num_workers > 0.
+    # DataLoader settings.  GPU under-utilization is often caused by the GPU
+    # waiting for CPU collation / host-to-device transfer.  pin_memory,
+    # persistent_workers and prefetch_factor keep batches ready in the background.
     persistent_workers = args.num_workers > 0
     pin_memory = torch.cuda.is_available() and args.gpus[0] != -1
+    loader_kwargs = dict(
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+    )
+    if args.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = max(2, int(args.prefetch_factor))
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size,
-                              num_workers=args.num_workers,
-                              shuffle=(args.shuffle and train_sampler is None),
-                              sampler=train_sampler,
-                              collate_fn=collate_fn,
-                              pin_memory=pin_memory,
-                              persistent_workers=persistent_workers)
-    valid_loader = DataLoader(valid_set, batch_size=args.batch_size,
-                              num_workers=args.num_workers,
-                              collate_fn=collate_fn,
-                              pin_memory=pin_memory,
-                              persistent_workers=persistent_workers)
+    train_loader = DataLoader(
+        train_set,
+        batch_size=args.batch_size,
+        shuffle=(args.shuffle and train_sampler is None),
+        sampler=train_sampler,
+        collate_fn=collate_fn,
+        **loader_kwargs,
+    )
+    valid_loader = DataLoader(
+        valid_set,
+        batch_size=args.batch_size,
+        collate_fn=collate_fn,
+        **loader_kwargs,
+    )
     
     trainer = Trainer(model, train_loader, valid_loader, config)
 
