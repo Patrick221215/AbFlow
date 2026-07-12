@@ -478,8 +478,32 @@ def parse():
     parser.add_argument('--save_topk', type=int, default=10, help='save topk checkpoint. -1 for saving all ckpt that has a better validation metric than its previous epoch')
     parser.add_argument('--shuffle', action='store_true', help='shuffle data')
     parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--prefetch_factor', type=int, default=4,
-                        help='DataLoader prefetch factor when num_workers > 0.')
+    parser.add_argument(
+        '--prefetch_factor',
+        type=int,
+        default=4,
+        help='Train DataLoader prefetch factor when num_workers > 0.'
+    )
+
+    parser.add_argument(
+        '--valid_num_workers',
+        type=int,
+        default=2,
+        help='Validation DataLoader workers. Formal validation keeps all metrics, but uses fewer workers to avoid RAM/pinned-memory spikes.'
+    )
+
+    parser.add_argument(
+        '--valid_prefetch_factor',
+        type=int,
+        default=2,
+        help='Validation DataLoader prefetch factor when valid_num_workers > 0.'
+    )
+
+    parser.add_argument(
+        '--valid_persistent_workers',
+        action='store_true',
+        help='Keep validation DataLoader workers persistent. Default off to avoid train+valid worker memory spikes.'
+    )
     parser.add_argument('--amp', action='store_true',
                         help='Enable CUDA automatic mixed precision training.')
     parser.add_argument('--amp_dtype', type=str, default='bf16',
@@ -679,15 +703,46 @@ def main(args):
     # DataLoader settings.  GPU under-utilization is often caused by the GPU
     # waiting for CPU collation / host-to-device transfer.  pin_memory,
     # persistent_workers and prefetch_factor keep batches ready in the background.
-    persistent_workers = args.num_workers > 0
     pin_memory = torch.cuda.is_available() and args.gpus[0] != -1
-    loader_kwargs = dict(
+
+    def _make_loader_kwargs(num_workers, prefetch_factor, persistent_workers):
+        num_workers = int(num_workers)
+        kwargs = dict(
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+
+        if num_workers > 0:
+            kwargs["prefetch_factor"] = max(2, int(prefetch_factor))
+            kwargs["persistent_workers"] = bool(persistent_workers)
+
+        return kwargs
+
+
+    train_loader_kwargs = _make_loader_kwargs(
         num_workers=args.num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=True,
     )
-    if args.num_workers > 0:
-        loader_kwargs["prefetch_factor"] = max(2, int(args.prefetch_factor))
+
+    # Formal validation must keep every validation epoch and every metric.
+    # The only change here is resource scheduling: use fewer workers and no
+    # persistent validation workers by default to avoid a memory spike when
+    # train_loader workers are still alive.
+    valid_loader_kwargs = _make_loader_kwargs(
+        num_workers=args.valid_num_workers,
+        prefetch_factor=args.valid_prefetch_factor,
+        persistent_workers=args.valid_persistent_workers,
+    )
+
+    if _is_main_rank(args.local_rank):
+        print_log(
+            f"DataLoader workers: train={args.num_workers}, "
+            f"valid={args.valid_num_workers}, "
+            f"train_prefetch={args.prefetch_factor}, "
+            f"valid_prefetch={args.valid_prefetch_factor}, "
+            f"valid_persistent_workers={args.valid_persistent_workers}"
+        )
 
     train_loader = DataLoader(
         train_set,
@@ -695,13 +750,15 @@ def main(args):
         shuffle=(args.shuffle and train_sampler is None),
         sampler=train_sampler,
         collate_fn=collate_fn,
-        **loader_kwargs,
+        **train_loader_kwargs,
     )
+
     valid_loader = DataLoader(
         valid_set,
         batch_size=args.batch_size,
+        shuffle=False,
         collate_fn=collate_fn,
-        **loader_kwargs,
+        **valid_loader_kwargs,
     )
     
     trainer = Trainer(model, train_loader, valid_loader, config)

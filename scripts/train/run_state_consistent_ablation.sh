@@ -6,16 +6,20 @@ EXP_ID=${2:-}
 GPU_ID=${3:-0}
 
 # ============================================================
-# AbFlow v28 condition-speed-final training ablations
+# AbFlow formal state-consistent train/test ablation launcher
 # ============================================================
-# 1. X_0/S_0 always come from the reference distribution.
-# 2. X_pep/S_pep are conditions only; they never overwrite X_t/S_t.
-# 3. No peptide-prior weights.
-# 4. No independent score head and no pair-time conditioning.
-# 5. One coordinate objective per complex:
-#      endpoint      : unique per-complex endpoint loss
-#      analytic_core : endpoint outside [t_min,t_max], CA analytic DSM inside
-# 6. No x1/velocity/DSM stacking and no geometry/contact auxiliary in this stage.
+# Formal principles:
+#   1. X0/S0 come from the reference state.
+#   2. X_pep/S_pep are conditions only; they never overwrite X0/S0.
+#   3. No peptide-prior weights are used.
+#   4. No independent score head; no pair-time module.
+#   5. Formal training keeps observability by default:
+#        LOG_INTERVAL=1, SAVE_INTERVAL=1, CONDITION_DIAGNOSTICS=on.
+#   6. Train/valid DataLoader resources are separated.
+#   7. Resume policy is explicit and reproducible:
+#        default = keep resume_checkpoint from BASE_CONFIG;
+#        ABFLOW_RESUME_CKPT overrides BASE_CONFIG;
+#        ABFLOW_RESUME_POLICY=none clears resume.
 
 STATE_PATH=on
 PER_SAMPLE_T=on
@@ -31,48 +35,53 @@ COORD_PEP_AS_CONDITION=off
 SEQ_INPUT_MODE=state
 SEQ_CE_WEIGHT=${ABFLOW_SEQ_CE_WEIGHT:-1.0}
 
-# Speed / utilization controls.  These affect training efficiency only; they do
-# not change the source/condition semantics.
+# Formal-training defaults. Override only when intentionally doing profiling
+# or resource debugging.
 AMP=${ABFLOW_AMP:-on}
 AMP_DTYPE=${ABFLOW_AMP_DTYPE:-bf16}
 ALLOW_TF32=${ABFLOW_ALLOW_TF32:-on}
-NUM_WORKERS=${ABFLOW_NUM_WORKERS:-12}
+NUM_WORKERS=${ABFLOW_NUM_WORKERS:-8}
 PREFETCH_FACTOR=${ABFLOW_PREFETCH_FACTOR:-4}
-LOG_INTERVAL=${ABFLOW_LOG_INTERVAL:-20}
+VALID_NUM_WORKERS=${ABFLOW_VALID_NUM_WORKERS:-2}
+VALID_PREFETCH_FACTOR=${ABFLOW_VALID_PREFETCH_FACTOR:-2}
+VALID_PERSISTENT_WORKERS=${ABFLOW_VALID_PERSISTENT_WORKERS:-off}
+LOG_INTERVAL=${ABFLOW_LOG_INTERVAL:-1}
 TQDM_MININTERVAL=${ABFLOW_TQDM_MININTERVAL:-5.0}
-SAVE_INTERVAL=${ABFLOW_SAVE_INTERVAL:-10}
-CONDITION_DIAGNOSTICS=${ABFLOW_CONDITION_DIAGNOSTICS:-off}
+SAVE_INTERVAL=${ABFLOW_SAVE_INTERVAL:-1}
+CONDITION_DIAGNOSTICS=${ABFLOW_CONDITION_DIAGNOSTICS:-on}
+
+# Resume policy:
+#   config: preserve resume_checkpoint in BASE_CONFIG unless ABFLOW_RESUME_CKPT is set.
+#   env:    require ABFLOW_RESUME_CKPT if resume is desired; config is ignored.
+#   none:   always train from scratch.
+RESUME_POLICY=${ABFLOW_RESUME_POLICY:-config}
+ALLOW_CROSS_EXP_RESUME=${ABFLOW_ALLOW_CROSS_EXP_RESUME:-off}
 
 case "$EXP_ID" in
-  # Pure reference-state endpoint FM.
   REF)
     LOSS_MODE=endpoint
     COORD_PEP_AS_CONDITION=off
     SEQ_INPUT_MODE=state
     ;;
 
-  # Isolate proposal-sequence conditioning.
   REF_SEQ)
     LOSS_MODE=endpoint
     COORD_PEP_AS_CONDITION=off
     SEQ_INPUT_MODE=pep_condition
     ;;
 
-  # Isolate coordinate conditioning without proposal-sequence conditioning.
   REF_COORD)
     LOSS_MODE=endpoint
     COORD_PEP_AS_CONDITION=on
     SEQ_INPUT_MODE=state
     ;;
 
-  # Main clean conditional endpoint baseline.
   REF_COND)
     LOSS_MODE=endpoint
     COORD_PEP_AS_CONDITION=on
     SEQ_INPUT_MODE=pep_condition
     ;;
 
-  # Main analytic-score experiment under identical source/condition semantics.
   CORE)
     LOSS_MODE=analytic_core
     COORD_PEP_AS_CONDITION=on
@@ -81,7 +90,7 @@ case "$EXP_ID" in
 
   *)
     echo "Unknown EXP_ID: $EXP_ID"
-    echo "Supported: REF REF_SEQ REF_COORD REF_COND CORE"
+    echo "Supported EXP_ID: REF REF_SEQ REF_COORD REF_COND CORE"
     exit 2
     ;;
 esac
@@ -100,6 +109,19 @@ run_with_env() {
   ABFLOW_SEQ_INPUT_MODE="$SEQ_INPUT_MODE" \
   ABFLOW_SEQ_CE_WEIGHT="$SEQ_CE_WEIGHT" \
   ABFLOW_CONDITION_DIAGNOSTICS="$CONDITION_DIAGNOSTICS" \
+  ABFLOW_AMP="$AMP" \
+  ABFLOW_AMP_DTYPE="$AMP_DTYPE" \
+  ABFLOW_ALLOW_TF32="$ALLOW_TF32" \
+  ABFLOW_NUM_WORKERS="$NUM_WORKERS" \
+  ABFLOW_PREFETCH_FACTOR="$PREFETCH_FACTOR" \
+  ABFLOW_VALID_NUM_WORKERS="$VALID_NUM_WORKERS" \
+  ABFLOW_VALID_PREFETCH_FACTOR="$VALID_PREFETCH_FACTOR" \
+  ABFLOW_VALID_PERSISTENT_WORKERS="$VALID_PERSISTENT_WORKERS" \
+  ABFLOW_LOG_INTERVAL="$LOG_INTERVAL" \
+  ABFLOW_TQDM_MININTERVAL="$TQDM_MININTERVAL" \
+  ABFLOW_SAVE_INTERVAL="$SAVE_INTERVAL" \
+  ABFLOW_RESUME_POLICY="$RESUME_POLICY" \
+  ABFLOW_ALLOW_CROSS_EXP_RESUME="$ALLOW_CROSS_EXP_RESUME" \
   GPU="$GPU_ID" \
   "$@"
 }
@@ -124,14 +146,45 @@ print_settings() {
   echo "ALLOW_TF32=$ALLOW_TF32"
   echo "NUM_WORKERS=$NUM_WORKERS"
   echo "PREFETCH_FACTOR=$PREFETCH_FACTOR"
+  echo "VALID_NUM_WORKERS=$VALID_NUM_WORKERS"
+  echo "VALID_PREFETCH_FACTOR=$VALID_PREFETCH_FACTOR"
+  echo "VALID_PERSISTENT_WORKERS=$VALID_PERSISTENT_WORKERS"
   echo "LOG_INTERVAL=$LOG_INTERVAL"
   echo "TQDM_MININTERVAL=$TQDM_MININTERVAL"
   echo "SAVE_INTERVAL=$SAVE_INTERVAL"
   echo "CONDITION_DIAGNOSTICS=$CONDITION_DIAGNOSTICS"
+  echo "RESUME_POLICY=$RESUME_POLICY"
+  echo "ALLOW_CROSS_EXP_RESUME=$ALLOW_CROSS_EXP_RESUME"
+  echo "ABFLOW_RESUME_CKPT=${ABFLOW_RESUME_CKPT:-}"
 }
 
+if [[ "$MODE" == "test" ]]; then
+  CKPT=${4:-}
+  RESULT_DIR=${5:-}
+  TEST_JSON=${6:-datasets/RAbD/test.json}
+
+  if [[ -z "$CKPT" || -z "$RESULT_DIR" ]]; then
+    echo "Usage: bash $0 test <EXP_ID> <GPU_ID> <CKPT> <RESULT_DIR> [TEST_JSON]"
+    exit 2
+  fi
+
+  [[ -f "$CKPT" ]] || { echo "Checkpoint not found: $CKPT"; exit 2; }
+  [[ -f "$TEST_JSON" ]] || { echo "Test JSON not found: $TEST_JSON"; exit 2; }
+
+  print_settings
+  echo "Checkpoint: $CKPT"
+  echo "Result dir: $RESULT_DIR"
+  echo "Test JSON: $TEST_JSON"
+
+  run_with_env bash scripts/test/test.sh \
+    "$CKPT" "$TEST_JSON" "$RESULT_DIR" rabd
+
+  exit 0
+fi
+
 if [[ "$MODE" != "train" ]]; then
-  echo "Usage: bash $0 train <EXP_ID> <GPU_ID> <BASE_CONFIG>"
+  echo "Train: bash $0 train <EXP_ID> <GPU_ID> <BASE_CONFIG>"
+  echo "Test:  bash $0 test  <EXP_ID> <GPU_ID> <CKPT> <RESULT_DIR> [TEST_JSON]"
   echo "Supported EXP_ID: REF REF_SEQ REF_COORD REF_COND CORE"
   exit 2
 fi
@@ -153,44 +206,122 @@ import os
 import sys
 
 src, dst, save_dir, exp_id, runtime_meta = sys.argv[1:6]
+
 with open(src, "r", encoding="utf-8") as f:
     cfg = json.load(f)
 
+# ---------------------------------------------------------------------
+# train.sh converts every top-level JSON key into --<key>.
+# Therefore uppercase JSON keys such as VALID_NUM_WORKERS become
+# --VALID_NUM_WORKERS, but train.py only accepts --valid_num_workers.
+# Remove stale uppercase control keys before writing generated config.
+# ---------------------------------------------------------------------
+for key in list(cfg.keys()):
+    if key.isupper():
+        cfg.pop(key, None)
+
+for key in [
+    "VALID_NUM_WORKERS",
+    "VALID_PREFETCH_FACTOR",
+    "VALID_PERSISTENT_WORKERS",
+    "NUM_WORKERS",
+    "PREFETCH_FACTOR",
+    "LOG_INTERVAL",
+    "SAVE_INTERVAL",
+    "CONDITION_DIAGNOSTICS",
+]:
+    cfg.pop(key, None)
+
 cfg["save_dir"] = save_dir
-# Fresh start is the default.  A legacy checkpoint in the base JSON must never
-# silently leak into a new condition ablation.  Resume is allowed only through
-# the explicit ABFLOW_RESUME_CKPT environment variable.
-resume_ckpt = os.environ.get("ABFLOW_RESUME_CKPT", "").strip()
-cfg["resume_checkpoint"] = resume_ckpt
-if resume_ckpt and not os.path.isfile(resume_ckpt):
-    raise FileNotFoundError(
-        f"ABFLOW_RESUME_CKPT does not exist: {resume_ckpt}"
-    )
 
 def _env_on(name, default="off"):
     return os.environ.get(name, default).strip().lower() in {
         "1", "true", "yes", "y", "on"
     }
 
-# Training-speed controls.  These fields are accepted by train.py in v28.
-cfg["num_workers"] = int(os.environ.get("ABFLOW_NUM_WORKERS", "12"))
-cfg["prefetch_factor"] = int(os.environ.get("ABFLOW_PREFETCH_FACTOR", "4"))
-cfg["log_interval"] = int(os.environ.get("ABFLOW_LOG_INTERVAL", "20"))
-cfg["tqdm_mininterval"] = float(os.environ.get("ABFLOW_TQDM_MININTERVAL", "5.0"))
-cfg["save_interval"] = int(os.environ.get("ABFLOW_SAVE_INTERVAL", "10"))
-cfg["amp_dtype"] = os.environ.get("ABFLOW_AMP_DTYPE", "bf16").strip().lower()
-if cfg["amp_dtype"] not in {"bf16", "fp16"}:
+def _env_int(name, default):
+    return int(os.environ.get(name, str(default)))
+
+def _env_float(name, default):
+    return float(os.environ.get(name, str(default)))
+
+# -------------------------------------------------------------------------
+# Resume logic: single source of truth is the base config.
+# -------------------------------------------------------------------------
+# If single_cdr_design.json contains:
+#     "resume_checkpoint": ""
+# then training starts from scratch.
+#
+# If it contains:
+#     "resume_checkpoint": "/path/to/checkpoint"
+# then training resumes from that checkpoint.
+#
+# The launcher must not silently override this field.
+resume_ckpt = str(cfg.get("resume_checkpoint", "") or "").strip()
+cfg["resume_checkpoint"] = resume_ckpt
+
+if resume_ckpt and not os.path.isfile(resume_ckpt):
+    raise FileNotFoundError(
+        f"resume_checkpoint in base config does not exist: {resume_ckpt}"
+    )
+
+# Canonical lowercase keys accepted by train.py argparse.
+cfg["num_workers"] = _env_int(
+    "ABFLOW_NUM_WORKERS",
+    cfg.get("num_workers", 8),
+)
+cfg["prefetch_factor"] = _env_int(
+    "ABFLOW_PREFETCH_FACTOR",
+    cfg.get("prefetch_factor", 4),
+)
+cfg["valid_num_workers"] = _env_int(
+    "ABFLOW_VALID_NUM_WORKERS",
+    cfg.get("valid_num_workers", 2),
+)
+cfg["valid_prefetch_factor"] = _env_int(
+    "ABFLOW_VALID_PREFETCH_FACTOR",
+    cfg.get("valid_prefetch_factor", 2),
+)
+
+if _env_on("ABFLOW_VALID_PERSISTENT_WORKERS", "off"):
+    cfg["valid_persistent_workers"] = True
+else:
+    cfg.pop("valid_persistent_workers", None)
+
+cfg["log_interval"] = _env_int(
+    "ABFLOW_LOG_INTERVAL",
+    cfg.get("log_interval", 1),
+)
+cfg["tqdm_mininterval"] = _env_float(
+    "ABFLOW_TQDM_MININTERVAL",
+    cfg.get("tqdm_mininterval", 5.0),
+)
+cfg["save_interval"] = _env_int(
+    "ABFLOW_SAVE_INTERVAL",
+    cfg.get("save_interval", 1),
+)
+
+amp_dtype = os.environ.get(
+    "ABFLOW_AMP_DTYPE",
+    str(cfg.get("amp_dtype", "bf16")),
+).strip().lower()
+
+if amp_dtype not in {"bf16", "fp16"}:
     raise ValueError("ABFLOW_AMP_DTYPE must be bf16 or fp16.")
+
+cfg["amp_dtype"] = amp_dtype
+
 if _env_on("ABFLOW_AMP", "on"):
     cfg["amp"] = True
 else:
     cfg.pop("amp", None)
+
 if _env_on("ABFLOW_ALLOW_TF32", "on"):
     cfg["allow_tf32"] = True
 else:
     cfg.pop("allow_tf32", None)
 
-# Remove obsolete weighted-prior and redundant objective controls.
+# Remove obsolete peptide-prior and redundant objective controls.
 obsolete_exact = {
     "coord_prior",
     "seq_prior",
@@ -210,7 +341,9 @@ obsolete_exact = {
     "scorefm_hybrid_mix_mode",
     "scorefm_max_effective_snr",
     "coord_pep_max_fraction",
+    "abflow_runtime",
 }
+
 for key in list(cfg.keys()):
     low = key.lower()
     if (
@@ -232,19 +365,21 @@ runtime = {
     "dsm_t_min": os.environ.get("ABFLOW_SCOREFM_DSM_T_MIN", ""),
     "dsm_t_max": os.environ.get("ABFLOW_SCOREFM_DSM_T_MAX", ""),
     "sampler_mode": os.environ.get("ABFLOW_SCOREFM_SAMPLER_MODE", ""),
-    "coord_pep_as_condition": os.environ.get(
-        "ABFLOW_COORD_PEP_AS_CONDITION", ""
-    ),
+    "coord_pep_as_condition": os.environ.get("ABFLOW_COORD_PEP_AS_CONDITION", ""),
     "seq_input_mode": os.environ.get("ABFLOW_SEQ_INPUT_MODE", ""),
     "seq_ce_weight": os.environ.get("ABFLOW_SEQ_CE_WEIGHT", ""),
     "amp": os.environ.get("ABFLOW_AMP", "on"),
     "amp_dtype": os.environ.get("ABFLOW_AMP_DTYPE", "bf16"),
     "allow_tf32": os.environ.get("ABFLOW_ALLOW_TF32", "on"),
-    "num_workers": os.environ.get("ABFLOW_NUM_WORKERS", "12"),
-    "prefetch_factor": os.environ.get("ABFLOW_PREFETCH_FACTOR", "4"),
-    "log_interval": os.environ.get("ABFLOW_LOG_INTERVAL", "20"),
-    "save_interval": os.environ.get("ABFLOW_SAVE_INTERVAL", "10"),
+    "num_workers": os.environ.get("ABFLOW_NUM_WORKERS", str(cfg.get("num_workers", 8))),
+    "prefetch_factor": os.environ.get("ABFLOW_PREFETCH_FACTOR", str(cfg.get("prefetch_factor", 4))),
+    "valid_num_workers": os.environ.get("ABFLOW_VALID_NUM_WORKERS", str(cfg.get("valid_num_workers", 2))),
+    "valid_prefetch_factor": os.environ.get("ABFLOW_VALID_PREFETCH_FACTOR", str(cfg.get("valid_prefetch_factor", 2))),
+    "valid_persistent_workers": os.environ.get("ABFLOW_VALID_PERSISTENT_WORKERS", "off"),
+    "log_interval": os.environ.get("ABFLOW_LOG_INTERVAL", str(cfg.get("log_interval", 1))),
+    "save_interval": os.environ.get("ABFLOW_SAVE_INTERVAL", str(cfg.get("save_interval", 1))),
     "condition_diagnostics": os.environ.get("ABFLOW_CONDITION_DIAGNOSTICS", "on"),
+    "resume_checkpoint": resume_ckpt,
     "clean_reference_state": "true",
     "peptide_state_injection": "false",
     "peptide_prior_weighting": "false",
@@ -253,20 +388,22 @@ runtime = {
     "coordinate_objective_stacking": "false",
     "analytic_score_scope": "CA_translation_only",
     "true_path_endpoint": "1.0",
-    "condition_representation": (
-        "proposal_local_frame_radial_log1p_state_time_residual"
-    ),
+    "condition_representation": "proposal_local_frame_radial_log1p_state_time_residual",
     "direct_coordinate_condition_update": "false",
-    "train_only_script": "true",
 }
 
-# Store non-training metadata in a sidecar file.  Keeping it out of the model
-# config prevents train.sh/argparse from receiving an unknown --abflow_runtime
-# argument.
 os.makedirs(os.path.dirname(runtime_meta), exist_ok=True)
+
 with open(runtime_meta, "w", encoding="utf-8") as f:
     json.dump(runtime, f, indent=2, ensure_ascii=False)
     f.write("\n")
+
+uppercase_keys = [k for k in cfg if k.isupper()]
+if uppercase_keys:
+    raise ValueError(
+        "Generated config still contains uppercase keys that would break "
+        f"argparse: {uppercase_keys}"
+    )
 
 with open(dst, "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
@@ -274,18 +411,42 @@ with open(dst, "w", encoding="utf-8") as f:
 PY
 
 print_settings
+
 echo "Config: $RUN_CONFIG"
 echo "Save dir: $RUN_DIR"
 echo "Runtime metadata: $RUNTIME_META"
 
-EFFECTIVE_RESUME_CKPT=$(python - "$RUN_CONFIG" <<'PY'
+python - "$RUN_CONFIG" <<'PY'
 import json
 import sys
+
 with open(sys.argv[1], "r", encoding="utf-8") as f:
     cfg = json.load(f)
-print(cfg.get("resume_checkpoint", ""))
+
+print("Generated loader/log/resume config:")
+for key in [
+    "num_workers",
+    "prefetch_factor",
+    "valid_num_workers",
+    "valid_prefetch_factor",
+    "valid_persistent_workers",
+    "log_interval",
+    "save_interval",
+    "amp",
+    "amp_dtype",
+    "allow_tf32",
+    "resume_checkpoint",
+]:
+    print(f"  {key}={cfg.get(key, '')}")
+
+bad = [k for k in cfg if k.isupper()]
+if bad:
+    raise SystemExit(f"ERROR: uppercase keys remain in generated config: {bad}")
 PY
-)
-echo "resume_checkpoint=$EFFECTIVE_RESUME_CKPT"
+
+if [[ "${ABFLOW_DRY_RUN:-0}" == "1" ]]; then
+  echo "ABFLOW_DRY_RUN=1: configuration generated; training was not started."
+  exit 0
+fi
 
 run_with_env bash scripts/train/train.sh "$RUN_CONFIG"
