@@ -579,9 +579,38 @@ class SeparatedAminoAcidFeature(AminoAcidFeature):
         H = self.aa_embedding.residue_embedding(S)
         if smooth_prob is not None:
             res_embeddings = self.aa_embedding.residue_embedding(
-                torch.arange(smooth_prob.shape[-1], device=S.device, dtype=S.dtype)
+                torch.arange(
+                    smooth_prob.shape[-1],
+                    device=S.device,
+                    dtype=S.dtype,
+                )
             )  # [num_aa_type, embed_size]
-            H[smooth_mask] = smooth_prob.mm(res_embeddings)
+
+            # AMP-safe smooth residue embedding.
+            #
+            # Why this is necessary:
+            # Under torch.cuda.amp.autocast(dtype=torch.bfloat16/float16),
+            # matrix multiplication may return a lower-precision tensor even
+            # when the destination embedding tensor H remains float32.
+            #
+            # PyTorch index assignment requires:
+            #     H[smooth_mask].dtype == source.dtype
+            #
+            # Original code:
+            #     H[smooth_mask] = smooth_prob.mm(res_embeddings)
+            #
+            # may therefore fail with:
+            #     Float destination vs BFloat16 source.
+            #
+            # We keep AMP acceleration for the matmul, but cast the source
+            # back to H.dtype before index assignment.
+            smooth_res_embedding = smooth_prob.to(
+                device=res_embeddings.device,
+                dtype=res_embeddings.dtype,
+            ).mm(res_embeddings)
+
+            H[smooth_mask] = smooth_res_embedding.to(dtype=H.dtype)
+
         H = H + pos_embedding
 
         # atom embedding
