@@ -164,207 +164,164 @@ class AbFlowModel(nn.Module):
         self.batch_constants = {}
 
         # =========================================================
-        # Coordinate Score-Factorized Flow Matching losses
+        # Analytic-score-consistent endpoint Flow Matching
         # =========================================================
-        # We follow the AbX score-based principle at the level of AbFlow's
-        # coordinate path: the network predicts a clean endpoint X_1^theta,
-        # and the score is analytically induced from p_t(X_t | X_1^theta).
-        # No arbitrary score head is introduced here.
+        # The network predicts a clean endpoint X_1^theta. Following the
+        # analytic parameterization used in AbX, the coordinate score is
+        # induced from the known forward kernel; no independent score head is
+        # introduced.
         #
-        # Path:               X_t = (1 - t) X_0 + t X_1
-        # sigma_t:            sigma_t = 1 - t
-        # conditional score:  s_t(X_t | X_1) = -(X_t - t X_1) / sigma_t^2
-        self.scorefm_min_sigma = 1e-2
+        # Core principles of this version:
+        #   1. X_0/S_0 always come from the reference distribution.
+        #   2. X_pep/S_pep are conditions only and never overwrite X_t/S_t.
+        #   3. The endpoint objective is defined exactly once per complex.
+        #   4. Endpoint and analytic DSM targets replace one another per complex;
+        #      they are never stacked for the same sample.
+        #   5. Analytic DSM is applied only to CA translation, whose reference
+        #      kernel is exactly isotropic Gaussian around the antigen center.
+        #   6. The real transport path reaches t=1; min_sigma protects only
+        #      analytic score/bridge denominators.
         self.scorefm_eps = 1e-8
+        self.scorefm_min_sigma = _env_float(
+            "ABFLOW_SCOREFM_MIN_SIGMA", 1e-2
+        )
+        if not (0.0 < self.scorefm_min_sigma < 1.0):
+            raise ValueError(
+                "ABFLOW_SCOREFM_MIN_SIGMA must be in (0, 1)."
+            )
 
-        # Threshold for choosing score/DSM-style supervision versus endpoint
-        # x1 supervision in the hybrid objective.
-        # This must be applied per complex, not at batch level.
-        self.scorefm_t_threshold = _env_float("ABFLOW_SCOREFM_T_THRESHOLD", 0.2)
+        # Coordinate objective:
+        #   endpoint:
+        #       Unique per-complex clean-endpoint SmoothL1 at every t.
+        #   analytic_core:
+        #       Use analytic CA-score DSM only inside a bounded time interval;
+        #       use endpoint reconstruction outside that interval. This avoids
+        #       both low-t score degeneracy and late-time score singularity.
+        self.scorefm_loss_mode = _env_str(
+            "ABFLOW_SCOREFM_LOSS_MODE", "endpoint"
+        ).lower()
+        if self.scorefm_loss_mode in {"off", "none", "base"}:
+            self.scorefm_loss_mode = "endpoint"
+        if self.scorefm_loss_mode in {"core", "dtm_core", "hybrid"}:
+            self.scorefm_loss_mode = "analytic_core"
+        if self.scorefm_loss_mode not in {"endpoint", "analytic_core"}:
+            raise ValueError(
+                "Unknown ABFLOW_SCOREFM_LOSS_MODE="
+                f"{self.scorefm_loss_mode}. Choose from endpoint, analytic_core."
+            )
 
-        # AbX-style per-sample hybrid mixing.
-        # hard:  use DSM if t > threshold, otherwise x1.
-        # soft:  use sigmoid gate around threshold.
-        self.scorefm_hybrid_mix_mode = _env_str("ABFLOW_SCOREFM_HYBRID_MIX_MODE", "hard").lower()
-        self.scorefm_hybrid_gate_k = _env_float("ABFLOW_SCOREFM_HYBRID_GATE_K", 12.0)
+        self.scorefm_dsm_t_min = _env_float(
+            "ABFLOW_SCOREFM_DSM_T_MIN", 0.2
+        )
+        self.scorefm_dsm_t_max = _env_float(
+            "ABFLOW_SCOREFM_DSM_T_MAX", 0.8
+        )
+        if not (
+            0.0 <= self.scorefm_dsm_t_min
+            < self.scorefm_dsm_t_max <= 1.0
+        ):
+            raise ValueError(
+                "Require 0 <= ABFLOW_SCOREFM_DSM_T_MIN < "
+                "ABFLOW_SCOREFM_DSM_T_MAX <= 1."
+            )
 
-        # Overall weight of the new objective. The component weights below are
-        # active by default; they are not placeholders. Keep the global weight
-        # conservative because AbFlow already has sequence, structure and docking losses.
-        self.scorefm_loss_weight = 5e-2
-        self.scorefm_velocity_weight = 1.0
-        self.scorefm_dsm_weight = 1.0
-        self.scorefm_x1_weight = 0.1
-        self.scorefm_local_dist_weight = 0.05
-        self.scorefm_interface_contact_weight = 0.05
-        # self.scorefm_inter_clash_weight = 0.01
-        # self.scorefm_intra_clash_weight = 0.005
-        self.scorefm_inter_clash_weight = 0.0
-        self.scorefm_intra_clash_weight = 0.0
-
-        # Interface contact BCE.
-        # AbX-style principle:
-        #   1) soft contact label around the cutoff boundary;
-        #   2) hard-negative sampling to avoid trivial far negatives;
-        #   3) dynamic positive weighting for sparse native contacts;
-        #   4) RMSD-linked confidence weight at the complex level.
-        self.scorefm_contact_cutoff = _env_float("ABFLOW_SCOREFM_CONTACT_CUTOFF", 8.0)
-        self.scorefm_contact_temperature = _env_float("ABFLOW_SCOREFM_CONTACT_TAU", 2.0)
-        self.scorefm_contact_max_neg_ratio = _env_float("ABFLOW_SCOREFM_CONTACT_MAX_NEG_RATIO", 3.0)
-        self.scorefm_contact_soft_label = _env_flag("ABFLOW_SCOREFM_CONTACT_SOFT_LABEL", True)
-        self.scorefm_contact_rmsd_threshold = _env_float("ABFLOW_SCOREFM_CONTACT_RMSD_THRESHOLD", 3.0)
-        self.scorefm_contact_rmsd_temperature = _env_float("ABFLOW_SCOREFM_CONTACT_RMSD_TAU", 1.0)
-        self.scorefm_contact_min_confidence = _env_float("ABFLOW_SCOREFM_CONTACT_MIN_CONFIDENCE", 0.25)
-
-        # Clash losses are disabled by default. When enabled, they should aggregate
-        # only violating atom pairs and must exclude covalently adjacent residues.
-        self.scorefm_inter_clash_cutoff = _env_float("ABFLOW_SCOREFM_INTER_CLASH_CUTOFF", 2.0)
-        self.scorefm_intra_clash_cutoff = _env_float("ABFLOW_SCOREFM_INTRA_CLASH_CUTOFF", 1.5)
-        self.scorefm_intra_clash_exclude_neighbors = int(
-            _env_float("ABFLOW_SCOREFM_INTRA_CLASH_EXCLUDE_NEIGHBORS", 1.0)
+        # State-path controls.
+        self.scorefm_per_sample_t = _env_flag(
+            "ABFLOW_SCOREFM_PER_SAMPLE_T", True
+        )
+        self.scorefm_t_sampling = _env_str(
+            "ABFLOW_SCOREFM_T_SAMPLING", "uniform"
+        ).lower()
+        self.scorefm_state_path = _env_flag(
+            "ABFLOW_SCOREFM_STATE_PATH", True
         )
 
-        # Time-aware x1 endpoint regularization:
-        #   w_x1(t) = w_min + (1 - w_min) * t^gamma
-        self.scorefm_x1_time_min_weight = _env_float("ABFLOW_SCOREFM_X1_TIME_MIN_WEIGHT", 0.25)
-        self.scorefm_x1_time_power = _env_float("ABFLOW_SCOREFM_X1_TIME_POWER", 1.0)
-        
-        
-        self.last_scorefm_losses = {}
-        self.use_scorefm = True  # current Score-FM code path
-
-        # self.timing_stats = {
-        #     'surface_processing': 0.0,
-        #     'sme_encoding': 0.0,
-        #     'count': 0
-        # }
-        
-        # =========================================================
-        # Ablation controls
-        # =========================================================
-        # Loss modes:
-        #   off        : no new DTM/ScoreFM objective, only base AbFlow losses
-        #   x1         : clean endpoint reconstruction only
-        #   dsm        : analytic score DSM only
-        #   hybrid     : thresholded DSM/x1 hybrid + x1
-        #   velocity   : velocity identity only
-        #   x1_vel     : x1 + velocity
-        #   dtm_core   : x1 + hybrid DSM/x1 + velocity, no geometry regularizers
-        #   geom_only  : local/contact/clash only
-        #   no_contact : full but contact loss disabled
-        #   no_clash   : full but clash losses disabled
-        #   no_geom    : same as dtm_core
-        #   full       : current full objective
-        self.scorefm_loss_mode = _env_str("ABFLOW_SCOREFM_LOSS_MODE", "off").lower()
-
-        # Path/time controls.
-        # ABFLOW_SCOREFM_PER_SAMPLE_T=on follows the AbX practice: every complex
-        # receives its own continuous time t instead of sharing one scalar for the
-        # whole batch. This reduces timestep-gradient variance and prevents a batch
-        # from being dominated by a single noise level.
-        self.scorefm_per_sample_t = _env_flag("ABFLOW_SCOREFM_PER_SAMPLE_T", True)
-
-        # t sampling schedule for the coordinate path:
-        #   uniform    : t ~ U(0, 1)
-        #   low_t      : t = u^2, biases training toward harder low-t states
-        #                that contain less native endpoint information
-        #   stratified : approximately covers the whole [0, 1] interval in each batch
-        # scorefm_min_sigma is used only for score/velocity numerical stability;
-        # it must not shrink the true flow endpoint.
-        self.scorefm_t_sampling = _env_str("ABFLOW_SCOREFM_T_SAMPLING", "uniform").lower()
-
-        # Flow-time conditioning. When enabled, a sinusoidal embedding of t is
-        # added to the initial residue feature H_0 before the AbFlow encoder.
-        # This is the minimal AbFlow analogue of AbX's time-conditioned Seqformer.
-        self.scorefm_time_embed = _env_flag("ABFLOW_SCOREFM_TIME_EMBED", False)
+        # Node-level time conditioning. Pair-time conditioning is deliberately
+        # deferred so that the present experiments remain attributable.
+        self.scorefm_time_embed = _env_flag(
+            "ABFLOW_SCOREFM_TIME_EMBED", True
+        )
         self.flow_time_mlp = nn.Sequential(
             nn.Linear(embed_size, embed_size),
             nn.SiLU(),
             nn.Linear(embed_size, embed_size),
         )
 
-        # bridge:
-        #     dX = pred_clean_X + sigma_t * pred_score
-        #        = (pred_clean_X - X_t) / sigma_t
-        #     This recovers the FM velocity X_1 - X_0 when pred_clean_X = X_1.
-        # residual:
-        #     dX = pred_clean_X - X_t
-        #     Conservative endpoint residual, not the exact FM velocity.
-        # damped_bridge:
-        #     dX = sigma_t^p * bridge_velocity
-        #     Reduces bridge magnitude near late time if p > 0.
-        # blend:
-        #     Interpolates between residual and bridge velocity.
-        self.scorefm_sampler_mode = _env_str("ABFLOW_SCOREFM_SAMPLER_MODE", "bridge").lower()
-        self.scorefm_bridge_damping_power = _env_float("ABFLOW_SCOREFM_DAMPING_POWER", 0.0)
-        self.scorefm_bridge_blend = _env_float("ABFLOW_SCOREFM_BRIDGE_BLEND", 1.0)
+        # Minimal sampler set: residual is a conservative ablation; bridge is
+        # the endpoint-parameterized FM sampler used by default.
+        self.scorefm_sampler_mode = _env_str(
+            "ABFLOW_SCOREFM_SAMPLER_MODE", "bridge"
+        ).lower()
+        if self.scorefm_sampler_mode not in {"residual", "bridge"}:
+            raise ValueError(
+                "Unknown ABFLOW_SCOREFM_SAMPLER_MODE="
+                f"{self.scorefm_sampler_mode}. Choose from residual, bridge."
+            )
 
         # =========================================================
-        # Clean source / condition policy
+        # Peptide information as condition, never as source-state injection
         # =========================================================
-        # First-principle rule:
-        #   X_0/S_0 are generated states and must come from the reference/base
-        #   distribution. Peptide-derived information must not overwrite X_0/S_0
-        #   and must not be mixed into them with heuristic weights.
-        #
-        # Allowed peptide use in this clean version:
-        #   1) coordinate condition: X_pep is encoded as residue-level condition;
-        #   2) sequence condition: S_pep is encoded as residue-level condition.
-        #
-        # This clean implementation has no peptide-prior state overwrite and no
-        # peptide-prior weighting mechanism.
+        # Coordinate proposal conditioning is represented only in scalar hidden
+        # space. The directional CA displacement is expressed in the proposal's
+        # local N-CA-C frame, which is stable even when the current flow state is
+        # highly noisy at low t. Distance statistics use log1p compression to
+        # limit dynamic range. The resulting scalar features are invariant to global
+        # SE(3) transformations. Crucially, X_pep never directly updates
+        # interface_X; it conditions f_theta instead of acting as a post-hoc
+        # coordinate correction.
         self.coord_pep_as_condition = _env_flag(
             "ABFLOW_COORD_PEP_AS_CONDITION", False
         )
+        self.coord_pep_condition_dim = 6
         if self.coord_pep_as_condition:
-            self.coord_pep_condition_mlp = nn.Sequential(
-                nn.Linear(4, embed_size),
+            # Input: current hidden state H_0 plus six E(3)-invariant features:
+            #   local-frame CA displacement (3),
+            #   CA distance, mean backbone distance, RMS backbone distance (3).
+            self.coord_pep_condition_adapter = nn.Sequential(
+                nn.Linear(embed_size + self.coord_pep_condition_dim, embed_size),
                 nn.SiLU(),
                 nn.Linear(embed_size, embed_size),
             )
+            # Zero-start residual adapter: the initial model is exactly REF.
+            nn.init.zeros_(self.coord_pep_condition_adapter[-1].weight)
+            nn.init.zeros_(self.coord_pep_condition_adapter[-1].bias)
         else:
-            self.coord_pep_condition_mlp = None
+            self.coord_pep_condition_adapter = None
 
-        # Sequence input policy.
-        #   state:
-        #       The model sees only the sampled categorical state S_t.
-        #   pep_condition:
-        #       S_t is still the generated state; S_pep is added only as a
-        #       separate condition embedding, analogous to AbX-style priors.
-        self.seq_input_mode = _env_str("ABFLOW_SEQ_INPUT_MODE", "state").lower()
+        # S_pep is a proposal-token condition, not an ESM representation and
+        # never a replacement for S_t.  Fusion is residue- and state-dependent:
+        # H_0 already contains the current state and time embedding, so the
+        # adapter can learn when the proposal token is useful instead of applying
+        # one global scalar to every residue and every time.
+        self.seq_input_mode = _env_str(
+            "ABFLOW_SEQ_INPUT_MODE", "state"
+        ).lower()
         if self.seq_input_mode not in {"state", "pep_condition"}:
             raise ValueError(
                 "Unknown ABFLOW_SEQ_INPUT_MODE="
                 f"{self.seq_input_mode}. Choose from state, pep_condition."
             )
         if self.seq_input_mode == "pep_condition":
-            self.seq_pep_condition_embedding = nn.Embedding(num_classes, embed_size)
+            self.seq_pep_condition_embedding = nn.Embedding(
+                num_classes, embed_size
+            )
+            self.seq_pep_condition_adapter = nn.Sequential(
+                nn.Linear(2 * embed_size, embed_size),
+                nn.SiLU(),
+                nn.Linear(embed_size, embed_size),
+            )
+            nn.init.zeros_(self.seq_pep_condition_adapter[-1].weight)
+            nn.init.zeros_(self.seq_pep_condition_adapter[-1].bias)
         else:
             self.seq_pep_condition_embedding = None
+            self.seq_pep_condition_adapter = None
 
         self.seq_ce_weight = _env_float("ABFLOW_SEQ_CE_WEIGHT", 1.0)
+        self.last_scorefm_losses = {}
         self.last_abflow_diagnostics = {}
-
-        # Allow component weights to be overridden from shell scripts.
-        self.scorefm_loss_weight = _env_float("ABFLOW_SCOREFM_LOSS_WEIGHT", self.scorefm_loss_weight)
-        self.scorefm_velocity_weight = _env_float("ABFLOW_SCOREFM_VELOCITY_WEIGHT", self.scorefm_velocity_weight)
-        self.scorefm_dsm_weight = _env_float("ABFLOW_SCOREFM_DSM_WEIGHT", self.scorefm_dsm_weight)
-        self.scorefm_x1_weight = _env_float("ABFLOW_SCOREFM_X1_WEIGHT", self.scorefm_x1_weight)
-        self.scorefm_local_dist_weight = _env_float("ABFLOW_SCOREFM_LOCAL_DIST_WEIGHT", self.scorefm_local_dist_weight)
-        self.scorefm_interface_contact_weight = _env_float("ABFLOW_SCOREFM_CONTACT_WEIGHT", self.scorefm_interface_contact_weight)
-        self.scorefm_inter_clash_weight = _env_float("ABFLOW_SCOREFM_INTER_CLASH_WEIGHT", self.scorefm_inter_clash_weight)
-        self.scorefm_intra_clash_weight = _env_float("ABFLOW_SCOREFM_INTRA_CLASH_WEIGHT", self.scorefm_intra_clash_weight)
-
-        if self.scorefm_loss_mode in {"off", "none", "base"}:
-            self.use_scorefm = False
-
-        # Separate the state path from the auxiliary Score-FM loss.
-        # This makes LOSS_MODE=off a true loss ablation: users can still enable
-        # X_t/S_t/t input explicitly with ABFLOW_SCOREFM_STATE_PATH=on.
-        self.scorefm_state_path = _env_flag(
-            "ABFLOW_SCOREFM_STATE_PATH",
-            self.use_scorefm
-        )
+        # Detached condition-strength diagnostics. These do not affect training.
+        self._last_condition_diagnostics = {}
+        self._latest_condition_diagnostics = {}
 
 
     def init_mask(self, X, S, cmask, smask, template):
@@ -504,105 +461,352 @@ class AbFlowModel(nn.Module):
 
 
     def _build_coord_pep_condition_for_residues(
-            self, X_pep, paratope_mask, batch_id, interface_X):
-        """Build residue-level coordinate condition from X_pep.
+            self, pep_X_model, interface_X, paratope_mask,
+            pep_coord_valid=None):
+        """Build dynamic proposal-coordinate condition features.
 
-        X_pep is a condition, not a generated state.  For each paratope residue,
-        encode the CA displacement from the current state X_t to the peptide
-        proposal X_pep:
+        X_pep is condition only: this function never modifies interface_X.
 
-            [dx, dy, dz, ||d||]
+        Direction:
+            The displacement from the current CA to the proposal CA is projected
+            into the proposal N-CA-C local frame. Under any global proper
+            rotation/translation, the frame and displacement transform together,
+            so the projected components are SE(3)-invariant.
 
-        The generated coordinates are never overwritten by this feature.  This is
-        the coordinate analogue of using ESM/context features as conditions in
-        AbX rather than adding them to the noisy state.
+        Magnitude:
+            The signed local displacement is compressed radially so its norm is
+            log1p(CA distance). CA, mean-backbone and RMS-backbone distances are
+            also compressed with log1p. This preserves direction and near-range
+            sensitivity while preventing a poor proposal from dominating the
+            hidden-state adapter through extreme raw distances.
+
+        Robustness:
+            Invalid proposal residues are masked. Degenerate proposal frames use
+            distance-only conditioning by setting directional components to zero.
+
+        Features per paratope residue:
+            1-3) radially log-compressed proposal-local CA displacement;
+            4)   log1p(CA distance);
+            5)   log1p(mean backbone distance);
+            6)   log1p(RMS backbone distance).
         """
         if (
-            not getattr(self, "coord_pep_as_condition", False)
-            or self.coord_pep_condition_mlp is None
-            or X_pep is None
-            or X_pep.shape != interface_X.shape
-            or not bool(torch.any(X_pep != 0))
+            not self.coord_pep_as_condition
+            or self.coord_pep_condition_adapter is None
+            or pep_X_model is None
         ):
             return None, None
 
-        pep_X = X_pep.to(device=interface_X.device, dtype=interface_X.dtype)
-        pep_X_model = self._raw_interface_to_model_frame(
-            pep_X, paratope_mask, batch_id
+        if pep_X_model.shape != interface_X.shape:
+            raise ValueError(
+                "pep_X_model/interface_X shape mismatch: "
+                f"{tuple(pep_X_model.shape)} vs {tuple(interface_X.shape)}"
+            )
+        if interface_X.shape[1] < 3:
+            raise ValueError(
+                "Coordinate conditioning requires N/CA/C channels."
+            )
+
+        n_int = int(interface_X.shape[0])
+        if int(paratope_mask.sum().item()) != n_int:
+            raise ValueError(
+                "paratope/interface size mismatch: "
+                f"{int(paratope_mask.sum().item())} vs {n_int}."
+            )
+        if pep_coord_valid is None:
+            valid_int = torch.ones(
+                n_int, device=interface_X.device, dtype=torch.bool
+            )
+        else:
+            valid_int = torch.as_tensor(
+                pep_coord_valid,
+                device=interface_X.device,
+                dtype=torch.bool,
+            ).reshape(-1)
+            if valid_int.numel() != n_int:
+                raise ValueError(
+                    "pep_coord_valid length mismatch: "
+                    f"expected {n_int}, got {valid_int.numel()}."
+                )
+
+        delta = pep_X_model - interface_X
+        ca_delta = delta[:, 1]
+        ca_dist = torch.norm(ca_delta, dim=-1, keepdim=True)
+
+        # Stable proposal-local N-CA-C frame.
+        n_vec = pep_X_model[:, 0] - pep_X_model[:, 1]
+        c_vec = pep_X_model[:, 2] - pep_X_model[:, 1]
+
+        c_norm = torch.norm(c_vec, dim=-1, keepdim=True)
+        e1 = F.normalize(c_vec, dim=-1, eps=self.scorefm_eps)
+
+        n_orth = (
+            n_vec
+            - (n_vec * e1).sum(dim=-1, keepdim=True) * e1
+        )
+        n_orth_norm = torch.norm(n_orth, dim=-1, keepdim=True)
+        e2 = F.normalize(n_orth, dim=-1, eps=self.scorefm_eps)
+        e3 = F.normalize(
+            torch.cross(e1, e2, dim=-1),
+            dim=-1,
+            eps=self.scorefm_eps,
         )
 
-        # CA channel is index 1 in the current AbFlow atom layout.
-        delta_ca = pep_X_model[:, 1] - interface_X[:, 1]
-        dist_ca = torch.norm(delta_ca, dim=-1, keepdim=True)
-        prior_feat_int = torch.cat([delta_ca, dist_ca], dim=-1)
+        local_delta = torch.stack(
+            [
+                (ca_delta * e1).sum(dim=-1),
+                (ca_delta * e2).sum(dim=-1),
+                (ca_delta * e3).sum(dim=-1),
+            ],
+            dim=-1,
+        )
+
+        # Parameter-free radial dynamic-range compression.  The three signed
+        # proposal-local components retain their direction, while their joint
+        # magnitude changes from d to log(1+d).  This avoids letting a very poor
+        # proposal dominate the residual adapter through an arbitrarily large
+        # raw displacement, without introducing a peptide-prior weight.
+        ca_dist_safe = ca_dist.clamp_min(self.scorefm_eps)
+        local_delta = (
+            local_delta
+            * (torch.log1p(ca_dist) / ca_dist_safe)
+        )
+
+        frame_valid = (
+            torch.isfinite(c_norm.squeeze(-1))
+            & torch.isfinite(n_orth_norm.squeeze(-1))
+            & (c_norm.squeeze(-1) > 1e-4)
+            & (n_orth_norm.squeeze(-1) > 1e-4)
+        )
+        direction_valid = valid_int & frame_valid
+        local_delta = torch.where(
+            direction_valid.unsqueeze(-1),
+            local_delta,
+            torch.zeros_like(local_delta),
+        )
+
+        # N/CA/C/O are available independently of the sampled side-chain token.
+        n_bb = min(4, interface_X.shape[1])
+        bb_dist = torch.norm(delta[:, :n_bb], dim=-1)
+        mean_bb_dist = bb_dist.mean(dim=-1, keepdim=True)
+        rms_bb_dist = torch.sqrt(
+            (bb_dist ** 2).mean(dim=-1, keepdim=True)
+            + self.scorefm_eps
+        )
+
+        distance_feat = torch.cat(
+            [ca_dist, mean_bb_dist, rms_bb_dist],
+            dim=-1,
+        )
+        distance_feat = torch.log1p(
+            distance_feat.clamp_min(0.0)
+        )
+
+        feat_int = torch.cat(
+            [local_delta, distance_feat],
+            dim=-1,
+        )
+        feat_int = torch.nan_to_num(
+            feat_int, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        feat_int = (
+            feat_int
+            * valid_int.unsqueeze(-1).to(feat_int.dtype)
+        )
 
         n_res = int(paratope_mask.shape[0])
-        prior_feat = interface_X.new_zeros((n_res, 4))
-        prior_mask = torch.zeros(n_res, device=interface_X.device, dtype=torch.bool)
-        prior_feat[paratope_mask] = prior_feat_int
-        prior_mask[paratope_mask] = True
-        return prior_feat, prior_mask
+        feat_full = interface_X.new_zeros(
+            (n_res, self.coord_pep_condition_dim)
+        )
+        mask_full = torch.zeros(
+            n_res, device=interface_X.device, dtype=torch.bool
+        )
+        feat_full[paratope_mask] = feat_int
+        mask_full[paratope_mask] = valid_int
+        return feat_full, mask_full
 
-    def _build_seq_pep_condition_for_residues(self, S_pep, paratope_mask, ref_tensor):
-        """Build residue-level sequence condition from S_pep.
+    def _build_seq_pep_condition_for_residues(
+            self, S_pep, paratope_mask, ref_tensor):
+        """Build residue-level sequence proposal conditions.
 
-        S_pep is not written into S_t.  It is embedded as an additional condition
-        on paratope residues, preserving the separation between generated state
-        and conditioning information.
+        S_pep is never written into S_t. Valid proposal tokens are embedded and
+        placed on the corresponding paratope residues through functional tensor
+        construction. Invalid or missing tokens contribute exactly zero.
+
+        The returned tensor has the same hidden width and dtype as ref_tensor.
         """
-        if (
-            self.seq_pep_condition_embedding is None
-            or S_pep is None
-            or S_pep.numel() != int(paratope_mask.sum().item())
-        ):
+        if self.seq_pep_condition_embedding is None or S_pep is None:
             return None, None
 
-        pep_S = S_pep.to(device=ref_tensor.device, dtype=torch.long).reshape(-1)
-        valid_int = torch.logical_and(pep_S >= 0, pep_S < self.num_classes)
+        n_int = int(paratope_mask.sum().item())
+        if S_pep.numel() != n_int:
+            raise ValueError(
+                "S_pep/paratope size mismatch: "
+                f"expected {n_int}, got {S_pep.numel()}."
+            )
+
+        pep_S = S_pep.to(
+            device=ref_tensor.device, dtype=torch.long
+        ).reshape(-1)
+        valid_int = torch.logical_and(
+            pep_S >= 0, pep_S < self.num_classes
+        )
         if not valid_int.any():
             return None, None
 
         n_res = int(paratope_mask.shape[0])
-        cond_emb = ref_tensor.new_zeros((n_res, ref_tensor.shape[-1]))
-        cond_mask = torch.zeros(n_res, device=ref_tensor.device, dtype=torch.bool)
-
-        par_idx = paratope_mask.nonzero(as_tuple=False).reshape(-1)
+        par_idx = paratope_mask.nonzero(
+            as_tuple=False
+        ).reshape(-1)
         valid_idx = par_idx[valid_int]
-        cond_emb[valid_idx] = self.seq_pep_condition_embedding(pep_S[valid_int]).to(
-            device=ref_tensor.device, dtype=ref_tensor.dtype
+
+        # Build full residue-aligned token/mask tensors without modifying an
+        # embedding output in place. Invalid positions use token 0 but are
+        # multiplied by a zero mask, so they contribute no forward value or
+        # embedding gradient.
+        full_tokens = torch.zeros(
+            n_res, device=ref_tensor.device, dtype=torch.long
         )
-        cond_mask[valid_idx] = True
+        full_tokens = full_tokens.index_copy(
+            0, valid_idx, pep_S[valid_int]
+        )
+
+        cond_mask = torch.zeros(
+            n_res, device=ref_tensor.device, dtype=torch.bool
+        )
+        cond_mask = cond_mask.index_fill(0, valid_idx, True)
+
+        cond_emb = self.seq_pep_condition_embedding(
+            full_tokens
+        ).to(
+            device=ref_tensor.device,
+            dtype=ref_tensor.dtype,
+        )
+        cond_emb = (
+            cond_emb
+            * cond_mask.unsqueeze(-1).to(cond_emb.dtype)
+        )
         return cond_emb, cond_mask
 
     def message_passing(self, X, S, residue_pos, interface_X, surf, paratope_mask,
                         batch_id, round_idx, memory_H=None, smooth_prob=None,
                         smooth_mask=None, flow_t=None,
-                        coord_pep_condition=None, coord_pep_condition_mask=None,
-                        seq_pep_condition=None, seq_pep_condition_mask=None):
-        # embeddings, hidden state, (internal edges, external edges), (A : c * d, w : c * 1)
+                        coord_pep_condition=None,
+                        coord_pep_condition_mask=None,
+                        seq_pep_condition=None,
+                        seq_pep_condition_mask=None):
+        # embeddings, hidden state, (internal edges, external edges),
+        # (A : c*d, w : c*1)
         H_0, (ctx_edges, inter_edges), (atom_embeddings, atom_weights) = self.aa_feature(
             X, S, batch_id, self.k_neighbors, residue_pos,
             smooth_prob=smooth_prob, smooth_mask=smooth_mask
         )
 
-        time_emb = self._flow_time_embedding_for_residues(flow_t, batch_id, H_0)
+        time_emb = self._flow_time_embedding_for_residues(
+            flow_t, batch_id, H_0
+        )
         if time_emb is not None:
             H_0 = H_0 + time_emb
 
+        # Reset detached condition-strength diagnostics for this refinement round.
+        zero_diag = H_0.detach().new_tensor(0.0)
+        self._last_condition_diagnostics = {
+            "coord_condition_residual_ratio": zero_diag,
+            "seq_condition_residual_ratio": zero_diag,
+            "coord_condition_valid_rate": zero_diag,
+            "seq_condition_valid_rate": zero_diag,
+        }
+
+        # Coordinate proposal enters only through a zero-start residual feature
+        # adapter.  H_0 already contains the current state and time embedding,
+        # making the fusion residue-, context-, and time-dependent.
         if (
             coord_pep_condition is not None
             and coord_pep_condition_mask is not None
-            and self.coord_pep_condition_mlp is not None
+            and self.coord_pep_condition_adapter is not None
         ):
-            cond_feat = coord_pep_condition.to(device=H_0.device, dtype=H_0.dtype)
-            cond_mask = coord_pep_condition_mask.to(device=H_0.device, dtype=torch.bool)
-            cond_emb = self.coord_pep_condition_mlp(cond_feat)
-            H_0 = H_0 + cond_emb * cond_mask.unsqueeze(-1).to(H_0.dtype)
+            cond_feat = coord_pep_condition.to(
+                device=H_0.device, dtype=H_0.dtype
+            )
+            if cond_feat.shape != (
+                H_0.shape[0], self.coord_pep_condition_dim
+            ):
+                raise ValueError(
+                    "coordinate condition shape mismatch: expected "
+                    f"{(H_0.shape[0], self.coord_pep_condition_dim)}, "
+                    f"got {tuple(cond_feat.shape)}."
+                )
+            cond_mask = coord_pep_condition_mask.to(
+                device=H_0.device, dtype=torch.bool
+            )
+            coord_residual = self.coord_pep_condition_adapter(
+                torch.cat([H_0, cond_feat], dim=-1)
+            )
+            coord_mask_f = cond_mask.unsqueeze(-1).to(H_0.dtype)
+            masked_coord_residual = coord_residual * coord_mask_f
 
-        if seq_pep_condition is not None and seq_pep_condition_mask is not None:
-            seq_cond = seq_pep_condition.to(device=H_0.device, dtype=H_0.dtype)
-            seq_mask = seq_pep_condition_mask.to(device=H_0.device, dtype=torch.bool)
-            H_0 = H_0 + seq_cond * seq_mask.unsqueeze(-1).to(H_0.dtype)
+            with torch.no_grad():
+                if cond_mask.any():
+                    base_rms = torch.sqrt(
+                        (H_0[cond_mask].detach() ** 2).mean()
+                        + self.scorefm_eps
+                    )
+                    residual_rms = torch.sqrt(
+                        (coord_residual[cond_mask].detach() ** 2).mean()
+                        + self.scorefm_eps
+                    )
+                    self._last_condition_diagnostics[
+                        "coord_condition_residual_ratio"
+                    ] = residual_rms / base_rms.clamp_min(self.scorefm_eps)
+                    self._last_condition_diagnostics[
+                        "coord_condition_valid_rate"
+                    ] = cond_mask.float().mean()
+
+            H_0 = H_0 + masked_coord_residual
+
+        # Sequence proposal is fused through a residue- and time-dependent
+        # zero-start adapter, rather than a single global scalar shared by all
+        # samples, residues and times.
+        if (
+            seq_pep_condition is not None
+            and seq_pep_condition_mask is not None
+            and self.seq_pep_condition_adapter is not None
+        ):
+            seq_cond = seq_pep_condition.to(
+                device=H_0.device, dtype=H_0.dtype
+            )
+            if seq_cond.shape != H_0.shape:
+                raise ValueError(
+                    "sequence condition shape mismatch: expected "
+                    f"{tuple(H_0.shape)}, got {tuple(seq_cond.shape)}."
+                )
+            seq_mask = seq_pep_condition_mask.to(
+                device=H_0.device, dtype=torch.bool
+            )
+            seq_residual = self.seq_pep_condition_adapter(
+                torch.cat([H_0, seq_cond], dim=-1)
+            )
+            seq_mask_f = seq_mask.unsqueeze(-1).to(H_0.dtype)
+            masked_seq_residual = seq_residual * seq_mask_f
+
+            with torch.no_grad():
+                if seq_mask.any():
+                    base_rms = torch.sqrt(
+                        (H_0[seq_mask].detach() ** 2).mean()
+                        + self.scorefm_eps
+                    )
+                    residual_rms = torch.sqrt(
+                        (seq_residual[seq_mask].detach() ** 2).mean()
+                        + self.scorefm_eps
+                    )
+                    self._last_condition_diagnostics[
+                        "seq_condition_residual_ratio"
+                    ] = residual_rms / base_rms.clamp_min(self.scorefm_eps)
+                    self._last_condition_diagnostics[
+                        "seq_condition_valid_rate"
+                    ] = seq_mask.float().mean()
+
+            H_0 = H_0 + masked_seq_residual
 
         if not self.keep_memory:
             memory_H = None
@@ -646,7 +850,7 @@ class AbFlowModel(nn.Module):
             src_H, dst_H = local_H[local_inter_edges[0]], local_H[local_inter_edges[1]]
             p_edge_dist = self.edge_dist_ffn(torch.cat([src_H, dst_H], dim=-1)) +\
                           self.edge_dist_ffn(torch.cat([dst_H, src_H], dim=-1))  # perm-invariant
-            p_edge_dist = p_edge_dist.squeeze()
+            p_edge_dist = p_edge_dist.squeeze(-1)
         else:
             p_edge_dist = None
         local_inter_edges = _knn_edges(
@@ -767,203 +971,148 @@ class AbFlowModel(nn.Module):
         ag_centers = self.normalizer.ag_centers[interface_batch_id]
         return self.normalizer.normalize(interface_X - ag_centers.unsqueeze(1))
 
-    def _coord_score_from_clean(self, Xt, clean_X, t, sigma_t):
-        """Analytic coordinate score under the zero-mean isotropic base assumption.
+    def _reference_ca_mean(self, X, S, paratope_mask, batch_id):
+        """Reference mean for CA translation under init_interface().
+
+        init_interface samples each paratope CA as:
+            antigen_center + N(0, I_3).
+        Therefore the conditional CA score is analytically available with
+        mean=antigen_center and identity covariance.
+        """
+        ag_centers = X[S == self.aa_feature.boa_idx][:, 0]
+        return ag_centers[batch_id[paratope_mask]]
+
+    def _analytic_ca_score_from_clean(
+            self, Xt, clean_X, t, sigma_t, source_ca_mean):
+        """Analytic CA translation score for the linear reference bridge.
 
         Path:
-            X_t = sigma_t X_0 + t X_1.
+            X_t^CA = sigma_t X_0^CA + t X_1^CA,
+            X_0^CA ~ N(source_ca_mean, I).
 
-        If X_0 ~ N(0, I) in the same normalized coordinate frame, then:
-            p_t(X_t | X_1) = N(t X_1, sigma_t^2 I),
-            s_t(X_t | X_1) = -(X_t - t X_1) / sigma_t^2.
+        Hence:
+            p_t(X_t^CA | X_1^CA, c)
+              = N(sigma_t * source_ca_mean + t * X_1^CA,
+                  sigma_t^2 I)
 
-        In AbFlow, the actual base can be antigen-centered and atom-correlated, so this
-        formula should be understood as the standard Gaussian-path approximation unless
-        the base has been normalized/whitened to N(0, I).
+            score = -(X_t^CA - sigma_t*mu_0 - t*X_1^CA) / sigma_t^2.
+
+        Only CA translation is used here. The full-atom initialization is
+        atom-correlated, so pretending that all atom channels are isotropic
+        Gaussian would be mathematically inconsistent.
         """
         t = torch.as_tensor(t, device=Xt.device, dtype=Xt.dtype)
-        sigma_t = torch.as_tensor(sigma_t, device=Xt.device, dtype=Xt.dtype)
-        return -(Xt - t * clean_X) / (sigma_t ** 2 + self.scorefm_eps)
+        sigma_t = torch.as_tensor(
+            sigma_t, device=Xt.device, dtype=Xt.dtype
+        )
 
-    def _interface_valid_graph_mask(self, interface_batch_id, n_graph, device):
-        """Return graph-valid mask for interface-level tensors."""
-        valid = torch.zeros(n_graph, device=device, dtype=torch.bool)
+        if t.dim() == 3:
+            t_ca = t[:, 0, :]
+        else:
+            t_ca = t.reshape(-1, 1)
+
+        if sigma_t.dim() == 3:
+            sigma_ca = sigma_t[:, 0, :]
+        else:
+            sigma_ca = sigma_t.reshape(-1, 1)
+
+        ca_idx = 1 if Xt.shape[1] > 1 else 0
+        Xt_ca = Xt[:, ca_idx]
+        clean_ca = clean_X[:, ca_idx]
+        mean_t = (
+            sigma_ca * source_ca_mean
+            + t_ca * clean_ca
+        )
+        return -(
+            Xt_ca - mean_t
+        ) / (sigma_ca.pow(2) + self.scorefm_eps)
+
+    def _interface_valid_graph_mask(
+            self, interface_batch_id, n_graph, device):
+        valid = torch.zeros(
+            n_graph, device=device, dtype=torch.bool
+        )
         if interface_batch_id.numel() > 0:
             valid[torch.unique(interface_batch_id)] = True
         return valid
 
-    def _masked_residue_mse_per_graph(self, diff, atom_mask, interface_batch_id):
-        """Per-complex normalized vector MSE for [N_int, C, 3] tensors.
+    def _masked_residue_mse_per_graph(
+            self, diff, atom_mask, interface_batch_id):
+        """Per-complex normalized vector MSE.
 
-        Normalization order:
-            atom channels -> residues -> complex
-
-        Returning per-complex values is essential for per-sample time mixing.
+        Reduction order:
+            xyz -> atom channels -> residues -> complex.
         """
         if interface_batch_id.numel() == 0:
-            zero = diff.new_zeros(1)
-            valid = torch.zeros(1, device=diff.device, dtype=torch.bool)
-            return zero, valid
+            return (
+                diff.new_zeros(1),
+                torch.zeros(1, device=diff.device, dtype=torch.bool),
+            )
 
         n_graph = int(interface_batch_id.max().item()) + 1
-
         atom_mask_f = atom_mask.to(diff.dtype)
-        atom_sq = (diff ** 2).sum(dim=-1) * atom_mask_f  # [N_int, C]
 
-        per_res = atom_sq.sum(dim=-1) / atom_mask_f.sum(dim=-1).clamp_min(1.0)
+        atom_sq = (diff ** 2).sum(dim=-1) * atom_mask_f
+        per_res = atom_sq.sum(dim=-1) / (
+            3.0 * atom_mask_f.sum(dim=-1).clamp_min(1.0)
+        )
 
         per_graph = scatter_mean(
             per_res,
             interface_batch_id,
             dim=0,
-            dim_size=n_graph
+            dim_size=n_graph,
         )
-
         valid_graph = self._interface_valid_graph_mask(
             interface_batch_id, n_graph, diff.device
         )
-
         return per_graph, valid_graph
 
-    def _masked_residue_mse(self, diff, atom_mask, interface_batch_id):
-        """Batch scalar wrapper for normalized vector MSE."""
-        per_graph, valid_graph = self._masked_residue_mse_per_graph(
-            diff, atom_mask, interface_batch_id
-        )
-        if valid_graph.any():
-            return per_graph[valid_graph].mean()
-        return diff.new_tensor(0.0)
+    def _masked_residue_smooth_l1_per_graph(
+            self, pred, target, atom_mask, interface_batch_id):
+        """Unique per-complex endpoint objective.
 
-    def _masked_residue_smooth_l1_per_graph(self, pred, target, atom_mask,
-                                            interface_batch_id, residue_weight=None):
-        """Per-complex normalized SmoothL1 for coordinate tensors.
-
-        pred/target: [N_int, C, 3]
-        atom_mask:   [N_int, C]
-        residue_weight: optional [N_int]
-
-        This mirrors AbX's principle: normalize locally first, then aggregate
-        per sample, then reduce across the batch.
+        This replaces both the old global interface loss and the duplicated
+        auxiliary x1 loss. Each complex contributes one normalized value,
+        independent of CDR length.
         """
         if interface_batch_id.numel() == 0:
-            zero = pred.new_zeros(1)
-            valid = torch.zeros(1, device=pred.device, dtype=torch.bool)
-            return zero, valid
+            return (
+                pred.new_zeros(1),
+                torch.zeros(1, device=pred.device, dtype=torch.bool),
+            )
 
         n_graph = int(interface_batch_id.max().item()) + 1
-
         atom_mask_f = atom_mask.to(pred.dtype)
-        err = F.smooth_l1_loss(pred, target, reduction='none').sum(dim=-1)  # [N_int, C]
+
+        err = F.smooth_l1_loss(
+            pred, target, reduction="none"
+        ).sum(dim=-1)
         err = err * atom_mask_f
-
-        per_res = err.sum(dim=-1) / atom_mask_f.sum(dim=-1).clamp_min(1.0)
-
-        if residue_weight is not None:
-            residue_weight = torch.as_tensor(
-                residue_weight,
-                device=pred.device,
-                dtype=pred.dtype
-            ).reshape(-1)
-
-            if residue_weight.numel() == 1:
-                residue_weight = residue_weight.expand_as(per_res)
-
-            if residue_weight.numel() != per_res.numel():
-                raise ValueError(
-                    f"residue_weight must have {per_res.numel()} values, "
-                    f"got {residue_weight.numel()}."
-                )
-
-            per_res = per_res * residue_weight
+        per_res = err.sum(dim=-1) / (
+            3.0 * atom_mask_f.sum(dim=-1).clamp_min(1.0)
+        )
 
         per_graph = scatter_mean(
             per_res,
             interface_batch_id,
             dim=0,
-            dim_size=n_graph
+            dim_size=n_graph,
         )
-
         valid_graph = self._interface_valid_graph_mask(
             interface_batch_id, n_graph, pred.device
         )
-
         return per_graph, valid_graph
 
-    def _masked_residue_smooth_l1(self, pred, target, atom_mask,
-                                  interface_batch_id, residue_weight=None):
-        """Batch scalar wrapper for normalized SmoothL1."""
-        per_graph, valid_graph = self._masked_residue_smooth_l1_per_graph(
-            pred, target, atom_mask, interface_batch_id,
-            residue_weight=residue_weight
-        )
-        if valid_graph.any():
-            return per_graph[valid_graph].mean()
-        return pred.new_tensor(0.0)
-
-    def _x1_time_weight_for_interface(self, t, interface_batch_id, ref_tensor):
-        """Residue-level time weight for endpoint reconstruction.
-
-        x1 is an endpoint denoising regularizer. Its supervision should be weaker
-        at low t and stronger near the clean endpoint.
-
-            w_x1(t) = w_min + (1 - w_min) * t^gamma
-
-        This w_x1(t) = w_min + (1 - w_min) * t^gamma
-
-        This function accepts three valid forms of t:
-          1) scalar shared by the whole batch;
-          2) graph-level tensor [B];
-          3) interface-level tensor [N_interface, 1, 1] or [N_interface].
-
-        The previous implementation incorrectly indexed interface-level t by
-        interface_batch_id. This version handles all three cases explicitly.
-        """
-        t_tensor = torch.as_tensor(t, device=ref_tensor.device, dtype=ref_tensor.dtype)
-        n_int = int(interface_batch_id.shape[0])
-
-        if t_tensor.dim() == 0 or t_tensor.numel() == 1:
-            t_res = t_tensor.reshape(1).expand(n_int)
-
-        else:
-            t_flat = t_tensor.reshape(-1)
-
-            if t_flat.numel() == n_int:
-                # Already residue/interface-level time.
-                t_res = t_flat
-
-            else:
-                n_graph = int(interface_batch_id.max().item()) + 1 if n_int > 0 else 1
-                if t_flat.numel() != n_graph:
-                    raise ValueError(
-                        f"t must be scalar, graph-level [B], or interface-level [N_int]. "
-                        f"Got {t_flat.numel()} values for {n_graph} graphs and {n_int} interface residues."
-                    )
-                t_res = t_flat[interface_batch_id]
-
-        t_res = t_res.clamp(0.0, 1.0)
-
-        min_w = float(self.scorefm_x1_time_min_weight)
-        min_w = max(0.0, min(1.0, min_w))
-
-        power = max(float(self.scorefm_x1_time_power), 1e-6)
-
-        return (min_w + (1.0 - min_w) * torch.pow(t_res, power)).detach()
-
-
-    def _scorefm_time_per_graph(self, t, interface_batch_id, ref_tensor):
-        """Convert scalar / graph-level / interface-level t into graph-level t.
-
-        Valid inputs:
-          1) scalar t;
-          2) graph-level t: [B];
-          3) interface-level t: [N_int], [N_int, 1], or [N_int, 1, 1].
-
-        This function is needed because ScoreFM hybrid mixing must be done
-        per complex, following the AbX per-sample loss aggregation principle.
-        """
+    def _scorefm_time_per_graph(
+            self, t, interface_batch_id, ref_tensor):
+        """Convert scalar/graph/interface time to one value per complex."""
         if interface_batch_id.numel() == 0:
-            return ref_tensor.new_zeros(1), torch.zeros(
-                1, device=ref_tensor.device, dtype=torch.bool
+            return (
+                ref_tensor.new_zeros(1),
+                torch.zeros(
+                    1, device=ref_tensor.device, dtype=torch.bool
+                ),
             )
 
         n_graph = int(interface_batch_id.max().item()) + 1
@@ -972,624 +1121,141 @@ class AbFlowModel(nn.Module):
         )
 
         t_tensor = torch.as_tensor(
-            t,
-            device=ref_tensor.device,
-            dtype=ref_tensor.dtype
+            t, device=ref_tensor.device, dtype=ref_tensor.dtype
         )
-
         if t_tensor.dim() == 0 or t_tensor.numel() == 1:
             t_graph = t_tensor.reshape(1).expand(n_graph)
-
         else:
             t_flat = t_tensor.reshape(-1)
-
             if t_flat.numel() == n_graph:
                 t_graph = t_flat
-
             elif t_flat.numel() == interface_batch_id.numel():
-                # Interface-level t. Average it back to graph-level.
                 t_graph = scatter_mean(
                     t_flat,
                     interface_batch_id,
                     dim=0,
-                    dim_size=n_graph
+                    dim_size=n_graph,
                 )
-
             else:
                 raise ValueError(
-                    f"t must be scalar, graph-level [B], or interface-level [N_int]. "
-                    f"Got {t_flat.numel()} values for {n_graph} graphs and "
-                    f"{interface_batch_id.numel()} interface residues."
+                    "t must be scalar, graph-level [B], or "
+                    "interface-level [N_int]. "
+                    f"Got {t_flat.numel()} values for "
+                    f"{n_graph} graphs and "
+                    f"{interface_batch_id.numel()} residues."
                 )
 
         return t_graph.clamp(0.0, 1.0), valid_graph
-    
-    def _local_ca_distance_loss(self, pred_X, true_X, interface_batch_id):
-        """Paratope internal C-alpha distance preservation.
 
-        This is a coordinate-level analogue of a distogram/FAPE stabilizer for
-        AbFlow, but it does not require adding a distogram head. It preserves the
-        local loop geometry of the generated paratope endpoint.
+    def _coordinate_training_objective(
+            self, *, Xt, X1, pred_clean_X, atom_mask,
+            interface_batch_id, t, sigma_t, source_ca_mean):
+        """Single non-redundant coordinate objective.
+
+        endpoint mode:
+            Per-complex endpoint SmoothL1 for every sample.
+
+        analytic_core mode:
+            Use analytic CA-score DSM only in the bounded interval
+            [dsm_t_min, dsm_t_max]. Outside this interval use the endpoint
+            objective. The switch is per complex and the two objectives are
+            never added together for the same sample.
         """
-        if pred_X.shape[0] <= 1:
-            return pred_X.new_tensor(0.0)
-        ca_idx = 1 if pred_X.shape[1] > 1 else 0
-        losses = []
-        for b in torch.unique(interface_batch_id):
-            mask = interface_batch_id == b
-            if mask.sum() <= 1:
-                continue
-            pred_ca = pred_X[mask, ca_idx]
-            true_ca = true_X[mask, ca_idx]
-            pred_d = torch.cdist(pred_ca, pred_ca)
-            true_d = torch.cdist(true_ca, true_ca)
-            tri = torch.triu(torch.ones_like(pred_d, dtype=torch.bool), diagonal=1)
-            if tri.any():
-                losses.append(F.smooth_l1_loss(pred_d[tri], true_d[tri]))
-        if len(losses) == 0:
-            return pred_X.new_tensor(0.0)
-        return torch.stack(losses).mean()
-
-    def _residue_min_dist(self, A, B, A_mask, B_mask):
-        """Minimum valid atom distance for every residue pair.
-
-        Args:
-            A: [Na, Ca, 3], B: [Nb, Cb, 3]
-            A_mask: [Na, Ca], B_mask: [Nb, Cb]
-        Returns:
-            min_d: [Na, Nb], valid_pair: [Na, Nb]
-        """
-        if A.shape[0] == 0 or B.shape[0] == 0:
-            return None, None
-        d = torch.norm(A[:, None, :, None, :] - B[None, :, None, :, :], dim=-1)  # [Na,Nb,Ca,Cb]
-        valid = A_mask[:, None, :, None] & B_mask[None, :, None, :]
-        d = d.masked_fill(~valid, 1e6)
-        min_d = d.flatten(2).min(dim=-1)[0]
-        valid_pair = valid.flatten(2).any(dim=-1)
-        return min_d, valid_pair
-
-
-    def _interface_contact_bce_loss(self, pred_X, true_interface_X, true_X, true_S,
-                                    paratope_mask, batch_id, segment_ids,
-                                    interface_batch_id, interface_atom_mask):
-        """Soft RMSD-linked contact BCE for antigen-paratope residue pairs.
-
-        This is the AbFlow sparse-pair analogue of AbX's RMSD-aware interface BCE.
-
-        Differences from AbX:
-          - AbX BCE is sample-level good/bad interface classification.
-          - Here BCE is residue-pair contact supervision.
-
-        What we inherit from AbX:
-          - BCE should be masked and class-balanced.
-          - Interface quality should be linked to RMSD.
-          - BCE should remain an auxiliary interface objective, not dominate geometry.
-
-        Implementation:
-          - soft contact label by native min-atom distance;
-          - keep all native contacts and limited hard negatives;
-          - dynamic pos_weight for sparse contacts;
-          - per-complex RMSD confidence weight, detached from gradient.
-        """
-        atom_pos_full = self.aa_feature._construct_atom_pos(true_S)
-        atom_mask_full = atom_pos_full != self.aa_feature.atom_pos_pad_idx
-        ag_mask_full = torch.logical_and(
-            segment_ids == self.aa_feature.ag_seg_id,
-            true_S != self.aa_feature.boa_idx
+        endpoint_per_graph, endpoint_valid = (
+            self._masked_residue_smooth_l1_per_graph(
+                pred_clean_X, X1, atom_mask, interface_batch_id
+            )
         )
 
-        cutoff = pred_X.new_tensor(float(self.scorefm_contact_cutoff))
-        tau = max(float(self.scorefm_contact_temperature), 1e-6)
-        max_neg_ratio = max(float(self.scorefm_contact_max_neg_ratio), 1.0)
-
-        rmsd_thr = pred_X.new_tensor(float(self.scorefm_contact_rmsd_threshold))
-        rmsd_tau = max(float(self.scorefm_contact_rmsd_temperature), 1e-6)
-        min_conf = float(self.scorefm_contact_min_confidence)
-        min_conf = max(0.0, min(1.0, min_conf))
-
-        losses = []
-
-        for b in torch.unique(interface_batch_id):
-            p_mask = interface_batch_id == b
-            a_mask = (batch_id == b) & ag_mask_full
-
-            if p_mask.sum() == 0 or a_mask.sum() == 0:
-                continue
-
-            pred_par = pred_X[p_mask]
-            true_par = true_interface_X[p_mask]
-            par_atom_mask = interface_atom_mask[p_mask]
-
-            ag_X = true_X[a_mask]
-            ag_atom_mask = atom_mask_full[a_mask]
-
-            pred_d, valid_pair = self._residue_min_dist(
-                pred_par, ag_X, par_atom_mask, ag_atom_mask
-            )
-            true_d, _ = self._residue_min_dist(
-                true_par, ag_X, par_atom_mask, ag_atom_mask
-            )
-
-            if pred_d is None or true_d is None or not valid_pair.any():
-                continue
-
-            valid_pair = valid_pair & torch.isfinite(pred_d) & torch.isfinite(true_d)
-            if not valid_pair.any():
-                continue
-
-            hard_labels = (true_d < cutoff).to(dtype=pred_X.dtype)
-            pos_mask = valid_pair & (hard_labels > 0.5)
-            neg_mask = valid_pair & (hard_labels <= 0.5)
-
-            n_pos = int(pos_mask.sum().item())
-            n_neg = int(neg_mask.sum().item())
-
-            # If there is no native contact, this complex provides no useful
-            # contact-recovery supervision.
-            if n_pos == 0:
-                continue
-
-            # Prediction logit: smaller predicted distance means higher contact probability.
-            logits = (cutoff - pred_d) / tau
-
-            # Soft label removes artificial discontinuity around the cutoff.
-            if getattr(self, "scorefm_contact_soft_label", True):
-                labels = torch.sigmoid((cutoff - true_d) / tau)
-            else:
-                labels = hard_labels
-
-            # Keep all positives.
-            selected_mask = pos_mask.clone()
-
-            # Keep limited hard negatives, not all trivial far negatives.
-            if n_neg > 0:
-                neg_indices = neg_mask.nonzero(as_tuple=False)
-                neg_pred_d = pred_d.detach()[neg_mask]
-                neg_true_d = true_d.detach()[neg_mask]
-
-                # A negative is hard if native distance is near the boundary
-                # or the prediction falsely places it close.
-                hardness = torch.minimum(neg_true_d, neg_pred_d)
-
-                k_neg = min(n_neg, max(1, int(max_neg_ratio * n_pos)))
-                hard_idx = torch.topk(-hardness, k=k_neg, largest=True).indices
-
-                hard_neg_indices = neg_indices[hard_idx]
-                selected_mask[hard_neg_indices[:, 0], hard_neg_indices[:, 1]] = True
-
-            logits_i = logits[selected_mask]
-            labels_i = labels[selected_mask]
-            hard_labels_i = hard_labels[selected_mask]
-
-            if logits_i.numel() == 0:
-                continue
-
-            pos_count = hard_labels_i.sum()
-            neg_count = hard_labels_i.numel() - pos_count
-
-            if pos_count > 0 and neg_count > 0:
-                pos_weight = (neg_count / pos_count).detach().clamp(min=1.0, max=20.0)
-                bce_i = F.binary_cross_entropy_with_logits(
-                    logits_i,
-                    labels_i,
-                    pos_weight=pos_weight,
-                    reduction='none'
-                )
-            else:
-                bce_i = F.binary_cross_entropy_with_logits(
-                    logits_i,
-                    labels_i,
-                    reduction='none'
-                )
-
-            contact_loss_b = bce_i.mean()
-
-            # RMSD-linked confidence, inspired by AbX sample-level interface BCE.
-            # Important: detach RMSD so this term only weights contact supervision;
-            # it does not become another coordinate regression loss.
-            atom_mask_f = par_atom_mask.to(pred_X.dtype)
-            sq = ((pred_par - true_par) ** 2).sum(dim=-1) * atom_mask_f
-            denom = atom_mask_f.sum().clamp_min(1.0)
-            rmsd_b = torch.sqrt(sq.sum() / denom + self.scorefm_eps)
-
-            q_b = torch.sigmoid((rmsd_thr - rmsd_b.detach()) / rmsd_tau)
-            confidence_b = min_conf + (1.0 - min_conf) * q_b
-
-            losses.append(confidence_b * contact_loss_b)
-
-        if len(losses) == 0:
-            return pred_X.new_tensor(0.0)
-
-        return torch.stack(losses).mean()
-
-    def _interface_clash_loss(self, pred_X, true_X, true_S, batch_id, segment_ids,
-                              interface_batch_id, interface_atom_mask):
-        """Repel predicted paratope atoms from antigen atoms if they clash.
-
-        Important:
-        We aggregate only violating atom pairs. Averaging over all atom pairs
-        would dilute rare but severe clashes by thousands of normal pairs.
-        """
-        atom_pos_full = self.aa_feature._construct_atom_pos(true_S)
-        atom_mask_full = atom_pos_full != self.aa_feature.atom_pos_pad_idx
-        ag_mask_full = torch.logical_and(
-            segment_ids == self.aa_feature.ag_seg_id,
-            true_S != self.aa_feature.boa_idx
-        )
-
-        losses = []
-        cutoff = pred_X.new_tensor(float(self.scorefm_inter_clash_cutoff))
-
-        for b in torch.unique(interface_batch_id):
-            p_mask = interface_batch_id == b
-            a_mask = (batch_id == b) & ag_mask_full
-
-            if p_mask.sum() == 0 or a_mask.sum() == 0:
-                continue
-
-            p_atoms = pred_X[p_mask].reshape(-1, 3)
-            p_valid = interface_atom_mask[p_mask].reshape(-1)
-
-            a_atoms = true_X[a_mask].reshape(-1, 3)
-            a_valid = atom_mask_full[a_mask].reshape(-1)
-
-            p_atoms = p_atoms[p_valid]
-            a_atoms = a_atoms[a_valid]
-
-            if p_atoms.shape[0] == 0 or a_atoms.shape[0] == 0:
-                continue
-
-            d = torch.cdist(p_atoms, a_atoms)
-            penalty = F.relu(cutoff - d).pow(2)
-
-            violating = penalty > 0
-            if violating.any():
-                losses.append(penalty[violating].mean())
-
-        if len(losses) == 0:
-            return pred_X.new_tensor(0.0)
-
-        return torch.stack(losses).mean()
-
-    def _intra_paratope_clash_loss(self, pred_X, interface_atom_mask,
-                                   interface_batch_id, interface_residue_pos=None):
-        """Repel non-bonded atoms inside the predicted paratope.
-
-        We must exclude:
-          - self atom pairs;
-          - atoms from the same residue;
-          - atoms from neighboring residues, because normal peptide bonds and
-            adjacent backbone geometry can be shorter than a generic clash cutoff.
-
-        If interface_residue_pos is provided, adjacency is based on residue index.
-        Otherwise we fall back to local paratope order, which is less precise.
-        """
-        losses = []
-        cutoff = pred_X.new_tensor(float(self.scorefm_intra_clash_cutoff))
-        neighbor_exclusion = int(getattr(self, "scorefm_intra_clash_exclude_neighbors", 1))
-
-        for b in torch.unique(interface_batch_id):
-            mask = interface_batch_id == b
-            if mask.sum() <= 1:
-                continue
-
-            Xb = pred_X[mask]
-            Mb = interface_atom_mask[mask]
-
-            n_res, n_ch = Mb.shape
-
-            atoms_all = Xb.reshape(-1, 3)
-            valid_all = Mb.reshape(-1)
-
-            local_res_ids_all = torch.arange(
-                n_res, device=pred_X.device
-            ).repeat_interleave(n_ch)
-
-            if interface_residue_pos is not None:
-                pos_b = torch.as_tensor(
-                    interface_residue_pos[mask],
-                    device=pred_X.device
-                ).reshape(-1)
-                residue_pos_all = pos_b.repeat_interleave(n_ch)
-            else:
-                residue_pos_all = local_res_ids_all
-
-            atoms = atoms_all[valid_all]
-            local_res_ids = local_res_ids_all[valid_all]
-            residue_pos_ids = residue_pos_all[valid_all]
-
-            if atoms.shape[0] <= 1:
-                continue
-
-            d = torch.cdist(atoms, atoms)
-
-            eye = torch.eye(d.shape[0], device=d.device, dtype=torch.bool)
-            same_res = local_res_ids[:, None] == local_res_ids[None, :]
-
-            # Exclude adjacent residues to avoid penalizing normal covalent backbone
-            # geometry, especially peptide bonds between residue i and i+1.
-            adjacent_res = (
-                torch.abs(residue_pos_ids[:, None] - residue_pos_ids[None, :])
-                <= neighbor_exclusion
-            )
-
-            # Use upper triangle to avoid double counting.
-            upper = torch.triu(
-                torch.ones_like(d, dtype=torch.bool),
-                diagonal=1
-            )
-
-            valid_pair = upper & (~same_res) & (~adjacent_res)
-
-            if not valid_pair.any():
-                continue
-
-            penalty = F.relu(cutoff - d[valid_pair]).pow(2)
-            violating = penalty > 0
-
-            if violating.any():
-                losses.append(penalty[violating].mean())
-
-        if len(losses) == 0:
-            return pred_X.new_tensor(0.0)
-
-        return torch.stack(losses).mean()
-
-    def _scorefm_loss(self, *, Xt, X0, X1, pred_clean_X, atom_mask,
-                      true_X, true_S, paratope_mask, batch_id, segment_ids,
-                      interface_batch_id, t, sigma_t, interface_residue_pos=None):
-        """Ablation-aware coordinate DTM / ScoreFM objective.
-
-        The goal is to identify which part of the new objective helps or hurts:
-          - x1: clean endpoint reconstruction
-          - dsm: analytically induced score matching
-          - velocity: score-to-velocity identity
-          - geometry: local distance/contact/clash feasibility terms
-        """
-        mode = self.scorefm_loss_mode
-        zero = pred_clean_X.new_tensor(0.0)
-
-        # Fast exit for pure AbFlow baseline under the v4 code path.
-        if mode in {"off", "none", "base"} or (not self.use_scorefm) or self.scorefm_loss_weight == 0:
+        if endpoint_valid.any():
+            endpoint_loss = endpoint_per_graph[
+                endpoint_valid
+            ].mean()
+        else:
+            endpoint_loss = pred_clean_X.new_tensor(0.0)
+
+        zero = endpoint_loss.detach() * 0.0
+
+        if self.scorefm_loss_mode == "endpoint":
             details = {
-                "scorefm_total": zero.detach(),
-                "scorefm_dsm": zero.detach(),
-                "scorefm_x1": zero.detach(),
-                "scorefm_hybrid": zero.detach(),
-                "scorefm_velocity": zero.detach(),
-                "scorefm_high_t_rate": zero.detach(),
-                "scorefm_local_dist": zero.detach(),
-                "scorefm_interface_contact": zero.detach(),
-                "scorefm_inter_clash": zero.detach(),
-                "scorefm_intra_clash": zero.detach(),
+                "scorefm_total": endpoint_loss.detach(),
+                "scorefm_endpoint": endpoint_loss.detach(),
+                "scorefm_dsm": zero,
+                "scorefm_dsm_rate": zero,
             }
-            return zero, details
+            return endpoint_loss, details
 
-        # 1. Analytic scores induced by the same Gaussian coordinate path.
-        gt_score = self._coord_score_from_clean(Xt, X1, t, sigma_t).detach()
-        pred_score = self._coord_score_from_clean(Xt, pred_clean_X, t, sigma_t)
+        gt_score_ca = self._analytic_ca_score_from_clean(
+            Xt, X1, t, sigma_t, source_ca_mean
+        ).detach()
+        pred_score_ca = self._analytic_ca_score_from_clean(
+            Xt, pred_clean_X, t, sigma_t, source_ca_mean
+        )
 
-        # 2. Scaled DSM.
-        # score_scaling = 1 / sigma_t, so (pred_score - gt_score) / score_scaling
-        # equals sigma_t * score residual. This avoids excessive late-time score scale.
-        score_scaling = 1.0 / sigma_t.clamp_min(self.scorefm_min_sigma)
-        dsm_diff = (pred_score - gt_score) / score_scaling
+        if sigma_t.dim() == 3:
+            sigma_ca = sigma_t[:, 0, :]
+        else:
+            sigma_ca = sigma_t.reshape(-1, 1)
+
+        # AbX-style score scaling: sigma_t * score residual. DSM is used
+        # only where t/(1-t) is bounded by the configured interval.
+        scaled_score_diff = (
+            sigma_ca * (pred_score_ca - gt_score_ca)
+        ).unsqueeze(1)
+
+        ca_idx = 1 if atom_mask.shape[1] > 1 else 0
+        ca_mask = atom_mask[:, ca_idx:ca_idx + 1]
 
         dsm_per_graph, dsm_valid = self._masked_residue_mse_per_graph(
-            dsm_diff, atom_mask, interface_batch_id
+            scaled_score_diff, ca_mask, interface_batch_id
         )
 
-        # 3. Time-aware clean endpoint reconstruction.
-        x1_time_weight = self._x1_time_weight_for_interface(
-            t, interface_batch_id, pred_clean_X
-        )
-
-        x1_per_graph, x1_valid = self._masked_residue_smooth_l1_per_graph(
-            pred_clean_X, X1, atom_mask, interface_batch_id,
-            residue_weight=x1_time_weight
-        )
-
-        # 4. Velocity identity for the same path:
-        # v_theta = Xhat_1 + sigma_t * s_theta
-        # true velocity for X_t = sigma_t X_0 + t X_1 is X_1 - X_0.
-        pred_v = pred_clean_X + sigma_t * pred_score
-        true_v = X1 - X0
-
-        velocity_per_graph, velocity_valid = self._masked_residue_smooth_l1_per_graph(
-            pred_v, true_v, atom_mask, interface_batch_id
-        )
-
-        # 5. Per-complex hybrid DSM/x1 mixing.
-        # This fixes the previous batch-level mixing bug:
-        #   old: score_or_x1 = batch_high_t_ratio * mean(DSM) + ...
-        #   new: score_or_x1_b = gate(t_b) * DSM_b + (1-gate(t_b)) * x1_b
         t_graph, t_valid = self._scorefm_time_per_graph(
             t, interface_batch_id, pred_clean_X
         )
-
-        core_valid = dsm_valid & x1_valid & velocity_valid & t_valid
+        valid = endpoint_valid & dsm_valid & t_valid
 
         if dsm_valid.any():
             dsm_loss = dsm_per_graph[dsm_valid].mean()
         else:
-            dsm_loss = zero
+            dsm_loss = pred_clean_X.new_tensor(0.0)
 
-        if x1_valid.any():
-            x1_loss = x1_per_graph[x1_valid].mean()
-        else:
-            x1_loss = zero
+        if not valid.any():
+            details = {
+                "scorefm_total": endpoint_loss.detach(),
+                "scorefm_endpoint": endpoint_loss.detach(),
+                "scorefm_dsm": dsm_loss.detach(),
+                "scorefm_dsm_rate": zero,
+            }
+            return endpoint_loss, details
 
-        if velocity_valid.any():
-            velocity_loss = velocity_per_graph[velocity_valid].mean()
-        else:
-            velocity_loss = zero
+        use_dsm = (
+            (t_graph >= self.scorefm_dsm_t_min)
+            & (t_graph <= self.scorefm_dsm_t_max)
+        )
 
-        if core_valid.any():
-            if getattr(self, "scorefm_hybrid_mix_mode", "hard") == "soft":
-                gate_k = pred_clean_X.new_tensor(float(self.scorefm_hybrid_gate_k))
-                threshold = pred_clean_X.new_tensor(float(self.scorefm_t_threshold))
-                hybrid_gate = torch.sigmoid(gate_k * (t_graph - threshold))
-            else:
-                hybrid_gate = (
-                    t_graph > pred_clean_X.new_tensor(float(self.scorefm_t_threshold))
-                ).to(pred_clean_X.dtype)
-
-            score_or_x1_per_graph = (
-                hybrid_gate * dsm_per_graph
-                + (1.0 - hybrid_gate) * x1_per_graph
-            )
-
-            score_or_x1 = score_or_x1_per_graph[core_valid].mean()
-            high_t_weight = hybrid_gate[core_valid].mean()
-        else:
-            score_or_x1 = zero
-            high_t_weight = zero
-
-        # 6. Geometry terms are only computed when needed.
-        need_geometry = mode in {
-            "full",
-            "geom_only",
-            "no_contact",
-            "no_clash",
-        }
-
-        if need_geometry:
-            local_dist_loss = self._local_ca_distance_loss(
-                pred_clean_X, X1, interface_batch_id
-            )
-
-            if self.scorefm_interface_contact_weight > 0 and mode != "no_contact":
-                interface_contact_loss = self._interface_contact_bce_loss(
-                    pred_clean_X, X1, true_X, true_S, paratope_mask, batch_id,
-                    segment_ids, interface_batch_id, atom_mask
-                )
-            else:
-                interface_contact_loss = zero
-
-            if self.scorefm_inter_clash_weight > 0 and mode != "no_clash":
-                inter_clash_loss = self._interface_clash_loss(
-                    pred_clean_X, true_X, true_S, batch_id, segment_ids,
-                    interface_batch_id, atom_mask
-                )
-            else:
-                inter_clash_loss = zero
-
-            if self.scorefm_intra_clash_weight > 0 and mode != "no_clash":
-                intra_clash_loss = self._intra_paratope_clash_loss(
-                    pred_clean_X, atom_mask, interface_batch_id,
-                    interface_residue_pos=interface_residue_pos
-                )
-            else:
-                intra_clash_loss = zero
-        else:
-            local_dist_loss = zero
-            interface_contact_loss = zero
-            inter_clash_loss = zero
-            intra_clash_loss = zero
-
-        # 7. Select objective according to ablation mode.
-        if mode == "x1":
-            objective = self.scorefm_x1_weight * x1_loss
-
-        elif mode == "dsm":
-            objective = self.scorefm_dsm_weight * dsm_loss
-
-        elif mode == "hybrid":
-            objective = (
-                self.scorefm_dsm_weight * score_or_x1
-                + self.scorefm_x1_weight * x1_loss
-            )
-
-        elif mode == "velocity":
-            objective = self.scorefm_velocity_weight * velocity_loss
-
-        elif mode == "x1_vel":
-            objective = (
-                self.scorefm_x1_weight * x1_loss
-                + self.scorefm_velocity_weight * velocity_loss
-            )
-
-        elif mode in {"dtm_core", "no_geom"}:
-            objective = (
-                self.scorefm_velocity_weight * velocity_loss
-                + self.scorefm_dsm_weight * score_or_x1
-                + self.scorefm_x1_weight * x1_loss
-            )
-
-        elif mode == "geom_only":
-            objective = (
-                self.scorefm_local_dist_weight * local_dist_loss
-                + self.scorefm_interface_contact_weight * interface_contact_loss
-                + self.scorefm_inter_clash_weight * inter_clash_loss
-                + self.scorefm_intra_clash_weight * intra_clash_loss
-            )
-
-        elif mode == "no_contact":
-            objective = (
-                self.scorefm_velocity_weight * velocity_loss
-                + self.scorefm_dsm_weight * score_or_x1
-                + self.scorefm_x1_weight * x1_loss
-                + self.scorefm_local_dist_weight * local_dist_loss
-                + self.scorefm_inter_clash_weight * inter_clash_loss
-                + self.scorefm_intra_clash_weight * intra_clash_loss
-            )
-
-        elif mode == "no_clash":
-            objective = (
-                self.scorefm_velocity_weight * velocity_loss
-                + self.scorefm_dsm_weight * score_or_x1
-                + self.scorefm_x1_weight * x1_loss
-                + self.scorefm_local_dist_weight * local_dist_loss
-                + self.scorefm_interface_contact_weight * interface_contact_loss
-            )
-
-        elif mode == "full":
-            objective = (
-                self.scorefm_velocity_weight * velocity_loss
-                + self.scorefm_dsm_weight * score_or_x1
-                + self.scorefm_x1_weight * x1_loss
-                + self.scorefm_local_dist_weight * local_dist_loss
-                + self.scorefm_interface_contact_weight * interface_contact_loss
-                + self.scorefm_inter_clash_weight * inter_clash_loss
-                + self.scorefm_intra_clash_weight * intra_clash_loss
-            )
-
-        else:
-            raise ValueError(
-                f"Unknown ABFLOW_SCOREFM_LOSS_MODE={mode}. "
-                "Choose from off, x1, dsm, hybrid, velocity, x1_vel, "
-                "dtm_core, geom_only, no_contact, no_clash, no_geom, full."
-            )
-
-        total = self.scorefm_loss_weight * objective
+        per_graph = torch.where(
+            use_dsm,
+            dsm_per_graph,
+            endpoint_per_graph,
+        )
+        total = per_graph[valid].mean()
 
         details = {
             "scorefm_total": total.detach(),
+            "scorefm_endpoint": endpoint_loss.detach(),
             "scorefm_dsm": dsm_loss.detach(),
-            "scorefm_x1": x1_loss.detach(),
-            "scorefm_hybrid": score_or_x1.detach(),
-            "scorefm_velocity": velocity_loss.detach(),
-            "scorefm_high_t_rate": high_t_weight.detach(),
-            "scorefm_local_dist": local_dist_loss.detach(),
-            "scorefm_interface_contact": interface_contact_loss.detach(),
-            "scorefm_inter_clash": inter_clash_loss.detach(),
-            "scorefm_intra_clash": intra_clash_loss.detach(),
+            "scorefm_dsm_rate": use_dsm[valid].float().mean().detach(),
         }
         return total, details
 
     def _forward(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep,
                  surface, residue_pos, template, lengths, init_noise=None,
                  interface_init=None, sequence_init=None, flow_t=None):
-        """
-        This function is the model evaluator f_theta(X_t, S_t, t, condition).
+        """Evaluate f_theta(X_t, S_t, t, conditions).
 
-        Important semantics:
-          - interface_init is an explicit raw-coordinate paratope state X_t.
-            If provided, peptide coordinates never overwrite it.
-          - sequence_init is an explicit categorical state S_t.
-          - seq_input_mode == "pep_condition" adds S_pep only through a condition embedding;
-            it does not overwrite S_t.
-          - flow_t is the continuous graph-level time used for time embedding.
+        X_pep/S_pep are conditions only. They never overwrite the explicit
+        generated states interface_init/sequence_init.
         """
         batch_id = self.batch_constants['batch_id']
 
@@ -1600,16 +1266,8 @@ class AbFlowModel(nn.Module):
         has_interface_state = interface_init is not None
         has_sequence_state = sequence_init is not None
 
-        # 1. Apply standard AbFlow masks.
-        # Coordinates in cmask are first set to template; explicit X_t below will
-        # then overwrite the paratope part if has_interface_state is True.
         X, S = self.init_mask(X, S, cmask, smask, template)
 
-        # 2. Clean state semantics.
-        # Do not overwrite X/S with X_pep/S_pep. Peptide-derived information can
-        # only enter through explicit condition embeddings in message_passing().
-
-        # 3. Inject explicit coordinate state X_t.
         if has_interface_state:
             expected_shape = X[paratope_mask].shape
             if interface_init.shape != expected_shape:
@@ -1617,9 +1275,10 @@ class AbFlowModel(nn.Module):
                     f"interface_init shape mismatch: expected {tuple(expected_shape)}, "
                     f"got {tuple(interface_init.shape)}."
                 )
-            X[paratope_mask] = interface_init.to(device=X.device, dtype=X.dtype)
+            X[paratope_mask] = interface_init.to(
+                device=X.device, dtype=X.dtype
+            )
 
-        # 4. Inject explicit categorical state S_t.
         if has_sequence_state:
             expected_shape = S[paratope_mask].shape
             if sequence_init.shape != expected_shape:
@@ -1627,19 +1286,15 @@ class AbFlowModel(nn.Module):
                     f"sequence_init shape mismatch: expected {tuple(expected_shape)}, "
                     f"got {tuple(sequence_init.shape)}."
                 )
-            S[paratope_mask] = sequence_init.to(device=S.device, dtype=torch.long)
+            S[paratope_mask] = sequence_init.to(
+                device=S.device, dtype=torch.long
+            )
 
-        # 5. Normalize global coordinates and surface into model frame.
         X = self.normalizer.centering(X, S, batch_id, self.aa_feature)
         X = self.normalizer.normalize(X)
         surface = self.normalizer.normalize(surface)
-
-        # 6. Update global atom coordinates using the current model-frame X/S.
         X = self.aa_feature.update_global_coordinates(X, S)
 
-        # 7. Prepare shadow-interface state in the internal model frame.
-        # If explicit raw X_t was supplied, convert it to the antigen-centered
-        # normalized frame used by AbFlow's shadow paratope branch.
         if has_interface_state:
             interface_X = self._raw_interface_to_model_frame(
                 interface_init, paratope_mask, batch_id
@@ -1650,72 +1305,119 @@ class AbFlowModel(nn.Module):
                 X, S, paratope_mask, batch_id, init_noise
             )
 
-        coord_pep_condition, coord_pep_condition_mask = (
-            self._build_coord_pep_condition_for_residues(
-                X_pep, paratope_mask, batch_id, interface_X
+        # Convert X_pep once to the internal frame. Its relation to the current
+        # interface state is recomputed after every refinement round. Proposal
+        # validity is tracked per residue so missing/invalid proposal coordinates
+        # cannot silently become a condition.
+        pep_X_model = None
+        pep_coord_valid = None
+        if (
+            self.coord_pep_as_condition
+            and X_pep is not None
+            and X_pep.shape == interface_X.shape
+        ):
+            pep_X_raw = X_pep.to(device=X.device, dtype=X.dtype)
+            proposal_backbone = pep_X_raw[:, :3]
+            pep_coord_valid = (
+                torch.isfinite(proposal_backbone).all(dim=-1).all(dim=-1)
+                & (
+                    proposal_backbone.abs()
+                    .sum(dim=-1)
+                    .sum(dim=-1)
+                    > self.scorefm_eps
+                )
             )
-        )
-        # Sequence peptide condition lives in residue hidden space, not coordinate
-        # space. interface_X has last dimension 3, so it must not be used as the
-        # reference tensor for sequence condition embeddings.
+            if pep_coord_valid.any():
+                pep_X_model = self._raw_interface_to_model_frame(
+                    pep_X_raw, paratope_mask, batch_id
+                )
+
         if self.seq_pep_condition_embedding is not None:
             seq_ref_tensor = interface_X.new_zeros(
-                (paratope_mask.shape[0], self.seq_pep_condition_embedding.embedding_dim)
+                (paratope_mask.shape[0],
+                 self.seq_pep_condition_embedding.embedding_dim)
             )
         else:
-            seq_ref_tensor = interface_X.new_zeros((paratope_mask.shape[0], 1))
-
+            seq_ref_tensor = interface_X.new_zeros(
+                (paratope_mask.shape[0], 1)
+            )
         seq_pep_condition, seq_pep_condition_mask = (
             self._build_seq_pep_condition_for_residues(
                 S_pep, paratope_mask, seq_ref_tensor
             )
         )
 
-        # 8. Iterative message passing.
         r_pred_S_logits, pred_S_dist = [], None
         r_interface_X = [interface_X.clone()]
         r_edge_dist = []
         memory_H = None
+        condition_diag_rounds = []
 
         for round_idx in range(self.round):
+            (
+                coord_pep_condition,
+                coord_pep_condition_mask,
+            ) = self._build_coord_pep_condition_for_residues(
+                pep_X_model,
+                interface_X,
+                paratope_mask,
+                pep_coord_valid=pep_coord_valid,
+            )
+
             pred_S_logits, pred_X, interface_X, H, edge_dist = self.message_passing(
-                X, S, residue_pos, interface_X, surface, paratope_mask, batch_id,
-                round_idx, memory_H, pred_S_dist, smask, flow_t=flow_t,
+                X, S, residue_pos, interface_X, surface, paratope_mask,
+                batch_id, round_idx, memory_H, pred_S_dist, smask,
+                flow_t=flow_t,
                 coord_pep_condition=coord_pep_condition,
                 coord_pep_condition_mask=coord_pep_condition_mask,
                 seq_pep_condition=seq_pep_condition,
                 seq_pep_condition_mask=seq_pep_condition_mask,
             )
 
+            condition_diag_rounds.append({
+                key: value.detach()
+                for key, value in self._last_condition_diagnostics.items()
+            })
+
             memory_H = H
             r_interface_X.append(interface_X.clone())
             r_pred_S_logits.append((pred_S_logits, smask))
             r_edge_dist.append(edge_dist)
 
-            # Update coordinates for the next refinement round.
             X = X.clone()
             X[cmask] = pred_X[cmask]
             X = self.aa_feature.update_global_coordinates(X, S)
 
-            # Update sequence state for the next refinement round.
             if not self.struct_only:
                 S = S.clone()
                 if round_idx == self.round - 1:
-                    S[smask] = torch.argmax(pred_S_logits[smask], dim=-1)
+                    S[smask] = torch.argmax(
+                        pred_S_logits[smask], dim=-1
+                    )
                 else:
-                    pred_S_dist = torch.softmax(pred_S_logits[smask], dim=-1)
+                    pred_S_dist = torch.softmax(
+                        pred_S_logits[smask], dim=-1
+                    )
+
+        if condition_diag_rounds:
+            keys = condition_diag_rounds[0].keys()
+            self._latest_condition_diagnostics = {
+                key: torch.stack(
+                    [round_diag[key] for round_diag in condition_diag_rounds]
+                ).mean()
+                for key in keys
+            }
+        else:
+            self._latest_condition_diagnostics = {}
 
         interface_batch_id = self.batch_constants['interface_batch_id']
-
         if self.struct_only:
             prmsd = self.prmsd_ffn(H[cmask]).squeeze()
         else:
             prmsd = None
 
-        # 9. Convert predictions back to raw coordinates.
         pred_X = self.normalizer.unnormalize(pred_X)
         pred_X = self.normalizer.uncentering(pred_X, batch_id)
-
         for i, interface_X_i in enumerate(r_interface_X):
             interface_X_i = self.normalizer.unnormalize(interface_X_i)
             interface_X_i = self.normalizer.uncentering(
@@ -1724,9 +1426,8 @@ class AbFlowModel(nn.Module):
             r_interface_X[i] = interface_X_i
 
         self.normalizer.clear_cache()
-
         return H, S, r_pred_S_logits, pred_X, r_interface_X, r_edge_dist, prmsd
-    
+
     def forward(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths, xloss_mask, context_ratio=0):
         '''
         :param X: [N, n_channel, 3], Cartesian coordinates
@@ -1753,12 +1454,15 @@ class AbFlowModel(nn.Module):
         gt_interface_X = true_X[paratope_mask]
         batch_size = int(self.batch_constants['batch_size'].item()) if torch.is_tensor(self.batch_constants['batch_size']) else int(self.batch_constants['batch_size'])
         interface_batch_id = self.batch_constants['interface_batch_id']
-        state_path = bool(getattr(self, "scorefm_state_path", self.use_scorefm))
+        state_path = bool(self.scorefm_state_path)
 
         if state_path:
             # Sample X_0/S_0 from the reference initialization used at inference.
             # Peptide-derived information never overwrites this generated state.
             interface_X, interface_S = self.init_interface(
+                X, S, paratope_mask, batch_id
+            )
+            source_ca_mean = self._reference_ca_mean(
                 X, S, paratope_mask, batch_id
             )
 
@@ -1798,6 +1502,7 @@ class AbFlowModel(nn.Module):
             sigma_score_int = None
             t_graph = X.new_zeros(1)
             sequence_state_for_model = None
+            source_ca_mean = None
 
         # get results
         H, pred_S, r_pred_S_logits, pred_X, r_interface_X, r_edge_dist, prmsd = self._forward(
@@ -1825,46 +1530,54 @@ class AbFlowModel(nn.Module):
 
         # docking loss
 
-        # 1. interface loss (shadow paratope)
-        interface_atom_pos = self.aa_feature._construct_atom_pos(true_S[paratope_mask])
-        interface_atom_mask = interface_atom_pos != self.aa_feature.atom_pos_pad_idx
-        interface_loss = F.smooth_l1_loss(
-            r_interface_X[-1][interface_atom_mask],
-            gt_interface_X[interface_atom_mask])
+        # 1. Unique coordinate objective for the shadow paratope.
+        # The previous implementation added a global interface loss and a second
+        # x1 auxiliary loss for the same endpoint error. Here the endpoint is
+        # supervised exactly once, with per-complex normalization.
+        interface_atom_pos = self.aa_feature._construct_atom_pos(
+            true_S[paratope_mask]
+        )
+        interface_atom_mask = (
+            interface_atom_pos != self.aa_feature.atom_pos_pad_idx
+        )
 
-        # complete coordinate Score-FM loss
         if state_path:
-            flow_loss, scorefm_details = self._scorefm_loss(
-                Xt=Xt,
-                X0=interface_X,
-                X1=gt_interface_X,
-                pred_clean_X=r_interface_X[-1],
-                atom_mask=interface_atom_mask,
-                true_X=true_X,
-                true_S=true_S,
-                paratope_mask=paratope_mask,
-                batch_id=batch_id,
-                segment_ids=self.batch_constants['segment_ids'],
-                interface_batch_id=self.batch_constants['interface_batch_id'],
-                t=t_int,
-                sigma_t=sigma_score_int,
-                interface_residue_pos=residue_pos[paratope_mask],
+            interface_loss, scorefm_details = (
+                self._coordinate_training_objective(
+                    Xt=Xt,
+                    X1=gt_interface_X,
+                    pred_clean_X=r_interface_X[-1],
+                    atom_mask=interface_atom_mask,
+                    interface_batch_id=interface_batch_id,
+                    t=t_int,
+                    sigma_t=sigma_score_int,
+                    source_ca_mean=source_ca_mean,
+                )
             )
         else:
-            flow_loss = pred_X.new_tensor(0.0)
-            zero = flow_loss.detach()
+            endpoint_per_graph, endpoint_valid = (
+                self._masked_residue_smooth_l1_per_graph(
+                    r_interface_X[-1],
+                    gt_interface_X,
+                    interface_atom_mask,
+                    interface_batch_id,
+                )
+            )
+            if endpoint_valid.any():
+                interface_loss = endpoint_per_graph[
+                    endpoint_valid
+                ].mean()
+            else:
+                interface_loss = pred_X.new_tensor(0.0)
+
+            zero = interface_loss.detach() * 0.0
             scorefm_details = {
-                "scorefm_total": zero,
+                "scorefm_total": interface_loss.detach(),
+                "scorefm_endpoint": interface_loss.detach(),
                 "scorefm_dsm": zero,
-                "scorefm_x1": zero,
-                "scorefm_hybrid": zero,
-                "scorefm_velocity": zero,
-                "scorefm_high_t_rate": zero,
-                "scorefm_local_dist": zero,
-                "scorefm_interface_contact": zero,
-                "scorefm_inter_clash": zero,
-                "scorefm_intra_clash": zero,
+                "scorefm_dsm_rate": zero,
             }
+
         self.last_scorefm_losses = scorefm_details
 
 
@@ -1889,8 +1602,12 @@ class AbFlowModel(nn.Module):
             pdev_loss, prmsd_loss = None, None
 
         # comprehensive loss
-        loss = self.seq_ce_weight * snll + struct_loss + dock_loss + flow_loss + (0 if pdev_loss is None else pdev_loss)
-        # loss = snll + struct_loss + dock_loss + flow_loss + (0 if pdev_loss is None else pdev_loss)
+        loss = (
+            self.seq_ce_weight * snll
+            + struct_loss
+            + dock_loss
+            + (0 if pdev_loss is None else pdev_loss)
+        )
 
         self._clean_batch_constants()
 
@@ -1921,6 +1638,9 @@ class AbFlowModel(nn.Module):
                 "t_min": t_graph.detach().float().min(),
                 "t_max": t_graph.detach().float().max(),
             }
+            for key, value in self._latest_condition_diagnostics.items():
+                diag[key] = value.detach()
+
             valid_pep = (
                 S_pep is not None
                 and S_pep.numel() == int(paratope_mask.sum().item())
@@ -1934,6 +1654,72 @@ class AbFlowModel(nn.Module):
                 pep_native_hit = pep_full[pep_mask] == true_S[pep_mask]
                 diag["seq_pred_vs_pep_aar"] = pred_pep_hit.float().mean()
                 diag["seq_pep_vs_native_aar"] = pep_native_hit.float().mean()
+
+            # Measure the proposal's own coordinate quality.  Without this
+            # diagnostic, an improvement or degradation from coordinate
+            # conditioning cannot be attributed to the condition mechanism
+            # versus the quality of X_pep itself.
+            valid_coord_pep = (
+                X_pep is not None
+                and X_pep.shape == gt_interface_X.shape
+            )
+            if valid_coord_pep:
+                pep_raw = X_pep.to(
+                    device=gt_interface_X.device,
+                    dtype=gt_interface_X.dtype,
+                )
+                proposal_backbone = pep_raw[:, :3]
+                proposal_valid = (
+                    torch.isfinite(proposal_backbone)
+                    .all(dim=-1)
+                    .all(dim=-1)
+                    & (
+                        proposal_backbone.abs()
+                        .sum(dim=-1)
+                        .sum(dim=-1)
+                        > self.scorefm_eps
+                    )
+                )
+                if proposal_valid.any():
+                    ca_idx = 1 if X_pep.shape[1] > 1 else 0
+                    pep_ca = pep_raw[:, ca_idx]
+                    native_ca = gt_interface_X[:, ca_idx]
+                    pep_ca_sq = ((pep_ca - native_ca) ** 2).sum(dim=-1)
+
+                    valid_graph_id = interface_batch_id[proposal_valid]
+                    n_graph = int(interface_batch_id.max().item()) + 1
+                    pep_ca_sum = torch.zeros(
+                        n_graph,
+                        device=pep_ca_sq.device,
+                        dtype=pep_ca_sq.dtype,
+                    )
+                    pep_ca_count = torch.zeros(
+                        n_graph,
+                        device=pep_ca_sq.device,
+                        dtype=pep_ca_sq.dtype,
+                    )
+                    pep_ca_sum.scatter_add_(
+                        0,
+                        valid_graph_id,
+                        pep_ca_sq[proposal_valid],
+                    )
+                    pep_ca_count.scatter_add_(
+                        0,
+                        valid_graph_id,
+                        torch.ones_like(pep_ca_sq[proposal_valid]),
+                    )
+                    valid_graph = pep_ca_count > 0
+                    pep_ca_mse_graph = (
+                        pep_ca_sum
+                        / pep_ca_count.clamp_min(1.0)
+                    )
+                    diag["coord_pep_to_native_ca_rmsd"] = torch.sqrt(
+                        pep_ca_mse_graph[valid_graph].clamp_min(0.0)
+                    ).mean()
+                    diag["coord_pep_valid_rate"] = (
+                        proposal_valid.float().mean()
+                    )
+
             self.last_abflow_diagnostics = {
                 k: v.detach() if torch.is_tensor(v) else v for k, v in diag.items()
             }
@@ -1942,73 +1728,69 @@ class AbFlowModel(nn.Module):
 
 
     def _sampling_time_grid(self, n_steps, device, dtype):
-        """Inference time grid with real endpoint t=1.
+        """Return true interval boundaries [0, ..., 1].
 
-        We return interval boundaries [0, ..., 1]. The sampler performs n_steps
-        updates from t_i to t_{i+1}. The model is queried at the left endpoint
-        t_i for velocity updates, and the final readout is queried at t=1.
+        Velocity is evaluated at left endpoints t_i<1. The final model readout
+        is queried at t=1 without evaluating an analytic score denominator.
         """
         n_steps = max(1, int(n_steps))
-        t_grid = torch.linspace(0.0, 1.0, steps=n_steps + 1, device=device, dtype=dtype)
-        return t_grid
-    
-    def sample(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths,
-               n_steps=10, init_noise=None, return_hidden=False, show_progress=False, progress_desc=None):
-        
+        return torch.linspace(
+            0.0, 1.0, steps=n_steps + 1,
+            device=device, dtype=dtype
+        )
+
+    @torch.no_grad()
+    def sample(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep,
+               surface, residue_pos, template, lengths, n_steps=10,
+               init_noise=None, return_hidden=False, show_progress=False,
+               progress_desc=None):
         if not bool(getattr(self, "scorefm_state_path", True)):
             return self.struct_sample(
                 X, S, cmask, smask, paratope_mask, X_pep, S_pep,
                 surface, residue_pos, template, lengths,
-                init_noise=init_noise,
-                return_hidden=return_hidden,
+                init_noise=init_noise, return_hidden=return_hidden
             )
 
         if self.backbone_only:
-            X, template = X[:, :4], template[:, :4]  # backbone
+            X, template = X[:, :4], template[:, :4]
             if X_pep is not None:
                 X_pep = X_pep[:, :4]
-        
-        # self.timing_stats = {
-        #     'surface_processing': 0.0,
-        #     'sme_encoding': 0.0,
-        #     'count': 0
-        # }
-        
+
         gen_X, gen_S = X.clone(), S.clone()
-        
-        # prepare constants
         self._prepare_batch_constants(S, paratope_mask, lengths)
 
         batch_id = self.batch_constants['batch_id']
-        batch_size = self.batch_constants['batch_size']
-        batch_size = int(batch_size.item()) if torch.is_tensor(batch_size) else int(batch_size)
+        batch_size_raw = self.batch_constants['batch_size']
+        batch_size = (
+            int(batch_size_raw.item())
+            if torch.is_tensor(batch_size_raw)
+            else int(batch_size_raw)
+        )
         segment_ids = self.batch_constants['segment_ids']
         interface_batch_id = self.batch_constants['interface_batch_id']
         is_ab = segment_ids != self.aa_feature.ag_seg_id
         s_batch_id = batch_id[smask]
 
-        best_metric = torch.ones(batch_size, dtype=torch.float, device=X.device) * 1e10
+        best_metric = torch.full(
+            (batch_size,), 1e10, dtype=torch.float, device=X.device
+        )
         interface_cmask = paratope_mask[cmask]
 
         interface_X, interface_S = self.init_interface(
             X, S, paratope_mask, batch_id, init_noise=init_noise
         )
-        
         time_grid = self._sampling_time_grid(
             n_steps, device=X.device, dtype=X.dtype
         )
-        
         Xt = interface_X.clone()
         St = interface_S.clone()
-        
+
         step_iter = range(n_steps)
         if show_progress:
             step_iter = tqdm(
-                step_iter,
-                total=n_steps,
+                step_iter, total=n_steps,
                 desc=progress_desc or 'Sampling ODE',
-                leave=False,
-                dynamic_ncols=True
+                leave=False, dynamic_ncols=True
             )
 
         for i in step_iter:
@@ -2016,74 +1798,40 @@ class AbFlowModel(nn.Module):
             t_next = time_grid[i + 1]
             dt = t_next - t
             flow_t_graph = t.reshape(1).expand(batch_size)
-            
             if show_progress and hasattr(step_iter, 'set_postfix'):
                 step_iter.set_postfix(t=f'{float(t):.2f}')
-            
-            # Use the explicit state interface_init/sequence_init pathway.
-            # No need to first write Xt/St into X/S because _forward will do it
-            # after applying the standard template/mask logic.
-            sequence_state_for_model = St if not self.struct_only else None
 
-            H, pred_S, r_pred_S_logits, pred_X, r_interface_X, r_edge_dist, prmsd = self._forward(
-                X, S, cmask, smask, paratope_mask,
-                X_pep, S_pep, surface, residue_pos, template, lengths,
+            sequence_state_for_model = St if not self.struct_only else None
+            H, pred_S, r_pred_S_logits, pred_X, r_interface_X, _, prmsd = self._forward(
+                X, S, cmask, smask, paratope_mask, X_pep, S_pep,
+                surface, residue_pos, template, lengths,
                 interface_init=Xt,
                 sequence_init=sequence_state_for_model,
                 flow_t=flow_t_graph
             )
-
-            # Score-factorized velocity. Given predicted clean endpoint Xhat_1,
-            # induced score s_theta = -(X_t - t Xhat_1) / sigma_t^2 and
-            # v_theta = Xhat_1 + sigma_t * s_theta = (Xhat_1 - X_t) / sigma_t.
-            sigma_t = (1.0 - t).clamp_min(self.scorefm_min_sigma)
             pred_clean_X = r_interface_X[-1]
-            pred_score = self._coord_score_from_clean(Xt, pred_clean_X, t, sigma_t)
 
-            # Sampler ablation:
-            # residual:      original conservative endpoint residual update
-            # bridge:        score-to-velocity bridge, v = Xhat_1 + sigma_t * score
-            # damped_bridge: bridge velocity damped by sigma_t^p
-            # blend:         interpolation between residual and bridge
             raw_residual = pred_clean_X - Xt
-            bridge_velocity = pred_clean_X + sigma_t * pred_score
-
-            sampler_mode = self.scorefm_sampler_mode
-            if sampler_mode == "residual":
+            if self.scorefm_sampler_mode == "residual":
                 dX = raw_residual
-
-            elif sampler_mode == "bridge":
-                dX = bridge_velocity
-
-            elif sampler_mode == "damped_bridge":
-                damping = sigma_t.clamp_min(self.scorefm_min_sigma).pow(
-                    self.scorefm_bridge_damping_power
+            elif self.scorefm_sampler_mode == "bridge":
+                sigma_t = (1.0 - t).clamp_min(
+                    self.scorefm_min_sigma
                 )
-                dX = damping * bridge_velocity
-
-            elif sampler_mode == "blend":
-                alpha = float(self.scorefm_bridge_blend)
-                alpha = max(0.0, min(1.0, alpha))
-                dX = (1.0 - alpha) * raw_residual + alpha * bridge_velocity
-
+                dX = raw_residual / sigma_t
             else:
                 raise ValueError(
-                    f"Unknown ABFLOW_SCOREFM_SAMPLER_MODE={sampler_mode}. "
-                    "Choose from residual, bridge, damped_bridge, blend."
+                    f"Unknown sampler mode: {self.scorefm_sampler_mode}"
                 )
-            update_sequence_state = not self.struct_only
-            if update_sequence_state:
-                cur_logits = r_pred_S_logits[-1][0][paratope_mask]
-                cur_logits = cur_logits - cur_logits.max(dim=-1, keepdim=True)[0]
-                cur_probs = F.softmax(cur_logits, dim=-1)
-                
-            # Euler coordinate step.
+
             Xt = Xt + dX * dt
-            if update_sequence_state:
-                # Categorical stochastic interpolation. For q_t =
-                # t*delta(clean)+(1-t)*pi_0, moving from t to t+dt refreshes a
-                # residue from the predicted clean distribution with
-                # probability dt/(1-t), otherwise retaining its current state.
+
+            if not self.struct_only:
+                cur_logits = r_pred_S_logits[-1][0][paratope_mask]
+                cur_logits = cur_logits - cur_logits.max(
+                    dim=-1, keepdim=True
+                )[0]
+                cur_probs = F.softmax(cur_logits, dim=-1)
                 refresh_prob = min(
                     1.0,
                     float(dt) / max(1e-8, 1.0 - float(t))
@@ -2091,78 +1839,78 @@ class AbFlowModel(nn.Module):
                 proposed_S = torch.multinomial(
                     cur_probs.clamp_min(1e-8), num_samples=1
                 ).squeeze(-1)
-                refresh = torch.rand(
-                    St.shape, device=St.device
-                ) < refresh_prob
+                refresh = (
+                    torch.rand(St.shape, device=St.device) < refresh_prob
+                )
                 refresh = refresh & smask[paratope_mask]
                 St = torch.where(refresh, proposed_S, St)
-        
-        X[paratope_mask] = Xt
-        S[paratope_mask] = St
-            
-        n_tries = 10 if self.struct_only else 1
-        for i in range(n_tries):
-        
-            # generate
-            # Use the final ODE state Xt as shadow-interface input instead of
-            # reinitializing from noise.
-            final_t = time_grid[-1].detach()
-            final_flow_t_graph = final_t.reshape(1).expand(batch_size)
-            sequence_state_for_model = St if not self.struct_only else None
 
-            H, pred_S, r_pred_S_logits, pred_X, r_interface_X, _, prmsd = self._forward(
-                X, S, cmask, smask, paratope_mask, X_pep, S_pep,
-                surface, residue_pos, template, lengths,
-                interface_init=Xt,
-                sequence_init=sequence_state_for_model,
-                flow_t=final_flow_t_graph
+        # Never mutate caller-owned input tensors during final readout.
+        X_state = X.clone()
+        S_state = S.clone()
+        X_state[paratope_mask] = Xt
+        S_state[paratope_mask] = St
+
+        final_t = time_grid[-1].detach()
+        final_flow_t_graph = final_t.reshape(1).expand(batch_size)
+        sequence_state_for_model = St if not self.struct_only else None
+        H, pred_S, r_pred_S_logits, pred_X, r_interface_X, _, prmsd = self._forward(
+            X_state, S_state, cmask, smask, paratope_mask, X_pep, S_pep,
+            surface, residue_pos, template, lengths,
+            interface_init=Xt,
+            sequence_init=sequence_state_for_model,
+            flow_t=final_flow_t_graph
+        )
+
+        if not self.struct_only:
+            S_logits = r_pred_S_logits[-1][0][smask]
+            if S_logits.shape[0] > 0:
+                S_probs = torch.softmax(
+                    S_logits, dim=-1
+                ).max(dim=-1)[0]
+                nlls = -torch.log(S_probs.clamp_min(1e-8))
+                metric = scatter_mean(
+                    nlls, s_batch_id, dim=0, dim_size=batch_size
+                )
+            else:
+                metric = best_metric.new_zeros(batch_size)
+        else:
+            metric = scatter_mean(
+                prmsd[interface_cmask], interface_batch_id,
+                dim=0, dim_size=batch_size
             )
 
-            # PPL or PRMSD
-            if not self.struct_only:
-                S_logits = r_pred_S_logits[-1][0][smask]
-                S_probs = torch.max(torch.softmax(S_logits, dim=-1), dim=-1)[0]
-                nlls = -torch.log(S_probs)
-                metric = scatter_mean(nlls, s_batch_id, dim=0, dim_size=batch_size)  # [batch_size]
-            else:
-                metric = scatter_mean(prmsd[interface_cmask], interface_batch_id, dim=0, dim_size=batch_size)  # [batch_size]
+        update = metric < best_metric
+        cupdate = cmask & update[batch_id]
+        supdate = smask & update[batch_id]
+        best_metric[update] = metric[update]
+        gen_X[cupdate] = pred_X[cupdate]
+        if not self.struct_only:
+            gen_S[supdate] = pred_S[supdate]
 
-            update = metric < best_metric
-            cupdate = cmask & update[batch_id]
-            supdate = smask & update[batch_id]
-            # update metric history
-            best_metric[update] = metric[update]
-
-            # 1. set generated part
-            gen_X[cupdate] = pred_X[cupdate]
-            if not self.struct_only:
-                gen_S[supdate] = pred_S[supdate]
-        
-            interface_X = r_interface_X[-1]
-            # 2. align by cdr
-            for i in range(batch_size):
-                if not update[i]:
-                    continue
-                # 1. align CDRH3
-                is_cur_graph = batch_id == i
-                cdrh3_cur_graph = torch.logical_and(is_cur_graph, paratope_mask)
-                ori_cdr = gen_X[cdrh3_cur_graph][:, :4]  # backbone
-                pred_cdr = interface_X[interface_batch_id == i][:, :4]
-                _, R, t = kabsch_torch(ori_cdr.reshape(-1, 3), pred_cdr.reshape(-1, 3))
-
-                # 2. tranform antibody
-                is_cur_ab = is_cur_graph & is_ab
-                ab_X = torch.matmul(gen_X[is_cur_ab], R.T) + t
-                gen_X[is_cur_ab] = ab_X
+        interface_X_final = r_interface_X[-1]
+        for b in range(batch_size):
+            if not update[b]:
+                continue
+            is_cur_graph = batch_id == b
+            current_paratope = is_cur_graph & paratope_mask
+            ori_cdr = gen_X[current_paratope][:, :4]
+            pred_cdr = interface_X_final[
+                interface_batch_id == b
+            ][:, :4]
+            _, R, trans = kabsch_torch(
+                ori_cdr.reshape(-1, 3), pred_cdr.reshape(-1, 3)
+            )
+            is_cur_ab = is_cur_graph & is_ab
+            gen_X[is_cur_ab] = torch.matmul(
+                gen_X[is_cur_ab], R.T
+            ) + trans
 
         self._clean_batch_constants()
-
-        # self.timing_stats['count'] += 1
-
         if return_hidden:
             return gen_X, gen_S, best_metric, H
         return gen_X, gen_S, best_metric
-    
+
     def struct_sample(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths, init_noise=None, return_hidden=False):
         
         if self.backbone_only:
