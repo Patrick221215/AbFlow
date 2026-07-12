@@ -244,7 +244,7 @@ runtime = {
     "prefetch_factor": os.environ.get("ABFLOW_PREFETCH_FACTOR", "4"),
     "log_interval": os.environ.get("ABFLOW_LOG_INTERVAL", "20"),
     "save_interval": os.environ.get("ABFLOW_SAVE_INTERVAL", "10"),
-    "condition_diagnostics": os.environ.get("ABFLOW_CONDITION_DIAGNOSTICS", "off"),
+    "condition_diagnostics": os.environ.get("ABFLOW_CONDITION_DIAGNOSTICS", "on"),
     "clean_reference_state": "true",
     "peptide_state_injection": "false",
     "peptide_prior_weighting": "false",

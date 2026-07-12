@@ -262,9 +262,11 @@ class Trainer:
 
         self.last_valid_metric = valid_metric
 
-        for name in self.writer_buffer:
-            value = np.mean(self.writer_buffer[name])
-            self.log(name, value, self.epoch)
+        if self._is_main_proc():
+            for name, values in self.writer_buffer.items():
+                value = float(np.mean(values))
+                self.writer.add_scalar(name, value, self.epoch)
+
         self.writer_buffer = {}
         
     def _metric_better(self, new):

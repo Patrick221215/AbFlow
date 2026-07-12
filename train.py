@@ -485,7 +485,7 @@ def parse():
     parser.add_argument('--amp_dtype', type=str, default='bf16',
                         choices=['bf16', 'fp16'],
                         help='AMP dtype. bf16 is preferred on Ampere/A6000 for stability.')
-    parser.add_argument('--log_interval', type=int, default=20,
+    parser.add_argument('--log_interval', type=int, default=1,
                         help='Write training scalar logs every N steps to reduce CUDA sync.')
     parser.add_argument('--tqdm_mininterval', type=float, default=5.0,
                         help='Minimum seconds between tqdm screen refreshes.')
