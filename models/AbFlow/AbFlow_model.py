@@ -33,6 +33,13 @@ def _env_float(name, default):
     return float(value)
 
 
+def _env_int(name, default):
+    value = os.environ.get(name, None)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
 def _env_flag(name, default=False):
     value = os.environ.get(name, None)
     if value is None or value == "":
@@ -259,6 +266,52 @@ class AbFlowModel(nn.Module):
             )
 
         # =========================================================
+        # Proposal-conditioned source and recurrent proposal context
+        # =========================================================
+        # Source modes:
+        #   reference:
+        #       X_0/S_0 are sampled from the antigen-centered reference source.
+        #   pcs:
+        #       Proposal-conditioned source. X_pep/S_pep define or bias X_0/S_0,
+        #       but the recurrent global context remains the current generated
+        #       state. This tests the source role alone.
+        #   pcs_rc:
+        #       Proposal-conditioned source + recurrent proposal context. X_pep/S_pep
+        #       define or bias X_0/S_0 and are also used to build the global
+        #       proposal context at every _forward call, while interface_X/St remain
+        #       the explicit generated state. This recovers the original AbFlow
+        #       information strength without overwriting the generated state.
+        self.abflow_source_mode = _env_str(
+            "ABFLOW_SOURCE_MODE", "reference"
+        ).lower()
+        if self.abflow_source_mode in {"ref", "reference"}:
+            self.abflow_source_mode = "reference"
+        elif self.abflow_source_mode in {"cond", "conditional", "proposal", "pcs"}:
+            self.abflow_source_mode = "pcs"
+        elif self.abflow_source_mode in {"pcs_rc", "proposal_context", "proposal_recurrent_context"}:
+            self.abflow_source_mode = "pcs_rc"
+        else:
+            raise ValueError(
+                "Unknown ABFLOW_SOURCE_MODE="
+                f"{self.abflow_source_mode}. Choose reference, pcs, or pcs_rc."
+            )
+
+        self.abflow_recurrent_proposal_context = _env_flag(
+            "ABFLOW_RECURRENT_PROPOSAL_CONTEXT",
+            self.abflow_source_mode == "pcs_rc",
+        )
+
+        # Deterministic proposal-conditioned source.
+        #
+        # We intentionally remove continuous peptide-source weights from the
+        # formal method.  In PCS/PCS-RC, a valid proposal defines the source
+        # state; invalid proposal residues fall back to the reference source.
+        # This avoids heuristic mixtures such as 0.5 * reference + 0.5 * proposal
+        # and makes the base distribution easy to state and reproduce.
+        self.coord_pep_source_weight = 1.0
+        self.seq_pep_source_weight = 1.0
+
+        # =========================================================
         # Peptide information as condition, never as source-state injection
         # =========================================================
         # Coordinate proposal conditioning is represented only in scalar hidden
@@ -317,6 +370,21 @@ class AbFlowModel(nn.Module):
             self.seq_pep_condition_adapter = None
 
         self.seq_ce_weight = _env_float("ABFLOW_SEQ_CE_WEIGHT", 1.0)
+
+        # Local-correction schedule for proposal adapters.
+        #
+        # start_round=0 reproduces PCS_RC_COND: proposal-relative adapters are
+        # active before the first refinement round and can influence placement.
+        # start_round=1 is the recommended PCS_RC_LC setting: the first round
+        # establishes the interface placement using the PCS-RC backbone, while
+        # later rounds use proposal-relative features for local geometry and
+        # sequence correction.  This directly targets the observed trade-off:
+        # preserve PCS_RC raw H3 placement/DockQ while absorbing the local
+        # structural benefit of PCS_RC_COND.
+        self.proposal_adapter_start_round = max(
+            0, _env_int("ABFLOW_PROPOSAL_ADAPTER_START_ROUND", 0)
+        )
+
         self.last_scorefm_losses = {}
         self.last_abflow_diagnostics = {}
         # Detached condition-strength diagnostics. They are useful for debugging
@@ -338,6 +406,88 @@ class AbFlowModel(nn.Module):
         X[cmask] = template
         return X, S
     
+    def replace_pep(self, X, S, paratope_mask, X_pep, S_pep,
+                    replace_seq=True, replace_struct=True):
+        """Build a proposal-conditioned global context.
+
+        This function is not used to overwrite the explicit generated state
+        Xt/St.  In PCS-RC mode it creates the recurrent proposal context that
+        the original AbFlow effectively used through hard replacement, while
+        the shadow interface still receives the actual generated state.
+        """
+        if (
+            replace_seq
+            and getattr(self, 'pep_seq', True)
+            and S_pep is not None
+            and S_pep.numel() == int(paratope_mask.sum().item())
+        ):
+            pep_S = S_pep.to(device=S.device, dtype=torch.long)
+            valid = (pep_S >= 0) & (pep_S < self.num_classes)
+            if valid.any():
+                local_S = S[paratope_mask].clone()
+                local_S = torch.where(valid, pep_S, local_S)
+                S[paratope_mask] = local_S
+
+        if (
+            replace_struct
+            and getattr(self, 'pep_struct', True)
+            and X_pep is not None
+            and X_pep.shape == X[paratope_mask].shape
+        ):
+            pep_X = X_pep.to(device=X.device, dtype=X.dtype)
+            proposal_backbone = pep_X[:, :min(3, pep_X.shape[1])]
+            valid = (
+                torch.isfinite(proposal_backbone).all(dim=-1).all(dim=-1)
+                & (proposal_backbone.abs().sum(dim=-1).sum(dim=-1) > self.scorefm_eps)
+            )
+            if valid.any():
+                local_X = X[paratope_mask].clone()
+                local_X = torch.where(valid.view(-1, 1, 1), pep_X, local_X)
+                X[paratope_mask] = local_X
+        return X, S
+
+    @torch.no_grad()
+    def _condition_initial_interface(self, interface_X, interface_S, X_pep, S_pep):
+        """Sample a deterministic proposal-conditioned source state.
+
+        reference mode keeps the antigen-centered random source.  PCS/PCS-RC
+        mode uses X_pep/S_pep as the declared source whenever the corresponding
+        proposal residue is valid; invalid proposal residues fall back to the
+        reference source.
+
+        No continuous source mixing weight is used here.  This is deliberate:
+        the formal base should not depend on an unexplained heuristic coefficient.
+        """
+        if self.abflow_source_mode not in {"pcs", "pcs_rc"}:
+            return interface_X, interface_S
+
+        if (
+            getattr(self, 'pep_struct', True)
+            and X_pep is not None
+            and X_pep.shape == interface_X.shape
+        ):
+            pep_X = X_pep.to(device=interface_X.device, dtype=interface_X.dtype)
+            proposal_backbone = pep_X[:, :min(3, pep_X.shape[1])]
+            valid = (
+                torch.isfinite(proposal_backbone).all(dim=-1).all(dim=-1)
+                & (proposal_backbone.abs().sum(dim=-1).sum(dim=-1) > self.scorefm_eps)
+            )
+            if valid.any():
+                interface_X = torch.where(valid.view(-1, 1, 1), pep_X, interface_X)
+
+        if (
+            not self.struct_only
+            and getattr(self, 'pep_seq', True)
+            and S_pep is not None
+            and S_pep.shape == interface_S.shape
+        ):
+            pep_S = S_pep.to(device=interface_S.device, dtype=torch.long)
+            valid = (pep_S >= 0) & (pep_S < self.num_classes)
+            if valid.any():
+                interface_S = torch.where(valid, pep_S, interface_S)
+
+        return interface_X, interface_S
+
     @torch.no_grad()
     def _sample_categorical_path(self, clean_S, base_S, t_graph,
                                  interface_batch_id, corrupt_mask=None):
@@ -1301,10 +1451,11 @@ class AbFlowModel(nn.Module):
     def _forward(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep,
                  surface, residue_pos, template, lengths, init_noise=None,
                  interface_init=None, sequence_init=None, flow_t=None):
-        """Evaluate f_theta(X_t, S_t, t, conditions).
+        """Evaluate f_theta(X_t, S_t, t, proposal context).
 
-        X_pep/S_pep are conditions only. They never overwrite the explicit
-        generated states interface_init/sequence_init.
+        interface_init/sequence_init are the explicit generated state Xt/St.
+        In PCS-RC mode X_pep/S_pep are also used to build a recurrent global
+        proposal context, but they never overwrite the explicit shadow state.
         """
         batch_id = self.batch_constants['batch_id']
 
@@ -1324,9 +1475,6 @@ class AbFlowModel(nn.Module):
                     f"interface_init shape mismatch: expected {tuple(expected_shape)}, "
                     f"got {tuple(interface_init.shape)}."
                 )
-            X[paratope_mask] = interface_init.to(
-                device=X.device, dtype=X.dtype
-            )
 
         if has_sequence_state:
             expected_shape = S[paratope_mask].shape
@@ -1335,9 +1483,36 @@ class AbFlowModel(nn.Module):
                     f"sequence_init shape mismatch: expected {tuple(expected_shape)}, "
                     f"got {tuple(sequence_init.shape)}."
                 )
-            S[paratope_mask] = sequence_init.to(
-                device=S.device, dtype=torch.long
+
+        # Build the graph context.
+        #
+        # reference/PCS:
+        #     the global graph carries the current generated state Xt/St.
+        # PCS-RC:
+        #     the global graph carries the recurrent proposal context X_pep/S_pep,
+        #     while the shadow interface below carries the true generated Xt/St.
+        #
+        # This recovers the original AbFlow information channel, but avoids
+        # erasing the explicit generated state at every flow step.
+        use_recurrent_proposal_context = bool(
+            getattr(self, "abflow_recurrent_proposal_context", False)
+        )
+
+        if use_recurrent_proposal_context:
+            X, S = self.replace_pep(
+                X, S, paratope_mask, X_pep, S_pep,
+                replace_seq=True, replace_struct=True,
             )
+        else:
+            if has_interface_state:
+                X[paratope_mask] = interface_init.to(
+                    device=X.device, dtype=X.dtype
+                )
+            if has_sequence_state:
+                S[paratope_mask] = sequence_init.to(
+                    device=S.device, dtype=torch.long
+                )
+
 
         X = self.normalizer.centering(X, S, batch_id, self.aa_feature)
         X = self.normalizer.normalize(X)
@@ -1348,10 +1523,18 @@ class AbFlowModel(nn.Module):
             interface_X = self._raw_interface_to_model_frame(
                 interface_init, paratope_mask, batch_id
             )
-            interface_S = S[paratope_mask].clone()
+            if has_sequence_state:
+                interface_S = sequence_init.to(
+                    device=S.device, dtype=torch.long
+                ).clone()
+            else:
+                interface_S = S[paratope_mask].clone()
         else:
             interface_X, interface_S = self.init_interface(
                 X, S, paratope_mask, batch_id, init_noise
+            )
+            interface_X, interface_S = self._condition_initial_interface(
+                interface_X, interface_S, X_pep, S_pep
             )
 
         # Convert X_pep once to the internal frame. Its relation to the current
@@ -1403,15 +1586,31 @@ class AbFlowModel(nn.Module):
         condition_diag_rounds = [] if self.condition_diagnostics_enabled else None
 
         for round_idx in range(self.round):
-            (
-                coord_pep_condition,
-                coord_pep_condition_mask,
-            ) = self._build_coord_pep_condition_for_residues(
-                pep_X_model,
-                interface_X,
-                paratope_mask,
-                pep_coord_valid=pep_coord_valid,
+            # Role-separated local correction.  The recurrent proposal context
+            # is present in every round through X/S.  The proposal-relative
+            # adapters are optionally delayed so the first refinement round can
+            # establish H3 placement before local proposal correction is applied.
+            use_local_correction = (
+                round_idx >= int(getattr(self, "proposal_adapter_start_round", 0))
             )
+
+            if use_local_correction:
+                (
+                    coord_pep_condition,
+                    coord_pep_condition_mask,
+                ) = self._build_coord_pep_condition_for_residues(
+                    pep_X_model,
+                    interface_X,
+                    paratope_mask,
+                    pep_coord_valid=pep_coord_valid,
+                )
+                seq_pep_condition_this = seq_pep_condition
+                seq_pep_condition_mask_this = seq_pep_condition_mask
+            else:
+                coord_pep_condition = None
+                coord_pep_condition_mask = None
+                seq_pep_condition_this = None
+                seq_pep_condition_mask_this = None
 
             pred_S_logits, pred_X, interface_X, H, edge_dist = self.message_passing(
                 X, S, residue_pos, interface_X, surface, paratope_mask,
@@ -1419,8 +1618,8 @@ class AbFlowModel(nn.Module):
                 flow_t=flow_t,
                 coord_pep_condition=coord_pep_condition,
                 coord_pep_condition_mask=coord_pep_condition_mask,
-                seq_pep_condition=seq_pep_condition,
-                seq_pep_condition_mask=seq_pep_condition_mask,
+                seq_pep_condition=seq_pep_condition_this,
+                seq_pep_condition_mask=seq_pep_condition_mask_this,
             )
 
             if condition_diag_rounds is not None:
@@ -1507,10 +1706,17 @@ class AbFlowModel(nn.Module):
         state_path = bool(self.scorefm_state_path)
 
         if state_path:
-            # Sample X_0/S_0 from the reference initialization used at inference.
-            # Peptide-derived information never overwrites this generated state.
+            # Sample X_0/S_0 from the configured source distribution.
+            #
+            # reference:
+            #     antigen-centered random source.
+            # PCS/PCS-RC:
+            #     proposal-conditioned source using X_pep/S_pep when valid.
             interface_X, interface_S = self.init_interface(
                 X, S, paratope_mask, batch_id
+            )
+            interface_X, interface_S = self._condition_initial_interface(
+                interface_X, interface_S, X_pep, S_pep
             )
             source_ca_mean = self._reference_ca_mean(
                 X, S, paratope_mask, batch_id
@@ -1674,8 +1880,34 @@ class AbFlowModel(nn.Module):
                 "scorefm_state_path": torch.as_tensor(
                     1.0 if state_path else 0.0, device=X.device
                 ),
+                "source_mode_reference": torch.as_tensor(
+                    1.0 if getattr(self, "abflow_source_mode", "reference") == "reference" else 0.0,
+                    device=X.device
+                ),
+                "source_mode_pcs": torch.as_tensor(
+                    1.0 if getattr(self, "abflow_source_mode", "reference") == "pcs" else 0.0,
+                    device=X.device
+                ),
+                "source_mode_pcs_rc": torch.as_tensor(
+                    1.0 if getattr(self, "abflow_source_mode", "reference") == "pcs_rc" else 0.0,
+                    device=X.device
+                ),
+                "recurrent_proposal_context": torch.as_tensor(
+                    1.0 if getattr(self, "abflow_recurrent_proposal_context", False) else 0.0,
+                    device=X.device
+                ),
+                "coord_pep_source_weight": torch.as_tensor(
+                    float(getattr(self, "coord_pep_source_weight", 0.0)), device=X.device
+                ),
+                "seq_pep_source_weight": torch.as_tensor(
+                    float(getattr(self, "seq_pep_source_weight", 0.0)), device=X.device
+                ),
                 "coord_pep_as_condition": torch.as_tensor(
                     1.0 if getattr(self, "coord_pep_as_condition", False) else 0.0,
+                    device=X.device
+                ),
+                "proposal_adapter_start_round": torch.as_tensor(
+                    float(getattr(self, "proposal_adapter_start_round", 0)),
                     device=X.device
                 ),
                 "seq_input_mode_state": torch.as_tensor(
@@ -1828,6 +2060,9 @@ class AbFlowModel(nn.Module):
 
         interface_X, interface_S = self.init_interface(
             X, S, paratope_mask, batch_id, init_noise=init_noise
+        )
+        interface_X, interface_S = self._condition_initial_interface(
+            interface_X, interface_S, X_pep, S_pep
         )
         time_grid = self._sampling_time_grid(
             n_steps, device=X.device, dtype=X.dtype

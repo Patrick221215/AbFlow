@@ -8,18 +8,40 @@ GPU_ID=${3:-0}
 # ============================================================
 # AbFlow formal state-consistent train/test ablation launcher
 # ============================================================
-# Formal principles:
-#   1. X0/S0 come from the reference state.
-#   2. X_pep/S_pep are conditions only; they never overwrite X0/S0.
-#   3. No peptide-prior weights are used.
-#   4. No independent score head; no pair-time module.
-#   5. Formal training keeps observability by default:
-#        LOG_INTERVAL=1, SAVE_INTERVAL=1, CONDITION_DIAGNOSTICS=on.
-#   6. Train/valid DataLoader resources are separated.
-#   7. Resume policy is explicit and reproducible:
-#        default = keep resume_checkpoint from BASE_CONFIG;
-#        ABFLOW_RESUME_CKPT overrides BASE_CONFIG;
-#        ABFLOW_RESUME_POLICY=none clears resume.
+# Core experimental hierarchy:
+#
+#   REF:
+#       reference source, no peptide hidden condition.
+#
+#   REF_COND:
+#       reference source + peptide hidden condition.
+#
+#   PCS:
+#       proposal-conditioned source only. This tests whether using X_pep/S_pep
+#       as the declared source is enough.
+#
+#   PCS_RC:
+#       proposal-conditioned source + recurrent proposal context. This is the
+#       recommended strong base: X_pep/S_pep define the source and also build
+#       the recurrent global proposal context at every _forward call, while the
+#       explicit generated state Xt/St is never overwritten.
+#
+#   PCS_RC_COND:
+#       PCS_RC plus the zero-start hidden proposal adapters. This is diagnostic
+#       only, for testing whether adapter conditioning adds value beyond the
+#       recurrent proposal context.
+#
+#   CORE:
+#       reference source + analytic_core objective.
+#       Analytic score is currently valid only for reference source.
+#
+# Formal defaults:
+#   - full observability: LOG_INTERVAL=1, SAVE_INTERVAL=1
+#   - condition diagnostics on
+#   - train/valid DataLoader resources separated
+#   - resume behavior follows resume_checkpoint in BASE_CONFIG:
+#       ""       -> train from scratch
+#       nonempty -> resume from that checkpoint
 
 STATE_PATH=on
 PER_SAMPLE_T=on
@@ -31,58 +53,84 @@ MIN_SIGMA=${ABFLOW_SCOREFM_MIN_SIGMA:-0.01}
 DSM_T_MIN=${ABFLOW_SCOREFM_DSM_T_MIN:-0.2}
 DSM_T_MAX=${ABFLOW_SCOREFM_DSM_T_MAX:-0.8}
 
+SOURCE_MODE=reference
+RECURRENT_PROPOSAL_CONTEXT=off
+COORD_PEP_SOURCE_WEIGHT=${ABFLOW_COORD_PEP_SOURCE_WEIGHT:-1.0}
+SEQ_PEP_SOURCE_WEIGHT=${ABFLOW_SEQ_PEP_SOURCE_WEIGHT:-1.0}
 COORD_PEP_AS_CONDITION=off
 SEQ_INPUT_MODE=state
 SEQ_CE_WEIGHT=${ABFLOW_SEQ_CE_WEIGHT:-1.0}
 
-# Formal-training defaults. Override only when intentionally doing profiling
-# or resource debugging.
 AMP=${ABFLOW_AMP:-on}
 AMP_DTYPE=${ABFLOW_AMP_DTYPE:-bf16}
 ALLOW_TF32=${ABFLOW_ALLOW_TF32:-on}
+
 NUM_WORKERS=${ABFLOW_NUM_WORKERS:-8}
 PREFETCH_FACTOR=${ABFLOW_PREFETCH_FACTOR:-4}
 VALID_NUM_WORKERS=${ABFLOW_VALID_NUM_WORKERS:-2}
 VALID_PREFETCH_FACTOR=${ABFLOW_VALID_PREFETCH_FACTOR:-2}
 VALID_PERSISTENT_WORKERS=${ABFLOW_VALID_PERSISTENT_WORKERS:-off}
+
 LOG_INTERVAL=${ABFLOW_LOG_INTERVAL:-1}
 TQDM_MININTERVAL=${ABFLOW_TQDM_MININTERVAL:-5.0}
 SAVE_INTERVAL=${ABFLOW_SAVE_INTERVAL:-1}
 CONDITION_DIAGNOSTICS=${ABFLOW_CONDITION_DIAGNOSTICS:-on}
 
-# Resume policy:
-#   config: preserve resume_checkpoint in BASE_CONFIG unless ABFLOW_RESUME_CKPT is set.
-#   env:    require ABFLOW_RESUME_CKPT if resume is desired; config is ignored.
-#   none:   always train from scratch.
-RESUME_POLICY=${ABFLOW_RESUME_POLICY:-config}
-ALLOW_CROSS_EXP_RESUME=${ABFLOW_ALLOW_CROSS_EXP_RESUME:-off}
-
 case "$EXP_ID" in
   REF)
+    SOURCE_MODE=reference
     LOSS_MODE=endpoint
     COORD_PEP_AS_CONDITION=off
     SEQ_INPUT_MODE=state
     ;;
 
   REF_SEQ)
+    SOURCE_MODE=reference
     LOSS_MODE=endpoint
     COORD_PEP_AS_CONDITION=off
     SEQ_INPUT_MODE=pep_condition
     ;;
 
   REF_COORD)
+    SOURCE_MODE=reference
     LOSS_MODE=endpoint
     COORD_PEP_AS_CONDITION=on
     SEQ_INPUT_MODE=state
     ;;
 
   REF_COND)
+    SOURCE_MODE=reference
+    LOSS_MODE=endpoint
+    COORD_PEP_AS_CONDITION=on
+    SEQ_INPUT_MODE=pep_condition
+    ;;
+
+  PCS|CS)
+    SOURCE_MODE=pcs
+    RECURRENT_PROPOSAL_CONTEXT=off
+    LOSS_MODE=endpoint
+    COORD_PEP_AS_CONDITION=off
+    SEQ_INPUT_MODE=state
+    ;;
+
+  PCS_RC)
+    SOURCE_MODE=pcs_rc
+    RECURRENT_PROPOSAL_CONTEXT=on
+    LOSS_MODE=endpoint
+    COORD_PEP_AS_CONDITION=off
+    SEQ_INPUT_MODE=state
+    ;;
+
+  PCS_RC_COND|CS_COND)
+    SOURCE_MODE=pcs_rc
+    RECURRENT_PROPOSAL_CONTEXT=on
     LOSS_MODE=endpoint
     COORD_PEP_AS_CONDITION=on
     SEQ_INPUT_MODE=pep_condition
     ;;
 
   CORE)
+    SOURCE_MODE=reference
     LOSS_MODE=analytic_core
     COORD_PEP_AS_CONDITION=on
     SEQ_INPUT_MODE=pep_condition
@@ -90,12 +138,16 @@ case "$EXP_ID" in
 
   *)
     echo "Unknown EXP_ID: $EXP_ID"
-    echo "Supported EXP_ID: REF REF_SEQ REF_COORD REF_COND CORE"
+    echo "Supported EXP_ID: REF REF_SEQ REF_COORD REF_COND PCS PCS_RC PCS_RC_COND CORE"
     exit 2
     ;;
 esac
 
 run_with_env() {
+  ABFLOW_SOURCE_MODE="$SOURCE_MODE" \
+  ABFLOW_RECURRENT_PROPOSAL_CONTEXT="$RECURRENT_PROPOSAL_CONTEXT" \
+  ABFLOW_COORD_PEP_SOURCE_WEIGHT="$COORD_PEP_SOURCE_WEIGHT" \
+  ABFLOW_SEQ_PEP_SOURCE_WEIGHT="$SEQ_PEP_SOURCE_WEIGHT" \
   ABFLOW_SCOREFM_STATE_PATH="$STATE_PATH" \
   ABFLOW_SCOREFM_PER_SAMPLE_T="$PER_SAMPLE_T" \
   ABFLOW_SCOREFM_TIME_EMBED="$TIME_EMBED" \
@@ -120,8 +172,6 @@ run_with_env() {
   ABFLOW_LOG_INTERVAL="$LOG_INTERVAL" \
   ABFLOW_TQDM_MININTERVAL="$TQDM_MININTERVAL" \
   ABFLOW_SAVE_INTERVAL="$SAVE_INTERVAL" \
-  ABFLOW_RESUME_POLICY="$RESUME_POLICY" \
-  ABFLOW_ALLOW_CROSS_EXP_RESUME="$ALLOW_CROSS_EXP_RESUME" \
   GPU="$GPU_ID" \
   "$@"
 }
@@ -129,6 +179,10 @@ run_with_env() {
 print_settings() {
   echo "Experiment: $EXP_ID"
   echo "GPU: $GPU_ID"
+  echo "SOURCE_MODE=$SOURCE_MODE"
+  echo "RECURRENT_PROPOSAL_CONTEXT=$RECURRENT_PROPOSAL_CONTEXT"
+  echo "COORD_PEP_SOURCE_WEIGHT=$COORD_PEP_SOURCE_WEIGHT"
+  echo "SEQ_PEP_SOURCE_WEIGHT=$SEQ_PEP_SOURCE_WEIGHT"
   echo "STATE_PATH=$STATE_PATH"
   echo "PER_SAMPLE_T=$PER_SAMPLE_T"
   echo "TIME_EMBED=$TIME_EMBED"
@@ -153,9 +207,6 @@ print_settings() {
   echo "TQDM_MININTERVAL=$TQDM_MININTERVAL"
   echo "SAVE_INTERVAL=$SAVE_INTERVAL"
   echo "CONDITION_DIAGNOSTICS=$CONDITION_DIAGNOSTICS"
-  echo "RESUME_POLICY=$RESUME_POLICY"
-  echo "ALLOW_CROSS_EXP_RESUME=$ALLOW_CROSS_EXP_RESUME"
-  echo "ABFLOW_RESUME_CKPT=${ABFLOW_RESUME_CKPT:-}"
 }
 
 if [[ "$MODE" == "test" ]]; then
@@ -185,7 +236,7 @@ fi
 if [[ "$MODE" != "train" ]]; then
   echo "Train: bash $0 train <EXP_ID> <GPU_ID> <BASE_CONFIG>"
   echo "Test:  bash $0 test  <EXP_ID> <GPU_ID> <CKPT> <RESULT_DIR> [TEST_JSON]"
-  echo "Supported EXP_ID: REF REF_SEQ REF_COORD REF_COND CORE"
+  echo "Supported EXP_ID: REF REF_SEQ REF_COORD REF_COND PCS PCS_RC PCS_RC_COND CORE"
   exit 2
 fi
 
@@ -210,12 +261,9 @@ src, dst, save_dir, exp_id, runtime_meta = sys.argv[1:6]
 with open(src, "r", encoding="utf-8") as f:
     cfg = json.load(f)
 
-# ---------------------------------------------------------------------
 # train.sh converts every top-level JSON key into --<key>.
-# Therefore uppercase JSON keys such as VALID_NUM_WORKERS become
-# --VALID_NUM_WORKERS, but train.py only accepts --valid_num_workers.
-# Remove stale uppercase control keys before writing generated config.
-# ---------------------------------------------------------------------
+# Therefore uppercase keys such as VALID_NUM_WORKERS become
+# --VALID_NUM_WORKERS, which train.py does not accept.
 for key in list(cfg.keys()):
     if key.isupper():
         cfg.pop(key, None)
@@ -229,6 +277,10 @@ for key in [
     "LOG_INTERVAL",
     "SAVE_INTERVAL",
     "CONDITION_DIAGNOSTICS",
+    "SOURCE_MODE",
+    "RECURRENT_PROPOSAL_CONTEXT",
+    "COORD_PEP_SOURCE_WEIGHT",
+    "SEQ_PEP_SOURCE_WEIGHT",
 ]:
     cfg.pop(key, None)
 
@@ -245,27 +297,17 @@ def _env_int(name, default):
 def _env_float(name, default):
     return float(os.environ.get(name, str(default)))
 
-# -------------------------------------------------------------------------
-# Resume logic: single source of truth is the base config.
-# -------------------------------------------------------------------------
-# If single_cdr_design.json contains:
-#     "resume_checkpoint": ""
-# then training starts from scratch.
-#
-# If it contains:
-#     "resume_checkpoint": "/path/to/checkpoint"
-# then training resumes from that checkpoint.
-#
+# Resume logic:
+#   resume_checkpoint == ""       -> train from scratch
+#   resume_checkpoint == nonempty -> resume from that checkpoint
 # The launcher must not silently override this field.
 resume_ckpt = str(cfg.get("resume_checkpoint", "") or "").strip()
 cfg["resume_checkpoint"] = resume_ckpt
-
 if resume_ckpt and not os.path.isfile(resume_ckpt):
     raise FileNotFoundError(
         f"resume_checkpoint in base config does not exist: {resume_ckpt}"
     )
 
-# Canonical lowercase keys accepted by train.py argparse.
 cfg["num_workers"] = _env_int(
     "ABFLOW_NUM_WORKERS",
     cfg.get("num_workers", 8),
@@ -356,6 +398,10 @@ for key in list(cfg.keys()):
 
 runtime = {
     "experiment_id": exp_id,
+    "source_mode": os.environ.get("ABFLOW_SOURCE_MODE", ""),
+    "recurrent_proposal_context": os.environ.get("ABFLOW_RECURRENT_PROPOSAL_CONTEXT", ""),
+    "coord_pep_source_weight": os.environ.get("ABFLOW_COORD_PEP_SOURCE_WEIGHT", ""),
+    "seq_pep_source_weight": os.environ.get("ABFLOW_SEQ_PEP_SOURCE_WEIGHT", ""),
     "state_path": os.environ.get("ABFLOW_SCOREFM_STATE_PATH", ""),
     "per_sample_t": os.environ.get("ABFLOW_SCOREFM_PER_SAMPLE_T", ""),
     "time_embed": os.environ.get("ABFLOW_SCOREFM_TIME_EMBED", ""),
@@ -380,16 +426,15 @@ runtime = {
     "save_interval": os.environ.get("ABFLOW_SAVE_INTERVAL", str(cfg.get("save_interval", 1))),
     "condition_diagnostics": os.environ.get("ABFLOW_CONDITION_DIAGNOSTICS", "on"),
     "resume_checkpoint": resume_ckpt,
-    "clean_reference_state": "true",
+    "clean_reference_source": os.environ.get("ABFLOW_SOURCE_MODE", "") == "reference",
+    "proposal_conditioned_source": os.environ.get("ABFLOW_SOURCE_MODE", "") in {"pcs", "pcs_rc"},
+    "proposal_recurrent_context": os.environ.get("ABFLOW_RECURRENT_PROPOSAL_CONTEXT", "") == "on",
     "peptide_state_injection": "false",
     "peptide_prior_weighting": "false",
     "independent_score_head": "false",
     "pair_time_conditioning": "false",
     "coordinate_objective_stacking": "false",
-    "analytic_score_scope": "CA_translation_only",
     "true_path_endpoint": "1.0",
-    "condition_representation": "proposal_local_frame_radial_log1p_state_time_residual",
-    "direct_coordinate_condition_update": "false",
 }
 
 os.makedirs(os.path.dirname(runtime_meta), exist_ok=True)
