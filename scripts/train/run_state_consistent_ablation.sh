@@ -27,9 +27,17 @@ GPU_ID=${3:-0}
 #       explicit generated state Xt/St is never overwritten.
 #
 #   PCS_RC_COND:
-#       PCS_RC plus the zero-start hidden proposal adapters. This is diagnostic
-#       only, for testing whether adapter conditioning adds value beyond the
-#       recurrent proposal context.
+#       PCS_RC plus unrestricted proposal-relative adapters from round 0.
+#       This is the already-tested upper local-correction endpoint.
+#
+#   PCS_RC_LC_R1:
+#       PCS_RC plus delayed local correction from round 1.  Round 0 is reserved
+#       for H3 placement; later rounds use proposal-relative adapters for local
+#       structure/sequence correction.
+#
+#   PCS_RC_LC_R2:
+#       PCS_RC plus late local correction from round 2.  With iter_round=3 this
+#       means only the final refinement round uses proposal-relative adapters.
 #
 #   CORE:
 #       reference source + analytic_core objective.
@@ -60,6 +68,7 @@ SEQ_PEP_SOURCE_WEIGHT=${ABFLOW_SEQ_PEP_SOURCE_WEIGHT:-1.0}
 COORD_PEP_AS_CONDITION=off
 SEQ_INPUT_MODE=state
 SEQ_CE_WEIGHT=${ABFLOW_SEQ_CE_WEIGHT:-1.0}
+PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-0}
 
 AMP=${ABFLOW_AMP:-on}
 AMP_DTYPE=${ABFLOW_AMP_DTYPE:-bf16}
@@ -127,6 +136,25 @@ case "$EXP_ID" in
     LOSS_MODE=endpoint
     COORD_PEP_AS_CONDITION=on
     SEQ_INPUT_MODE=pep_condition
+    PROPOSAL_ADAPTER_START_ROUND=0
+    ;;
+
+  PCS_RC_LC|PCS_RC_LC_R1)
+    SOURCE_MODE=pcs_rc
+    RECURRENT_PROPOSAL_CONTEXT=on
+    LOSS_MODE=endpoint
+    COORD_PEP_AS_CONDITION=on
+    SEQ_INPUT_MODE=pep_condition
+    PROPOSAL_ADAPTER_START_ROUND=1
+    ;;
+
+  PCS_RC_LC_R2)
+    SOURCE_MODE=pcs_rc
+    RECURRENT_PROPOSAL_CONTEXT=on
+    LOSS_MODE=endpoint
+    COORD_PEP_AS_CONDITION=on
+    SEQ_INPUT_MODE=pep_condition
+    PROPOSAL_ADAPTER_START_ROUND=2
     ;;
 
   CORE)
@@ -138,7 +166,7 @@ case "$EXP_ID" in
 
   *)
     echo "Unknown EXP_ID: $EXP_ID"
-    echo "Supported EXP_ID: REF REF_SEQ REF_COORD REF_COND PCS PCS_RC PCS_RC_COND CORE"
+    echo "Supported EXP_ID: REF REF_SEQ REF_COORD REF_COND PCS PCS_RC PCS_RC_COND PCS_RC_LC_R1 PCS_RC_LC_R2 CORE"
     exit 2
     ;;
 esac
@@ -160,6 +188,7 @@ run_with_env() {
   ABFLOW_COORD_PEP_AS_CONDITION="$COORD_PEP_AS_CONDITION" \
   ABFLOW_SEQ_INPUT_MODE="$SEQ_INPUT_MODE" \
   ABFLOW_SEQ_CE_WEIGHT="$SEQ_CE_WEIGHT" \
+  ABFLOW_PROPOSAL_ADAPTER_START_ROUND="$PROPOSAL_ADAPTER_START_ROUND" \
   ABFLOW_CONDITION_DIAGNOSTICS="$CONDITION_DIAGNOSTICS" \
   ABFLOW_AMP="$AMP" \
   ABFLOW_AMP_DTYPE="$AMP_DTYPE" \
@@ -195,6 +224,7 @@ print_settings() {
   echo "COORD_PEP_AS_CONDITION=$COORD_PEP_AS_CONDITION"
   echo "SEQ_INPUT_MODE=$SEQ_INPUT_MODE"
   echo "SEQ_CE_WEIGHT=$SEQ_CE_WEIGHT"
+  echo "PROPOSAL_ADAPTER_START_ROUND=$PROPOSAL_ADAPTER_START_ROUND"
   echo "AMP=$AMP"
   echo "AMP_DTYPE=$AMP_DTYPE"
   echo "ALLOW_TF32=$ALLOW_TF32"
@@ -236,7 +266,7 @@ fi
 if [[ "$MODE" != "train" ]]; then
   echo "Train: bash $0 train <EXP_ID> <GPU_ID> <BASE_CONFIG>"
   echo "Test:  bash $0 test  <EXP_ID> <GPU_ID> <CKPT> <RESULT_DIR> [TEST_JSON]"
-  echo "Supported EXP_ID: REF REF_SEQ REF_COORD REF_COND PCS PCS_RC PCS_RC_COND CORE"
+  echo "Supported EXP_ID: REF REF_SEQ REF_COORD REF_COND PCS PCS_RC PCS_RC_COND PCS_RC_LC_R1 PCS_RC_LC_R2 CORE"
   exit 2
 fi
 
@@ -281,6 +311,7 @@ for key in [
     "RECURRENT_PROPOSAL_CONTEXT",
     "COORD_PEP_SOURCE_WEIGHT",
     "SEQ_PEP_SOURCE_WEIGHT",
+    "PROPOSAL_ADAPTER_START_ROUND",
 ]:
     cfg.pop(key, None)
 
@@ -414,6 +445,7 @@ runtime = {
     "coord_pep_as_condition": os.environ.get("ABFLOW_COORD_PEP_AS_CONDITION", ""),
     "seq_input_mode": os.environ.get("ABFLOW_SEQ_INPUT_MODE", ""),
     "seq_ce_weight": os.environ.get("ABFLOW_SEQ_CE_WEIGHT", ""),
+    "proposal_adapter_start_round": os.environ.get("ABFLOW_PROPOSAL_ADAPTER_START_ROUND", ""),
     "amp": os.environ.get("ABFLOW_AMP", "on"),
     "amp_dtype": os.environ.get("ABFLOW_AMP_DTYPE", "bf16"),
     "allow_tf32": os.environ.get("ABFLOW_ALLOW_TF32", "on"),
