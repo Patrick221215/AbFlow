@@ -201,9 +201,33 @@ class AbFlowModel(nn.Module):
         #   endpoint:
         #       Unique per-complex clean-endpoint SmoothL1 at every t.
         #   analytic_core:
-        #       Use analytic CA-score DSM only inside a bounded time interval;
-        #       use endpoint reconstruction outside that interval. This avoids
-        #       both low-t score degeneracy and late-time score singularity.
+        #       Old reference-source analytic score diagnostic. It is retained
+        #       only for historical ablation because PCS-RC uses a proposal-
+        #       conditioned source rather than an antigen-centered Gaussian.
+        #   velocity_core:
+        #       Deprecated deterministic bridge-velocity replacement. It is
+        #       retained only for backwards compatibility with v32 logs.
+        #   si_score:
+        #       PCS_RC_LC_R1 endpoint baseline plus a stochastic-interpolant
+        #       analytic score regularizer. No independent score head is added.
+        #   si_score_fm:
+        #       si_score plus stochastic-interpolant velocity consistency.
+        #       Retained for historical diagnostics.
+        #   traj_consistency:
+        #       PCS_RC_LC_R1 endpoint baseline plus trajectory endpoint
+        #       consistency between two neighboring states along the model-
+        #       induced flow. No independent score/velocity head is added.
+        #   traj_consistency_fm:
+        #       traj_consistency plus an induced velocity-field consistency
+        #       term. This is retained as a full two-query diagnostic.
+        #   score_aware_traj_lite:
+        #       One-forward score-aware trajectory/tangent regularization.
+        #       The training state is perturbed off the clean bridge by a known
+        #       noise direction, so the induced endpoint velocity must contain
+        #       an explicit score-like correction back toward the clean path.
+        #   score_aware_traj_fm_lite:
+        #       score_aware_traj_lite plus a small projected correction-magnitude
+        #       consistency term.  No independent score or velocity head is added.
         self.scorefm_loss_mode = _env_str(
             "ABFLOW_SCOREFM_LOSS_MODE", "endpoint"
         ).lower()
@@ -211,11 +235,109 @@ class AbFlowModel(nn.Module):
             self.scorefm_loss_mode = "endpoint"
         if self.scorefm_loss_mode in {"core", "dtm_core", "hybrid"}:
             self.scorefm_loss_mode = "analytic_core"
-        if self.scorefm_loss_mode not in {"endpoint", "analytic_core"}:
+        if self.scorefm_loss_mode in {
+            "velocity_core", "flow_velocity", "fm_velocity",
+            "pcs_velocity", "pcs_velocity_core",
+        }:
+            self.scorefm_loss_mode = "velocity_core"
+        if self.scorefm_loss_mode in {
+            "si_score", "stochastic_score", "score_interpolant",
+            "stochastic_interpolant_score",
+        }:
+            self.scorefm_loss_mode = "si_score"
+        if self.scorefm_loss_mode in {
+            "si_score_fm", "stochastic_score_fm", "score_fm",
+            "stochastic_interpolant", "stochastic_interpolant_fm",
+        }:
+            self.scorefm_loss_mode = "si_score_fm"
+        if self.scorefm_loss_mode in {
+            "traj_consistency", "trajectory_consistency", "tc",
+            "traj", "r1_traj",
+        }:
+            self.scorefm_loss_mode = "traj_consistency"
+        if self.scorefm_loss_mode in {
+            "traj_consistency_fm", "trajectory_consistency_fm",
+            "tc_fm", "traj_fm", "r1_traj_fm",
+        }:
+            self.scorefm_loss_mode = "traj_consistency_fm"
+        if self.scorefm_loss_mode in {
+            "score_aware_traj_lite", "satc_lite",
+            "score_aware_trajectory_lite", "r1_satc_lite",
+        }:
+            self.scorefm_loss_mode = "score_aware_traj_lite"
+        if self.scorefm_loss_mode in {
+            "score_aware_traj_fm_lite", "satc_fm_lite",
+            "score_aware_trajectory_fm_lite", "r1_satc_fm_lite",
+        }:
+            self.scorefm_loss_mode = "score_aware_traj_fm_lite"
+        if self.scorefm_loss_mode not in {
+            "endpoint", "analytic_core", "velocity_core",
+            "si_score", "si_score_fm",
+            "traj_consistency", "traj_consistency_fm",
+            "score_aware_traj_lite", "score_aware_traj_fm_lite",
+        }:
             raise ValueError(
                 "Unknown ABFLOW_SCOREFM_LOSS_MODE="
-                f"{self.scorefm_loss_mode}. Choose from endpoint, analytic_core."
+                f"{self.scorefm_loss_mode}. Choose from endpoint, "
+                "analytic_core, velocity_core, si_score, si_score_fm, "
+                "traj_consistency, traj_consistency_fm, "
+                "score_aware_traj_lite, score_aware_traj_fm_lite."
             )
+
+        # Stochastic-interpolant controls.  These regularizers keep the strong
+        # PCS_RC_LC_R1 endpoint objective as the primary target and add a small
+        # analytic score / velocity consistency term on noisy intermediate
+        # states.  The score is induced by the endpoint head; no extra score
+        # head or velocity head is introduced.
+        self.si_gamma_scale = _env_float("ABFLOW_SI_GAMMA_SCALE", 0.25)
+        if not (0.0 < self.si_gamma_scale <= 1.0):
+            raise ValueError("ABFLOW_SI_GAMMA_SCALE must be in (0, 1].")
+        self.si_score_weight = _env_float("ABFLOW_SI_SCORE_WEIGHT", 0.002)
+        self.si_velocity_weight = _env_float("ABFLOW_SI_VELOCITY_WEIGHT", 0.01)
+        if self.si_score_weight < 0.0 or self.si_velocity_weight < 0.0:
+            raise ValueError("ABFLOW_SI_*_WEIGHT must be non-negative.")
+
+        # Trajectory-consistency controls.
+        # These terms do not introduce a new score head or velocity head.
+        # The model is evaluated at Xt and at a neighboring model-induced
+        # state Xt+dt, and the induced endpoint / velocity field is required
+        # to be locally self-consistent.  Endpoint reconstruction remains the
+        # main supervised objective.
+        self.traj_consistency_weight = _env_float(
+            "ABFLOW_TRAJ_CONSISTENCY_WEIGHT", 0.05
+        )
+        self.traj_velocity_weight = _env_float(
+            "ABFLOW_TRAJ_VELOCITY_WEIGHT", 0.0
+        )
+        self.traj_delta_t = _env_float("ABFLOW_TRAJ_DELTA_T", 0.15)
+        self.traj_t_min = _env_float("ABFLOW_TRAJ_T_MIN", 0.05)
+        self.traj_t_max = _env_float("ABFLOW_TRAJ_T_MAX", 0.80)
+        if self.traj_consistency_weight < 0.0 or self.traj_velocity_weight < 0.0:
+            raise ValueError("ABFLOW_TRAJ_*_WEIGHT must be non-negative.")
+        if not (0.0 < self.traj_delta_t < 1.0):
+            raise ValueError("ABFLOW_TRAJ_DELTA_T must be in (0, 1).")
+        if not (0.0 <= self.traj_t_min < self.traj_t_max <= 1.0):
+            raise ValueError("Require 0 <= ABFLOW_TRAJ_T_MIN < ABFLOW_TRAJ_T_MAX <= 1.")
+
+        # Lightweight score-aware trajectory controls.  Unlike full trajectory
+        # consistency, these modes do not call _forward a second time.  They
+        # perturb the current bridge state off the clean trajectory and then
+        # require the endpoint-induced velocity to contain a correction component
+        # aligned with the known analytic score direction (-epsilon).
+        self.satc_apply_prob = _env_float("ABFLOW_SATC_APPLY_PROB", 0.50)
+        self.satc_gamma_scale = _env_float("ABFLOW_SATC_GAMMA_SCALE", 0.08)
+        self.satc_score_weight = _env_float("ABFLOW_SATC_SCORE_WEIGHT", 0.02)
+        self.satc_velocity_weight = _env_float("ABFLOW_SATC_VELOCITY_WEIGHT", 0.003)
+        self.satc_t_min = _env_float("ABFLOW_SATC_T_MIN", 0.10)
+        self.satc_t_max = _env_float("ABFLOW_SATC_T_MAX", 0.80)
+        if not (0.0 <= self.satc_apply_prob <= 1.0):
+            raise ValueError("ABFLOW_SATC_APPLY_PROB must be in [0, 1].")
+        if not (0.0 < self.satc_gamma_scale <= 1.0):
+            raise ValueError("ABFLOW_SATC_GAMMA_SCALE must be in (0, 1].")
+        if self.satc_score_weight < 0.0 or self.satc_velocity_weight < 0.0:
+            raise ValueError("ABFLOW_SATC_*_WEIGHT must be non-negative.")
+        if not (0.0 <= self.satc_t_min < self.satc_t_max <= 1.0):
+            raise ValueError("Require 0 <= ABFLOW_SATC_T_MIN < ABFLOW_SATC_T_MAX <= 1.")
 
         self.scorefm_dsm_t_min = _env_float(
             "ABFLOW_SCOREFM_DSM_T_MIN", 0.2
@@ -614,10 +736,21 @@ class AbFlowModel(nn.Module):
                 perm = torch.randperm(n, device=device)
                 t = base[perm]
 
+        elif mode in {'mid_t', 'mid'}:
+            # Central bridge interval. This avoids both the source endpoint
+            # and the near-target singular regime. It is useful for diagnosing
+            # whether dynamic supervision should act over the middle trajectory.
+            t = 0.2 + 0.6 * torch.rand(n, device=device, dtype=dtype)
+
+        elif mode in {'late_t', 'late'}:
+            # Late but non-singular bridge interval. It tests whether dynamic
+            # correction should act after H3 placement has largely formed.
+            t = 0.55 + 0.35 * torch.rand(n, device=device, dtype=dtype)
+
         else:
             raise ValueError(
                 f"Unknown ABFLOW_SCOREFM_T_SAMPLING={mode}. "
-                "Choose from uniform, low_t, stratified."
+                "Choose from uniform, low_t, stratified, mid_t, late_t."
             )
 
         return t.clamp(min=0.0, max=1.0)
@@ -1348,17 +1481,22 @@ class AbFlowModel(nn.Module):
 
     def _coordinate_training_objective(
             self, *, Xt, X1, pred_clean_X, atom_mask,
-            interface_batch_id, t, sigma_t, source_ca_mean):
-        """Single non-redundant coordinate objective.
+            interface_batch_id, t, sigma_t, source_ca_mean,
+            source_X0=None, si_gamma_t=None, si_gamma_prime_t=None,
+            sat_eps_t=None, sat_gamma_t=None, sat_active_t=None):
+        """Coordinate objective for the shadow paratope.
 
         endpoint mode:
             Per-complex endpoint SmoothL1 for every sample.
 
+        si_score / si_score_fm modes:
+            Keep endpoint reconstruction as the main target and add small
+            stochastic-interpolant analytic score / velocity regularizers.
+            These terms are induced by the endpoint prediction and the known
+            injected noise, so no independent score or velocity head is added.
+
         analytic_core mode:
-            Use analytic CA-score DSM only in the bounded interval
-            [dsm_t_min, dsm_t_max]. Outside this interval use the endpoint
-            objective. The switch is per complex and the two objectives are
-            never added together for the same sample.
+            Historical reference-source score diagnostic.
         """
         endpoint_per_graph, endpoint_valid = (
             self._masked_residue_smooth_l1_per_graph(
@@ -1375,14 +1513,325 @@ class AbFlowModel(nn.Module):
 
         zero = endpoint_loss.detach() * 0.0
 
-        if self.scorefm_loss_mode == "endpoint":
+        if self.scorefm_loss_mode in {
+            "endpoint", "traj_consistency", "traj_consistency_fm"
+        }:
             details = {
                 "scorefm_total": endpoint_loss.detach(),
                 "scorefm_endpoint": endpoint_loss.detach(),
                 "scorefm_dsm": zero,
                 "scorefm_dsm_rate": zero,
+                "scorefm_velocity": zero,
+                "scorefm_velocity_rate": zero,
+                "scorefm_traj_consistency": zero,
+                "scorefm_traj_velocity": zero,
+                "scorefm_traj_rate": zero,
             }
             return endpoint_loss, details
+
+        if self.scorefm_loss_mode in {
+            "score_aware_traj_lite", "score_aware_traj_fm_lite"
+        }:
+            if (
+                source_X0 is None or sat_eps_t is None
+                or sat_gamma_t is None or sat_active_t is None
+            ):
+                details = {
+                    "scorefm_total": endpoint_loss.detach(),
+                    "scorefm_endpoint": endpoint_loss.detach(),
+                    "scorefm_dsm": zero,
+                    "scorefm_dsm_rate": zero,
+                    "scorefm_velocity": zero,
+                    "scorefm_velocity_rate": zero,
+                    "scorefm_traj_consistency": zero,
+                    "scorefm_traj_velocity": zero,
+                    "scorefm_traj_rate": zero,
+                    "scorefm_satc_score": zero,
+                    "scorefm_satc_velocity": zero,
+                    "scorefm_satc_rate": zero,
+                }
+                return endpoint_loss, details
+
+            sigma_safe = torch.as_tensor(
+                sigma_t, device=pred_clean_X.device, dtype=pred_clean_X.dtype
+            ).clamp_min(self.scorefm_min_sigma)
+            gamma = torch.as_tensor(
+                sat_gamma_t, device=pred_clean_X.device, dtype=pred_clean_X.dtype
+            ).clamp_min(self.scorefm_eps)
+            eps = torch.as_tensor(
+                sat_eps_t, device=pred_clean_X.device, dtype=pred_clean_X.dtype
+            )
+            active_res = torch.as_tensor(
+                sat_active_t, device=pred_clean_X.device
+            ).reshape(-1).bool()
+
+            # Endpoint-induced velocity at the off-path state Z_t.
+            # Clean bridge velocity is X1 - X0.  The remaining component should
+            # point back along the analytic score direction -epsilon because
+            # Z_t = X_t^clean + gamma(t) epsilon.
+            pred_velocity = (pred_clean_X - Xt) / sigma_safe
+            clean_velocity = X1 - source_X0
+            correction_pred = pred_velocity - clean_velocity
+            correction_true = -(gamma / sigma_safe) * eps
+
+            valid_atom = atom_mask.bool() & active_res[:, None]
+            valid_res = valid_atom.any(dim=-1)
+
+            score_loss = zero
+            velocity_loss = zero
+            satc_rate = active_res.float().mean() if active_res.numel() > 0 else zero
+
+            if bool(valid_res.any()):
+                cp = correction_pred[valid_res]
+                ct = correction_true[valid_res].detach()
+                vm = valid_atom[valid_res]
+
+                dot = (cp * ct).sum(dim=-1)
+                cp_norm = cp.pow(2).sum(dim=-1).sqrt()
+                ct_norm = ct.pow(2).sum(dim=-1).sqrt()
+                cos = dot / (cp_norm * ct_norm + self.scorefm_eps)
+                score_atom_loss = (1.0 - cos.clamp(-1.0, 1.0)).masked_fill(~vm, 0.0)
+                score_res_loss = score_atom_loss.sum(dim=-1) / vm.float().sum(dim=-1).clamp_min(1.0)
+
+                graph_ids = interface_batch_id[valid_res]
+                n_graph = int(interface_batch_id.max().item()) + 1
+                per_graph = scatter_mean(score_res_loss, graph_ids, dim=0, dim_size=n_graph)
+                score_loss = per_graph.mean()
+
+                if self.scorefm_loss_mode == "score_aware_traj_fm_lite":
+                    # Project the learned correction onto the analytic score
+                    # direction and softly match the target correction magnitude.
+                    # This is a one-forward velocity-field constraint, not a
+                    # second endpoint target and not an independent velocity head.
+                    direction = ct / (ct_norm.unsqueeze(-1) + self.scorefm_eps)
+                    proj = (cp * direction).sum(dim=-1)
+                    target_mag = ct_norm.detach()
+                    vel_atom_loss = F.smooth_l1_loss(
+                        proj, target_mag, reduction="none"
+                    ).masked_fill(~vm, 0.0)
+                    vel_res_loss = vel_atom_loss.sum(dim=-1) / vm.float().sum(dim=-1).clamp_min(1.0)
+                    per_graph_v = scatter_mean(vel_res_loss, graph_ids, dim=0, dim_size=n_graph)
+                    velocity_loss = per_graph_v.mean()
+
+            total = (
+                endpoint_loss
+                + float(self.satc_score_weight) * score_loss
+                + float(self.satc_velocity_weight) * velocity_loss
+            )
+            details = {
+                "scorefm_total": total.detach(),
+                "scorefm_endpoint": endpoint_loss.detach(),
+                "scorefm_dsm": zero,
+                "scorefm_dsm_rate": zero,
+                "scorefm_velocity": zero,
+                "scorefm_velocity_rate": zero,
+                "scorefm_traj_consistency": zero,
+                "scorefm_traj_velocity": zero,
+                "scorefm_traj_rate": zero,
+                "scorefm_satc_score": score_loss.detach(),
+                "scorefm_satc_velocity": velocity_loss.detach(),
+                "scorefm_satc_rate": satc_rate.detach(),
+            }
+            return total, details
+
+        if self.scorefm_loss_mode in {"si_score", "si_score_fm"}:
+            if source_X0 is None or si_gamma_t is None or si_gamma_prime_t is None:
+                raise ValueError(
+                    "si_score/si_score_fm require source_X0, si_gamma_t and "
+                    "si_gamma_prime_t. These are created only in state_path mode."
+                )
+
+            t_tensor = torch.as_tensor(
+                t, device=pred_clean_X.device, dtype=pred_clean_X.dtype
+            )
+            if t_tensor.dim() == 0 or t_tensor.numel() == 1:
+                t_int = t_tensor.reshape(1, 1, 1)
+            else:
+                t_int = t_tensor.reshape(-1, 1, 1)
+
+            gamma = torch.as_tensor(
+                si_gamma_t, device=pred_clean_X.device, dtype=pred_clean_X.dtype
+            ).clamp_min(self.scorefm_min_sigma)
+            gamma_prime = torch.as_tensor(
+                si_gamma_prime_t, device=pred_clean_X.device, dtype=pred_clean_X.dtype
+            )
+
+            # True and predicted means of the noisy stochastic interpolant:
+            #   Z_t = (1-t) X0 + t X1 + gamma(t) eps.
+            # The model still predicts X1; the score/velocity regularizers are
+            # analytically induced by this endpoint prediction.
+            mu_true = (1.0 - t_int) * source_X0 + t_int * X1
+            mu_pred = (1.0 - t_int) * source_X0 + t_int * pred_clean_X
+
+            # Analytic Gaussian score: s(z_t) = -(z_t - mu_t) / gamma(t)^2.
+            # We compare gamma * score residual, following the AbX-style
+            # scaled-score convention.  This keeps the target analytic while
+            # avoiding an independent score head.
+            pred_score = -(Xt - mu_pred) / (gamma ** 2)
+            true_score = -(Xt - mu_true) / (gamma ** 2)
+            scaled_score_diff = gamma * (pred_score - true_score)
+            score_zero = torch.zeros_like(scaled_score_diff)
+            score_per_graph, score_valid = (
+                self._masked_residue_smooth_l1_per_graph(
+                    scaled_score_diff, score_zero, atom_mask, interface_batch_id
+                )
+            )
+            if score_valid.any():
+                si_score_loss = score_per_graph[score_valid].mean()
+            else:
+                si_score_loss = pred_clean_X.new_tensor(0.0)
+
+            si_velocity_loss = pred_clean_X.new_tensor(0.0)
+            velocity_per_graph = endpoint_per_graph.new_zeros(endpoint_per_graph.shape)
+            velocity_valid = endpoint_valid.clone()
+
+            if self.scorefm_loss_mode == "si_score_fm":
+                # Stochastic-interpolant velocity consistency.
+                # True velocity:      X1 - X0 + gamma'(t) eps.
+                # Predicted velocity: X1_pred - X0 + gamma'(t) eps_pred.
+                # eps_pred is induced by the endpoint-predicted mean, not by
+                # an extra head.
+                eps_true = (Xt - mu_true) / gamma
+                eps_pred = (Xt - mu_pred) / gamma
+                true_velocity = X1 - source_X0 + gamma_prime * eps_true
+                pred_velocity = pred_clean_X - source_X0 + gamma_prime * eps_pred
+                velocity_per_graph, velocity_valid = (
+                    self._masked_residue_smooth_l1_per_graph(
+                        pred_velocity, true_velocity, atom_mask, interface_batch_id
+                    )
+                )
+                if velocity_valid.any():
+                    si_velocity_loss = velocity_per_graph[velocity_valid].mean()
+
+            t_graph, t_valid = self._scorefm_time_per_graph(
+                t, interface_batch_id, pred_clean_X
+            )
+            valid = endpoint_valid & score_valid & t_valid
+            if self.scorefm_loss_mode == "si_score_fm":
+                valid = valid & velocity_valid
+
+            if not valid.any():
+                details = {
+                    "scorefm_total": endpoint_loss.detach(),
+                    "scorefm_endpoint": endpoint_loss.detach(),
+                    "scorefm_dsm": si_score_loss.detach(),
+                    "scorefm_dsm_rate": zero,
+                    "scorefm_velocity": si_velocity_loss.detach(),
+                    "scorefm_velocity_rate": zero,
+                    "scorefm_si_score": si_score_loss.detach(),
+                    "scorefm_si_velocity": si_velocity_loss.detach(),
+                }
+                return endpoint_loss, details
+
+            use_si = (
+                (t_graph >= self.scorefm_dsm_t_min)
+                & (t_graph <= self.scorefm_dsm_t_max)
+            )
+
+            total_per_graph = endpoint_per_graph.clone()
+            total_per_graph = total_per_graph + torch.where(
+                use_si,
+                float(self.si_score_weight) * score_per_graph,
+                torch.zeros_like(score_per_graph),
+            )
+            if self.scorefm_loss_mode == "si_score_fm":
+                total_per_graph = total_per_graph + torch.where(
+                    use_si,
+                    float(self.si_velocity_weight) * velocity_per_graph,
+                    torch.zeros_like(velocity_per_graph),
+                )
+
+            total = total_per_graph[valid].mean()
+            details = {
+                "scorefm_total": total.detach(),
+                "scorefm_endpoint": endpoint_loss.detach(),
+                "scorefm_dsm": si_score_loss.detach(),
+                "scorefm_dsm_rate": use_si[valid].float().mean().detach(),
+                "scorefm_velocity": si_velocity_loss.detach(),
+                "scorefm_velocity_rate": (
+                    use_si[valid].float().mean().detach()
+                    if self.scorefm_loss_mode == "si_score_fm" else zero
+                ),
+                "scorefm_si_score": si_score_loss.detach(),
+                "scorefm_si_velocity": si_velocity_loss.detach(),
+            }
+            return total, details
+
+        if self.scorefm_loss_mode == "velocity_core":
+            # PCS-consistent deterministic bridge Flow Matching.
+            #
+            # For PCS-RC-LC, X0 is a proposal-conditioned source rather than a
+            # reference Gaussian. Therefore the mathematically consistent
+            # dynamic target is the exact deterministic bridge velocity:
+            #
+            #     Xt = (1 - t) X0 + t X1,
+            #     u*_t = (X1 - Xt) / (1 - t).
+            #
+            # The model predicts a clean endpoint X1^theta; its induced
+            # velocity is
+            #
+            #     u^theta_t = (X1^theta - Xt) / (1 - t).
+            #
+            # Inside the configured time interval we replace endpoint
+            # reconstruction by bridge-velocity supervision. Outside that
+            # interval we keep endpoint reconstruction. This avoids stacking
+            # redundant losses while testing whether dynamic trajectory
+            # supervision improves the strong PCS_RC_LC_R1 baseline.
+            sigma_safe = torch.as_tensor(
+                sigma_t, device=pred_clean_X.device, dtype=pred_clean_X.dtype
+            ).clamp_min(self.scorefm_min_sigma)
+
+            pred_velocity = (pred_clean_X - Xt) / sigma_safe
+            true_velocity = (X1 - Xt) / sigma_safe
+
+            velocity_per_graph, velocity_valid = (
+                self._masked_residue_smooth_l1_per_graph(
+                    pred_velocity, true_velocity, atom_mask, interface_batch_id
+                )
+            )
+
+            if velocity_valid.any():
+                velocity_loss = velocity_per_graph[velocity_valid].mean()
+            else:
+                velocity_loss = pred_clean_X.new_tensor(0.0)
+
+            t_graph, t_valid = self._scorefm_time_per_graph(
+                t, interface_batch_id, pred_clean_X
+            )
+            valid = endpoint_valid & velocity_valid & t_valid
+
+            if not valid.any():
+                details = {
+                    "scorefm_total": endpoint_loss.detach(),
+                    "scorefm_endpoint": endpoint_loss.detach(),
+                    "scorefm_dsm": zero,
+                    "scorefm_dsm_rate": zero,
+                    "scorefm_velocity": velocity_loss.detach(),
+                    "scorefm_velocity_rate": zero,
+                }
+                return endpoint_loss, details
+
+            use_velocity = (
+                (t_graph >= self.scorefm_dsm_t_min)
+                & (t_graph <= self.scorefm_dsm_t_max)
+            )
+
+            per_graph = torch.where(
+                use_velocity,
+                velocity_per_graph,
+                endpoint_per_graph,
+            )
+            total = per_graph[valid].mean()
+
+            details = {
+                "scorefm_total": total.detach(),
+                "scorefm_endpoint": endpoint_loss.detach(),
+                "scorefm_dsm": zero,
+                "scorefm_dsm_rate": zero,
+                "scorefm_velocity": velocity_loss.detach(),
+                "scorefm_velocity_rate": use_velocity[valid].float().mean().detach(),
+            }
+            return total, details
 
         gt_score_ca = self._analytic_ca_score_from_clean(
             Xt, X1, t, sigma_t, source_ca_mean
@@ -1677,6 +2126,153 @@ class AbFlowModel(nn.Module):
         self.normalizer.clear_cache()
         return H, S, r_pred_S_logits, pred_X, r_interface_X, r_edge_dist, prmsd
 
+
+    def _trajectory_consistency_objective(
+            self, *, X, S, cmask, smask, paratope_mask, X_pep, S_pep,
+            surface, residue_pos, template, lengths,
+            Xt, pred_clean_X, interface_atom_mask, interface_batch_id,
+            t_graph, sequence_state_for_model):
+        """Local trajectory consistency for endpoint-parameterized Flow Matching.
+
+        This objective is designed for PCS_RC_LC_R1 after the endpoint baseline
+        is already strong.  It does not compare an induced score to a target
+        score, and it does not add an independent prediction head.
+
+        Given the current generated state Xt at time t and the model-predicted
+        endpoint X1_hat(t), we form a short model-induced Euler step:
+
+            v_t^theta = (X1_hat(t) - Xt) / (1 - t)
+            X_{t+dt}^theta = Xt + dt * stopgrad(v_t^theta)
+
+        We then call the same network again at (X_{t+dt}^theta, t+dt) and ask
+        its predicted endpoint to stay consistent with stopgrad(X1_hat(t)).
+        This directly constrains the local self-consistency of the learned
+        trajectory.  The FM variant additionally asks the induced velocity at
+        the neighboring state to match the previous velocity.
+        """
+        zero = pred_clean_X.new_tensor(0.0)
+        if self.scorefm_loss_mode not in {
+            "traj_consistency", "traj_consistency_fm"
+        }:
+            return zero, {
+                "scorefm_traj_consistency": zero.detach(),
+                "scorefm_traj_velocity": zero.detach(),
+                "scorefm_traj_rate": zero.detach(),
+            }
+
+        if Xt is None or pred_clean_X is None or t_graph is None:
+            return zero, {
+                "scorefm_traj_consistency": zero.detach(),
+                "scorefm_traj_velocity": zero.detach(),
+                "scorefm_traj_rate": zero.detach(),
+            }
+
+        if interface_batch_id.numel() == 0:
+            return zero, {
+                "scorefm_traj_consistency": zero.detach(),
+                "scorefm_traj_velocity": zero.detach(),
+                "scorefm_traj_rate": zero.detach(),
+            }
+
+        device = pred_clean_X.device
+        dtype = pred_clean_X.dtype
+        n_graph = int(interface_batch_id.max().item()) + 1
+        t_graph = torch.as_tensor(t_graph, device=device, dtype=dtype)
+        if t_graph.dim() == 0 or t_graph.numel() == 1:
+            t_graph = t_graph.reshape(1).expand(n_graph)
+        else:
+            t_graph = t_graph.reshape(-1)
+            if t_graph.numel() != n_graph:
+                raise ValueError(
+                    "trajectory consistency expects graph-level t_graph with "
+                    f"{n_graph} values, got {t_graph.numel()}."
+                )
+
+        # Only apply the consistency term on a safe interval.  This prevents
+        # near-source states from being dominated by an unreliable early
+        # prediction and prevents near-target states from suffering the
+        # 1/(1-t) singularity of endpoint-parameterized velocity.
+        max_dt = (1.0 - t_graph - self.scorefm_min_sigma).clamp_min(0.0)
+        dt_graph = torch.minimum(
+            torch.full_like(t_graph, float(self.traj_delta_t)),
+            max_dt,
+        )
+        active_graph = (
+            (t_graph >= float(self.traj_t_min))
+            & (t_graph <= float(self.traj_t_max))
+            & (dt_graph > self.scorefm_eps)
+        )
+
+        if not bool(active_graph.any()):
+            return zero, {
+                "scorefm_traj_consistency": zero.detach(),
+                "scorefm_traj_velocity": zero.detach(),
+                "scorefm_traj_rate": zero.detach(),
+            }
+
+        t_int = self._time_for_interface(t_graph, interface_batch_id, pred_clean_X)
+        dt_int = self._time_for_interface(dt_graph, interface_batch_id, pred_clean_X)
+        t_next_graph = (t_graph + dt_graph).clamp(max=1.0 - self.scorefm_min_sigma)
+        t_next_int = self._time_for_interface(t_next_graph, interface_batch_id, pred_clean_X)
+
+        sigma_int = (1.0 - t_int).clamp_min(self.scorefm_min_sigma)
+        sigma_next_int = (1.0 - t_next_int).clamp_min(self.scorefm_min_sigma)
+
+        # The step is intentionally detached.  The first prediction is already
+        # trained by the endpoint loss; the trajectory term trains the same
+        # network to be consistent when it is queried at the next state.  This
+        # avoids high-memory second-order coupling and reduces collapse risk.
+        with torch.no_grad():
+            velocity_t = (pred_clean_X - Xt) / sigma_int
+            x_next = Xt + dt_int * velocity_t
+            endpoint_target = pred_clean_X.detach()
+            velocity_target = velocity_t.detach()
+
+        _, _, _, _, r_interface_X_next, _, _ = self._forward(
+            X, S, cmask, smask, paratope_mask, X_pep, S_pep,
+            surface, residue_pos, template, lengths,
+            interface_init=x_next,
+            sequence_init=sequence_state_for_model,
+            flow_t=t_next_graph,
+        )
+        pred_next = r_interface_X_next[-1]
+
+        endpoint_per_graph, endpoint_valid = (
+            self._masked_residue_smooth_l1_per_graph(
+                pred_next, endpoint_target, interface_atom_mask, interface_batch_id
+            )
+        )
+
+        active = active_graph & endpoint_valid
+        if active.any():
+            endpoint_consistency = endpoint_per_graph[active].mean()
+        else:
+            endpoint_consistency = zero
+
+        velocity_consistency = zero
+        if self.scorefm_loss_mode == "traj_consistency_fm":
+            velocity_next = (pred_next - x_next) / sigma_next_int
+            velocity_per_graph, velocity_valid = (
+                self._masked_residue_smooth_l1_per_graph(
+                    velocity_next, velocity_target,
+                    interface_atom_mask, interface_batch_id
+                )
+            )
+            active_v = active_graph & velocity_valid
+            if active_v.any():
+                velocity_consistency = velocity_per_graph[active_v].mean()
+
+        total = (
+            float(self.traj_consistency_weight) * endpoint_consistency
+            + float(self.traj_velocity_weight) * velocity_consistency
+        )
+        traj_rate = active_graph.float().mean()
+        return total, {
+            "scorefm_traj_consistency": endpoint_consistency.detach(),
+            "scorefm_traj_velocity": velocity_consistency.detach(),
+            "scorefm_traj_rate": traj_rate.detach(),
+        }
+
     def forward(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths, xloss_mask, context_ratio=0):
         '''
         :param X: [N, n_channel, 3], Cartesian coordinates
@@ -1737,7 +2333,59 @@ class AbFlowModel(nn.Module):
             base_weight_int = self._time_for_interface(base_weight_graph, interface_batch_id, interface_X)
             sigma_score_int = self._time_for_interface(sigma_score_graph, interface_batch_id, interface_X)
 
-            Xt = base_weight_int * interface_X + t_int * gt_interface_X
+            mu_t = base_weight_int * interface_X + t_int * gt_interface_X
+
+            si_gamma_int = None
+            si_gamma_prime_int = None
+            sat_eps_int = None
+            sat_gamma_int = None
+            sat_active_int = None
+            if self.scorefm_loss_mode in {"si_score", "si_score_fm"}:
+                # Training-only stochastic interpolant around the PCS source-to-
+                # native bridge.  This creates an analytic score target without
+                # adding an independent score head:
+                #   Z_t = mu_t + gamma(t) * eps,
+                #   gamma(t) = gamma_scale * t * (1 - t).
+                gamma_graph = (
+                    float(self.si_gamma_scale)
+                    * t_graph
+                    * (1.0 - t_graph)
+                ).clamp_min(self.scorefm_min_sigma)
+                gamma_prime_graph = float(self.si_gamma_scale) * (1.0 - 2.0 * t_graph)
+                si_gamma_int = self._time_for_interface(
+                    gamma_graph, interface_batch_id, interface_X
+                )
+                si_gamma_prime_int = self._time_for_interface(
+                    gamma_prime_graph, interface_batch_id, interface_X
+                )
+                Xt = mu_t + si_gamma_int * torch.randn_like(mu_t)
+            elif self.scorefm_loss_mode in {
+                "score_aware_traj_lite", "score_aware_traj_fm_lite"
+            }:
+                # One-forward score-aware off-path training.  We perturb only
+                # the model input state, keep X1 as the endpoint target, and
+                # use the known perturbation direction to regularize the
+                # endpoint-induced correction velocity.  This avoids a second
+                # _forward call while still exposing score-defined off-path
+                # states to the R1 flow.
+                gamma_graph = (
+                    float(self.satc_gamma_scale)
+                    * t_graph
+                    * (1.0 - t_graph)
+                ).clamp_min(self.scorefm_eps)
+                active_graph = (
+                    (torch.rand_like(t_graph) < float(self.satc_apply_prob))
+                    & (t_graph >= float(self.satc_t_min))
+                    & (t_graph <= float(self.satc_t_max))
+                )
+                sat_gamma_int = self._time_for_interface(
+                    gamma_graph, interface_batch_id, interface_X
+                )
+                sat_active_int = active_graph[interface_batch_id].reshape(-1, 1, 1)
+                sat_eps_int = torch.randn_like(mu_t)
+                Xt = mu_t + sat_active_int.to(mu_t.dtype) * sat_gamma_int * sat_eps_int
+            else:
+                Xt = mu_t
 
             if not self.struct_only:
                 St = self._sample_categorical_path(
@@ -1756,6 +2404,11 @@ class AbFlowModel(nn.Module):
             St = None
             t_int = None
             sigma_score_int = None
+            si_gamma_int = None
+            si_gamma_prime_int = None
+            sat_eps_int = None
+            sat_gamma_int = None
+            sat_active_int = None
             t_graph = X.new_zeros(1)
             sequence_state_for_model = None
             source_ca_mean = None
@@ -1808,6 +2461,12 @@ class AbFlowModel(nn.Module):
                     t=t_int,
                     sigma_t=sigma_score_int,
                     source_ca_mean=source_ca_mean,
+                    source_X0=interface_X,
+                    si_gamma_t=si_gamma_int,
+                    si_gamma_prime_t=si_gamma_prime_int,
+                    sat_eps_t=sat_eps_int,
+                    sat_gamma_t=sat_gamma_int,
+                    sat_active_t=sat_active_int,
                 )
             )
         else:
@@ -1832,7 +2491,35 @@ class AbFlowModel(nn.Module):
                 "scorefm_endpoint": interface_loss.detach(),
                 "scorefm_dsm": zero,
                 "scorefm_dsm_rate": zero,
+                "scorefm_velocity": zero,
+                "scorefm_velocity_rate": zero,
             }
+
+        if state_path and self.scorefm_loss_mode in {
+            "traj_consistency", "traj_consistency_fm"
+        }:
+            traj_loss, traj_details = self._trajectory_consistency_objective(
+                X=X,
+                S=S,
+                cmask=cmask,
+                smask=smask,
+                paratope_mask=paratope_mask,
+                X_pep=X_pep,
+                S_pep=S_pep,
+                surface=surface,
+                residue_pos=residue_pos,
+                template=template,
+                lengths=lengths,
+                Xt=Xt,
+                pred_clean_X=r_interface_X[-1],
+                interface_atom_mask=interface_atom_mask,
+                interface_batch_id=interface_batch_id,
+                t_graph=t_graph,
+                sequence_state_for_model=sequence_state_for_model,
+            )
+            interface_loss = interface_loss + traj_loss
+            scorefm_details.update(traj_details)
+            scorefm_details["scorefm_total"] = interface_loss.detach()
 
         self.last_scorefm_losses = scorefm_details
 
@@ -1877,6 +2564,84 @@ class AbFlowModel(nn.Module):
 
             diag = {
                 "seq_ce_weight": torch.as_tensor(self.seq_ce_weight, device=X.device),
+                "scorefm_loss_mode_endpoint": torch.as_tensor(
+                    1.0 if self.scorefm_loss_mode == "endpoint" else 0.0,
+                    device=X.device,
+                ),
+                "scorefm_loss_mode_velocity_core": torch.as_tensor(
+                    1.0 if self.scorefm_loss_mode == "velocity_core" else 0.0,
+                    device=X.device,
+                ),
+                "scorefm_loss_mode_analytic_core": torch.as_tensor(
+                    1.0 if self.scorefm_loss_mode == "analytic_core" else 0.0,
+                    device=X.device,
+                ),
+                "scorefm_loss_mode_si_score": torch.as_tensor(
+                    1.0 if self.scorefm_loss_mode == "si_score" else 0.0,
+                    device=X.device,
+                ),
+                "scorefm_loss_mode_si_score_fm": torch.as_tensor(
+                    1.0 if self.scorefm_loss_mode == "si_score_fm" else 0.0,
+                    device=X.device,
+                ),
+                "scorefm_loss_mode_traj_consistency": torch.as_tensor(
+                    1.0 if self.scorefm_loss_mode == "traj_consistency" else 0.0,
+                    device=X.device,
+                ),
+                "scorefm_loss_mode_traj_consistency_fm": torch.as_tensor(
+                    1.0 if self.scorefm_loss_mode == "traj_consistency_fm" else 0.0,
+                    device=X.device,
+                ),
+                "scorefm_loss_mode_score_aware_traj_lite": torch.as_tensor(
+                    1.0 if self.scorefm_loss_mode == "score_aware_traj_lite" else 0.0,
+                    device=X.device,
+                ),
+                "scorefm_loss_mode_score_aware_traj_fm_lite": torch.as_tensor(
+                    1.0 if self.scorefm_loss_mode == "score_aware_traj_fm_lite" else 0.0,
+                    device=X.device,
+                ),
+                "si_gamma_scale": torch.as_tensor(
+                    float(getattr(self, "si_gamma_scale", 0.0)), device=X.device
+                ),
+                "si_score_weight": torch.as_tensor(
+                    float(getattr(self, "si_score_weight", 0.0)), device=X.device
+                ),
+                "si_velocity_weight": torch.as_tensor(
+                    float(getattr(self, "si_velocity_weight", 0.0)), device=X.device
+                ),
+                "traj_consistency_weight": torch.as_tensor(
+                    float(getattr(self, "traj_consistency_weight", 0.0)), device=X.device
+                ),
+                "traj_velocity_weight": torch.as_tensor(
+                    float(getattr(self, "traj_velocity_weight", 0.0)), device=X.device
+                ),
+                "traj_delta_t": torch.as_tensor(
+                    float(getattr(self, "traj_delta_t", 0.0)), device=X.device
+                ),
+                "traj_t_min": torch.as_tensor(
+                    float(getattr(self, "traj_t_min", 0.0)), device=X.device
+                ),
+                "traj_t_max": torch.as_tensor(
+                    float(getattr(self, "traj_t_max", 0.0)), device=X.device
+                ),
+                "satc_apply_prob": torch.as_tensor(
+                    float(getattr(self, "satc_apply_prob", 0.0)), device=X.device
+                ),
+                "satc_gamma_scale": torch.as_tensor(
+                    float(getattr(self, "satc_gamma_scale", 0.0)), device=X.device
+                ),
+                "satc_score_weight": torch.as_tensor(
+                    float(getattr(self, "satc_score_weight", 0.0)), device=X.device
+                ),
+                "satc_velocity_weight": torch.as_tensor(
+                    float(getattr(self, "satc_velocity_weight", 0.0)), device=X.device
+                ),
+                "satc_t_min": torch.as_tensor(
+                    float(getattr(self, "satc_t_min", 0.0)), device=X.device
+                ),
+                "satc_t_max": torch.as_tensor(
+                    float(getattr(self, "satc_t_max", 0.0)), device=X.device
+                ),
                 "scorefm_state_path": torch.as_tensor(
                     1.0 if state_path else 0.0, device=X.device
                 ),
