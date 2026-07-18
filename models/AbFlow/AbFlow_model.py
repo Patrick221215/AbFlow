@@ -385,6 +385,38 @@ class AbFlowModel(nn.Module):
         if self.satc_interface_temperature <= 0.0:
             raise ValueError("ABFLOW_SATC_INTERFACE_TEMPERATURE must be positive.")
 
+        # SATC schedule controls.  Current experiments show that the strongest
+        # mechanism is SATC_MAIN (score-aware correction direction), whereas the
+        # FM/velocity-magnitude component can help AAR/CAAR but becomes harmful
+        # if kept at full strength late in training.  We therefore decouple the
+        # late-stage schedules for off-path perturbation, score-direction loss
+        # and velocity-magnitude loss.
+        self.satc_schedule = _env_str("ABFLOW_SATC_SCHEDULE", "constant").lower()
+        if self.satc_schedule in {"none", "off"}:
+            self.satc_schedule = "constant"
+        if self.satc_schedule not in {"constant", "linear_decay", "cosine_decay"}:
+            raise ValueError(
+                "ABFLOW_SATC_SCHEDULE must be constant, linear_decay or cosine_decay."
+            )
+        self.satc_steps_per_epoch = max(1, _env_int("ABFLOW_SATC_STEPS_PER_EPOCH", 52))
+        self.satc_decay_start_epoch = _env_float("ABFLOW_SATC_DECAY_START_EPOCH", 100.0)
+        self.satc_decay_end_epoch = _env_float("ABFLOW_SATC_DECAY_END_EPOCH", 130.0)
+        self.satc_perturb_final_scale = _env_float("ABFLOW_SATC_PERTURB_FINAL_SCALE", 1.0)
+        self.satc_score_final_scale = _env_float("ABFLOW_SATC_SCORE_FINAL_SCALE", 1.0)
+        self.satc_velocity_final_scale = _env_float("ABFLOW_SATC_VELOCITY_FINAL_SCALE", 1.0)
+        if self.satc_decay_end_epoch <= self.satc_decay_start_epoch:
+            raise ValueError("ABFLOW_SATC_DECAY_END_EPOCH must be > ABFLOW_SATC_DECAY_START_EPOCH.")
+        for _name, _value in {
+            "ABFLOW_SATC_PERTURB_FINAL_SCALE": self.satc_perturb_final_scale,
+            "ABFLOW_SATC_SCORE_FINAL_SCALE": self.satc_score_final_scale,
+            "ABFLOW_SATC_VELOCITY_FINAL_SCALE": self.satc_velocity_final_scale,
+        }.items():
+            if not (0.0 <= float(_value) <= 1.0):
+                raise ValueError(f"{_name} must be in [0, 1].")
+        self.register_buffer(
+            "satc_train_step", torch.zeros((), dtype=torch.long), persistent=True
+        )
+
         self.scorefm_dsm_t_min = _env_float(
             "ABFLOW_SCOREFM_DSM_T_MIN", 0.2
         )
@@ -1612,12 +1644,62 @@ class AbFlowModel(nn.Module):
 
         return weights.clamp_min(0.25)
 
+    def _satc_schedule_phase(self):
+        """Return the current SATC schedule phase in [0, 1]."""
+        if getattr(self, "satc_schedule", "constant") == "constant":
+            return 1.0
+        step = float(getattr(self, "satc_train_step", torch.zeros(())).detach().cpu().item())
+        epoch = step / float(max(1, getattr(self, "satc_steps_per_epoch", 1)))
+        start = float(getattr(self, "satc_decay_start_epoch", 100.0))
+        end = float(getattr(self, "satc_decay_end_epoch", 130.0))
+        if epoch <= start:
+            return 1.0
+        if epoch >= end:
+            return 0.0
+        progress = (epoch - start) / max(end - start, self.scorefm_eps)
+        progress = min(1.0, max(0.0, progress))
+        if getattr(self, "satc_schedule", "constant") == "linear_decay":
+            return 1.0 - progress
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    def _satc_effective_runtime(self, increment_step=False):
+        """Effective one-forward SATC coefficients for this forward pass.
+
+        The best configuration keeps score-aware direction alignment as the
+        primary signal.  The hybrid configuration uses velocity magnitude only
+        as a transient weak auxiliary signal and decays it much faster late in
+        training.
+        """
+        if bool(increment_step) and bool(self.training):
+            with torch.no_grad():
+                self.satc_train_step.add_(1)
+        phase = self._satc_schedule_phase()
+
+        def interp(final_scale):
+            final_scale = float(final_scale)
+            return final_scale + (1.0 - final_scale) * phase
+
+        perturb_scale = interp(getattr(self, "satc_perturb_final_scale", 1.0))
+        score_scale = interp(getattr(self, "satc_score_final_scale", 1.0))
+        velocity_scale = interp(getattr(self, "satc_velocity_final_scale", 1.0))
+        return {
+            "phase": phase,
+            "apply_prob": float(self.satc_apply_prob) * perturb_scale,
+            "gamma_scale": float(self.satc_gamma_scale) * perturb_scale,
+            "score_weight": float(self.satc_score_weight) * score_scale,
+            "velocity_weight": float(self.satc_velocity_weight) * velocity_scale,
+            "perturb_scale": perturb_scale,
+            "score_scale": score_scale,
+            "velocity_scale": velocity_scale,
+        }
+
     def _coordinate_training_objective(
             self, *, Xt, X1, pred_clean_X, atom_mask,
             interface_batch_id, t, sigma_t, source_ca_mean,
             source_X0=None, si_gamma_t=None, si_gamma_prime_t=None,
             sat_eps_t=None, sat_gamma_t=None, sat_active_t=None,
-            satc_residue_weight=None):
+            satc_residue_weight=None, satc_score_weight_eff=None,
+            satc_velocity_weight_eff=None, satc_schedule_info=None):
         """Coordinate objective for the shadow paratope.
 
         endpoint mode:
@@ -1774,10 +1856,18 @@ class AbFlowModel(nn.Module):
                         per_graph_v = scatter_mean(vel_res_loss, graph_ids, dim=0, dim_size=n_graph)
                         velocity_loss = per_graph_v.mean()
 
+            score_weight_eff = (
+                float(self.satc_score_weight)
+                if satc_score_weight_eff is None else float(satc_score_weight_eff)
+            )
+            velocity_weight_eff = (
+                float(self.satc_velocity_weight)
+                if satc_velocity_weight_eff is None else float(satc_velocity_weight_eff)
+            )
             total = (
                 endpoint_loss
-                + float(self.satc_score_weight) * score_loss
-                + float(self.satc_velocity_weight) * velocity_loss
+                + score_weight_eff * score_loss
+                + velocity_weight_eff * velocity_loss
             )
             details = {
                 "scorefm_total": total.detach(),
@@ -1792,6 +1882,11 @@ class AbFlowModel(nn.Module):
                 "scorefm_satc_score": score_loss.detach(),
                 "scorefm_satc_velocity": velocity_loss.detach(),
                 "scorefm_satc_rate": satc_rate.detach(),
+                "scorefm_satc_score_weight_eff": pred_clean_X.new_tensor(score_weight_eff),
+                "scorefm_satc_velocity_weight_eff": pred_clean_X.new_tensor(velocity_weight_eff),
+                "scorefm_satc_schedule_phase": pred_clean_X.new_tensor(
+                    1.0 if satc_schedule_info is None else float(satc_schedule_info.get("phase", 1.0))
+                ),
             }
             return total, details
 
@@ -2501,6 +2596,7 @@ class AbFlowModel(nn.Module):
             sat_eps_int = None
             sat_gamma_int = None
             sat_active_int = None
+            satc_runtime = None
             if self.scorefm_loss_mode in {"si_score", "si_score_fm"}:
                 # Training-only stochastic interpolant around the PCS source-to-
                 # native bridge.  This creates an analytic score target without
@@ -2530,13 +2626,14 @@ class AbFlowModel(nn.Module):
                 # endpoint-induced correction velocity.  This avoids a second
                 # _forward call while still exposing score-defined off-path
                 # states to the R1 flow.
+                satc_runtime = self._satc_effective_runtime(increment_step=True)
                 gamma_graph = (
-                    float(self.satc_gamma_scale)
+                    float(satc_runtime["gamma_scale"])
                     * t_graph
                     * (1.0 - t_graph)
                 ).clamp_min(self.scorefm_eps)
                 active_graph = (
-                    (torch.rand_like(t_graph) < float(self.satc_apply_prob))
+                    (torch.rand_like(t_graph) < float(satc_runtime["apply_prob"]))
                     & (t_graph >= float(self.satc_t_min))
                     & (t_graph <= float(self.satc_t_max))
                 )
@@ -2638,6 +2735,13 @@ class AbFlowModel(nn.Module):
                     sat_gamma_t=sat_gamma_int,
                     sat_active_t=sat_active_int,
                     satc_residue_weight=satc_residue_weight,
+                    satc_score_weight_eff=(
+                        None if satc_runtime is None else satc_runtime["score_weight"]
+                    ),
+                    satc_velocity_weight_eff=(
+                        None if satc_runtime is None else satc_runtime["velocity_weight"]
+                    ),
+                    satc_schedule_info=satc_runtime,
                 )
             )
         else:
