@@ -228,6 +228,14 @@ class AbFlowModel(nn.Module):
         #   score_aware_traj_fm_lite:
         #       score_aware_traj_lite plus a small projected correction-magnitude
         #       consistency term.  No independent score or velocity head is added.
+        #   score_aware_traj_if_lite:
+        #       Interface-weighted SATC.  The same one-forward off-path score
+        #       correction is retained, but the regularizer is weighted toward
+        #       native paratope residues close to antigen, directly targeting
+        #       DockQ/CAAR without an extra forward or a new prediction head.
+        #   score_aware_traj_if_fm_lite:
+        #       Interface-weighted SATC plus a very soft projected velocity
+        #       magnitude term for controlled flow-field ablation.
         self.scorefm_loss_mode = _env_str(
             "ABFLOW_SCOREFM_LOSS_MODE", "endpoint"
         ).lower()
@@ -270,18 +278,32 @@ class AbFlowModel(nn.Module):
             "score_aware_trajectory_fm_lite", "r1_satc_fm_lite",
         }:
             self.scorefm_loss_mode = "score_aware_traj_fm_lite"
+        if self.scorefm_loss_mode in {
+            "score_aware_traj_if_lite", "satc_if_lite",
+            "satc_if_main", "interface_satc",
+            "score_aware_interface_traj_lite",
+        }:
+            self.scorefm_loss_mode = "score_aware_traj_if_lite"
+        if self.scorefm_loss_mode in {
+            "score_aware_traj_if_fm_lite", "satc_if_fm_lite",
+            "satc_if_fm_soft", "interface_satc_fm",
+            "score_aware_interface_traj_fm_lite",
+        }:
+            self.scorefm_loss_mode = "score_aware_traj_if_fm_lite"
         if self.scorefm_loss_mode not in {
             "endpoint", "analytic_core", "velocity_core",
             "si_score", "si_score_fm",
             "traj_consistency", "traj_consistency_fm",
             "score_aware_traj_lite", "score_aware_traj_fm_lite",
+            "score_aware_traj_if_lite", "score_aware_traj_if_fm_lite",
         }:
             raise ValueError(
                 "Unknown ABFLOW_SCOREFM_LOSS_MODE="
                 f"{self.scorefm_loss_mode}. Choose from endpoint, "
                 "analytic_core, velocity_core, si_score, si_score_fm, "
                 "traj_consistency, traj_consistency_fm, "
-                "score_aware_traj_lite, score_aware_traj_fm_lite."
+                "score_aware_traj_lite, score_aware_traj_fm_lite, "
+                "score_aware_traj_if_lite, score_aware_traj_if_fm_lite."
             )
 
         # Stochastic-interpolant controls.  These regularizers keep the strong
@@ -338,6 +360,30 @@ class AbFlowModel(nn.Module):
             raise ValueError("ABFLOW_SATC_*_WEIGHT must be non-negative.")
         if not (0.0 <= self.satc_t_min < self.satc_t_max <= 1.0):
             raise ValueError("Require 0 <= ABFLOW_SATC_T_MIN < ABFLOW_SATC_T_MAX <= 1.")
+
+        # Interface-weighted SATC controls.  These do not change the endpoint
+        # objective and do not add a second forward pass.  They only reweight the
+        # score-aware correction regularizer toward paratope residues that are
+        # close to antigen in the native complex, so the added signal is targeted
+        # at DockQ/CAAR rather than spread uniformly over all CDR residues.
+        self.satc_interface_weight_alpha = _env_float(
+            "ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA", 1.0
+        )
+        self.satc_interface_cutoff = _env_float(
+            "ABFLOW_SATC_INTERFACE_CUTOFF", 8.0
+        )
+        self.satc_interface_temperature = _env_float(
+            "ABFLOW_SATC_INTERFACE_TEMPERATURE", 1.0
+        )
+        self.satc_interface_normalize = _env_flag(
+            "ABFLOW_SATC_INTERFACE_NORMALIZE", True
+        )
+        if self.satc_interface_weight_alpha < 0.0:
+            raise ValueError("ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA must be non-negative.")
+        if self.satc_interface_cutoff <= 0.0:
+            raise ValueError("ABFLOW_SATC_INTERFACE_CUTOFF must be positive.")
+        if self.satc_interface_temperature <= 0.0:
+            raise ValueError("ABFLOW_SATC_INTERFACE_TEMPERATURE must be positive.")
 
         self.scorefm_dsm_t_min = _env_float(
             "ABFLOW_SCOREFM_DSM_T_MIN", 0.2
@@ -1479,11 +1525,99 @@ class AbFlowModel(nn.Module):
 
         return t_graph.clamp(0.0, 1.0), valid_graph
 
+    @torch.no_grad()
+    def _satc_interface_residue_weights(self, X, paratope_mask):
+        """Native-interface weights for SATC regularization.
+
+        The returned vector has one value per paratope residue in the same order
+        as X[paratope_mask].  A residue receives a larger weight when its native
+        CA atom is close to any antigen residue in the local antibody-antigen
+        graph.  The weights are normalized to graph mean one by default, so this
+        focuses the SATC signal spatially without changing the total regularizer
+        scale across complexes.
+        """
+        n_int = int(paratope_mask.sum().item())
+        if n_int == 0:
+            return X.new_zeros(0)
+        if float(getattr(self, "satc_interface_weight_alpha", 0.0)) <= 0.0:
+            return X.new_ones(n_int)
+
+        local_mask = self.batch_constants.get('local_mask', None)
+        local_is_ab = self.batch_constants.get('local_is_ab', None)
+        local_inter_edges = self.batch_constants.get('local_inter_edges', None)
+        interface_batch_id = self.batch_constants.get('interface_batch_id', None)
+        if (
+            local_mask is None or local_is_ab is None
+            or local_inter_edges is None or interface_batch_id is None
+            or local_inter_edges.numel() == 0
+        ):
+            return X.new_ones(n_int)
+
+        local_X = X[local_mask]
+        ca_idx = 1 if local_X.shape[1] > 1 else 0
+        ca = local_X[:, ca_idx]
+        row, col = local_inter_edges[0], local_inter_edges[1]
+        row_is_ab = local_is_ab[row]
+        col_is_ab = local_is_ab[col]
+        valid_cross = torch.logical_xor(row_is_ab, col_is_ab)
+        if not bool(valid_cross.any()):
+            return X.new_ones(n_int)
+
+        row = row[valid_cross]
+        col = col[valid_cross]
+        row_is_ab = row_is_ab[valid_cross]
+        ab_local = torch.where(row_is_ab, row, col)
+        ag_local = torch.where(row_is_ab, col, row)
+
+        ab_local_order = torch.nonzero(local_is_ab, as_tuple=False).reshape(-1)
+        if ab_local_order.numel() != n_int:
+            return X.new_ones(n_int)
+        local_to_int = torch.full(
+            (local_is_ab.numel(),), -1,
+            device=X.device, dtype=torch.long,
+        )
+        local_to_int[ab_local_order] = torch.arange(n_int, device=X.device)
+        ab_int = local_to_int[ab_local]
+        valid_ab = ab_int >= 0
+        if not bool(valid_ab.any()):
+            return X.new_ones(n_int)
+
+        ab_int = ab_int[valid_ab]
+        ab_local = ab_local[valid_ab]
+        ag_local = ag_local[valid_ab]
+        dist = torch.linalg.norm(ca[ab_local] - ca[ag_local], dim=-1)
+        cutoff = float(self.satc_interface_cutoff)
+        temperature = float(self.satc_interface_temperature)
+        edge_contact = torch.sigmoid((cutoff - dist) / temperature).to(X.dtype)
+
+        contact_strength = X.new_zeros(n_int)
+        # Compatibility note:
+        #   torch.Tensor.scatter_reduce_ is unavailable in the PyTorch version used
+        #   by the current AbFlow environment.  We keep the same "amax over antigen
+        #   neighbors" semantics with a small per-interface loop.  n_int is the
+        #   number of antibody interface residues, so this is negligible compared
+        #   with the model forward and does not change the SATC objective.
+        for ridx in range(n_int):
+            ridx_mask = (ab_int == ridx)
+            if bool(ridx_mask.any()):
+                contact_strength[ridx] = edge_contact[ridx_mask].max()
+        weights = 1.0 + float(self.satc_interface_weight_alpha) * contact_strength
+
+        if bool(getattr(self, "satc_interface_normalize", True)):
+            n_graph = int(interface_batch_id.max().item()) + 1 if interface_batch_id.numel() > 0 else 1
+            mean_w = scatter_mean(
+                weights, interface_batch_id, dim=0, dim_size=n_graph
+            )
+            weights = weights / mean_w[interface_batch_id].clamp_min(self.scorefm_eps)
+
+        return weights.clamp_min(0.25)
+
     def _coordinate_training_objective(
             self, *, Xt, X1, pred_clean_X, atom_mask,
             interface_batch_id, t, sigma_t, source_ca_mean,
             source_X0=None, si_gamma_t=None, si_gamma_prime_t=None,
-            sat_eps_t=None, sat_gamma_t=None, sat_active_t=None):
+            sat_eps_t=None, sat_gamma_t=None, sat_active_t=None,
+            satc_residue_weight=None):
         """Coordinate objective for the shadow paratope.
 
         endpoint mode:
@@ -1530,7 +1664,8 @@ class AbFlowModel(nn.Module):
             return endpoint_loss, details
 
         if self.scorefm_loss_mode in {
-            "score_aware_traj_lite", "score_aware_traj_fm_lite"
+            "score_aware_traj_lite", "score_aware_traj_fm_lite",
+            "score_aware_traj_if_lite", "score_aware_traj_if_fm_lite"
         }:
             if (
                 source_X0 is None or sat_eps_t is None
@@ -1595,10 +1730,28 @@ class AbFlowModel(nn.Module):
 
                 graph_ids = interface_batch_id[valid_res]
                 n_graph = int(interface_batch_id.max().item()) + 1
-                per_graph = scatter_mean(score_res_loss, graph_ids, dim=0, dim_size=n_graph)
-                score_loss = per_graph.mean()
+                if satc_residue_weight is not None and self.scorefm_loss_mode in {
+                    "score_aware_traj_if_lite", "score_aware_traj_if_fm_lite"
+                }:
+                    res_w_full = torch.as_tensor(
+                        satc_residue_weight, device=pred_clean_X.device,
+                        dtype=pred_clean_X.dtype,
+                    ).reshape(-1)
+                    res_w = res_w_full[valid_res].clamp_min(self.scorefm_eps)
+                    score_num = pred_clean_X.new_zeros(n_graph)
+                    score_den = pred_clean_X.new_zeros(n_graph)
+                    score_num.scatter_add_(0, graph_ids, score_res_loss * res_w)
+                    score_den.scatter_add_(0, graph_ids, res_w)
+                    per_graph = score_num / score_den.clamp_min(self.scorefm_eps)
+                    score_loss = per_graph[score_den > self.scorefm_eps].mean()
+                else:
+                    res_w = None
+                    per_graph = scatter_mean(score_res_loss, graph_ids, dim=0, dim_size=n_graph)
+                    score_loss = per_graph.mean()
 
-                if self.scorefm_loss_mode == "score_aware_traj_fm_lite":
+                if self.scorefm_loss_mode in {
+                    "score_aware_traj_fm_lite", "score_aware_traj_if_fm_lite"
+                }:
                     # Project the learned correction onto the analytic score
                     # direction and softly match the target correction magnitude.
                     # This is a one-forward velocity-field constraint, not a
@@ -1610,8 +1763,16 @@ class AbFlowModel(nn.Module):
                         proj, target_mag, reduction="none"
                     ).masked_fill(~vm, 0.0)
                     vel_res_loss = vel_atom_loss.sum(dim=-1) / vm.float().sum(dim=-1).clamp_min(1.0)
-                    per_graph_v = scatter_mean(vel_res_loss, graph_ids, dim=0, dim_size=n_graph)
-                    velocity_loss = per_graph_v.mean()
+                    if res_w is not None:
+                        vel_num = pred_clean_X.new_zeros(n_graph)
+                        vel_den = pred_clean_X.new_zeros(n_graph)
+                        vel_num.scatter_add_(0, graph_ids, vel_res_loss * res_w)
+                        vel_den.scatter_add_(0, graph_ids, res_w)
+                        per_graph_v = vel_num / vel_den.clamp_min(self.scorefm_eps)
+                        velocity_loss = per_graph_v[vel_den > self.scorefm_eps].mean()
+                    else:
+                        per_graph_v = scatter_mean(vel_res_loss, graph_ids, dim=0, dim_size=n_graph)
+                        velocity_loss = per_graph_v.mean()
 
             total = (
                 endpoint_loss
@@ -2360,7 +2521,8 @@ class AbFlowModel(nn.Module):
                 )
                 Xt = mu_t + si_gamma_int * torch.randn_like(mu_t)
             elif self.scorefm_loss_mode in {
-                "score_aware_traj_lite", "score_aware_traj_fm_lite"
+                "score_aware_traj_lite", "score_aware_traj_fm_lite",
+                "score_aware_traj_if_lite", "score_aware_traj_if_fm_lite"
             }:
                 # One-forward score-aware off-path training.  We perturb only
                 # the model input state, keep X1 as the endpoint target, and
@@ -2450,6 +2612,14 @@ class AbFlowModel(nn.Module):
             interface_atom_pos != self.aa_feature.atom_pos_pad_idx
         )
 
+        satc_residue_weight = None
+        if state_path and self.scorefm_loss_mode in {
+            "score_aware_traj_if_lite", "score_aware_traj_if_fm_lite"
+        }:
+            satc_residue_weight = self._satc_interface_residue_weights(
+                true_X, paratope_mask
+            )
+
         if state_path:
             interface_loss, scorefm_details = (
                 self._coordinate_training_objective(
@@ -2467,6 +2637,7 @@ class AbFlowModel(nn.Module):
                     sat_eps_t=sat_eps_int,
                     sat_gamma_t=sat_gamma_int,
                     sat_active_t=sat_active_int,
+                    satc_residue_weight=satc_residue_weight,
                 )
             )
         else:
@@ -2600,6 +2771,14 @@ class AbFlowModel(nn.Module):
                     1.0 if self.scorefm_loss_mode == "score_aware_traj_fm_lite" else 0.0,
                     device=X.device,
                 ),
+                "scorefm_loss_mode_score_aware_traj_if_lite": torch.as_tensor(
+                    1.0 if self.scorefm_loss_mode == "score_aware_traj_if_lite" else 0.0,
+                    device=X.device,
+                ),
+                "scorefm_loss_mode_score_aware_traj_if_fm_lite": torch.as_tensor(
+                    1.0 if self.scorefm_loss_mode == "score_aware_traj_if_fm_lite" else 0.0,
+                    device=X.device,
+                ),
                 "si_gamma_scale": torch.as_tensor(
                     float(getattr(self, "si_gamma_scale", 0.0)), device=X.device
                 ),
@@ -2641,6 +2820,15 @@ class AbFlowModel(nn.Module):
                 ),
                 "satc_t_max": torch.as_tensor(
                     float(getattr(self, "satc_t_max", 0.0)), device=X.device
+                ),
+                "satc_interface_weight_alpha": torch.as_tensor(
+                    float(getattr(self, "satc_interface_weight_alpha", 0.0)), device=X.device
+                ),
+                "satc_interface_cutoff": torch.as_tensor(
+                    float(getattr(self, "satc_interface_cutoff", 0.0)), device=X.device
+                ),
+                "satc_interface_temperature": torch.as_tensor(
+                    float(getattr(self, "satc_interface_temperature", 0.0)), device=X.device
                 ),
                 "scorefm_state_path": torch.as_tensor(
                     1.0 if state_path else 0.0, device=X.device

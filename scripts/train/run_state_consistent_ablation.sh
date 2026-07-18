@@ -64,6 +64,10 @@ GPU_ID=${3:-0}
 #
 #   PCS_RC_LC_R1_SATC_FM_LITE:
 #       SATC_LITE plus a small projected velocity-correction consistency.
+#   PCS_RC_LC_R1_SATC_IF_MAIN:
+#       Interface-weighted SATC main candidate for DockQ/CAAR/LDDT.
+#   PCS_RC_LC_R1_SATC_IF_FM_SOFT:
+#       Interface-weighted SATC plus very soft velocity-magnitude consistency.
 #       This is the recommended next experiment for score+velocity.
 #
 #   CORE:
@@ -112,6 +116,10 @@ SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.02}
 SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.003}
 SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
 SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
+SATC_INTERFACE_WEIGHT_ALPHA=${ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA:-0.0}
+SATC_INTERFACE_CUTOFF=${ABFLOW_SATC_INTERFACE_CUTOFF:-8.0}
+SATC_INTERFACE_TEMPERATURE=${ABFLOW_SATC_INTERFACE_TEMPERATURE:-1.0}
+SATC_INTERFACE_NORMALIZE=${ABFLOW_SATC_INTERFACE_NORMALIZE:-on}
 
 AMP=${ABFLOW_AMP:-on}
 AMP_DTYPE=${ABFLOW_AMP_DTYPE:-bf16}
@@ -310,6 +318,96 @@ case "$EXP_ID" in
     SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
     ;;
 
+  PCS_RC_LC_R1_SATC_MAIN|PCS_RC_LC_R1_SCORE_AWARE_TRAJ_MAIN)
+    # Final recommended main method after the current SATC results.
+    # It is the successful direction-only score-aware tangent consistency: score
+    # appears as the analytic off-path direction and velocity appears as the
+    # endpoint-induced correction velocity aligned to that score direction.
+    # No extra forward, no independent score/velocity head, and no explicit
+    # velocity-magnitude forcing.
+    SOURCE_MODE=pcs_rc
+    RECURRENT_PROPOSAL_CONTEXT=on
+    LOSS_MODE=score_aware_traj_lite
+    T_SAMPLING=uniform
+    COORD_PEP_AS_CONDITION=on
+    SEQ_INPUT_MODE=pep_condition
+    PROPOSAL_ADAPTER_START_ROUND=1
+    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
+    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.08}
+    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.02}
+    SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.0}
+    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
+    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
+    ;;
+
+  PCS_RC_LC_R1_SATC_FM_SOFT|PCS_RC_LC_R1_SCORE_AWARE_TRAJ_FM_SOFT)
+    # Soft velocity-magnitude diagnostic.  The v36 FM_LITE result improved
+    # AAR/CAAR but hurt H3 raw RMSD and DockQ; therefore v37 keeps the same
+    # score-aware tangent term and reduces the projected magnitude term.  This
+    # is the next controlled test of whether explicit velocity magnitude can be
+    # added without damaging placement.
+    SOURCE_MODE=pcs_rc
+    RECURRENT_PROPOSAL_CONTEXT=on
+    LOSS_MODE=score_aware_traj_fm_lite
+    T_SAMPLING=uniform
+    COORD_PEP_AS_CONDITION=on
+    SEQ_INPUT_MODE=pep_condition
+    PROPOSAL_ADAPTER_START_ROUND=1
+    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
+    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.08}
+    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.018}
+    SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.001}
+    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
+    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
+    ;;
+
+  PCS_RC_LC_R1_SATC_IF_MAIN|PCS_RC_LC_R1_SCORE_AWARE_TRAJ_IF_MAIN)
+    # Interface-weighted SATC main candidate.  It keeps the validated
+    # SATC_MAIN direction-only mechanism and reweights only the SATC regularizer
+    # toward native interface/contact residues.  This targets DockQ/CAAR/LDDT
+    # without adding a second forward or a new score/velocity head.
+    SOURCE_MODE=pcs_rc
+    RECURRENT_PROPOSAL_CONTEXT=on
+    LOSS_MODE=score_aware_traj_if_lite
+    T_SAMPLING=uniform
+    COORD_PEP_AS_CONDITION=on
+    SEQ_INPUT_MODE=pep_condition
+    PROPOSAL_ADAPTER_START_ROUND=1
+    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
+    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.08}
+    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.02}
+    SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.0}
+    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
+    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
+    SATC_INTERFACE_WEIGHT_ALPHA=${ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA:-1.0}
+    SATC_INTERFACE_CUTOFF=${ABFLOW_SATC_INTERFACE_CUTOFF:-8.0}
+    SATC_INTERFACE_TEMPERATURE=${ABFLOW_SATC_INTERFACE_TEMPERATURE:-1.0}
+    SATC_INTERFACE_NORMALIZE=${ABFLOW_SATC_INTERFACE_NORMALIZE:-on}
+    ;;
+
+  PCS_RC_LC_R1_SATC_IF_FM_SOFT|PCS_RC_LC_R1_SCORE_AWARE_TRAJ_IF_FM_SOFT)
+    # Interface-weighted SATC with very soft projected velocity magnitude.
+    # This is a controlled ablation for whether explicit velocity magnitude can
+    # improve AAR/CAAR while the interface weighting protects H3 placement/DockQ.
+    SOURCE_MODE=pcs_rc
+    RECURRENT_PROPOSAL_CONTEXT=on
+    LOSS_MODE=score_aware_traj_if_fm_lite
+    T_SAMPLING=uniform
+    COORD_PEP_AS_CONDITION=on
+    SEQ_INPUT_MODE=pep_condition
+    PROPOSAL_ADAPTER_START_ROUND=1
+    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
+    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.08}
+    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.018}
+    SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.0005}
+    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
+    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
+    SATC_INTERFACE_WEIGHT_ALPHA=${ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA:-1.0}
+    SATC_INTERFACE_CUTOFF=${ABFLOW_SATC_INTERFACE_CUTOFF:-8.0}
+    SATC_INTERFACE_TEMPERATURE=${ABFLOW_SATC_INTERFACE_TEMPERATURE:-1.0}
+    SATC_INTERFACE_NORMALIZE=${ABFLOW_SATC_INTERFACE_NORMALIZE:-on}
+    ;;
+
   CORE)
     SOURCE_MODE=reference
     LOSS_MODE=analytic_core
@@ -319,7 +417,7 @@ case "$EXP_ID" in
 
   *)
     echo "Unknown EXP_ID: $EXP_ID"
-    echo "Supported EXP_ID: REF REF_SEQ REF_COORD REF_COND PCS PCS_RC PCS_RC_COND PCS_RC_LC_R1 PCS_RC_LC_R2 PCS_RC_LC_R1_SI_SCORE PCS_RC_LC_R1_SI_SCORE_FM PCS_RC_LC_R1_TRAJ PCS_RC_LC_R1_TRAJ_FM PCS_RC_LC_R1_SATC_LITE PCS_RC_LC_R1_SATC_FM_LITE CORE"
+    echo "Supported EXP_ID: REF REF_SEQ REF_COORD REF_COND PCS PCS_RC PCS_RC_COND PCS_RC_LC_R1 PCS_RC_LC_R2 PCS_RC_LC_R1_SI_SCORE PCS_RC_LC_R1_SI_SCORE_FM PCS_RC_LC_R1_TRAJ PCS_RC_LC_R1_TRAJ_FM PCS_RC_LC_R1_SATC_LITE PCS_RC_LC_R1_SATC_FM_LITE PCS_RC_LC_R1_SATC_MAIN PCS_RC_LC_R1_SATC_FM_SOFT PCS_RC_LC_R1_SATC_IF_MAIN PCS_RC_LC_R1_SATC_IF_FM_SOFT CORE"
     exit 2
     ;;
 esac
@@ -356,6 +454,10 @@ run_with_env() {
   ABFLOW_SATC_VELOCITY_WEIGHT="$SATC_VELOCITY_WEIGHT" \
   ABFLOW_SATC_T_MIN="$SATC_T_MIN" \
   ABFLOW_SATC_T_MAX="$SATC_T_MAX" \
+  ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA="$SATC_INTERFACE_WEIGHT_ALPHA" \
+  ABFLOW_SATC_INTERFACE_CUTOFF="$SATC_INTERFACE_CUTOFF" \
+  ABFLOW_SATC_INTERFACE_TEMPERATURE="$SATC_INTERFACE_TEMPERATURE" \
+  ABFLOW_SATC_INTERFACE_NORMALIZE="$SATC_INTERFACE_NORMALIZE" \
   ABFLOW_CONDITION_DIAGNOSTICS="$CONDITION_DIAGNOSTICS" \
   ABFLOW_AMP="$AMP" \
   ABFLOW_AMP_DTYPE="$AMP_DTYPE" \
@@ -406,6 +508,10 @@ print_settings() {
   echo "SATC_VELOCITY_WEIGHT=$SATC_VELOCITY_WEIGHT"
   echo "SATC_T_MIN=$SATC_T_MIN"
   echo "SATC_T_MAX=$SATC_T_MAX"
+  echo "SATC_INTERFACE_WEIGHT_ALPHA=$SATC_INTERFACE_WEIGHT_ALPHA"
+  echo "SATC_INTERFACE_CUTOFF=$SATC_INTERFACE_CUTOFF"
+  echo "SATC_INTERFACE_TEMPERATURE=$SATC_INTERFACE_TEMPERATURE"
+  echo "SATC_INTERFACE_NORMALIZE=$SATC_INTERFACE_NORMALIZE"
   echo "AMP=$AMP"
   echo "AMP_DTYPE=$AMP_DTYPE"
   echo "ALLOW_TF32=$ALLOW_TF32"
@@ -447,7 +553,7 @@ fi
 if [[ "$MODE" != "train" ]]; then
   echo "Train: bash $0 train <EXP_ID> <GPU_ID> <BASE_CONFIG>"
   echo "Test:  bash $0 test  <EXP_ID> <GPU_ID> <CKPT> <RESULT_DIR> [TEST_JSON]"
-  echo "Supported EXP_ID: REF REF_SEQ REF_COORD REF_COND PCS PCS_RC PCS_RC_COND PCS_RC_LC_R1 PCS_RC_LC_R2 PCS_RC_LC_R1_SI_SCORE PCS_RC_LC_R1_SI_SCORE_FM PCS_RC_LC_R1_TRAJ PCS_RC_LC_R1_TRAJ_FM PCS_RC_LC_R1_SATC_LITE PCS_RC_LC_R1_SATC_FM_LITE CORE"
+  echo "Supported EXP_ID: REF REF_SEQ REF_COORD REF_COND PCS PCS_RC PCS_RC_COND PCS_RC_LC_R1 PCS_RC_LC_R2 PCS_RC_LC_R1_SI_SCORE PCS_RC_LC_R1_SI_SCORE_FM PCS_RC_LC_R1_TRAJ PCS_RC_LC_R1_TRAJ_FM PCS_RC_LC_R1_SATC_LITE PCS_RC_LC_R1_SATC_FM_LITE PCS_RC_LC_R1_SATC_MAIN PCS_RC_LC_R1_SATC_FM_SOFT PCS_RC_LC_R1_SATC_IF_MAIN PCS_RC_LC_R1_SATC_IF_FM_SOFT CORE"
   exit 2
 fi
 
@@ -641,6 +747,10 @@ runtime = {
     "satc_velocity_weight": os.environ.get("ABFLOW_SATC_VELOCITY_WEIGHT", ""),
     "satc_t_min": os.environ.get("ABFLOW_SATC_T_MIN", ""),
     "satc_t_max": os.environ.get("ABFLOW_SATC_T_MAX", ""),
+    "satc_interface_weight_alpha": os.environ.get("ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA", ""),
+    "satc_interface_cutoff": os.environ.get("ABFLOW_SATC_INTERFACE_CUTOFF", ""),
+    "satc_interface_temperature": os.environ.get("ABFLOW_SATC_INTERFACE_TEMPERATURE", ""),
+    "satc_interface_normalize": os.environ.get("ABFLOW_SATC_INTERFACE_NORMALIZE", ""),
     "amp": os.environ.get("ABFLOW_AMP", "on"),
     "amp_dtype": os.environ.get("ABFLOW_AMP_DTYPE", "bf16"),
     "allow_tf32": os.environ.get("ABFLOW_ALLOW_TF32", "on"),
@@ -662,7 +772,8 @@ runtime = {
     "independent_velocity_head": "false",
     "stochastic_interpolant_training": os.environ.get("ABFLOW_SCOREFM_LOSS_MODE", "") in {"si_score", "si_score_fm"},
     "trajectory_consistency_training": os.environ.get("ABFLOW_SCOREFM_LOSS_MODE", "") in {"traj_consistency", "traj_consistency_fm"},
-    "score_aware_trajectory_lite_training": os.environ.get("ABFLOW_SCOREFM_LOSS_MODE", "") in {"score_aware_traj_lite", "score_aware_traj_fm_lite"},
+    "score_aware_trajectory_lite_training": os.environ.get("ABFLOW_SCOREFM_LOSS_MODE", "") in {"score_aware_traj_lite", "score_aware_traj_fm_lite", "score_aware_traj_if_lite", "score_aware_traj_if_fm_lite"},
+    "interface_weighted_satc": os.environ.get("ABFLOW_SCOREFM_LOSS_MODE", "") in {"score_aware_traj_if_lite", "score_aware_traj_if_fm_lite"},
     "pair_time_conditioning": "false",
     "coordinate_objective_stacking": "false",
     "true_path_endpoint": "1.0",
