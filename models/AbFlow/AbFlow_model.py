@@ -236,6 +236,16 @@ class AbFlowModel(nn.Module):
         #   score_aware_traj_if_fm_lite:
         #       Interface-weighted SATC plus a very soft projected velocity
         #       magnitude term for controlled flow-field ablation.
+        #   score_aware_traj_nt_lite:
+        #       Normal--tangent decomposed SATC.  The endpoint-induced velocity
+        #       is decomposed into a clean tangent transport component and an
+        #       off-path normal correction component.  Only the normal score
+        #       projection is constrained, so tangent transport remains governed
+        #       by endpoint flow matching.
+        #   score_aware_traj_nt_fm_lite:
+        #       score_aware_traj_nt_lite plus a very weak normal-correction
+        #       magnitude term.  This absorbs the useful AAR/CAAR signal of
+        #       SATC_FM without constraining the full velocity vector.
         self.scorefm_loss_mode = _env_str(
             "ABFLOW_SCOREFM_LOSS_MODE", "endpoint"
         ).lower()
@@ -290,12 +300,25 @@ class AbFlowModel(nn.Module):
             "score_aware_interface_traj_fm_lite",
         }:
             self.scorefm_loss_mode = "score_aware_traj_if_fm_lite"
+        if self.scorefm_loss_mode in {
+            "score_aware_traj_nt_lite", "satc_nt_lite",
+            "satc_nt_main", "normal_tangent_satc",
+            "score_aware_normal_tangent_lite",
+        }:
+            self.scorefm_loss_mode = "score_aware_traj_nt_lite"
+        if self.scorefm_loss_mode in {
+            "score_aware_traj_nt_fm_lite", "satc_nt_fm_lite",
+            "satc_nt_fm_soft", "normal_tangent_satc_fm",
+            "score_aware_normal_tangent_fm_lite",
+        }:
+            self.scorefm_loss_mode = "score_aware_traj_nt_fm_lite"
         if self.scorefm_loss_mode not in {
             "endpoint", "analytic_core", "velocity_core",
             "si_score", "si_score_fm",
             "traj_consistency", "traj_consistency_fm",
             "score_aware_traj_lite", "score_aware_traj_fm_lite",
             "score_aware_traj_if_lite", "score_aware_traj_if_fm_lite",
+            "score_aware_traj_nt_lite", "score_aware_traj_nt_fm_lite",
         }:
             raise ValueError(
                 "Unknown ABFLOW_SCOREFM_LOSS_MODE="
@@ -303,7 +326,8 @@ class AbFlowModel(nn.Module):
                 "analytic_core, velocity_core, si_score, si_score_fm, "
                 "traj_consistency, traj_consistency_fm, "
                 "score_aware_traj_lite, score_aware_traj_fm_lite, "
-                "score_aware_traj_if_lite, score_aware_traj_if_fm_lite."
+                "score_aware_traj_if_lite, score_aware_traj_if_fm_lite, "
+                "score_aware_traj_nt_lite, score_aware_traj_nt_fm_lite."
             )
 
         # Stochastic-interpolant controls.  These regularizers keep the strong
@@ -360,6 +384,14 @@ class AbFlowModel(nn.Module):
             raise ValueError("ABFLOW_SATC_*_WEIGHT must be non-negative.")
         if not (0.0 <= self.satc_t_min < self.satc_t_max <= 1.0):
             raise ValueError("Require 0 <= ABFLOW_SATC_T_MIN < ABFLOW_SATC_T_MAX <= 1.")
+
+        # Normal--tangent SATC controls.  Direction-only NT uses a lower-bound
+        # pull along the analytic normal score direction instead of forcing the
+        # whole correction vector to align with score.  This leaves orthogonal
+        # endpoint/transport errors to the main endpoint objective.
+        self.satc_nt_min_pull = _env_float("ABFLOW_SATC_NT_MIN_PULL", 0.50)
+        if not (0.0 <= self.satc_nt_min_pull <= 1.5):
+            raise ValueError("ABFLOW_SATC_NT_MIN_PULL must be in [0, 1.5].")
 
         # Interface-weighted SATC controls.  These do not change the endpoint
         # objective and do not add a second forward pass.  They only reweight the
@@ -1747,7 +1779,8 @@ class AbFlowModel(nn.Module):
 
         if self.scorefm_loss_mode in {
             "score_aware_traj_lite", "score_aware_traj_fm_lite",
-            "score_aware_traj_if_lite", "score_aware_traj_if_fm_lite"
+            "score_aware_traj_if_lite", "score_aware_traj_if_fm_lite",
+            "score_aware_traj_nt_lite", "score_aware_traj_nt_fm_lite"
         }:
             if (
                 source_X0 is None or sat_eps_t is None
@@ -1806,8 +1839,29 @@ class AbFlowModel(nn.Module):
                 dot = (cp * ct).sum(dim=-1)
                 cp_norm = cp.pow(2).sum(dim=-1).sqrt()
                 ct_norm = ct.pow(2).sum(dim=-1).sqrt()
-                cos = dot / (cp_norm * ct_norm + self.scorefm_eps)
-                score_atom_loss = (1.0 - cos.clamp(-1.0, 1.0)).masked_fill(~vm, 0.0)
+
+                if self.scorefm_loss_mode in {
+                    "score_aware_traj_nt_lite", "score_aware_traj_nt_fm_lite"
+                }:
+                    # Normal--tangent decomposed SATC.  The tangent transport
+                    # component is X1-X0 and is already handled by endpoint
+                    # flow matching.  For the off-path perturbation, constrain
+                    # only the scalar projection of the residual correction on
+                    # the analytic normal score direction.  Orthogonal/tangent
+                    # residuals are intentionally not penalized here; otherwise
+                    # the regularizer can suppress useful endpoint transport and
+                    # damage H3 placement/DockQ late in training.
+                    normal_ratio = dot / (ct_norm.pow(2) + self.scorefm_eps)
+                    min_pull = float(getattr(self, "satc_nt_min_pull", 0.50))
+                    score_atom_loss = F.relu(min_pull - normal_ratio).pow(2)
+                else:
+                    # Legacy SATC: constrain the full residual correction vector
+                    # to align with the analytic score direction.  Kept for
+                    # ablations, but NT modes are preferred for the main method.
+                    cos = dot / (cp_norm * ct_norm + self.scorefm_eps)
+                    score_atom_loss = 1.0 - cos.clamp(-1.0, 1.0)
+
+                score_atom_loss = score_atom_loss.masked_fill(~vm, 0.0)
                 score_res_loss = score_atom_loss.sum(dim=-1) / vm.float().sum(dim=-1).clamp_min(1.0)
 
                 graph_ids = interface_batch_id[valid_res]
@@ -1832,7 +1886,8 @@ class AbFlowModel(nn.Module):
                     score_loss = per_graph.mean()
 
                 if self.scorefm_loss_mode in {
-                    "score_aware_traj_fm_lite", "score_aware_traj_if_fm_lite"
+                    "score_aware_traj_fm_lite", "score_aware_traj_if_fm_lite",
+                    "score_aware_traj_nt_fm_lite"
                 }:
                     # Project the learned correction onto the analytic score
                     # direction and softly match the target correction magnitude.
@@ -1841,9 +1896,21 @@ class AbFlowModel(nn.Module):
                     direction = ct / (ct_norm.unsqueeze(-1) + self.scorefm_eps)
                     proj = (cp * direction).sum(dim=-1)
                     target_mag = ct_norm.detach()
-                    vel_atom_loss = F.smooth_l1_loss(
-                        proj, target_mag, reduction="none"
-                    ).masked_fill(~vm, 0.0)
+                    if self.scorefm_loss_mode == "score_aware_traj_nt_fm_lite":
+                        # NT-FM softly matches only the normal correction
+                        # magnitude.  This absorbs the useful velocity signal
+                        # from SATC_FM without constraining the full velocity
+                        # vector or its orthogonal/tangent residuals.
+                        vel_atom_loss = F.smooth_l1_loss(
+                            proj / (target_mag + self.scorefm_eps),
+                            torch.ones_like(proj),
+                            reduction="none",
+                        )
+                    else:
+                        vel_atom_loss = F.smooth_l1_loss(
+                            proj, target_mag, reduction="none"
+                        )
+                    vel_atom_loss = vel_atom_loss.masked_fill(~vm, 0.0)
                     vel_res_loss = vel_atom_loss.sum(dim=-1) / vm.float().sum(dim=-1).clamp_min(1.0)
                     if res_w is not None:
                         vel_num = pred_clean_X.new_zeros(n_graph)
@@ -2618,7 +2685,8 @@ class AbFlowModel(nn.Module):
                 Xt = mu_t + si_gamma_int * torch.randn_like(mu_t)
             elif self.scorefm_loss_mode in {
                 "score_aware_traj_lite", "score_aware_traj_fm_lite",
-                "score_aware_traj_if_lite", "score_aware_traj_if_fm_lite"
+                "score_aware_traj_if_lite", "score_aware_traj_if_fm_lite",
+                "score_aware_traj_nt_lite", "score_aware_traj_nt_fm_lite"
             }:
                 # One-forward score-aware off-path training.  We perturb only
                 # the model input state, keep X1 as the endpoint target, and
