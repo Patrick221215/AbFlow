@@ -312,6 +312,18 @@ class AbFlowModel(nn.Module):
             "score_aware_normal_tangent_fm_lite",
         }:
             self.scorefm_loss_mode = "score_aware_traj_nt_fm_lite"
+        if self.scorefm_loss_mode in {
+            "score_aware_traj_if_nt_lite", "satc_if_nt_lite",
+            "satc_if_nt_main", "interface_normal_tangent_satc",
+            "target_aligned_satc", "target_aligned_nt_satc",
+        }:
+            self.scorefm_loss_mode = "score_aware_traj_if_nt_lite"
+        if self.scorefm_loss_mode in {
+            "score_aware_traj_if_nt_fm_lite", "satc_if_nt_fm_lite",
+            "satc_if_nt_fm_soft", "interface_normal_tangent_satc_fm",
+            "target_aligned_satc_fm", "target_aligned_nt_satc_fm",
+        }:
+            self.scorefm_loss_mode = "score_aware_traj_if_nt_fm_lite"
         if self.scorefm_loss_mode not in {
             "endpoint", "analytic_core", "velocity_core",
             "si_score", "si_score_fm",
@@ -319,6 +331,7 @@ class AbFlowModel(nn.Module):
             "score_aware_traj_lite", "score_aware_traj_fm_lite",
             "score_aware_traj_if_lite", "score_aware_traj_if_fm_lite",
             "score_aware_traj_nt_lite", "score_aware_traj_nt_fm_lite",
+            "score_aware_traj_if_nt_lite", "score_aware_traj_if_nt_fm_lite",
         }:
             raise ValueError(
                 "Unknown ABFLOW_SCOREFM_LOSS_MODE="
@@ -327,7 +340,8 @@ class AbFlowModel(nn.Module):
                 "traj_consistency, traj_consistency_fm, "
                 "score_aware_traj_lite, score_aware_traj_fm_lite, "
                 "score_aware_traj_if_lite, score_aware_traj_if_fm_lite, "
-                "score_aware_traj_nt_lite, score_aware_traj_nt_fm_lite."
+                "score_aware_traj_nt_lite, score_aware_traj_nt_fm_lite, "
+                "score_aware_traj_if_nt_lite, score_aware_traj_if_nt_fm_lite."
             )
 
         # Stochastic-interpolant controls.  These regularizers keep the strong
@@ -1783,7 +1797,8 @@ class AbFlowModel(nn.Module):
         if self.scorefm_loss_mode in {
             "score_aware_traj_lite", "score_aware_traj_fm_lite",
             "score_aware_traj_if_lite", "score_aware_traj_if_fm_lite",
-            "score_aware_traj_nt_lite", "score_aware_traj_nt_fm_lite"
+            "score_aware_traj_nt_lite", "score_aware_traj_nt_fm_lite",
+            "score_aware_traj_if_nt_lite", "score_aware_traj_if_nt_fm_lite"
         }:
             if (
                 source_X0 is None or sat_eps_t is None
@@ -1844,7 +1859,8 @@ class AbFlowModel(nn.Module):
                 ct_norm = ct.pow(2).sum(dim=-1).sqrt()
 
                 if self.scorefm_loss_mode in {
-                    "score_aware_traj_nt_lite", "score_aware_traj_nt_fm_lite"
+                    "score_aware_traj_nt_lite", "score_aware_traj_nt_fm_lite",
+                    "score_aware_traj_if_nt_lite", "score_aware_traj_if_nt_fm_lite"
                 }:
                     # Normal--tangent decomposed SATC.  The tangent transport
                     # component is X1-X0 and is already handled by endpoint
@@ -1884,7 +1900,8 @@ class AbFlowModel(nn.Module):
                 graph_ids = interface_batch_id[valid_res]
                 n_graph = int(interface_batch_id.max().item()) + 1
                 if satc_residue_weight is not None and self.scorefm_loss_mode in {
-                    "score_aware_traj_if_lite", "score_aware_traj_if_fm_lite"
+                    "score_aware_traj_if_lite", "score_aware_traj_if_fm_lite",
+                    "score_aware_traj_if_nt_lite", "score_aware_traj_if_nt_fm_lite"
                 }:
                     res_w_full = torch.as_tensor(
                         satc_residue_weight, device=pred_clean_X.device,
@@ -1904,7 +1921,7 @@ class AbFlowModel(nn.Module):
 
                 if self.scorefm_loss_mode in {
                     "score_aware_traj_fm_lite", "score_aware_traj_if_fm_lite",
-                    "score_aware_traj_nt_fm_lite"
+                    "score_aware_traj_nt_fm_lite", "score_aware_traj_if_nt_fm_lite"
                 }:
                     # Project the learned correction onto the analytic score
                     # direction and softly match the target correction magnitude.
@@ -1913,7 +1930,7 @@ class AbFlowModel(nn.Module):
                     direction = ct / (ct_norm.unsqueeze(-1) + self.scorefm_eps)
                     proj = (cp * direction).sum(dim=-1)
                     target_mag = ct_norm.detach()
-                    if self.scorefm_loss_mode == "score_aware_traj_nt_fm_lite":
+                    if self.scorefm_loss_mode in {"score_aware_traj_nt_fm_lite", "score_aware_traj_if_nt_fm_lite"}:
                         # NT-FM softly matches only the normal correction
                         # magnitude.  This absorbs the useful velocity signal
                         # from SATC_FM without constraining the full velocity
@@ -2804,7 +2821,8 @@ class AbFlowModel(nn.Module):
 
         satc_residue_weight = None
         if state_path and self.scorefm_loss_mode in {
-            "score_aware_traj_if_lite", "score_aware_traj_if_fm_lite"
+            "score_aware_traj_if_lite", "score_aware_traj_if_fm_lite",
+            "score_aware_traj_if_nt_lite", "score_aware_traj_if_nt_fm_lite"
         }:
             satc_residue_weight = self._satc_interface_residue_weights(
                 true_X, paratope_mask
@@ -2974,6 +2992,14 @@ class AbFlowModel(nn.Module):
                 ),
                 "scorefm_loss_mode_score_aware_traj_if_fm_lite": torch.as_tensor(
                     1.0 if self.scorefm_loss_mode == "score_aware_traj_if_fm_lite" else 0.0,
+                    device=X.device,
+                ),
+                "scorefm_loss_mode_score_aware_traj_if_nt_lite": torch.as_tensor(
+                    1.0 if self.scorefm_loss_mode == "score_aware_traj_if_nt_lite" else 0.0,
+                    device=X.device,
+                ),
+                "scorefm_loss_mode_score_aware_traj_if_nt_fm_lite": torch.as_tensor(
+                    1.0 if self.scorefm_loss_mode == "score_aware_traj_if_nt_fm_lite" else 0.0,
                     device=X.device,
                 ),
                 "si_gamma_scale": torch.as_tensor(
