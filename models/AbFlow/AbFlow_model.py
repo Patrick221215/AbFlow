@@ -389,9 +389,12 @@ class AbFlowModel(nn.Module):
         # pull along the analytic normal score direction instead of forcing the
         # whole correction vector to align with score.  This leaves orthogonal
         # endpoint/transport errors to the main endpoint objective.
-        self.satc_nt_min_pull = _env_float("ABFLOW_SATC_NT_MIN_PULL", 0.50)
+        self.satc_nt_min_pull = _env_float("ABFLOW_SATC_NT_MIN_PULL", 0.15)
+        self.satc_nt_pull_clip = _env_float("ABFLOW_SATC_NT_PULL_CLIP", 2.0)
         if not (0.0 <= self.satc_nt_min_pull <= 1.5):
             raise ValueError("ABFLOW_SATC_NT_MIN_PULL must be in [0, 1.5].")
+        if not (0.25 <= self.satc_nt_pull_clip <= 10.0):
+            raise ValueError("ABFLOW_SATC_NT_PULL_CLIP must be in [0.25, 10.0].")
 
         # Interface-weighted SATC controls.  These do not change the endpoint
         # objective and do not add a second forward pass.  They only reweight the
@@ -1851,8 +1854,22 @@ class AbFlowModel(nn.Module):
                     # residuals are intentionally not penalized here; otherwise
                     # the regularizer can suppress useful endpoint transport and
                     # damage H3 placement/DockQ late in training.
-                    normal_ratio = dot / (ct_norm.pow(2) + self.scorefm_eps)
-                    min_pull = float(getattr(self, "satc_nt_min_pull", 0.50))
+                    # Stable normal pull objective.  The previous raw ratio
+                    #     (cp · ct) / ||ct||^2
+                    # is mathematically interpretable but numerically unsafe at
+                    # initialization because ||ct|| is deliberately small
+                    # (gamma/sigma times Gaussian noise).  A bad early prediction
+                    # can make the raw ratio very negative and the squared hinge
+                    # can dominate the whole AbFlow loss.  We therefore keep the
+                    # same normal--tangent semantics, but evaluate the hinge on a
+                    # smoothly bounded ratio.  This constrains only whether the
+                    # residual correction has a positive pull-back component along
+                    # the analytic score normal; it does not penalize tangent or
+                    # orthogonal transport residuals.
+                    normal_ratio_raw = dot / (ct_norm.pow(2) + self.scorefm_eps)
+                    pull_clip = float(getattr(self, "satc_nt_pull_clip", 2.0))
+                    normal_ratio = torch.tanh(normal_ratio_raw / pull_clip) * pull_clip
+                    min_pull = float(getattr(self, "satc_nt_min_pull", 0.15))
                     score_atom_loss = F.relu(min_pull - normal_ratio).pow(2)
                 else:
                     # Legacy SATC: constrain the full residual correction vector
@@ -1901,9 +1918,15 @@ class AbFlowModel(nn.Module):
                         # magnitude.  This absorbs the useful velocity signal
                         # from SATC_FM without constraining the full velocity
                         # vector or its orthogonal/tangent residuals.
+                        # Match only the bounded normal-projection ratio.
+                        # This preserves the useful velocity signal while
+                        # preventing rare early outliers from dominating training.
+                        pull_clip = float(getattr(self, "satc_nt_pull_clip", 2.0))
+                        proj_ratio_raw = proj / (target_mag + self.scorefm_eps)
+                        proj_ratio = torch.tanh(proj_ratio_raw / pull_clip) * pull_clip
                         vel_atom_loss = F.smooth_l1_loss(
-                            proj / (target_mag + self.scorefm_eps),
-                            torch.ones_like(proj),
+                            proj_ratio,
+                            torch.ones_like(proj_ratio),
                             reduction="none",
                         )
                     else:
@@ -1951,6 +1974,8 @@ class AbFlowModel(nn.Module):
                 "scorefm_satc_rate": satc_rate.detach(),
                 "scorefm_satc_score_weight_eff": pred_clean_X.new_tensor(score_weight_eff),
                 "scorefm_satc_velocity_weight_eff": pred_clean_X.new_tensor(velocity_weight_eff),
+                "scorefm_satc_nt_min_pull": pred_clean_X.new_tensor(float(getattr(self, "satc_nt_min_pull", 0.15))),
+                "scorefm_satc_nt_pull_clip": pred_clean_X.new_tensor(float(getattr(self, "satc_nt_pull_clip", 2.0))),
                 "scorefm_satc_schedule_phase": pred_clean_X.new_tensor(
                     1.0 if satc_schedule_info is None else float(satc_schedule_info.get("phase", 1.0))
                 ),

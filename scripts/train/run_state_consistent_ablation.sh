@@ -143,7 +143,8 @@ SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
 SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.08}
 SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.02}
 SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.003}
-SATC_NT_MIN_PULL=${ABFLOW_SATC_NT_MIN_PULL:-0.50}
+SATC_NT_MIN_PULL=${ABFLOW_SATC_NT_MIN_PULL:-0.15}
+SATC_NT_PULL_CLIP=${ABFLOW_SATC_NT_PULL_CLIP:-2.0}
 SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
 SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
 SATC_INTERFACE_WEIGHT_ALPHA=${ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA:-0.0}
@@ -520,10 +521,11 @@ case "$EXP_ID" in
     SEQ_INPUT_MODE=pep_condition
     PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-1}
     SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
-    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.08}
-    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.020}
+    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.06}
+    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.010}
     SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.0}
-    SATC_NT_MIN_PULL=${ABFLOW_SATC_NT_MIN_PULL:-0.50}
+    SATC_NT_MIN_PULL=${ABFLOW_SATC_NT_MIN_PULL:-0.15}
+    SATC_NT_PULL_CLIP=${ABFLOW_SATC_NT_PULL_CLIP:-2.0}
     SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
     SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
     SATC_INTERFACE_WEIGHT_ALPHA=${ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA:-0.0}
@@ -550,10 +552,11 @@ case "$EXP_ID" in
     SEQ_INPUT_MODE=pep_condition
     PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-1}
     SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
-    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.08}
-    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.018}
-    SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.0008}
-    SATC_NT_MIN_PULL=${ABFLOW_SATC_NT_MIN_PULL:-0.45}
+    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.06}
+    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.010}
+    SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.0003}
+    SATC_NT_MIN_PULL=${ABFLOW_SATC_NT_MIN_PULL:-0.10}
+    SATC_NT_PULL_CLIP=${ABFLOW_SATC_NT_PULL_CLIP:-2.0}
     SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
     SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
     SATC_INTERFACE_WEIGHT_ALPHA=${ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA:-0.0}
@@ -658,6 +661,7 @@ run_with_env() {
   ABFLOW_SATC_SCORE_WEIGHT="$SATC_SCORE_WEIGHT" \
   ABFLOW_SATC_VELOCITY_WEIGHT="$SATC_VELOCITY_WEIGHT" \
   ABFLOW_SATC_NT_MIN_PULL="$SATC_NT_MIN_PULL" \
+  ABFLOW_SATC_NT_PULL_CLIP="$SATC_NT_PULL_CLIP" \
   ABFLOW_SATC_T_MIN="$SATC_T_MIN" \
   ABFLOW_SATC_T_MAX="$SATC_T_MAX" \
   ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA="$SATC_INTERFACE_WEIGHT_ALPHA" \
@@ -721,6 +725,7 @@ print_settings() {
   echo "SATC_SCORE_WEIGHT=$SATC_SCORE_WEIGHT"
   echo "SATC_VELOCITY_WEIGHT=$SATC_VELOCITY_WEIGHT"
   echo "SATC_NT_MIN_PULL=$SATC_NT_MIN_PULL"
+  echo "SATC_NT_PULL_CLIP=$SATC_NT_PULL_CLIP"
   echo "SATC_T_MIN=$SATC_T_MIN"
   echo "SATC_T_MAX=$SATC_T_MAX"
   echo "SATC_INTERFACE_WEIGHT_ALPHA=$SATC_INTERFACE_WEIGHT_ALPHA"
@@ -749,6 +754,192 @@ print_settings() {
   echo "CONDITION_DIAGNOSTICS=$CONDITION_DIAGNOSTICS"
 }
 
+
+# ============================================================
+# Automatic topk-map evaluation helpers
+# ============================================================
+# Principle:
+#   The original training command remains unchanged:
+#     bash scripts/train/run_state_consistent_ablation.sh train <EXP_ID> <GPU_ID> <BASE_CONFIG>
+#   When ABFLOW_AUTO_TOPK_EVAL=on (default), the launcher automatically starts
+#   a background watcher if spare GPUs are available.  It reads topk_map.txt,
+#   evaluates new checkpoints with the existing test pipeline, and writes CSV
+#   next to topk_map.txt.  If no spare GPU is available, the launcher performs
+#   a final catch-up evaluation after training finishes.
+
+PROJECT_ROOT=${ABFLOW_PROJECT_ROOT:-/home/data3/cjm/project/AbFlow}
+AUTO_TOPK_EVAL=${ABFLOW_AUTO_TOPK_EVAL:-on}
+AUTO_TOPK_POLL_INTERVAL=${ABFLOW_TOPK_POLL_INTERVAL:-300}
+AUTO_TOPK_MAX_NEW=${ABFLOW_TOPK_MAX_NEW:-1}
+AUTO_TOPK_LATEST_ONLY=${ABFLOW_TOPK_LATEST_ONLY:-off}
+AUTO_TOPK_MAX_EVAL_GPUS=${ABFLOW_AUTO_TOPK_MAX_EVAL_GPUS:-1}
+AUTO_TOPK_TEST_JSON=${ABFLOW_TOPK_TEST_JSON:-${PROJECT_ROOT}/datasets/RAbD/test.json}
+AUTO_TOPK_EVAL_SCRIPT=${ABFLOW_TOPK_EVAL_SCRIPT:-scripts/test/evaluate_topk_map.py}
+AUTO_TOPK_FORCE=${ABFLOW_TOPK_FORCE:-off}
+
+_is_on() {
+  local v="${1:-off}"
+  case "${v,,}" in
+    1|true|yes|y|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_csv_contains() {
+  local csv=",$1,"
+  local item="$2"
+  [[ "$csv" == *",${item},"* ]]
+}
+
+_infer_spare_eval_gpus() {
+  if [[ -n "${ABFLOW_EVAL_GPUS:-}" ]]; then
+    echo "$ABFLOW_EVAL_GPUS"
+    return 0
+  fi
+  if [[ -n "${ABFLOW_EVAL_GPU:-}" ]]; then
+    echo "$ABFLOW_EVAL_GPU"
+    return 0
+  fi
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo ""
+    return 0
+  fi
+  local all_ids train_ids selected id count
+  all_ids=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | tr '\n' ',' | sed 's/,$//') || all_ids=""
+  train_ids="$GPU_ID"
+  selected=""
+  count=0
+  IFS=',' read -ra ids <<< "$all_ids"
+  for id in "${ids[@]}"; do
+    id=$(echo "$id" | xargs)
+    [[ -z "$id" ]] && continue
+    if _csv_contains "$train_ids" "$id"; then
+      continue
+    fi
+    if [[ -z "$selected" ]]; then
+      selected="$id"
+    else
+      selected="${selected},${id}"
+    fi
+    count=$((count + 1))
+    if [[ "$count" -ge "$AUTO_TOPK_MAX_EVAL_GPUS" ]]; then
+      break
+    fi
+  done
+  # normalize accidental leading pattern if any
+  selected=$(echo "$selected" | sed 's/^,//;s/,,*/,/g')
+  echo "$selected"
+}
+
+_start_auto_topk_watcher() {
+  local eval_gpus="$1"
+  local run_dir="$2"
+  local log_file="$run_dir/auto_topk_eval.log"
+  local pid_file="$run_dir/auto_topk_eval.pid"
+
+  if ! _is_on "$AUTO_TOPK_EVAL"; then
+    echo "[AutoTopK] disabled by ABFLOW_AUTO_TOPK_EVAL=$AUTO_TOPK_EVAL"
+    return 0
+  fi
+  if [[ -z "$eval_gpus" ]]; then
+    echo "[AutoTopK] no spare GPU inferred; watcher not started during training. Final catch-up evaluation will run after training."
+    return 0
+  fi
+  if [[ ! -f "$AUTO_TOPK_TEST_JSON" ]]; then
+    echo "[AutoTopK] test json not found: $AUTO_TOPK_TEST_JSON; auto evaluation disabled."
+    return 0
+  fi
+  if [[ ! -f "$AUTO_TOPK_EVAL_SCRIPT" ]]; then
+    echo "[AutoTopK] evaluator script not found: $AUTO_TOPK_EVAL_SCRIPT; auto evaluation disabled."
+    return 0
+  fi
+  mkdir -p "$run_dir"
+  echo "[AutoTopK] starting watcher: exp=$EXP_ID eval_gpus=$eval_gpus run_dir=$run_dir" | tee -a "$log_file"
+  (
+    python "$AUTO_TOPK_EVAL_SCRIPT" \
+      --exp-id "$EXP_ID" \
+      --run-dir "$run_dir" \
+      --test-json "$AUTO_TOPK_TEST_JSON" \
+      --gpu-ids "$eval_gpus" \
+      --project-root "$PROJECT_ROOT" \
+      --launcher "scripts/train/run_state_consistent_ablation.sh" \
+      --watch \
+      --poll-interval "$AUTO_TOPK_POLL_INTERVAL" \
+      --max-new "$AUTO_TOPK_MAX_NEW" \
+      $( _is_on "$AUTO_TOPK_LATEST_ONLY" && echo --latest-only ) \
+      $( _is_on "$AUTO_TOPK_FORCE" && echo --force )
+  ) >> "$log_file" 2>&1 &
+  echo $! > "$pid_file"
+  echo "[AutoTopK] watcher pid=$(cat "$pid_file") log=$log_file"
+}
+
+_stop_auto_topk_watcher() {
+  local run_dir="$1"
+  local pid_file="$run_dir/auto_topk_eval.pid"
+  if [[ -f "$pid_file" ]]; then
+    local pid
+    pid=$(cat "$pid_file" || true)
+    if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
+      echo "[AutoTopK] stopping watcher pid=$pid"
+      kill "$pid" >/dev/null 2>&1 || true
+      wait "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pid_file"
+  fi
+}
+
+_run_auto_topk_once() {
+  local eval_gpus="$1"
+  local run_dir="$2"
+  local log_file="$run_dir/auto_topk_eval_final.log"
+
+  if ! _is_on "$AUTO_TOPK_EVAL"; then
+    return 0
+  fi
+  if [[ -z "$eval_gpus" ]]; then
+    eval_gpus="$GPU_ID"
+  fi
+  if [[ ! -f "$AUTO_TOPK_TEST_JSON" || ! -f "$AUTO_TOPK_EVAL_SCRIPT" ]]; then
+    return 0
+  fi
+  mkdir -p "$run_dir"
+  echo "[AutoTopK] final catch-up evaluation: exp=$EXP_ID eval_gpus=$eval_gpus" | tee -a "$log_file"
+  python "$AUTO_TOPK_EVAL_SCRIPT" \
+    --exp-id "$EXP_ID" \
+    --run-dir "$run_dir" \
+    --test-json "$AUTO_TOPK_TEST_JSON" \
+    --gpu-ids "$eval_gpus" \
+    --project-root "$PROJECT_ROOT" \
+    --launcher "scripts/train/run_state_consistent_ablation.sh" \
+    $( _is_on "$AUTO_TOPK_LATEST_ONLY" && echo --latest-only ) \
+    $( _is_on "$AUTO_TOPK_FORCE" && echo --force ) \
+    >> "$log_file" 2>&1 || true
+}
+
+if [[ "$MODE" == "attach_eval" ]]; then
+  RUN_ROOT=${ABFLOW_RUN_ROOT:-/home/data3/cjm/project/AbFlow/results_dtm}
+  RUN_DIR="${RUN_ROOT}/${EXP_ID}"
+  EVAL_GPUS_ARG=${4:-}
+  if [[ -z "$EVAL_GPUS_ARG" || "$EVAL_GPUS_ARG" == "auto" ]]; then
+    EVAL_GPUS_ARG=$(_infer_spare_eval_gpus)
+    [[ -z "$EVAL_GPUS_ARG" ]] && EVAL_GPUS_ARG="$GPU_ID"
+  fi
+  echo "[AutoTopK] attach mode: exp=$EXP_ID run_dir=$RUN_DIR eval_gpus=$EVAL_GPUS_ARG"
+  python "$AUTO_TOPK_EVAL_SCRIPT" \
+    --exp-id "$EXP_ID" \
+    --run-dir "$RUN_DIR" \
+    --test-json "$AUTO_TOPK_TEST_JSON" \
+    --gpu-ids "$EVAL_GPUS_ARG" \
+    --project-root "$PROJECT_ROOT" \
+    --launcher "scripts/train/run_state_consistent_ablation.sh" \
+    --watch \
+    --poll-interval "$AUTO_TOPK_POLL_INTERVAL" \
+    --max-new "$AUTO_TOPK_MAX_NEW" \
+    $( _is_on "$AUTO_TOPK_LATEST_ONLY" && echo --latest-only ) \
+    $( _is_on "$AUTO_TOPK_FORCE" && echo --force )
+  exit 0
+fi
+
 if [[ "$MODE" == "test" ]]; then
   CKPT=${4:-}
   RESULT_DIR=${5:-}
@@ -776,6 +967,7 @@ fi
 if [[ "$MODE" != "train" ]]; then
   echo "Train: bash $0 train <EXP_ID> <GPU_ID> <BASE_CONFIG>"
   echo "Test:  bash $0 test  <EXP_ID> <GPU_ID> <CKPT> <RESULT_DIR> [TEST_JSON]"
+  echo "Attach current training auto-eval: bash $0 attach_eval <EXP_ID> <GPU_ID|auto> [EVAL_GPU_ID|auto]"
   echo "Supported EXP_ID: REF REF_SEQ REF_COORD REF_COND PCS PCS_RC PCS_RC_COND PCS_RC_LC_R1 PCS_RC_LC_R2 PCS_RC_LC_R1_SI_SCORE PCS_RC_LC_R1_SI_SCORE_FM PCS_RC_LC_R1_TRAJ PCS_RC_LC_R1_TRAJ_FM PCS_RC_LC_R1_SATC_LITE PCS_RC_LC_R1_SATC_FM_LITE PCS_RC_LC_R1_SATC_MAIN PCS_RC_LC_R1_SATC_FM_SOFT PCS_RC_LC_R1_SATC_FM_PRIMARY_ANNEAL PCS_RC_LC_R1_SATC_FM_DIRECTION_HYBRID PCS_RC_LC_R1_SATC_FM_BEST_E125 PCS_RC_LC_R1_SATC_FM_IF_GUARD_E125 PCS_RC_LC_R1_SATC_IF_MAIN PCS_RC_LC_R1_SATC_IF_FM_SOFT PCS_RC_LC_R1_SATC_NT_MAIN PCS_RC_LC_R1_SATC_NT_FM_SOFT CORE"
   exit 2
 fi
@@ -973,6 +1165,7 @@ runtime = {
     "satc_score_weight": os.environ.get("ABFLOW_SATC_SCORE_WEIGHT", ""),
     "satc_velocity_weight": os.environ.get("ABFLOW_SATC_VELOCITY_WEIGHT", ""),
     "satc_nt_min_pull": os.environ.get("ABFLOW_SATC_NT_MIN_PULL", ""),
+    "satc_nt_pull_clip": os.environ.get("ABFLOW_SATC_NT_PULL_CLIP", ""),
     "satc_t_min": os.environ.get("ABFLOW_SATC_T_MIN", ""),
     "satc_t_max": os.environ.get("ABFLOW_SATC_T_MAX", ""),
     "satc_interface_weight_alpha": os.environ.get("ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA", ""),
@@ -1072,4 +1265,18 @@ if [[ "${ABFLOW_DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
+AUTO_EVAL_GPUS=$(_infer_spare_eval_gpus)
+_start_auto_topk_watcher "$AUTO_EVAL_GPUS" "$RUN_DIR"
+
+set +e
 run_with_env bash scripts/train/train.sh "$RUN_CONFIG"
+TRAIN_STATUS=$?
+set -e
+
+# Ensure the latest topk entries are evaluated even if the watcher used spare
+# GPUs and the training process finishes between polling intervals.  If no
+# spare GPU existed during training, this runs after training on the training
+# GPU list, so it does not compete with training.
+_run_auto_topk_once "${AUTO_EVAL_GPUS:-$GPU_ID}" "$RUN_DIR"
+_stop_auto_topk_watcher "$RUN_DIR"
+exit "$TRAIN_STATUS"
