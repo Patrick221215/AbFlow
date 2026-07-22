@@ -41,8 +41,9 @@ class AbFlowTrainer(Trainer):
 
         self._diag_main_rank = int(getattr(self.config, "local_rank", -1)) in {-1, 0}
         requested_file_interval = _env_int("ABFLOW_DIAGNOSTIC_FILE_INTERVAL", 0)
+        actual_train_steps = max(1, len(self.train_loader))
         self._diag_file_interval = (
-            max(1, int(getattr(config, "step_per_epoch", 52)))
+            actual_train_steps
             if requested_file_interval <= 0
             else max(1, requested_file_interval)
         )
@@ -51,7 +52,7 @@ class AbFlowTrainer(Trainer):
         ))
         requested_grad_interval = _env_int("ABFLOW_GRAD_DIAGNOSTIC_INTERVAL", 0)
         self._diag_grad_interval = (
-            max(1, int(getattr(config, "step_per_epoch", 52)))
+            actual_train_steps
             if requested_grad_interval <= 0
             else max(1, requested_grad_interval)
         )
@@ -135,10 +136,13 @@ class AbFlowTrainer(Trainer):
         return int(self.global_step) % self._diag_file_interval == 0
 
     def _should_probe_grad(self, val):
+        # interval=0 means once per actual train epoch, not on batch 0.
+        step = int(self.global_step)
         return (
             (not val)
             and self._grad_diag_enabled
-            and int(self.global_step) % self._diag_grad_interval == 0
+            and step > 0
+            and step % self._diag_grad_interval == 0
         )
 
     @staticmethod
@@ -182,6 +186,10 @@ class AbFlowTrainer(Trainer):
         round_delta = get("diag/val_proxy_refinement_raw_rmsd_delta")
         if round_delta is not None and round_delta > 0.20:
             alerts.append("LATE_REFINEMENT_DEGRADES_GLOBAL_H3_PLACEMENT")
+
+        grad_failed = get("grad/grad_probe_failed")
+        if grad_failed is not None and grad_failed > 0.5:
+            alerts.append("GRADIENT_DIAGNOSTIC_FAILED_MAIN_TRAINING_CONTINUED")
 
         for key in (
             "grad/grad_probe_cos_endpoint_satc",
@@ -227,6 +235,17 @@ class AbFlowTrainer(Trainer):
 
         if self._should_probe_grad(val) and hasattr(raw_model, "compute_gradient_conflict_diagnostics"):
             raw_model.compute_gradient_conflict_diagnostics()
+            grad_error = str(getattr(raw_model, "_last_gradient_diagnostic_error", "") or "")
+            if grad_error and self._diag_main_rank and self._diag_enabled:
+                os.makedirs(self._diag_dir, exist_ok=True)
+                with open(
+                    os.path.join(self._diag_dir, "gradient_diagnostic_errors.log"),
+                    "a", encoding="utf-8"
+                ) as f:
+                    f.write(
+                        f"{datetime.now().isoformat(timespec='seconds')} "
+                        f"epoch={self.epoch} step={self.global_step} {grad_error}\n"
+                    )
         else:
             raw_model.last_gradient_diagnostics = {}
 

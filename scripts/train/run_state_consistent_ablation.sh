@@ -463,7 +463,7 @@ print_settings() {
 #   a final catch-up evaluation after training finishes.
 
 PROJECT_ROOT=${ABFLOW_PROJECT_ROOT:-/home/data3/cjm/project/AbFlow}
-AUTO_TOPK_EVAL=${ABFLOW_AUTO_TOPK_EVAL:-on}
+AUTO_TOPK_EVAL=${ABFLOW_AUTO_TOPK_EVAL:-off}
 AUTO_TOPK_POLL_INTERVAL=${ABFLOW_TOPK_POLL_INTERVAL:-300}
 AUTO_TOPK_MAX_NEW=${ABFLOW_TOPK_MAX_NEW:-1}
 AUTO_TOPK_LATEST_ONLY=${ABFLOW_TOPK_LATEST_ONLY:-off}
@@ -996,10 +996,13 @@ run_with_env bash scripts/train/train.sh "$RUN_CONFIG"
 TRAIN_STATUS=$?
 set -e
 
-# Ensure the latest topk entries are evaluated even if the watcher used spare
-# GPUs and the training process finishes between polling intervals.  If no
-# spare GPU existed during training, this runs after training on the training
-# GPU list, so it does not compete with training.
-_run_auto_topk_once "${AUTO_EVAL_GPUS:-$GPU_ID}" "$RUN_DIR"
+# Evaluate only after a successful training process.  A failed run has no valid
+# new checkpoint and must not launch a test-set catch-up job that obscures the
+# original exception or consumes another GPU.
+if [[ "$TRAIN_STATUS" -eq 0 ]]; then
+  _run_auto_topk_once "${AUTO_EVAL_GPUS:-$GPU_ID}" "$RUN_DIR"
+else
+  echo "[AutoTopK] training failed with status=$TRAIN_STATUS; skipping final evaluation."
+fi
 _stop_auto_topk_watcher "$RUN_DIR"
 exit "$TRAIN_STATUS"

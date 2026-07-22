@@ -1,6 +1,7 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
 import math, time, os
+from contextlib import nullcontext
 from tqdm import tqdm
 
 import torch
@@ -724,6 +725,10 @@ class AbFlowModel(nn.Module):
         )
         self.last_gradient_diagnostics = {}
         self._diagnostic_objective_tensors = {}
+        # AMP/DDP-safe gradient-conflict probe. Differentiate objectives with
+        # respect to a shared activation rather than a DDP parameter.
+        self._diagnostic_probe_tensor = None
+        self._last_gradient_diagnostic_error = ""
         self._diagnostic_validation_mode = False
         # Set by the trainer only on recorded/probed steps so diagnostics do not
         # turn every expensive training batch into a synchronization point.
@@ -1589,6 +1594,14 @@ class AbFlowModel(nn.Module):
         # surf_start = time.time()
         aligned_local_inter_edges, epi_index = self.align_epi_ab(local_inter_edges, local_is_ab)
         # self.timing_stats['surface_processing'] += time.time() - surf_start
+
+        # Capture the final-round shared activation only on diagnostic probe
+        # steps. Sequence logits and coordinate outputs both depend on H_0.
+        if (
+            bool(getattr(self, "_diagnostic_capture", False))
+            and int(round_idx) == int(self.round) - 1
+        ):
+            self._diagnostic_probe_tensor = H_0
 
         # message passing
         # sme_start = time.time()
@@ -3093,36 +3106,63 @@ class AbFlowModel(nn.Module):
         return out
 
     def compute_gradient_conflict_diagnostics(self):
-        """Probe objective interactions on one shared GNN parameter.
+        """AMP/DDP-safe observational objective-gradient probe.
 
-        A negative cosine is direct evidence that two objectives request opposing
-        updates on the shared representation.  This is a periodic diagnostic,
-        not a training loss and not gradient surgery.
+        v50 differentiated each objective with respect to a DDP parameter while
+        still inside bf16 autocast. PyTorch 2.0.1 can then fail in
+        ``at::autocast::prioritize``. This version probes a shared activation,
+        disables autocast for autograd.grad, uses fp32 diagnostics, and fails
+        soft because an observational diagnostic must never stop training.
         """
         if not self.grad_conflict_diagnostics:
             self.last_gradient_diagnostics = {}
             return {}
+
         terms = self._diagnostic_objective_tensors
-        if not terms:
+        probe = self._diagnostic_probe_tensor
+        if not terms or probe is None or not torch.is_tensor(probe):
             self.last_gradient_diagnostics = {}
             return {}
-        probe = next((p for p in self.gnn.parameters() if p.requires_grad), None)
-        if probe is None:
+        if not probe.requires_grad:
+            self.last_gradient_diagnostics = {}
             return {}
+
         grads = {}
-        for name, value in terms.items():
-            if not torch.is_tensor(value) or not value.requires_grad:
-                continue
-            g = torch.autograd.grad(
-                value, probe, retain_graph=True, allow_unused=True
-            )[0]
-            if g is not None:
-                grads[name] = g.detach().float().reshape(-1)
-        out = {}
+        self._last_gradient_diagnostic_error = ""
+        amp_ctx = torch.cuda.amp.autocast(enabled=False) if probe.is_cuda else nullcontext()
+        try:
+            with amp_ctx:
+                for name, value in terms.items():
+                    if not torch.is_tensor(value) or not value.requires_grad:
+                        continue
+                    scalar = value.float()
+                    if scalar.numel() != 1:
+                        scalar = scalar.mean()
+                    g = torch.autograd.grad(
+                        scalar, probe, retain_graph=True, allow_unused=True
+                    )[0]
+                    if g is not None:
+                        grads[name] = g.detach().float().reshape(-1)
+        except RuntimeError as exc:
+            self._last_gradient_diagnostic_error = str(exc)
+            self.last_gradient_diagnostics = {
+                "grad_probe_failed": probe.detach().new_tensor(1.0, dtype=torch.float32),
+                "grad_probe_amp_safe": probe.detach().new_tensor(0.0, dtype=torch.float32),
+            }
+            return self.last_gradient_diagnostics
+
+        out = {
+            "grad_probe_failed": probe.detach().new_tensor(0.0, dtype=torch.float32),
+            "grad_probe_amp_safe": probe.detach().new_tensor(1.0, dtype=torch.float32),
+        }
         for name, g in grads.items():
             out[f"grad_probe_norm_{name}"] = torch.linalg.norm(g)
-        pairs = [("endpoint", "satc"), ("seq", "satc"),
-                 ("endpoint", "seq"), ("structure", "satc")]
+        pairs = [
+            ("endpoint", "satc"),
+            ("seq", "satc"),
+            ("endpoint", "seq"),
+            ("structure", "satc"),
+        ]
         for a, b in pairs:
             if a in grads and b in grads:
                 ga, gb = grads[a], grads[b]
@@ -3285,6 +3325,9 @@ class AbFlowModel(nn.Module):
         :param context_ratio: float, rate of context provided in masked sequence, should be [0, 1) and anneal to 0 in training, probability of keeping ground-truth sequence context among originally masked positions.
         '''
         # import ipdb; ipdb.set_trace()
+        # Do not retain a shared activation from a previous batch.
+        self._diagnostic_probe_tensor = None
+        self._last_gradient_diagnostic_error = ""
         if self.backbone_only:
             X, template = X[:, :4], template[:, :4]  # backbone
             if X_pep is not None:
