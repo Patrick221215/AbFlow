@@ -718,6 +718,70 @@ class AbFlowModel(nn.Module):
             self.seq_state_adapter = None
         self.seq_state_embedding = None  # removed: reuse aa_feature embeddings
 
+        # =========================================================
+        # Joint path/sampler consistency controls (v51)
+        # =========================================================
+        # ``legacy`` reproduces the original context curriculum, where most
+        # designed residues are replaced by native context early in training.
+        # ``loss_only`` keeps the complete categorical path state for every
+        # designed residue, but may subsample the CE supervision mask.
+        # ``off`` disables native-context curriculum entirely and is the clean
+        # train/inference-matched setting used by the formal joint-path runs.
+        self.sequence_context_mode = _env_str(
+            "ABFLOW_SEQUENCE_CONTEXT_MODE", "legacy"
+        ).lower()
+        if self.sequence_context_mode not in {"legacy", "loss_only", "off"}:
+            raise ValueError(
+                "ABFLOW_SEQUENCE_CONTEXT_MODE must be legacy, loss_only or off."
+            )
+
+        # Transient categorical states should influence the network without
+        # abruptly deleting/creating geometry channels.  ``hard`` reproduces
+        # v50; ``hidden_only`` changes only the residue hidden state;
+        # ``time_gated_union`` smoothly blends proposal/state atom features by
+        # flow time and uses the union of proposal/state valid atom channels for
+        # KNN masking.  The latter preserves PCS-RC context while avoiding hard
+        # topology jumps from an uncertain intermediate token.
+        self.dual_sequence_atom_mode = _env_str(
+            "ABFLOW_DUAL_SEQUENCE_ATOM_MODE", "time_gated_union"
+        ).lower()
+        if self.dual_sequence_atom_mode not in {
+            "hard", "hidden_only", "time_gated_union"
+        }:
+            raise ValueError(
+                "ABFLOW_DUAL_SEQUENCE_ATOM_MODE must be hard, hidden_only or "
+                "time_gated_union."
+            )
+
+        # The bridge Euler/CTMC step already reaches the terminal state.  The
+        # old sampler queried the network once more at exactly t=1, a boundary
+        # never sampled during continuous-time training, and replaced the
+        # integrated state with that extra prediction.  Formal runs use the
+        # integrated endpoint and the last left-endpoint logits instead.
+        self.final_readout_mode = _env_str(
+            "ABFLOW_FINAL_READOUT_MODE", "integrated_endpoint"
+        ).lower()
+        if self.final_readout_mode not in {
+            "integrated_endpoint", "legacy_t1_query"
+        }:
+            raise ValueError(
+                "ABFLOW_FINAL_READOUT_MODE must be integrated_endpoint or "
+                "legacy_t1_query."
+            )
+        self.sequence_decode_mode = _env_str(
+            "ABFLOW_SEQUENCE_DECODE_MODE", "argmax"
+        ).lower()
+        if self.sequence_decode_mode not in {"argmax", "ctmc_sample"}:
+            raise ValueError(
+                "ABFLOW_SEQUENCE_DECODE_MODE must be argmax or ctmc_sample."
+            )
+
+        # Fixed validation paths make checkpoint ranking comparable across
+        # epochs.  Training remains stochastic.
+        self.deterministic_validation = _env_flag(
+            "ABFLOW_DETERMINISTIC_VALIDATION", True
+        )
+
         # Diagnostics are observational only. Gradient-conflict probing is
         # explicitly periodic because autograd.grad adds cost.
         self.grad_conflict_diagnostics = _env_flag(
@@ -856,11 +920,14 @@ class AbFlowModel(nn.Module):
     @torch.no_grad()
     def _sample_categorical_path(self, clean_S, base_S, t_graph,
                                  interface_batch_id, corrupt_mask=None):
-        """Sample a legal categorical interpolation q_t(S_t | S_1, S_0).
+        """Sample the linear categorical bridge q_t(S_t | S_1, S_0).
 
-        With the same time convention as the coordinate path, t=0 is the base
-        distribution and t=1 is clean. Each residue keeps the clean category
-        with probability t and otherwise keeps its sampled base category.
+        Conditional on a source/target pair, each residue is at the target token
+        with probability t and at the source token with probability 1-t.  This
+        is the same convex categorical path whose endpoint-prediction CTMC has
+        jump hazard 1/(1-t).  Training therefore remains stochastic, whereas
+        validation uses a fixed pseudo-random draw so checkpoint losses are
+        comparable across epochs.
         """
         t_graph = torch.as_tensor(
             t_graph, device=clean_S.device, dtype=torch.float32
@@ -869,15 +936,29 @@ class AbFlowModel(nn.Module):
             keep_prob = t_graph.reshape(1).expand_as(clean_S)
         else:
             keep_prob = t_graph[interface_batch_id]
-        keep_clean = torch.rand(
-            clean_S.shape, device=clean_S.device
-        ) < keep_prob.clamp(0.0, 1.0)
+
+        if self.deterministic_validation and not self.training:
+            # Stateless deterministic uniforms in [0, 1).  The construction is
+            # independent of global RNG state and therefore identical at every
+            # validation epoch for the same residue ordering.
+            idx = torch.arange(
+                clean_S.numel(), device=clean_S.device, dtype=torch.float32
+            )
+            uniforms = torch.frac(
+                torch.sin((idx + 1.0) * 12.9898) * 43758.5453
+            ).abs()
+        else:
+            uniforms = torch.rand(
+                clean_S.shape, device=clean_S.device
+            )
+
+        keep_clean = uniforms < keep_prob.clamp(0.0, 1.0)
         sampled = torch.where(keep_clean, clean_S, base_S).long()
         if corrupt_mask is None:
             return sampled
         corrupt_mask = corrupt_mask.to(device=clean_S.device, dtype=torch.bool)
         return torch.where(corrupt_mask, sampled, clean_S).long()
-    
+
     def align_epi_ab(self, local_inter_edges, local_is_ab):
         """Orient every cross-interface edge as antigen -> antibody.
 
@@ -955,13 +1036,34 @@ class AbFlowModel(nn.Module):
         
 
     def _sample_flow_times(self, batch_size, device, dtype=torch.float32):
-        """Sample continuous flow times for training.
+        """Sample continuous flow times.
 
-        t is a real path time in [0, 1]. We do not shrink the endpoint here.
-        Numerical stability is handled separately by sigma_score=max(1-t, sigma_min).
+        Training remains stochastic.  Validation uses a fixed midpoint-stratified
+        grid so validation loss changes reflect model changes rather than a new
+        random set of path times.
         """
         n = int(batch_size) if getattr(self, 'scorefm_per_sample_t', False) else 1
         mode = getattr(self, 'scorefm_t_sampling', 'uniform')
+
+        if self.deterministic_validation and not self.training:
+            if n <= 1:
+                t = torch.full((n,), 0.5, device=device, dtype=dtype)
+            else:
+                t = (
+                    torch.arange(n, device=device, dtype=dtype) + 0.5
+                ) / float(n)
+            if mode in {'low_t', 'low', 'square'}:
+                t = t ** 2
+            elif mode in {'mid_t', 'mid'}:
+                t = 0.2 + 0.6 * t
+            elif mode in {'late_t', 'late'}:
+                t = 0.55 + 0.35 * t
+            elif mode not in {'uniform', 'stratified', 'strat'}:
+                raise ValueError(
+                    f"Unknown ABFLOW_SCOREFM_T_SAMPLING={mode}. "
+                    "Choose from uniform, low_t, stratified, mid_t, late_t."
+                )
+            return t.clamp(min=0.0, max=1.0)
 
         if mode == 'uniform':
             t = torch.rand(n, device=device, dtype=dtype)
@@ -980,14 +1082,9 @@ class AbFlowModel(nn.Module):
                 t = base[perm]
 
         elif mode in {'mid_t', 'mid'}:
-            # Central bridge interval. This avoids both the source endpoint
-            # and the near-target singular regime. It is useful for diagnosing
-            # whether dynamic supervision should act over the middle trajectory.
             t = 0.2 + 0.6 * torch.rand(n, device=device, dtype=dtype)
 
         elif mode in {'late_t', 'late'}:
-            # Late but non-singular bridge interval. It tests whether dynamic
-            # correction should act after H3 placement has largely formed.
             t = 0.55 + 0.35 * torch.rand(n, device=device, dtype=dtype)
 
         else:
@@ -997,7 +1094,7 @@ class AbFlowModel(nn.Module):
             )
 
         return t.clamp(min=0.0, max=1.0)
-    
+
     def _time_for_interface(self, t_graph, interface_batch_id, ref_tensor):
         """Broadcast graph-level time to [N_interface, 1, 1]."""
         if t_graph is None:
@@ -1020,6 +1117,21 @@ class AbFlowModel(nn.Module):
         t_emb = self.flow_time_mlp(t_emb)
         return t_emb[batch_id]
 
+
+    def _flow_time_values_for_residues(self, flow_t, batch_id, ref_tensor):
+        """Broadcast graph-level t to one scalar per residue."""
+        if flow_t is None:
+            return torch.ones(
+                ref_tensor.shape[0], device=ref_tensor.device,
+                dtype=ref_tensor.dtype
+            )
+        t = torch.as_tensor(
+            flow_t, device=ref_tensor.device, dtype=ref_tensor.dtype
+        )
+        if t.dim() == 0 or t.numel() == 1:
+            return t.reshape(1).expand(ref_tensor.shape[0]).clamp(0.0, 1.0)
+        t = t.reshape(-1)
+        return t[batch_id].clamp(0.0, 1.0)
 
     def _build_coord_pep_condition_for_residues(
             self, pep_X_model, interface_X, paratope_mask,
@@ -1392,10 +1504,18 @@ class AbFlowModel(nn.Module):
                 dummy = sum(p.sum() for p in self.coord_pep_condition_adapter.parameters())
                 H_0 = H_0 + 0.0 * dummy
 
-        # Dual sequence representation.  S_pep remains the recurrent context
-        # that built H_0/ctx_edges, while S_t supplies paratope-local residue and
-        # atom features.  This preserves the strong base and fixes the incomplete
-        # hidden-only state injection of v49.
+        # Dual sequence representation.  S_pep remains the recurrent proposal
+        # context, while S_t contributes the generated categorical state.
+        #
+        # v50 used a hard replacement of atom identities, masks and weights.  A
+        # transient wrong token could therefore delete/create side-chain channels
+        # and abruptly rebuild the geometric graph.  v51 keeps the state signal
+        # but offers a time-gated union representation:
+        #   - residue-state residual strength grows with t;
+        #   - atom embeddings/weights interpolate from proposal to current state;
+        #   - KNN validity uses the union of proposal/state atom channels.
+        # This is a representation change only; the categorical CTMC itself is
+        # unchanged.
         state_atom_pos_full = None
         if self.seq_state_adapter is not None:
             state_features = self._build_dual_sequence_state_features(
@@ -1409,29 +1529,108 @@ class AbFlowModel(nn.Module):
                 state_residual = self.seq_state_adapter(
                     torch.cat([H_0, state_hidden], dim=-1)
                 )
+
+                state_t = self._flow_time_values_for_residues(
+                    flow_t, batch_id, H_0
+                )
+                if self.dual_sequence_atom_mode == "time_gated_union":
+                    hidden_gate = state_t
+                else:
+                    hidden_gate = torch.ones_like(state_t)
+
                 H_0 = H_0 + (
                     state_residual
                     * state_mask.unsqueeze(-1).to(H_0.dtype)
+                    * hidden_gate.unsqueeze(-1)
                 )
 
-                atom_mask = state_mask.view(-1, 1, 1)
-                atom_embeddings = torch.where(
-                    atom_mask, state_features["atom_embedding"], atom_embeddings
-                )
-                atom_weights = torch.where(
-                    state_mask.view(-1, 1),
-                    state_features["atom_weights"], atom_weights
-                )
                 context_atom_pos = self.aa_feature._construct_atom_pos(S)
-                state_atom_pos_full = torch.where(
-                    state_mask.view(-1, 1),
-                    state_features["atom_pos"], context_atom_pos
-                )
+                context_atom_embeddings = atom_embeddings
+                context_atom_weights = atom_weights
+
+                if self.dual_sequence_atom_mode == "hard":
+                    atom_embeddings = torch.where(
+                        state_mask.view(-1, 1, 1),
+                        state_features["atom_embedding"],
+                        atom_embeddings,
+                    )
+                    atom_weights = torch.where(
+                        state_mask.view(-1, 1),
+                        state_features["atom_weights"],
+                        atom_weights,
+                    )
+                    state_atom_pos_full = torch.where(
+                        state_mask.view(-1, 1),
+                        state_features["atom_pos"],
+                        context_atom_pos,
+                    )
+
+                elif self.dual_sequence_atom_mode == "time_gated_union":
+                    atom_gate = (
+                        state_t.view(-1, 1, 1)
+                        * state_mask.view(-1, 1, 1).to(H_0.dtype)
+                    )
+                    atom_embeddings = (
+                        context_atom_embeddings
+                        + atom_gate * (
+                            state_features["atom_embedding"]
+                            - context_atom_embeddings
+                        )
+                    )
+                    weight_gate = atom_gate.squeeze(-1)
+                    atom_weights = (
+                        context_atom_weights
+                        + weight_gate * (
+                            state_features["atom_weights"]
+                            - context_atom_weights
+                        )
+                    )
+
+                    context_valid_atom = (
+                        context_atom_pos != self.aa_feature.atom_pos_pad_idx
+                    )
+                    state_valid_atom = (
+                        state_features["atom_pos"]
+                        != self.aa_feature.atom_pos_pad_idx
+                    )
+                    union_valid_atom = context_valid_atom | (
+                        state_valid_atom & state_mask.view(-1, 1)
+                    )
+                    preferred_pos = torch.where(
+                        state_valid_atom,
+                        state_features["atom_pos"],
+                        context_atom_pos,
+                    )
+                    state_atom_pos_full = torch.where(
+                        union_valid_atom,
+                        preferred_pos,
+                        torch.full_like(
+                            preferred_pos,
+                            self.aa_feature.atom_pos_pad_idx,
+                        ),
+                    )
+
+                elif self.dual_sequence_atom_mode == "hidden_only":
+                    state_atom_pos_full = None
+
+                # The initial global context edges were created before the dual
+                # state was available.  Rebuild their KNN part with the union/hard
+                # atom validity so the graph and channel features share the same
+                # state semantics. Segment/global-node roles still come from the
+                # recurrent proposal context S.
+                if state_atom_pos_full is not None:
+                    ctx_edges, inter_edges = self.aa_feature.construct_edges(
+                        X, S, batch_id, self.k_neighbors,
+                        atom_pos=state_atom_pos_full,
+                        segment_ids=self.batch_constants["segment_ids"],
+                    )
 
                 if diagnostics_active:
                     with torch.no_grad():
                         if bool(state_mask.any()):
-                            context_tokens = S.to(device=H_0.device, dtype=torch.long)
+                            context_tokens = S.to(
+                                device=H_0.device, dtype=torch.long
+                            )
                             token_disagreement = (
                                 state_features["tokens"][state_mask]
                                 != context_tokens[state_mask]
@@ -1452,24 +1651,31 @@ class AbFlowModel(nn.Module):
                             ).to(H_0.dtype)
                             state_weights = state_features["atom_weights"][state_mask]
                             weight_delta = torch.sqrt(
-                                ((state_weights - context_weights).detach() ** 2).mean()
+                                (
+                                    (state_weights - context_weights)
+                                    .detach().pow(2).mean()
+                                )
                                 + self.scorefm_eps
                             )
                             weight_base = torch.sqrt(
-                                (context_weights.detach() ** 2).mean()
+                                context_weights.detach().pow(2).mean()
                                 + self.scorefm_eps
                             )
                             base_rms = torch.sqrt(
-                                (base_before_state[state_mask].detach() ** 2).mean()
+                                base_before_state[state_mask]
+                                .detach().pow(2).mean()
                                 + self.scorefm_eps
                             )
                             residual_rms = torch.sqrt(
-                                (state_residual[state_mask].detach() ** 2).mean()
+                                state_residual[state_mask]
+                                .detach().pow(2).mean()
                                 + self.scorefm_eps
                             )
                             self._last_condition_diagnostics[
                                 "seq_state_residual_ratio"
-                            ] = residual_rms / base_rms.clamp_min(self.scorefm_eps)
+                            ] = residual_rms / base_rms.clamp_min(
+                                self.scorefm_eps
+                            )
                             self._last_condition_diagnostics[
                                 "seq_state_valid_rate"
                             ] = state_mask.float().mean()
@@ -1481,9 +1687,34 @@ class AbFlowModel(nn.Module):
                             ] = atom_mask_disagreement
                             self._last_condition_diagnostics[
                                 "seq_state_atom_weight_delta_ratio"
-                            ] = weight_delta / weight_base.clamp_min(self.scorefm_eps)
+                            ] = weight_delta / weight_base.clamp_min(
+                                self.scorefm_eps
+                            )
+                            self._last_condition_diagnostics[
+                                "seq_state_time_gate_mean"
+                            ] = state_t[state_mask].mean()
+                            self._last_condition_diagnostics[
+                                "seq_state_atom_mode_hard"
+                            ] = H_0.detach().new_tensor(
+                                1.0 if self.dual_sequence_atom_mode == "hard"
+                                else 0.0
+                            )
+                            self._last_condition_diagnostics[
+                                "seq_state_atom_mode_hidden_only"
+                            ] = H_0.detach().new_tensor(
+                                1.0 if self.dual_sequence_atom_mode == "hidden_only"
+                                else 0.0
+                            )
+                            self._last_condition_diagnostics[
+                                "seq_state_atom_mode_time_gated_union"
+                            ] = H_0.detach().new_tensor(
+                                1.0 if self.dual_sequence_atom_mode
+                                == "time_gated_union" else 0.0
+                            )
             else:
-                dummy = sum(p.sum() for p in self.seq_state_adapter.parameters())
+                dummy = sum(
+                    p.sum() for p in self.seq_state_adapter.parameters()
+                )
                 H_0 = H_0 + 0.0 * dummy
 
         # Sequence proposal is fused through a residue- and time-dependent
@@ -3340,11 +3571,45 @@ class AbFlowModel(nn.Module):
         self._prepare_batch_constants(S, paratope_mask, lengths)
         batch_id = self.batch_constants['batch_id']
 
-        # provide some ground truth for annealing sequence training
-        if context_ratio > 0:
-            not_ctx_mask = torch.rand_like(smask, dtype=torch.float) >= context_ratio
-            smask = torch.logical_and(smask, not_ctx_mask)
-        
+        # Sequence design mask and supervision mask are deliberately separated.
+        #
+        # legacy:
+        #   Reproduces the original curriculum: native context is injected by
+        #   removing most designed residues from both the categorical path and CE.
+        # loss_only:
+        #   The complete H3 categorical state follows q_t for every designed
+        #   residue, while CE may be subsampled for curriculum purposes.
+        # off:
+        #   Every designed residue follows the same train-time path used at
+        #   inference and every residue is supervised.  This is the formal v51
+        #   setting because hard/native context leakage is amplified by DUAL_SEQ.
+        design_smask = smask.clone()
+        sequence_loss_mask = design_smask.clone()
+        if self.sequence_context_mode == "legacy":
+            if context_ratio > 0:
+                not_ctx_mask = (
+                    torch.rand_like(smask, dtype=torch.float) >= context_ratio
+                )
+                smask = torch.logical_and(design_smask, not_ctx_mask)
+                sequence_loss_mask = smask
+        elif self.sequence_context_mode == "loss_only":
+            smask = design_smask
+            if context_ratio > 0:
+                not_ctx_mask = (
+                    torch.rand_like(design_smask, dtype=torch.float)
+                    >= context_ratio
+                )
+                sequence_loss_mask = torch.logical_and(
+                    design_smask, not_ctx_mask
+                )
+        elif self.sequence_context_mode == "off":
+            smask = design_smask
+            sequence_loss_mask = design_smask
+        sequence_path_mask = (
+            smask if self.sequence_context_mode == "legacy"
+            else design_smask
+        )
+
         gt_interface_X = true_X[paratope_mask]
         batch_size = int(self.batch_constants['batch_size'].item()) if torch.is_tensor(self.batch_constants['batch_size']) else int(self.batch_constants['batch_size'])
         interface_batch_id = self.batch_constants['interface_batch_id']
@@ -3478,7 +3743,7 @@ class AbFlowModel(nn.Module):
             if not self.struct_only:
                 St = self._sample_categorical_path(
                     true_S[paratope_mask], interface_S, t_graph, interface_batch_id,
-                    corrupt_mask=smask[paratope_mask],
+                    corrupt_mask=sequence_path_mask[paratope_mask],
                 )
                 sequence_state_for_model = St
             else:
@@ -3516,7 +3781,8 @@ class AbFlowModel(nn.Module):
         snll = X.new_tensor(0.0)
         total = X.new_tensor(0.0)
         if not self.struct_only:
-            for logits, mask in r_pred_S_logits:
+            for logits, _round_mask in r_pred_S_logits:
+                mask = sequence_loss_mask
                 if mask.any():
                     snll = snll + F.cross_entropy(
                         logits[mask], true_S[mask], reduction='sum'
@@ -3674,8 +3940,11 @@ class AbFlowModel(nn.Module):
 
         # AAR and conditioning diagnostics.
         with torch.no_grad():
-            if smask.any():
-                aa_hit = pred_S[smask] == true_S[smask]
+            if sequence_loss_mask.any():
+                aa_hit = (
+                    pred_S[sequence_loss_mask]
+                    == true_S[sequence_loss_mask]
+                )
                 aar = aa_hit.float().mean()
             else:
                 aar = X.new_tensor(0.0)
@@ -3847,6 +4116,29 @@ class AbFlowModel(nn.Module):
                     1.0 if getattr(self, "dual_sequence_state", False) else 0.0,
                     device=X.device,
                 ),
+                "sequence_context_mode_legacy": torch.as_tensor(
+                    1.0 if self.sequence_context_mode == "legacy" else 0.0,
+                    device=X.device,
+                ),
+                "sequence_context_mode_loss_only": torch.as_tensor(
+                    1.0 if self.sequence_context_mode == "loss_only" else 0.0,
+                    device=X.device,
+                ),
+                "sequence_context_mode_off": torch.as_tensor(
+                    1.0 if self.sequence_context_mode == "off" else 0.0,
+                    device=X.device,
+                ),
+                "final_readout_integrated_endpoint": torch.as_tensor(
+                    1.0 if self.final_readout_mode == "integrated_endpoint"
+                    else 0.0,
+                    device=X.device,
+                ),
+                "deterministic_validation": torch.as_tensor(
+                    1.0 if self.deterministic_validation else 0.0,
+                    device=X.device,
+                ),
+                "sequence_path_mask_rate": sequence_path_mask.float().mean(),
+                "sequence_loss_mask_rate": sequence_loss_mask.float().mean(),
                 "t_mean": t_graph.detach().float().mean(),
                 "t_min": t_graph.detach().float().min(),
                 "t_max": t_graph.detach().float().max(),
@@ -4086,25 +4378,60 @@ class AbFlowModel(nn.Module):
                 refresh = refresh & smask[paratope_mask]
                 St = torch.where(refresh, proposed_S, St)
 
-        # Never mutate caller-owned input tensors during final readout.
-        X_state = X.clone()
-        S_state = S.clone()
-        X_state[paratope_mask] = Xt
-        S_state[paratope_mask] = St
+        # Terminal readout.
+        #
+        # For the bridge sampler, the last interval has
+        # dt = 1 - t, hence Xt <- Xt + (X1_hat-Xt)/(1-t)*dt = X1_hat.
+        # The categorical linear path has the same integrated jump probability
+        # dt/(1-t)=1 on the final interval.  Therefore the loop already produces
+        # a terminal state.  Querying the network again at exactly t=1 is both
+        # redundant and out of the continuous training support.
+        if self.final_readout_mode == "legacy_t1_query":
+            X_state = X.clone()
+            S_state = S.clone()
+            X_state[paratope_mask] = Xt
+            S_state[paratope_mask] = St
 
-        final_t = time_grid[-1].detach()
-        final_flow_t_graph = final_t.reshape(1).expand(batch_size)
-        sequence_state_for_model = St if not self.struct_only else None
-        H, pred_S, r_pred_S_logits, pred_X, r_interface_X, _, prmsd = self._forward(
-            X_state, S_state, cmask, smask, paratope_mask, X_pep, S_pep,
-            surface, residue_pos, template, lengths,
-            interface_init=Xt,
-            sequence_init=sequence_state_for_model,
-            flow_t=final_flow_t_graph
-        )
+            final_t = time_grid[-1].detach()
+            final_flow_t_graph = final_t.reshape(1).expand(batch_size)
+            sequence_state_for_model = St if not self.struct_only else None
+            (
+                H_final, pred_S_final, r_pred_S_logits_final,
+                pred_X_final, r_interface_X_final, _, prmsd_final
+            ) = self._forward(
+                X_state, S_state, cmask, smask, paratope_mask,
+                X_pep, S_pep, surface, residue_pos, template, lengths,
+                interface_init=Xt,
+                sequence_init=sequence_state_for_model,
+                flow_t=final_flow_t_graph,
+            )
+            interface_X_final = r_interface_X_final[-1]
+            final_logits_full = (
+                None if self.struct_only
+                else r_pred_S_logits_final[-1][0]
+            )
+        else:
+            # Reuse the final left-endpoint prediction and the integrated state.
+            H_final = H
+            pred_X_final = pred_X
+            prmsd_final = prmsd
+            interface_X_final = Xt
+            final_logits_full = (
+                None if self.struct_only
+                else r_pred_S_logits[-1][0]
+            )
+            pred_S_final = pred_S.clone()
+            if not self.struct_only and bool(smask.any()):
+                if self.sequence_decode_mode == "argmax":
+                    pred_S_final[smask] = torch.argmax(
+                        final_logits_full[smask], dim=-1
+                    )
+                else:
+                    # Keep the terminal CTMC sample for diverse generation.
+                    pred_S_final[paratope_mask] = St
 
         if not self.struct_only:
-            S_logits = r_pred_S_logits[-1][0][smask]
+            S_logits = final_logits_full[smask]
             if S_logits.shape[0] > 0:
                 S_probs = torch.softmax(
                     S_logits, dim=-1
@@ -4117,7 +4444,7 @@ class AbFlowModel(nn.Module):
                 metric = best_metric.new_zeros(batch_size)
         else:
             metric = scatter_mean(
-                prmsd[interface_cmask], interface_batch_id,
+                prmsd_final[interface_cmask], interface_batch_id,
                 dim=0, dim_size=batch_size
             )
 
@@ -4125,11 +4452,13 @@ class AbFlowModel(nn.Module):
         cupdate = cmask & update[batch_id]
         supdate = smask & update[batch_id]
         best_metric[update] = metric[update]
-        gen_X[cupdate] = pred_X[cupdate]
+        gen_X[cupdate] = pred_X_final[cupdate]
         if not self.struct_only:
-            gen_S[supdate] = pred_S[supdate]
+            gen_S[supdate] = pred_S_final[supdate]
 
-        interface_X_final = r_interface_X[-1]
+        # Preserve the original AbFlow global-antibody alignment convention, but
+        # align to the integrated terminal interface rather than a second t=1
+        # network query.
         for b in range(batch_size):
             if not update[b]:
                 continue
@@ -4149,7 +4478,7 @@ class AbFlowModel(nn.Module):
 
         self._clean_batch_constants()
         if return_hidden:
-            return gen_X, gen_S, best_metric, H
+            return gen_X, gen_S, best_metric, H_final
         return gen_X, gen_S, best_metric
 
     def struct_sample(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface, residue_pos, template, lengths, init_noise=None, return_hidden=False):
