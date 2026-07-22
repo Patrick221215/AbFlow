@@ -6,7 +6,7 @@ EXP_ID=${2:-}
 GPU_ID=${3:-0}
 
 # ============================================================
-# AbFlow formal state-consistent train/test ablation launcher
+# AbFlow v52 exact-state / graph-translation SATC launcher
 # ============================================================
 # Core experimental hierarchy:
 #
@@ -149,7 +149,7 @@ COORD_PEP_AS_CONDITION=off
 SEQ_INPUT_MODE=state
 SHADOW_SEQ_STATE=${ABFLOW_SHADOW_SEQ_STATE:-off}
 DUAL_SEQUENCE_STATE=${ABFLOW_DUAL_SEQUENCE_STATE:-off}
-DUAL_SEQUENCE_ATOM_MODE=${ABFLOW_DUAL_SEQUENCE_ATOM_MODE:-time_gated_union}
+DUAL_SEQUENCE_ATOM_MODE=${ABFLOW_DUAL_SEQUENCE_ATOM_MODE:-hard_exact}
 SEQUENCE_CONTEXT_MODE=${ABFLOW_SEQUENCE_CONTEXT_MODE:-legacy}
 FINAL_READOUT_MODE=${ABFLOW_FINAL_READOUT_MODE:-integrated_endpoint}
 SEQUENCE_DECODE_MODE=${ABFLOW_SEQUENCE_DECODE_MODE:-argmax}
@@ -191,6 +191,9 @@ SATC_DECAY_END_EPOCH=${ABFLOW_SATC_DECAY_END_EPOCH:-130}
 SATC_PERTURB_FINAL_SCALE=${ABFLOW_SATC_PERTURB_FINAL_SCALE:-1.0}
 SATC_SCORE_FINAL_SCALE=${ABFLOW_SATC_SCORE_FINAL_SCALE:-1.0}
 SATC_VELOCITY_FINAL_SCALE=${ABFLOW_SATC_VELOCITY_FINAL_SCALE:-1.0}
+SATC_GT_INTERVAL=${ABFLOW_SATC_GT_INTERVAL:-4}
+SATC_GT_START_EPOCH=${ABFLOW_SATC_GT_START_EPOCH:-5}
+SAMPLE_N_STEPS=${ABFLOW_SAMPLE_N_STEPS:-}
 
 AMP=${ABFLOW_AMP:-on}
 AMP_DTYPE=${ABFLOW_AMP_DTYPE:-bf16}
@@ -216,7 +219,7 @@ FORCE_SCRATCH=${ABFLOW_FORCE_SCRATCH:-off}
 
 case "$EXP_ID" in
   PCS_RC_LC_R1|R1)
-    # Frozen strong baseline reference.  No new state channel or SATC objective.
+    # Frozen strong baseline.  It is kept unchanged for reproducibility.
     SOURCE_MODE=pcs_rc
     RECURRENT_PROPOSAL_CONTEXT=on
     LOSS_MODE=endpoint
@@ -232,87 +235,22 @@ case "$EXP_ID" in
     SATC_VELOCITY_WEIGHT=0.0
     ;;
 
-  PCS_RC_LC_R1_DUAL_SEQ|DUAL_SEQ_CTRL|CTRL_V50)
-    # Corrected joint-state control.  S_pep remains the recurrent proposal
-    # context; S_t controls paratope residue/atom features and local atom masks.
-    # SATC is disabled so the state correction is independently attributable.
+  PCS_RC_LC_R1_JOINT_EXACT_CTRL|JOINT_EXACT_CTRL|CTRL_V52)
+    # v52 causal control:
+    #   - preserve PCS_RC_LC_R1 source/context/endpoint backbone;
+    #   - S_t exactly controls H3 residue and atom semantics;
+    #   - S_pep remains a proposal condition through the original adapter;
+    #   - no stochastic tube auxiliary.
     SOURCE_MODE=pcs_rc
     RECURRENT_PROPOSAL_CONTEXT=on
     LOSS_MODE=endpoint
     T_SAMPLING=uniform
     SAMPLER_MODE=bridge
     COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=state
+    SEQ_INPUT_MODE=pep_condition
     SHADOW_SEQ_STATE=off
     DUAL_SEQUENCE_STATE=on
-    PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-1}
-    SATC_APPLY_PROB=0.0
-    SATC_SCORE_WEIGHT=0.0
-    SATC_VELOCITY_WEIGHT=0.0
-    MAX_EPOCH=${ABFLOW_MAX_EPOCH:-160}
-    FORCE_SCRATCH=on
-    ;;
-
-  PCS_RC_LC_R1_DUAL_SEQ_SATC_IF_NT|DUAL_SEQ_SATC|MAIN_V50)
-    # Main idea: corrected joint sequence/structure state plus the existing
-    # one-forward SATC + native-interface weighting + normal-only correction.
-    # Magnitude matching and transport calibration are intentionally excluded
-    # because the two uploaded CSVs show that they lower validation loss while
-    # degrading CAAR/DockQ.
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=score_aware_traj_if_nt_lite
-    T_SAMPLING=uniform
-    SAMPLER_MODE=bridge
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=state
-    SHADOW_SEQ_STATE=off
-    DUAL_SEQUENCE_STATE=on
-    PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-1}
-    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.60}
-    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.06}
-    SATC_TUBE_MODE=legacy_absolute
-    SATC_PROJECTION_BOUND_MODE=legacy_tanh
-    SATC_MAGNITUDE_LOSS_MODE=legacy_tanh
-    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.030}
-    SATC_VELOCITY_WEIGHT=0.0
-    SATC_NT_MIN_PULL=${ABFLOW_SATC_NT_MIN_PULL:-0.18}
-    SATC_NT_PULL_CLIP=${ABFLOW_SATC_NT_PULL_CLIP:-2.0}
-    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
-    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.75}
-    SATC_INTERFACE_WEIGHT_ALPHA=${ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA:-2.0}
-    SATC_INTERFACE_CUTOFF=${ABFLOW_SATC_INTERFACE_CUTOFF:-8.0}
-    SATC_INTERFACE_TEMPERATURE=${ABFLOW_SATC_INTERFACE_TEMPERATURE:-1.0}
-    SATC_INTERFACE_NORMALIZE=${ABFLOW_SATC_INTERFACE_NORMALIZE:-on}
-    SATC_SCHEDULE=constant
-    SATC_STEPS_PER_EPOCH=${ABFLOW_SATC_STEPS_PER_EPOCH:-52}
-    SATC_DECAY_START_EPOCH=9999
-    SATC_DECAY_END_EPOCH=10000
-    SATC_PERTURB_FINAL_SCALE=1.0
-    SATC_SCORE_FINAL_SCALE=1.0
-    SATC_VELOCITY_FINAL_SCALE=0.0
-    MAX_EPOCH=${ABFLOW_MAX_EPOCH:-160}
-    FORCE_SCRATCH=on
-    ;;
-
-
-  PCS_RC_LC_R1_JOINT_PATH_CTRL|JOINT_PATH_CTRL|CTRL_V51)
-    # Formal v51 control:
-    #   PCS_RC_LC_R1 strong base
-    #   + train/inference-matched full H3 categorical path
-    #   + time-gated dual sequence representation
-    #   + integrated endpoint readout
-    #   - SATC/IF/NT
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=endpoint
-    T_SAMPLING=uniform
-    SAMPLER_MODE=bridge
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=state
-    SHADOW_SEQ_STATE=off
-    DUAL_SEQUENCE_STATE=on
-    DUAL_SEQUENCE_ATOM_MODE=time_gated_union
+    DUAL_SEQUENCE_ATOM_MODE=hard_exact
     SEQUENCE_CONTEXT_MODE=off
     FINAL_READOUT_MODE=integrated_endpoint
     SEQUENCE_DECODE_MODE=argmax
@@ -325,57 +263,50 @@ case "$EXP_ID" in
     FORCE_SCRATCH=on
     ;;
 
-  PCS_RC_LC_R1_JOINT_PATH_SATC_IF_NT|JOINT_PATH_MAIN|MAIN_V51)
-    # Formal v51 main method:
-    #   corrected joint categorical/coordinate state path
-    #   + one-forward SATC
-    #   + native-interface weighting
-    #   + normal-only correction
-    # Magnitude matching remains disabled.
+  PCS_RC_LC_R1_JOINT_EXACT_GT_SATC|JOINT_EXACT_GT_SATC|MAIN_V52)
+    # v52 main method:
+    #   exact joint categorical state + H3 graph-translation stochastic tube.
+    # The primary endpoint objective stays on the clean bridge.  Every fourth
+    # training step after epoch 5, a second query receives a rigid translation
+    # of the whole H3 loop and is required to preserve the clean endpoint.
+    # No atom-internal noise, projection clipping, NT hinge or SO(3) process.
     SOURCE_MODE=pcs_rc
     RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=score_aware_traj_if_nt_lite
+    LOSS_MODE=score_aware_graph_translation_consistency
     T_SAMPLING=uniform
     SAMPLER_MODE=bridge
     COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=state
+    SEQ_INPUT_MODE=pep_condition
     SHADOW_SEQ_STATE=off
     DUAL_SEQUENCE_STATE=on
-    DUAL_SEQUENCE_ATOM_MODE=time_gated_union
+    DUAL_SEQUENCE_ATOM_MODE=hard_exact
     SEQUENCE_CONTEXT_MODE=off
     FINAL_READOUT_MODE=integrated_endpoint
     SEQUENCE_DECODE_MODE=argmax
     DETERMINISTIC_VALIDATION=on
     PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-1}
-    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.60}
-    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.06}
-    SATC_TUBE_MODE=legacy_absolute
-    SATC_PROJECTION_BOUND_MODE=hard_clip
-    SATC_MAGNITUDE_LOSS_MODE=unbiased_ratio_huber
-    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.030}
+    SATC_APPLY_PROB=0.0
+    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.10}
+    SATC_TUBE_MODE=graph_translation_calibrated
+    SATC_TRANSPORT_RMS_MIN=${ABFLOW_SATC_TRANSPORT_RMS_MIN:-1.0}
+    SATC_TRANSPORT_RMS_MAX=${ABFLOW_SATC_TRANSPORT_RMS_MAX:-20.0}
+    SATC_GAMMA_ABS_MAX=${ABFLOW_SATC_GAMMA_ABS_MAX:-2.0}
+    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.05}
     SATC_VELOCITY_WEIGHT=0.0
-    SATC_NT_MIN_PULL=${ABFLOW_SATC_NT_MIN_PULL:-0.18}
-    SATC_NT_PULL_CLIP=${ABFLOW_SATC_NT_PULL_CLIP:-2.0}
     SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
-    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.75}
-    SATC_INTERFACE_WEIGHT_ALPHA=${ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA:-2.0}
-    SATC_INTERFACE_CUTOFF=${ABFLOW_SATC_INTERFACE_CUTOFF:-8.0}
-    SATC_INTERFACE_TEMPERATURE=${ABFLOW_SATC_INTERFACE_TEMPERATURE:-1.0}
-    SATC_INTERFACE_NORMALIZE=${ABFLOW_SATC_INTERFACE_NORMALIZE:-on}
+    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
+    SATC_INTERFACE_WEIGHT_ALPHA=0.0
     SATC_SCHEDULE=constant
     SATC_STEPS_PER_EPOCH=${ABFLOW_SATC_STEPS_PER_EPOCH:-52}
-    SATC_DECAY_START_EPOCH=9999
-    SATC_DECAY_END_EPOCH=10000
-    SATC_PERTURB_FINAL_SCALE=1.0
-    SATC_SCORE_FINAL_SCALE=1.0
-    SATC_VELOCITY_FINAL_SCALE=0.0
+    SATC_GT_INTERVAL=${ABFLOW_SATC_GT_INTERVAL:-4}
+    SATC_GT_START_EPOCH=${ABFLOW_SATC_GT_START_EPOCH:-5}
     MAX_EPOCH=${ABFLOW_MAX_EPOCH:-160}
     FORCE_SCRATCH=on
     ;;
 
   *)
     echo "Unknown EXP_ID: $EXP_ID"
-    echo "Supported: PCS_RC_LC_R1, PCS_RC_LC_R1_DUAL_SEQ, PCS_RC_LC_R1_DUAL_SEQ_SATC_IF_NT, PCS_RC_LC_R1_JOINT_PATH_CTRL, PCS_RC_LC_R1_JOINT_PATH_SATC_IF_NT"
+    echo "Supported: PCS_RC_LC_R1, PCS_RC_LC_R1_JOINT_EXACT_CTRL, PCS_RC_LC_R1_JOINT_EXACT_GT_SATC"
     exit 2
     ;;
 esac
@@ -438,6 +369,9 @@ run_with_env() {
   ABFLOW_SATC_PERTURB_FINAL_SCALE="$SATC_PERTURB_FINAL_SCALE" \
   ABFLOW_SATC_SCORE_FINAL_SCALE="$SATC_SCORE_FINAL_SCALE" \
   ABFLOW_SATC_VELOCITY_FINAL_SCALE="$SATC_VELOCITY_FINAL_SCALE" \
+  ABFLOW_SATC_GT_INTERVAL="$SATC_GT_INTERVAL" \
+  ABFLOW_SATC_GT_START_EPOCH="$SATC_GT_START_EPOCH" \
+  ABFLOW_SAMPLE_N_STEPS="$SAMPLE_N_STEPS" \
   ABFLOW_CONDITION_DIAGNOSTICS="$CONDITION_DIAGNOSTICS" \
   ABFLOW_DIAGNOSTIC_FILE="$DIAGNOSTIC_FILE" \
   ABFLOW_DIAGNOSTIC_FILE_INTERVAL="$DIAGNOSTIC_FILE_INTERVAL" \
@@ -521,6 +455,9 @@ print_settings() {
   echo "SATC_PERTURB_FINAL_SCALE=$SATC_PERTURB_FINAL_SCALE"
   echo "SATC_SCORE_FINAL_SCALE=$SATC_SCORE_FINAL_SCALE"
   echo "SATC_VELOCITY_FINAL_SCALE=$SATC_VELOCITY_FINAL_SCALE"
+  echo "SATC_GT_INTERVAL=$SATC_GT_INTERVAL"
+  echo "SATC_GT_START_EPOCH=$SATC_GT_START_EPOCH"
+  echo "SAMPLE_N_STEPS=${SAMPLE_N_STEPS:-<model/default>}"
   echo "AMP=$AMP"
   echo "AMP_DTYPE=$AMP_DTYPE"
   echo "ALLOW_TF32=$ALLOW_TF32"
@@ -544,14 +481,14 @@ print_settings() {
 
 
 # ============================================================
-# Automatic topk-map evaluation helpers
+# Automatic validation-rollout checkpoint evaluation helpers
 # ============================================================
 # Principle:
 #   The original training command remains unchanged:
 #     bash scripts/train/run_state_consistent_ablation.sh train <EXP_ID> <GPU_ID> <BASE_CONFIG>
 #   When ABFLOW_AUTO_TOPK_EVAL=on (explicit opt-in), the launcher automatically starts
 #   a background watcher if spare GPUs are available.  It reads topk_map.txt,
-#   evaluates new checkpoints with the existing test pipeline, and writes CSV
+#   evaluates new checkpoints on the validation JSON with the existing evaluation pipeline, and writes CSV
 #   next to topk_map.txt.  If no spare GPU is available, the launcher performs
 #   a final catch-up evaluation after training finishes.
 
@@ -561,7 +498,7 @@ AUTO_TOPK_POLL_INTERVAL=${ABFLOW_TOPK_POLL_INTERVAL:-300}
 AUTO_TOPK_MAX_NEW=${ABFLOW_TOPK_MAX_NEW:-1}
 AUTO_TOPK_LATEST_ONLY=${ABFLOW_TOPK_LATEST_ONLY:-off}
 AUTO_TOPK_MAX_EVAL_GPUS=${ABFLOW_AUTO_TOPK_MAX_EVAL_GPUS:-1}
-AUTO_TOPK_TEST_JSON=${ABFLOW_TOPK_TEST_JSON:-${PROJECT_ROOT}/datasets/RAbD/test.json}
+AUTO_TOPK_TEST_JSON=${ABFLOW_TOPK_TEST_JSON:-${PROJECT_ROOT}/datasets/RAbD/valid.json}
 AUTO_TOPK_EVAL_SCRIPT=${ABFLOW_TOPK_EVAL_SCRIPT:-scripts/test/evaluate_topk_map.py}
 AUTO_TOPK_FORCE=${ABFLOW_TOPK_FORCE:-off}
 
@@ -634,7 +571,7 @@ _start_auto_topk_watcher() {
     return 0
   fi
   if [[ ! -f "$AUTO_TOPK_TEST_JSON" ]]; then
-    echo "[AutoTopK] test json not found: $AUTO_TOPK_TEST_JSON; auto evaluation disabled."
+    echo "[AutoTopK] evaluation json not found: $AUTO_TOPK_TEST_JSON; auto evaluation disabled."
     return 0
   fi
   if [[ ! -f "$AUTO_TOPK_EVAL_SCRIPT" ]]; then
@@ -756,7 +693,7 @@ if [[ "$MODE" != "train" ]]; then
   echo "Train: bash $0 train <EXP_ID> <GPU_ID> <BASE_CONFIG>"
   echo "Test:  bash $0 test  <EXP_ID> <GPU_ID> <CKPT> <RESULT_DIR> [TEST_JSON]"
   echo "Attach current training auto-eval: bash $0 attach_eval <EXP_ID> <GPU_ID|auto> [EVAL_GPU_ID|auto]"
-  echo "Supported EXP_ID: PCS_RC_LC_R1, PCS_RC_LC_R1_DUAL_SEQ, PCS_RC_LC_R1_DUAL_SEQ_SATC_IF_NT, PCS_RC_LC_R1_JOINT_PATH_CTRL, PCS_RC_LC_R1_JOINT_PATH_SATC_IF_NT"
+  echo "Supported EXP_ID: PCS_RC_LC_R1, PCS_RC_LC_R1_JOINT_EXACT_CTRL, PCS_RC_LC_R1_JOINT_EXACT_GT_SATC"
   exit 2
 fi
 
@@ -994,6 +931,9 @@ runtime = {
     "satc_perturb_final_scale": os.environ.get("ABFLOW_SATC_PERTURB_FINAL_SCALE", ""),
     "satc_score_final_scale": os.environ.get("ABFLOW_SATC_SCORE_FINAL_SCALE", ""),
     "satc_velocity_final_scale": os.environ.get("ABFLOW_SATC_VELOCITY_FINAL_SCALE", ""),
+    "satc_gt_interval": os.environ.get("ABFLOW_SATC_GT_INTERVAL", ""),
+    "satc_gt_start_epoch": os.environ.get("ABFLOW_SATC_GT_START_EPOCH", ""),
+    "sample_n_steps": os.environ.get("ABFLOW_SAMPLE_N_STEPS", ""),
     "amp": os.environ.get("ABFLOW_AMP", "on"),
     "amp_dtype": os.environ.get("ABFLOW_AMP_DTYPE", "bf16"),
     "allow_tf32": os.environ.get("ABFLOW_ALLOW_TF32", "on"),
@@ -1095,7 +1035,7 @@ TRAIN_STATUS=$?
 set -e
 
 # Evaluate only after a successful training process.  A failed run has no valid
-# new checkpoint and must not launch a test-set catch-up job that obscures the
+# new checkpoint and must not launch a catch-up evaluation job that obscures the
 # original exception or consumes another GPU.
 if [[ "$TRAIN_STATUS" -eq 0 ]]; then
   _run_auto_topk_once "${AUTO_EVAL_GPUS:-$GPU_ID}" "$RUN_DIR"
