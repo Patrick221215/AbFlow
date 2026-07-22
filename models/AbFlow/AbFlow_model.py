@@ -18,6 +18,8 @@ from ..modules.am_enc import AMEncoder
 from ..modules.am_egnn import AMEGNN
 
 
+# v50: dual-role sequence state/context consistency with diagnostic observability.
+
 
 def _env_str(name, default):
     value = os.environ.get(name, None)
@@ -390,6 +392,72 @@ class AbFlowModel(nn.Module):
         self.satc_velocity_weight = _env_float("ABFLOW_SATC_VELOCITY_WEIGHT", 0.003)
         self.satc_t_min = _env_float("ABFLOW_SATC_T_MIN", 0.10)
         self.satc_t_max = _env_float("ABFLOW_SATC_T_MAX", 0.80)
+
+        # Tube calibration keeps the existing full-atom Cartesian AbFlow state.
+        # legacy_absolute reproduces v45 exactly:
+        #     gamma(t) = gamma_scale * t * (1-t).
+        # transport_calibrated removes the arbitrary Angstrom coefficient and
+        # measures tube width relative to the current PCS source-to-native path:
+        #     gamma_g(t) = gamma_scale * RMS_g(X1-X0) * 4t(1-t).
+        # Here gamma_scale is dimensionless and gamma_g reaches the configured
+        # fraction of the graph-level transport RMS at t=0.5.  The absolute cap
+        # is only a safety guard against malformed proposals; it is not the main
+        # scale definition.  Noise remains iid in the actual AbFlow state space,
+        # so the analytic isotropic score direction used by SATC is unchanged.
+        self.satc_tube_mode = _env_str(
+            "ABFLOW_SATC_TUBE_MODE", "legacy_absolute"
+        ).lower()
+        if self.satc_tube_mode not in {
+            "legacy_absolute", "transport_calibrated"
+        }:
+            raise ValueError(
+                "ABFLOW_SATC_TUBE_MODE must be legacy_absolute or "
+                "transport_calibrated."
+            )
+        self.satc_transport_rms_min = _env_float(
+            "ABFLOW_SATC_TRANSPORT_RMS_MIN", 0.25
+        )
+        self.satc_transport_rms_max = _env_float(
+            "ABFLOW_SATC_TRANSPORT_RMS_MAX", 20.0
+        )
+        self.satc_gamma_abs_max = _env_float(
+            "ABFLOW_SATC_GAMMA_ABS_MAX", 0.50
+        )
+        if not (
+            0.0 < self.satc_transport_rms_min
+            < self.satc_transport_rms_max
+        ):
+            raise ValueError(
+                "Require 0 < ABFLOW_SATC_TRANSPORT_RMS_MIN < "
+                "ABFLOW_SATC_TRANSPORT_RMS_MAX."
+            )
+        if self.satc_gamma_abs_max <= 0.0:
+            raise ValueError("ABFLOW_SATC_GAMMA_ABS_MAX must be positive.")
+
+        # Projection bounding is separated from the NT semantics.  hard_clip
+        # preserves the raw projection coefficient and therefore keeps every
+        # target (including magnitude target 1) at its exact theoretical value.
+        # legacy_tanh is retained only to reproduce v45.
+        self.satc_projection_bound_mode = _env_str(
+            "ABFLOW_SATC_PROJECTION_BOUND_MODE", "legacy_tanh"
+        ).lower()
+        if self.satc_projection_bound_mode not in {
+            "legacy_tanh", "hard_clip"
+        }:
+            raise ValueError(
+                "ABFLOW_SATC_PROJECTION_BOUND_MODE must be legacy_tanh "
+                "or hard_clip."
+            )
+        self.satc_magnitude_loss_mode = _env_str(
+            "ABFLOW_SATC_MAGNITUDE_LOSS_MODE", "legacy_tanh"
+        ).lower()
+        if self.satc_magnitude_loss_mode not in {
+            "legacy_tanh", "unbiased_ratio_huber"
+        }:
+            raise ValueError(
+                "ABFLOW_SATC_MAGNITUDE_LOSS_MODE must be legacy_tanh "
+                "or unbiased_ratio_huber."
+            )
         if not (0.0 <= self.satc_apply_prob <= 1.0):
             raise ValueError("ABFLOW_SATC_APPLY_PROB must be in [0, 1].")
         if not (0.0 < self.satc_gamma_scale <= 1.0):
@@ -617,6 +685,49 @@ class AbFlowModel(nn.Module):
         else:
             self.seq_pep_condition_embedding = None
             self.seq_pep_condition_adapter = None
+
+        # Dual-role sequence state/context for PCS-RC.
+        #
+        # PCS-RC deliberately keeps S_pep as recurrent proposal context, but the
+        # generated categorical state S_t must also control the state-dependent
+        # residue/atom representation.  A hidden-only token adapter is not enough:
+        # SeparatedAminoAcidFeature selects residue embeddings, atom types, atom
+        # positions, atom weights and valid local channels from S before message
+        # passing.  v50 therefore keeps the proposal context unchanged while
+        # replacing the paratope-local residue/atom features with features derived
+        # from S_t.  This is a dual representation, not a new generative process.
+        legacy_shadow = _env_flag("ABFLOW_SHADOW_SEQ_STATE", False)
+        self.dual_sequence_state = _env_flag(
+            "ABFLOW_DUAL_SEQUENCE_STATE", legacy_shadow
+        )
+        # Backward-compatible diagnostic name.
+        self.shadow_seq_state = self.dual_sequence_state
+        if self.dual_sequence_state and not self.struct_only:
+            self.seq_state_adapter = nn.Sequential(
+                nn.Linear(2 * embed_size, embed_size),
+                nn.SiLU(),
+                nn.Linear(embed_size, embed_size),
+            )
+            # Zero-start preserves the validated PCS-RC-LC-R1 computation at
+            # initialization.  Atom identity/masks are switched directly to S_t;
+            # the residue-level hidden correction is learned gradually.
+            nn.init.zeros_(self.seq_state_adapter[-1].weight)
+            nn.init.zeros_(self.seq_state_adapter[-1].bias)
+        else:
+            self.seq_state_adapter = None
+        self.seq_state_embedding = None  # removed: reuse aa_feature embeddings
+
+        # Diagnostics are observational only. Gradient-conflict probing is
+        # explicitly periodic because autograd.grad adds cost.
+        self.grad_conflict_diagnostics = _env_flag(
+            "ABFLOW_GRAD_CONFLICT_DIAGNOSTICS", False
+        )
+        self.last_gradient_diagnostics = {}
+        self._diagnostic_objective_tensors = {}
+        self._diagnostic_validation_mode = False
+        # Set by the trainer only on recorded/probed steps so diagnostics do not
+        # turn every expensive training batch into a synchronization point.
+        self._diagnostic_capture = False
 
         self.seq_ce_weight = _env_float("ABFLOW_SEQ_CE_WEIGHT", 1.0)
 
@@ -1133,13 +1244,57 @@ class AbFlowModel(nn.Module):
         )
         return cond_emb, cond_mask
 
+    def _build_dual_sequence_state_features(
+            self, sequence_state_full, residue_pos, ref_tensor):
+        """Construct residue/atom features from the explicit categorical state.
+
+        The proposal sequence remains the recurrent context used by the original
+        PCS-RC graph.  This helper computes the *state* features with the same
+        embedding tables as ``aa_feature`` so S_t has the same semantics as an
+        ordinary graph sequence: residue identity, atom identity, atom-position
+        mask and atom weights all change together.
+        """
+        if self.seq_state_adapter is None or sequence_state_full is None:
+            return None
+        state = torch.as_tensor(
+            sequence_state_full, device=ref_tensor.device, dtype=torch.long
+        ).reshape(-1)
+        if state.numel() != ref_tensor.shape[0]:
+            raise ValueError(
+                "sequence_state_full length mismatch: "
+                f"expected {ref_tensor.shape[0]}, got {state.numel()}."
+            )
+        valid = (state >= 0) & (state < self.num_classes)
+        safe_state = state.clamp(min=0, max=self.num_classes - 1)
+        if residue_pos is None:
+            residue_pos = self.aa_feature._construct_residue_pos(safe_state)
+        pos_embedding = self.aa_feature.aa_embedding.res_pos_embedding(residue_pos)
+        residue_hidden = self.aa_feature.aa_embedding.residue_embedding(safe_state)
+        residue_hidden = residue_hidden + pos_embedding
+        atom_type = self.aa_feature.residue_atom_type[safe_state]
+        atom_pos = self.aa_feature.residue_atom_pos[safe_state]
+        atom_embedding = (
+            self.aa_feature.aa_embedding.atom_embedding(atom_type)
+            + self.aa_feature.aa_embedding.atom_pos_embedding(atom_pos)
+        )
+        atom_weights = self.aa_feature.get_atom_weights(safe_state)
+        return {
+            "residue_hidden": residue_hidden.to(dtype=ref_tensor.dtype),
+            "atom_embedding": atom_embedding.to(dtype=ref_tensor.dtype),
+            "atom_weights": atom_weights.to(dtype=ref_tensor.dtype),
+            "atom_pos": atom_pos,
+            "valid": valid,
+            "tokens": safe_state,
+        }
+
     def message_passing(self, X, S, residue_pos, interface_X, surf, paratope_mask,
                         batch_id, round_idx, memory_H=None, smooth_prob=None,
                         smooth_mask=None, flow_t=None,
                         coord_pep_condition=None,
                         coord_pep_condition_mask=None,
                         seq_pep_condition=None,
-                        seq_pep_condition_mask=None):
+                        seq_pep_condition_mask=None,
+                        sequence_state_full=None):
         # embeddings, hidden state, (internal edges, external edges),
         # (A : c*d, w : c*1)
         H_0, (ctx_edges, inter_edges), (atom_embeddings, atom_weights) = self.aa_feature(
@@ -1153,14 +1308,28 @@ class AbFlowModel(nn.Module):
         if time_emb is not None:
             H_0 = H_0 + time_emb
 
-        # Reset detached condition-strength diagnostics for this refinement round.
+        # Reset detached condition-strength diagnostics only on sampled steps.
+        # The state/atom computation itself is always active; only reductions and
+        # GPU synchronizations used for observability are gated.
+        diagnostics_active = bool(
+            self.condition_diagnostics_enabled
+            and getattr(self, "_diagnostic_capture", False)
+        )
         zero_diag = H_0.detach().new_tensor(0.0)
-        if self.condition_diagnostics_enabled:
+        if diagnostics_active:
             self._last_condition_diagnostics = {
                 "coord_condition_residual_ratio": zero_diag,
                 "seq_condition_residual_ratio": zero_diag,
+                "seq_state_residual_ratio": zero_diag,
                 "coord_condition_valid_rate": zero_diag,
                 "seq_condition_valid_rate": zero_diag,
+                "seq_state_valid_rate": zero_diag,
+                "seq_state_token_disagreement_rate": zero_diag,
+                "seq_state_atom_mask_disagreement_rate": zero_diag,
+                "seq_state_atom_weight_delta_ratio": zero_diag,
+                "dual_sequence_state_enabled": H_0.detach().new_tensor(
+                    1.0 if self.dual_sequence_state else 0.0
+                ),
             }
         else:
             self._last_condition_diagnostics = {}
@@ -1192,7 +1361,7 @@ class AbFlowModel(nn.Module):
                     * cond_mask.unsqueeze(-1).to(H_0.dtype)
                 )
 
-                if self.condition_diagnostics_enabled:
+                if diagnostics_active:
                     with torch.no_grad():
                         # This branch is intentionally optional because the
                         # reductions below can synchronize GPU work.
@@ -1216,6 +1385,100 @@ class AbFlowModel(nn.Module):
                 # coordinate proposal.  The zero-valued term marks the parameters
                 # as used without changing the forward value.
                 dummy = sum(p.sum() for p in self.coord_pep_condition_adapter.parameters())
+                H_0 = H_0 + 0.0 * dummy
+
+        # Dual sequence representation.  S_pep remains the recurrent context
+        # that built H_0/ctx_edges, while S_t supplies paratope-local residue and
+        # atom features.  This preserves the strong base and fixes the incomplete
+        # hidden-only state injection of v49.
+        state_atom_pos_full = None
+        if self.seq_state_adapter is not None:
+            state_features = self._build_dual_sequence_state_features(
+                sequence_state_full, residue_pos, H_0
+            )
+            if state_features is not None:
+                state_valid = state_features["valid"]
+                state_mask = paratope_mask & state_valid
+                state_hidden = state_features["residue_hidden"]
+                base_before_state = H_0
+                state_residual = self.seq_state_adapter(
+                    torch.cat([H_0, state_hidden], dim=-1)
+                )
+                H_0 = H_0 + (
+                    state_residual
+                    * state_mask.unsqueeze(-1).to(H_0.dtype)
+                )
+
+                atom_mask = state_mask.view(-1, 1, 1)
+                atom_embeddings = torch.where(
+                    atom_mask, state_features["atom_embedding"], atom_embeddings
+                )
+                atom_weights = torch.where(
+                    state_mask.view(-1, 1),
+                    state_features["atom_weights"], atom_weights
+                )
+                context_atom_pos = self.aa_feature._construct_atom_pos(S)
+                state_atom_pos_full = torch.where(
+                    state_mask.view(-1, 1),
+                    state_features["atom_pos"], context_atom_pos
+                )
+
+                if diagnostics_active:
+                    with torch.no_grad():
+                        if bool(state_mask.any()):
+                            context_tokens = S.to(device=H_0.device, dtype=torch.long)
+                            token_disagreement = (
+                                state_features["tokens"][state_mask]
+                                != context_tokens[state_mask]
+                            ).float().mean()
+                            context_pos = context_atom_pos[state_mask]
+                            state_pos = state_features["atom_pos"][state_mask]
+                            context_pad = (
+                                context_pos == self.aa_feature.atom_pos_pad_idx
+                            )
+                            state_pad = (
+                                state_pos == self.aa_feature.atom_pos_pad_idx
+                            )
+                            atom_mask_disagreement = (
+                                context_pad != state_pad
+                            ).float().mean()
+                            context_weights = self.aa_feature.get_atom_weights(
+                                context_tokens[state_mask]
+                            ).to(H_0.dtype)
+                            state_weights = state_features["atom_weights"][state_mask]
+                            weight_delta = torch.sqrt(
+                                ((state_weights - context_weights).detach() ** 2).mean()
+                                + self.scorefm_eps
+                            )
+                            weight_base = torch.sqrt(
+                                (context_weights.detach() ** 2).mean()
+                                + self.scorefm_eps
+                            )
+                            base_rms = torch.sqrt(
+                                (base_before_state[state_mask].detach() ** 2).mean()
+                                + self.scorefm_eps
+                            )
+                            residual_rms = torch.sqrt(
+                                (state_residual[state_mask].detach() ** 2).mean()
+                                + self.scorefm_eps
+                            )
+                            self._last_condition_diagnostics[
+                                "seq_state_residual_ratio"
+                            ] = residual_rms / base_rms.clamp_min(self.scorefm_eps)
+                            self._last_condition_diagnostics[
+                                "seq_state_valid_rate"
+                            ] = state_mask.float().mean()
+                            self._last_condition_diagnostics[
+                                "seq_state_token_disagreement_rate"
+                            ] = token_disagreement
+                            self._last_condition_diagnostics[
+                                "seq_state_atom_mask_disagreement_rate"
+                            ] = atom_mask_disagreement
+                            self._last_condition_diagnostics[
+                                "seq_state_atom_weight_delta_ratio"
+                            ] = weight_delta / weight_base.clamp_min(self.scorefm_eps)
+            else:
+                dummy = sum(p.sum() for p in self.seq_state_adapter.parameters())
                 H_0 = H_0 + 0.0 * dummy
 
         # Sequence proposal is fused through a residue- and time-dependent
@@ -1242,7 +1505,7 @@ class AbFlowModel(nn.Module):
                     * seq_mask.unsqueeze(-1).to(H_0.dtype)
                 )
 
-                if self.condition_diagnostics_enabled:
+                if diagnostics_active:
                     with torch.no_grad():
                         if bool(seq_mask.any()):
                             base_rms = torch.sqrt(
@@ -1296,7 +1559,11 @@ class AbFlowModel(nn.Module):
         # prepare local complex edges
         local_ctx_edges = self.batch_constants['local_ctx_edges']  # [2, Ec]
         local_inter_edges = self.batch_constants['local_inter_edges']  # [2, Ei]
-        atom_pos = self.aa_feature._construct_atom_pos(S[local_mask])
+        atom_pos = (
+            state_atom_pos_full[local_mask]
+            if state_atom_pos_full is not None
+            else self.aa_feature._construct_atom_pos(S[local_mask])
+        )
         offsets, max_n, gni2lni = self.batch_constants['local_edge_infos']
         # Context and interaction edges are both derived from the current state.
         local_ctx_edges = _knn_edges(
@@ -1404,6 +1671,12 @@ class AbFlowModel(nn.Module):
 
     @torch.no_grad()
     def _get_inter_edge_dist(self, X, S):
+        """Ground-truth inter-edge distance using the supplied sequence.
+
+        This target is computed from native coordinates and ``true_S`` in
+        ``forward``.  It must not depend on the transient dual sequence state
+        used inside ``message_passing``.
+        """
         local_mask = self.batch_constants['local_mask']
         atom_pos = self.aa_feature._construct_atom_pos(S[local_mask])
         src_dst = self.batch_constants['local_inter_edges'].T
@@ -1607,6 +1880,73 @@ class AbFlowModel(nn.Module):
         return t_graph.clamp(0.0, 1.0), valid_graph
 
     @torch.no_grad()
+    def _satc_transport_calibrated_gamma(
+            self, source_X0, target_X1, atom_mask, t_graph,
+            interface_batch_id, gamma_scale):
+        """Build a path-relative SATC tube without changing AbFlow's state.
+
+        The original v45 coefficient had units of Angstrom but was selected as
+        a fixed number independent of the actual PCS source-to-native distance.
+        This helper instead computes one graph-level transport RMS in the same
+        full-atom Cartesian state used by AbFlow and defines a dimensionless
+        relative tube width:
+
+            s_g = RMS_valid_atoms(X1 - X0)
+            gamma_g(t) = eta * s_g * 4 t (1-t).
+
+        Therefore eta is directly interpretable: at t=0.5 the stochastic tube
+        standard deviation is eta times the clean transport RMS.  We deliberately
+        keep iid Gaussian noise in the existing Cartesian state; changing its
+        covariance would change the analytic score from -epsilon/gamma and would
+        require a different score target.
+        """
+        if interface_batch_id.numel() == 0:
+            zero_graph = target_X1.new_zeros(1)
+            return target_X1.new_zeros((0, 1, 1)), zero_graph, zero_graph
+
+        transport = (target_X1 - source_X0).detach().float()
+        mask = atom_mask.to(device=transport.device, dtype=transport.dtype)
+        valid_atoms = mask.sum(dim=-1).clamp_min(1.0)
+        per_res_mse = (
+            transport.pow(2).sum(dim=-1) * mask
+        ).sum(dim=-1) / (3.0 * valid_atoms)
+
+        n_graph = int(interface_batch_id.max().item()) + 1
+        graph_mse = scatter_mean(
+            per_res_mse, interface_batch_id, dim=0, dim_size=n_graph
+        )
+        graph_rms = torch.sqrt(graph_mse.clamp_min(self.scorefm_eps))
+        graph_rms = graph_rms.clamp(
+            min=float(self.satc_transport_rms_min),
+            max=float(self.satc_transport_rms_max),
+        )
+
+        t_graph = torch.as_tensor(
+            t_graph, device=transport.device, dtype=transport.dtype
+        ).reshape(-1)
+        if t_graph.numel() == 1 and n_graph > 1:
+            t_graph = t_graph.expand(n_graph)
+        if t_graph.numel() != n_graph:
+            raise ValueError(
+                "transport-calibrated SATC expects graph-level time with "
+                f"{n_graph} values, got {t_graph.numel()}."
+            )
+
+        bridge_shape = 4.0 * t_graph * (1.0 - t_graph)
+        gamma_graph = (
+            float(gamma_scale) * graph_rms * bridge_shape
+        ).clamp(
+            min=0.0,
+            max=float(self.satc_gamma_abs_max),
+        )
+        gamma_int = gamma_graph[interface_batch_id].reshape(-1, 1, 1)
+        return (
+            gamma_int.to(dtype=target_X1.dtype),
+            graph_rms.to(dtype=target_X1.dtype),
+            gamma_graph.to(dtype=target_X1.dtype),
+        )
+
+    @torch.no_grad()
     def _satc_interface_residue_weights(self, X, paratope_mask):
         """Native-interface weights for SATC regularization.
 
@@ -1748,7 +2088,8 @@ class AbFlowModel(nn.Module):
             source_X0=None, si_gamma_t=None, si_gamma_prime_t=None,
             sat_eps_t=None, sat_gamma_t=None, sat_active_t=None,
             satc_residue_weight=None, satc_score_weight_eff=None,
-            satc_velocity_weight_eff=None, satc_schedule_info=None):
+            satc_velocity_weight_eff=None, satc_schedule_info=None,
+            satc_transport_rms_graph=None, satc_gamma_graph=None):
         """Coordinate objective for the shadow paratope.
 
         endpoint mode:
@@ -1777,6 +2118,10 @@ class AbFlowModel(nn.Module):
             endpoint_loss = pred_clean_X.new_tensor(0.0)
 
         zero = endpoint_loss.detach() * 0.0
+        # Keep differentiable objective components only until the trainer's
+        # optional gradient-conflict probe has run.
+        self._last_endpoint_objective_tensor = endpoint_loss
+        self._last_satc_objective_tensor = endpoint_loss * 0.0
 
         if self.scorefm_loss_mode in {
             "endpoint", "traj_consistency", "traj_consistency_fm"
@@ -1847,7 +2192,58 @@ class AbFlowModel(nn.Module):
 
             score_loss = zero
             velocity_loss = zero
+            normal_ratio_mean = zero
+            normal_ratio_negative_rate = zero
+            normal_ratio_satisfied_rate = zero
+            normal_ratio_clipped_rate = zero
+            perturb_total_rms = zero
+            perturb_translation_rms = zero
+            perturb_internal_rms = zero
+            perturb_internal_energy_fraction = zero
+            perturb_to_transport_rms = zero
             satc_rate = active_res.float().mean() if active_res.numel() > 0 else zero
+
+            # Observe what the stochastic tube actually perturbs.  This does not
+            # change the objective.  For each residue we decompose the Cartesian
+            # displacement into a shared translation and atom-relative internal
+            # deformation.  The decomposition directly tests whether the legacy
+            # iid tube represents H3 placement recovery or mostly local atom noise.
+            if bool(valid_res.any()):
+                with torch.no_grad():
+                    delta = (gamma * eps).float()
+                    vm_full = valid_atom.to(delta.dtype)
+                    n_atom = vm_full.sum(dim=-1).clamp_min(1.0)
+                    translation = (
+                        delta * vm_full.unsqueeze(-1)
+                    ).sum(dim=1) / n_atom.unsqueeze(-1)
+                    internal = delta - translation.unsqueeze(1)
+                    total_energy_res = (
+                        delta.pow(2).sum(dim=-1) * vm_full
+                    ).sum(dim=-1) / (3.0 * n_atom)
+                    translation_energy_res = translation.pow(2).sum(dim=-1) / 3.0
+                    internal_energy_res = (
+                        internal.pow(2).sum(dim=-1) * vm_full
+                    ).sum(dim=-1) / (3.0 * n_atom)
+                    active_valid = valid_res
+                    total_energy = total_energy_res[active_valid].mean()
+                    translation_energy = translation_energy_res[active_valid].mean()
+                    internal_energy = internal_energy_res[active_valid].mean()
+                    perturb_total_rms = torch.sqrt(total_energy.clamp_min(0.0))
+                    perturb_translation_rms = torch.sqrt(translation_energy.clamp_min(0.0))
+                    perturb_internal_rms = torch.sqrt(internal_energy.clamp_min(0.0))
+                    perturb_internal_energy_fraction = internal_energy / (
+                        total_energy + self.scorefm_eps
+                    )
+                    transport = (X1 - source_X0).detach().float()
+                    transport_energy_res = (
+                        transport.pow(2).sum(dim=-1) * vm_full
+                    ).sum(dim=-1) / (3.0 * n_atom)
+                    transport_rms = torch.sqrt(
+                        transport_energy_res[active_valid].mean().clamp_min(0.0)
+                    )
+                    perturb_to_transport_rms = perturb_total_rms / (
+                        transport_rms + self.scorefm_eps
+                    )
 
             if bool(valid_res.any()):
                 cp = correction_pred[valid_res]
@@ -1884,9 +2280,30 @@ class AbFlowModel(nn.Module):
                     # orthogonal transport residuals.
                     normal_ratio_raw = dot / (ct_norm.pow(2) + self.scorefm_eps)
                     pull_clip = float(getattr(self, "satc_nt_pull_clip", 2.0))
-                    normal_ratio = torch.tanh(normal_ratio_raw / pull_clip) * pull_clip
+                    if self.satc_projection_bound_mode == "hard_clip":
+                        # Exact coefficient inside the safe interval.  In
+                        # particular, a theoretical ratio of one remains one.
+                        normal_ratio = normal_ratio_raw.clamp(
+                            min=-pull_clip, max=pull_clip
+                        )
+                    else:
+                        # Backward-compatible v45 behavior.
+                        normal_ratio = (
+                            torch.tanh(normal_ratio_raw / pull_clip)
+                            * pull_clip
+                        )
                     min_pull = float(getattr(self, "satc_nt_min_pull", 0.15))
                     score_atom_loss = F.relu(min_pull - normal_ratio).pow(2)
+                    valid_ratio = normal_ratio_raw.masked_select(vm)
+                    if valid_ratio.numel() > 0:
+                        normal_ratio_mean = valid_ratio.mean()
+                        normal_ratio_negative_rate = (valid_ratio < 0).float().mean()
+                        normal_ratio_satisfied_rate = (
+                            valid_ratio >= min_pull
+                        ).float().mean()
+                        normal_ratio_clipped_rate = (
+                            valid_ratio.abs() >= pull_clip
+                        ).float().mean()
                 else:
                     # Legacy SATC: constrain the full residual correction vector
                     # to align with the analytic score direction.  Kept for
@@ -1940,12 +2357,33 @@ class AbFlowModel(nn.Module):
                         # preventing rare early outliers from dominating training.
                         pull_clip = float(getattr(self, "satc_nt_pull_clip", 2.0))
                         proj_ratio_raw = proj / (target_mag + self.scorefm_eps)
-                        proj_ratio = torch.tanh(proj_ratio_raw / pull_clip) * pull_clip
+                        if self.satc_magnitude_loss_mode == "unbiased_ratio_huber":
+                            # Hard clipping limits outliers but does not move the
+                            # optimum: exact analytic magnitude has raw ratio 1
+                            # and therefore zero SmoothL1 loss.
+                            proj_ratio = proj_ratio_raw.clamp(
+                                min=-pull_clip, max=pull_clip
+                            )
+                        else:
+                            # Backward-compatible v45 mapping whose optimum is
+                            # pull_clip*atanh(1/pull_clip), not exactly one.
+                            proj_ratio = (
+                                torch.tanh(proj_ratio_raw / pull_clip)
+                                * pull_clip
+                            )
                         vel_atom_loss = F.smooth_l1_loss(
                             proj_ratio,
                             torch.ones_like(proj_ratio),
                             reduction="none",
                         )
+                        valid_ratio = proj_ratio_raw.masked_select(vm)
+                        if valid_ratio.numel() > 0:
+                            normal_ratio_mean = valid_ratio.mean()
+                            normal_ratio_negative_rate = (valid_ratio < 0).float().mean()
+                            normal_ratio_satisfied_rate = (valid_ratio >= 1.0).float().mean()
+                            normal_ratio_clipped_rate = (
+                                valid_ratio.abs() >= pull_clip
+                            ).float().mean()
                     else:
                         vel_atom_loss = F.smooth_l1_loss(
                             proj, target_mag, reduction="none"
@@ -1971,11 +2409,47 @@ class AbFlowModel(nn.Module):
                 float(self.satc_velocity_weight)
                 if satc_velocity_weight_eff is None else float(satc_velocity_weight_eff)
             )
-            total = (
-                endpoint_loss
-                + score_weight_eff * score_loss
-                + velocity_weight_eff * velocity_loss
+            weighted_score = score_weight_eff * score_loss
+            weighted_velocity = velocity_weight_eff * velocity_loss
+            weighted_aux = weighted_score + weighted_velocity
+            self._last_satc_objective_tensor = weighted_aux
+            total = endpoint_loss + weighted_aux
+            aux_to_endpoint = weighted_aux.detach() / (
+                endpoint_loss.detach().abs() + self.scorefm_eps
             )
+            transport_rms_mean = (
+                zero if satc_transport_rms_graph is None
+                else torch.as_tensor(
+                    satc_transport_rms_graph,
+                    device=pred_clean_X.device,
+                    dtype=pred_clean_X.dtype,
+                ).mean().detach()
+            )
+            gamma_mean = (
+                zero if satc_gamma_graph is None
+                else torch.as_tensor(
+                    satc_gamma_graph,
+                    device=pred_clean_X.device,
+                    dtype=pred_clean_X.dtype,
+                ).mean().detach()
+            )
+            if satc_residue_weight is not None:
+                iw = torch.as_tensor(
+                    satc_residue_weight, device=pred_clean_X.device,
+                    dtype=pred_clean_X.dtype
+                ).reshape(-1)
+                interface_weight_mean = iw.mean().detach()
+                interface_weight_std = iw.std(unbiased=False).detach()
+                interface_weight_max = iw.max().detach()
+                interface_weight_ess = (
+                    iw.sum().pow(2)
+                    / (iw.pow(2).sum() * max(1, iw.numel()) + self.scorefm_eps)
+                ).detach()
+            else:
+                interface_weight_mean = zero
+                interface_weight_std = zero
+                interface_weight_max = zero
+                interface_weight_ess = zero
             details = {
                 "scorefm_total": total.detach(),
                 "scorefm_endpoint": endpoint_loss.detach(),
@@ -1993,6 +2467,22 @@ class AbFlowModel(nn.Module):
                 "scorefm_satc_velocity_weight_eff": pred_clean_X.new_tensor(velocity_weight_eff),
                 "scorefm_satc_nt_min_pull": pred_clean_X.new_tensor(float(getattr(self, "satc_nt_min_pull", 0.15))),
                 "scorefm_satc_nt_pull_clip": pred_clean_X.new_tensor(float(getattr(self, "satc_nt_pull_clip", 2.0))),
+                "scorefm_satc_normal_ratio_mean": normal_ratio_mean.detach(),
+                "scorefm_satc_normal_ratio_negative_rate": normal_ratio_negative_rate.detach(),
+                "scorefm_satc_normal_ratio_satisfied_rate": normal_ratio_satisfied_rate.detach(),
+                "scorefm_satc_normal_ratio_clipped_rate": normal_ratio_clipped_rate.detach(),
+                "scorefm_satc_perturb_total_rms": perturb_total_rms.detach(),
+                "scorefm_satc_perturb_translation_rms": perturb_translation_rms.detach(),
+                "scorefm_satc_perturb_internal_rms": perturb_internal_rms.detach(),
+                "scorefm_satc_perturb_internal_energy_fraction": perturb_internal_energy_fraction.detach(),
+                "scorefm_satc_perturb_to_transport_rms": perturb_to_transport_rms.detach(),
+                "scorefm_satc_interface_weight_mean": interface_weight_mean,
+                "scorefm_satc_interface_weight_std": interface_weight_std,
+                "scorefm_satc_interface_weight_max": interface_weight_max,
+                "scorefm_satc_interface_weight_ess": interface_weight_ess,
+                "scorefm_satc_aux_to_endpoint": aux_to_endpoint.detach(),
+                "scorefm_satc_transport_rms_mean": transport_rms_mean,
+                "scorefm_satc_gamma_mean": gamma_mean,
                 "scorefm_satc_schedule_phase": pred_clean_X.new_tensor(
                     1.0 if satc_schedule_info is None else float(satc_schedule_info.get("phase", 1.0))
                 ),
@@ -2392,12 +2882,20 @@ class AbFlowModel(nn.Module):
                 S_pep, paratope_mask, seq_ref_tensor
             )
         )
+        sequence_state_full = None
+        if has_sequence_state and self.dual_sequence_state:
+            sequence_state_full = S.clone()
+            sequence_state_full[paratope_mask] = interface_S
 
         r_pred_S_logits, pred_S_dist = [], None
         r_interface_X = [interface_X.clone()]
         r_edge_dist = []
         memory_H = None
-        condition_diag_rounds = [] if self.condition_diagnostics_enabled else None
+        diagnostics_active = bool(
+            self.condition_diagnostics_enabled
+            and getattr(self, "_diagnostic_capture", False)
+        )
+        condition_diag_rounds = [] if diagnostics_active else None
 
         for round_idx in range(self.round):
             # Role-separated local correction.  The recurrent proposal context
@@ -2434,6 +2932,7 @@ class AbFlowModel(nn.Module):
                 coord_pep_condition_mask=coord_pep_condition_mask,
                 seq_pep_condition=seq_pep_condition_this,
                 seq_pep_condition_mask=seq_pep_condition_mask_this,
+                sequence_state_full=sequence_state_full,
             )
 
             if condition_diag_rounds is not None:
@@ -2491,6 +2990,148 @@ class AbFlowModel(nn.Module):
         self.normalizer.clear_cache()
         return H, S, r_pred_S_logits, pred_X, r_interface_X, r_edge_dist, prmsd
 
+
+    @torch.no_grad()
+    def _validation_proxy_diagnostics(
+            self, *, true_X, true_S, pred_S, r_pred_S_logits, r_interface_X,
+            paratope_mask, smask, batch_id, interface_batch_id):
+        """Cheap validation proxies aligned with the final evaluation axes.
+
+        These are not substitutes for TM-score/lDDT/DockQ and are never used as
+        test-set checkpoint selection.  They answer where the refinement process
+        changes: raw placement, aligned local geometry, native contacts and
+        contact-residue sequence recovery.
+        """
+        out = {}
+        if interface_batch_id.numel() == 0:
+            return out
+        true_int = true_X[paratope_mask]
+        ca_idx = 1 if true_int.shape[1] > 1 else 0
+        true_ca = true_int[:, ca_idx].float()
+        n_graph = int(interface_batch_id.max().item()) + 1
+
+        round_raw = []
+        round_aligned = []
+        for ridx, pred_int in enumerate(r_interface_X[1:]):
+            pred_ca = pred_int[:, ca_idx].float()
+            raw_values, aligned_values = [], []
+            for g in range(n_graph):
+                m = interface_batch_id == g
+                if not bool(m.any()):
+                    continue
+                p, q = pred_ca[m], true_ca[m]
+                raw_values.append(torch.sqrt(((p - q) ** 2).sum(-1).mean()))
+                if p.shape[0] >= 3:
+                    try:
+                        _, rot, trans = kabsch_torch(p, q)
+                        p_aligned = torch.matmul(p, rot.T) + trans
+                        aligned_values.append(
+                            torch.sqrt(((p_aligned - q) ** 2).sum(-1).mean())
+                        )
+                    except Exception:
+                        pass
+            if raw_values:
+                rv = torch.stack(raw_values).mean()
+                out[f"val_proxy_round{ridx}_h3_ca_rmsd"] = rv
+                round_raw.append(rv)
+            if aligned_values:
+                av = torch.stack(aligned_values).mean()
+                out[f"val_proxy_round{ridx}_h3_ca_aligned_rmsd"] = av
+                round_aligned.append(av)
+
+        for ridx, (logits, mask) in enumerate(r_pred_S_logits):
+            if bool(mask.any()):
+                pred_round = torch.argmax(logits[mask], dim=-1)
+                out[f"val_proxy_round{ridx}_aar"] = (
+                    pred_round == true_S[mask]
+                ).float().mean()
+
+        if round_raw:
+            out["val_proxy_refinement_raw_rmsd_delta"] = (
+                round_raw[-1] - round_raw[0]
+            )
+        if round_aligned:
+            out["val_proxy_refinement_aligned_rmsd_delta"] = (
+                round_aligned[-1] - round_aligned[0]
+            )
+
+        is_ag = self.batch_constants.get("is_ag")
+        if is_ag is None:
+            return out
+        pred_final_ca = r_interface_X[-1][:, ca_idx].float()
+        contact_f1, contact_precision, contact_recall, caar_values = [], [], [], []
+        for g in range(n_graph):
+            pm = interface_batch_id == g
+            agm = (batch_id == g) & is_ag & (true_S != self.aa_feature.boa_idx)
+            if not bool(pm.any()) or not bool(agm.any()):
+                continue
+            ag_ca = true_X[agm, ca_idx].float()
+            native_contact = torch.cdist(true_ca[pm], ag_ca) < 8.0
+            pred_contact = torch.cdist(pred_final_ca[pm], ag_ca) < 8.0
+            tp = (native_contact & pred_contact).float().sum()
+            fp = ((~native_contact) & pred_contact).float().sum()
+            fn = (native_contact & (~pred_contact)).float().sum()
+            precision = tp / (tp + fp + self.scorefm_eps)
+            recall = tp / (tp + fn + self.scorefm_eps)
+            f1 = 2.0 * precision * recall / (precision + recall + self.scorefm_eps)
+            contact_precision.append(precision)
+            contact_recall.append(recall)
+            contact_f1.append(f1)
+            native_res = native_contact.any(dim=-1)
+            if bool(native_res.any()):
+                global_par_idx = paratope_mask.nonzero(as_tuple=False).reshape(-1)[pm]
+                caar_values.append((
+                    pred_S[global_par_idx[native_res]]
+                    == true_S[global_par_idx[native_res]]
+                ).float().mean())
+        if contact_f1:
+            out["val_proxy_native_contact_f1"] = torch.stack(contact_f1).mean()
+            out["val_proxy_native_contact_precision"] = torch.stack(contact_precision).mean()
+            out["val_proxy_native_contact_recall"] = torch.stack(contact_recall).mean()
+        if caar_values:
+            out["val_proxy_caar"] = torch.stack(caar_values).mean()
+        return out
+
+    def compute_gradient_conflict_diagnostics(self):
+        """Probe objective interactions on one shared GNN parameter.
+
+        A negative cosine is direct evidence that two objectives request opposing
+        updates on the shared representation.  This is a periodic diagnostic,
+        not a training loss and not gradient surgery.
+        """
+        if not self.grad_conflict_diagnostics:
+            self.last_gradient_diagnostics = {}
+            return {}
+        terms = self._diagnostic_objective_tensors
+        if not terms:
+            self.last_gradient_diagnostics = {}
+            return {}
+        probe = next((p for p in self.gnn.parameters() if p.requires_grad), None)
+        if probe is None:
+            return {}
+        grads = {}
+        for name, value in terms.items():
+            if not torch.is_tensor(value) or not value.requires_grad:
+                continue
+            g = torch.autograd.grad(
+                value, probe, retain_graph=True, allow_unused=True
+            )[0]
+            if g is not None:
+                grads[name] = g.detach().float().reshape(-1)
+        out = {}
+        for name, g in grads.items():
+            out[f"grad_probe_norm_{name}"] = torch.linalg.norm(g)
+        pairs = [("endpoint", "satc"), ("seq", "satc"),
+                 ("endpoint", "seq"), ("structure", "satc")]
+        for a, b in pairs:
+            if a in grads and b in grads:
+                ga, gb = grads[a], grads[b]
+                out[f"grad_probe_cos_{a}_{b}"] = (
+                    torch.dot(ga, gb)
+                    / (torch.linalg.norm(ga) * torch.linalg.norm(gb) + self.scorefm_eps)
+                )
+        self.last_gradient_diagnostics = {k: v.detach() for k, v in out.items()}
+        return self.last_gradient_diagnostics
 
     def _trajectory_consistency_objective(
             self, *, X, S, cmask, smask, paratope_mask, X_pep, S_pep,
@@ -2706,6 +3347,8 @@ class AbFlowModel(nn.Module):
             sat_gamma_int = None
             sat_active_int = None
             satc_runtime = None
+            satc_transport_rms_graph = None
+            satc_gamma_graph = None
             if self.scorefm_loss_mode in {"si_score", "si_score_fm"}:
                 # Training-only stochastic interpolant around the PCS source-to-
                 # native bridge.  This creates an analytic score target without
@@ -2728,7 +3371,8 @@ class AbFlowModel(nn.Module):
             elif self.scorefm_loss_mode in {
                 "score_aware_traj_lite", "score_aware_traj_fm_lite",
                 "score_aware_traj_if_lite", "score_aware_traj_if_fm_lite",
-                "score_aware_traj_nt_lite", "score_aware_traj_nt_fm_lite"
+                "score_aware_traj_nt_lite", "score_aware_traj_nt_fm_lite",
+                "score_aware_traj_if_nt_lite", "score_aware_traj_if_nt_fm_lite"
             }:
                 # One-forward score-aware off-path training.  We perturb only
                 # the model input state, keep X1 as the endpoint target, and
@@ -2737,22 +3381,54 @@ class AbFlowModel(nn.Module):
                 # _forward call while still exposing score-defined off-path
                 # states to the R1 flow.
                 satc_runtime = self._satc_effective_runtime(increment_step=True)
-                gamma_graph = (
-                    float(satc_runtime["gamma_scale"])
-                    * t_graph
-                    * (1.0 - t_graph)
-                ).clamp_min(self.scorefm_eps)
                 active_graph = (
                     (torch.rand_like(t_graph) < float(satc_runtime["apply_prob"]))
                     & (t_graph >= float(self.satc_t_min))
                     & (t_graph <= float(self.satc_t_max))
                 )
-                sat_gamma_int = self._time_for_interface(
-                    gamma_graph, interface_batch_id, interface_X
-                )
+
+                if self.satc_tube_mode == "transport_calibrated":
+                    tube_atom_pos = self.aa_feature._construct_atom_pos(
+                        true_S[paratope_mask]
+                    )
+                    tube_atom_mask = (
+                        tube_atom_pos != self.aa_feature.atom_pos_pad_idx
+                    )
+                    (
+                        sat_gamma_int,
+                        satc_transport_rms_graph,
+                        satc_gamma_graph,
+                    ) = self._satc_transport_calibrated_gamma(
+                        source_X0=interface_X,
+                        target_X1=gt_interface_X,
+                        atom_mask=tube_atom_mask,
+                        t_graph=t_graph,
+                        interface_batch_id=interface_batch_id,
+                        gamma_scale=float(satc_runtime["gamma_scale"]),
+                    )
+                else:
+                    gamma_graph = (
+                        float(satc_runtime["gamma_scale"])
+                        * t_graph
+                        * (1.0 - t_graph)
+                    ).clamp_min(self.scorefm_eps)
+                    sat_gamma_int = self._time_for_interface(
+                        gamma_graph, interface_batch_id, interface_X
+                    )
+                    satc_gamma_graph = gamma_graph
+
                 sat_active_int = active_graph[interface_batch_id].reshape(-1, 1, 1)
+                # Keep iid Gaussian noise in AbFlow's actual full-atom Cartesian
+                # state.  This retains the analytic isotropic score used by the
+                # existing SATC derivation and avoids importing an SO(3) or
+                # residue-frame process from a different model family.
                 sat_eps_int = torch.randn_like(mu_t)
-                Xt = mu_t + sat_active_int.to(mu_t.dtype) * sat_gamma_int * sat_eps_int
+                Xt = (
+                    mu_t
+                    + sat_active_int.to(mu_t.dtype)
+                    * sat_gamma_int
+                    * sat_eps_int
+                )
             else:
                 Xt = mu_t
 
@@ -2778,6 +3454,8 @@ class AbFlowModel(nn.Module):
             sat_eps_int = None
             sat_gamma_int = None
             sat_active_int = None
+            satc_transport_rms_graph = None
+            satc_gamma_graph = None
             t_graph = X.new_zeros(1)
             sequence_state_for_model = None
             source_ca_mean = None
@@ -2853,6 +3531,8 @@ class AbFlowModel(nn.Module):
                         None if satc_runtime is None else satc_runtime["velocity_weight"]
                     ),
                     satc_schedule_info=satc_runtime,
+                    satc_transport_rms_graph=satc_transport_rms_graph,
+                    satc_gamma_graph=satc_gamma_graph,
                 )
             )
         else:
@@ -2937,8 +3617,17 @@ class AbFlowModel(nn.Module):
             + dock_loss
             + (0 if pdev_loss is None else pdev_loss)
         )
-
-        self._clean_batch_constants()
+        self._diagnostic_objective_tensors = {
+            "seq": self.seq_ce_weight * snll,
+            "structure": struct_loss,
+            "endpoint": getattr(
+                self, "_last_endpoint_objective_tensor", interface_loss
+            ),
+            "satc": getattr(
+                self, "_last_satc_objective_tensor", interface_loss * 0.0
+            ),
+            "edge": ed_loss if torch.is_tensor(ed_loss) else loss * 0.0,
+        }
 
         # AAR and conditioning diagnostics.
         with torch.no_grad():
@@ -3053,6 +3742,21 @@ class AbFlowModel(nn.Module):
                 "satc_interface_temperature": torch.as_tensor(
                     float(getattr(self, "satc_interface_temperature", 0.0)), device=X.device
                 ),
+                "satc_tube_mode_transport_calibrated": torch.as_tensor(
+                    1.0 if self.satc_tube_mode == "transport_calibrated" else 0.0,
+                    device=X.device,
+                ),
+                "satc_gamma_abs_max": torch.as_tensor(
+                    float(self.satc_gamma_abs_max), device=X.device
+                ),
+                "satc_projection_bound_hard_clip": torch.as_tensor(
+                    1.0 if self.satc_projection_bound_mode == "hard_clip" else 0.0,
+                    device=X.device,
+                ),
+                "satc_magnitude_loss_unbiased": torch.as_tensor(
+                    1.0 if self.satc_magnitude_loss_mode == "unbiased_ratio_huber" else 0.0,
+                    device=X.device,
+                ),
                 "scorefm_state_path": torch.as_tensor(
                     1.0 if state_path else 0.0, device=X.device
                 ),
@@ -3091,6 +3795,14 @@ class AbFlowModel(nn.Module):
                 ),
                 "seq_input_mode_pep_condition": torch.as_tensor(
                     1.0 if self.seq_input_mode == "pep_condition" else 0.0, device=X.device
+                ),
+                "shadow_seq_state_enabled": torch.as_tensor(
+                    1.0 if getattr(self, "dual_sequence_state", False) else 0.0,
+                    device=X.device,
+                ),
+                "dual_sequence_state_enabled": torch.as_tensor(
+                    1.0 if getattr(self, "dual_sequence_state", False) else 0.0,
+                    device=X.device,
                 ),
                 "t_mean": t_graph.detach().float().mean(),
                 "t_min": t_graph.detach().float().min(),
@@ -3178,10 +3890,35 @@ class AbFlowModel(nn.Module):
                         proposal_valid.float().mean()
                     )
 
+            if (
+                state_path
+                and St is not None
+                and S_pep is not None
+                and S_pep.numel() == St.numel()
+            ):
+                pep_state = S_pep.to(device=St.device, dtype=torch.long).reshape(-1)
+                valid_pair = (
+                    (pep_state >= 0) & (pep_state < self.num_classes)
+                    & (St >= 0) & (St < self.num_classes)
+                )
+                if bool(valid_pair.any()):
+                    diag["seq_state_vs_pep_disagreement_rate"] = (
+                        St[valid_pair] != pep_state[valid_pair]
+                    ).float().mean()
+
+            if bool(getattr(self, "_diagnostic_validation_mode", False)):
+                diag.update(self._validation_proxy_diagnostics(
+                    true_X=true_X, true_S=true_S, pred_S=pred_S,
+                    r_pred_S_logits=r_pred_S_logits,
+                    r_interface_X=r_interface_X,
+                    paratope_mask=paratope_mask, smask=smask,
+                    batch_id=batch_id, interface_batch_id=interface_batch_id,
+                ))
             self.last_abflow_diagnostics = {
                 k: v.detach() if torch.is_tensor(v) else v for k, v in diag.items()
             }
 
+        self._clean_batch_constants()
         return loss, (snll, aar), (struct_loss, *struct_loss_details), (dock_loss, interface_loss, ed_loss, r_ed_losses), (pdev_loss, prmsd_loss)
 
 

@@ -109,6 +109,16 @@ GPU_ID=${3:-0}
 #       velocity consistency term.  This is the only recommended velocity/flow
 #       ablation in this round.
 #
+#   PCS_RC_LC_R1_SATC_IF_NT_CALIBRATED:
+#       Main method. It preserves the complete PCS_RC_LC_R1 + SATC + IF + NT
+#       pipeline, but calibrates the iid stochastic-tube width to the current
+#       source-to-native transport RMS. Direction-only normal pull remains the
+#       main auxiliary signal; no magnitude term is used.
+#
+#   PCS_RC_LC_R1_SATC_IF_NT_MAG_CALIBRATED:
+#       One-factor ablation of the same method. It adds only an unbiased normal
+#       magnitude objective whose exact optimum is projection ratio 1.
+#
 #   CORE:
 #       reference source + analytic_core objective.
 #       Analytic score is currently valid only for reference source.
@@ -137,6 +147,8 @@ COORD_PEP_SOURCE_WEIGHT=${ABFLOW_COORD_PEP_SOURCE_WEIGHT:-1.0}
 SEQ_PEP_SOURCE_WEIGHT=${ABFLOW_SEQ_PEP_SOURCE_WEIGHT:-1.0}
 COORD_PEP_AS_CONDITION=off
 SEQ_INPUT_MODE=state
+SHADOW_SEQ_STATE=${ABFLOW_SHADOW_SEQ_STATE:-off}
+DUAL_SEQUENCE_STATE=${ABFLOW_DUAL_SEQUENCE_STATE:-off}
 SEQ_CE_WEIGHT=${ABFLOW_SEQ_CE_WEIGHT:-1.0}
 PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-0}
 SI_GAMMA_SCALE=${ABFLOW_SI_GAMMA_SCALE:-0.25}
@@ -151,6 +163,12 @@ TRAJ_T_MAX=${ABFLOW_TRAJ_T_MAX:-0.80}
 
 SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
 SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.08}
+SATC_TUBE_MODE=${ABFLOW_SATC_TUBE_MODE:-legacy_absolute}
+SATC_TRANSPORT_RMS_MIN=${ABFLOW_SATC_TRANSPORT_RMS_MIN:-0.25}
+SATC_TRANSPORT_RMS_MAX=${ABFLOW_SATC_TRANSPORT_RMS_MAX:-20.0}
+SATC_GAMMA_ABS_MAX=${ABFLOW_SATC_GAMMA_ABS_MAX:-0.50}
+SATC_PROJECTION_BOUND_MODE=${ABFLOW_SATC_PROJECTION_BOUND_MODE:-legacy_tanh}
+SATC_MAGNITUDE_LOSS_MODE=${ABFLOW_SATC_MAGNITUDE_LOSS_MODE:-legacy_tanh}
 SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.02}
 SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.003}
 SATC_NT_MIN_PULL=${ABFLOW_SATC_NT_MIN_PULL:-0.15}
@@ -183,422 +201,76 @@ LOG_INTERVAL=${ABFLOW_LOG_INTERVAL:-1}
 TQDM_MININTERVAL=${ABFLOW_TQDM_MININTERVAL:-5.0}
 SAVE_INTERVAL=${ABFLOW_SAVE_INTERVAL:-1}
 CONDITION_DIAGNOSTICS=${ABFLOW_CONDITION_DIAGNOSTICS:-on}
+DIAGNOSTIC_FILE=${ABFLOW_DIAGNOSTIC_FILE:-on}
+DIAGNOSTIC_FILE_INTERVAL=${ABFLOW_DIAGNOSTIC_FILE_INTERVAL:-0}
+DIAGNOSTIC_VALID_INTERVAL=${ABFLOW_DIAGNOSTIC_VALID_INTERVAL:-1}
+GRAD_CONFLICT_DIAGNOSTICS=${ABFLOW_GRAD_CONFLICT_DIAGNOSTICS:-on}
+GRAD_DIAGNOSTIC_INTERVAL=${ABFLOW_GRAD_DIAGNOSTIC_INTERVAL:-0}
 MAX_EPOCH=${ABFLOW_MAX_EPOCH:-}
+FORCE_SCRATCH=${ABFLOW_FORCE_SCRATCH:-off}
 
 case "$EXP_ID" in
-  REF)
-    SOURCE_MODE=reference
-    LOSS_MODE=endpoint
-    COORD_PEP_AS_CONDITION=off
-    SEQ_INPUT_MODE=state
-    ;;
-
-  REF_SEQ)
-    SOURCE_MODE=reference
-    LOSS_MODE=endpoint
-    COORD_PEP_AS_CONDITION=off
-    SEQ_INPUT_MODE=pep_condition
-    ;;
-
-  REF_COORD)
-    SOURCE_MODE=reference
-    LOSS_MODE=endpoint
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=state
-    ;;
-
-  REF_COND)
-    SOURCE_MODE=reference
-    LOSS_MODE=endpoint
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
-    ;;
-
-  PCS|CS)
-    SOURCE_MODE=pcs
-    RECURRENT_PROPOSAL_CONTEXT=off
-    LOSS_MODE=endpoint
-    COORD_PEP_AS_CONDITION=off
-    SEQ_INPUT_MODE=state
-    ;;
-
-  PCS_RC)
+  PCS_RC_LC_R1|R1)
+    # Frozen strong baseline reference.  No new state channel or SATC objective.
     SOURCE_MODE=pcs_rc
     RECURRENT_PROPOSAL_CONTEXT=on
     LOSS_MODE=endpoint
-    COORD_PEP_AS_CONDITION=off
-    SEQ_INPUT_MODE=state
-    ;;
-
-  PCS_RC_COND|CS_COND)
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=endpoint
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
-    PROPOSAL_ADAPTER_START_ROUND=0
-    ;;
-
-  PCS_RC_LC|PCS_RC_LC_R1)
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=endpoint
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
-    PROPOSAL_ADAPTER_START_ROUND=1
-    ;;
-
-  PCS_RC_LC_R2)
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=endpoint
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
-    PROPOSAL_ADAPTER_START_ROUND=2
-    ;;
-
-  PCS_RC_LC_R1_SI_SCORE)
-    # R1 strong baseline + stochastic-interpolant analytic score.
-    # This is the safer diagnostic: endpoint remains the primary objective;
-    # the analytic score term is a small regularizer on noisy mid-trajectory
-    # states induced by the endpoint head.
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=si_score
-    T_SAMPLING=mid_t
-    DSM_T_MIN=${ABFLOW_SCOREFM_DSM_T_MIN:-0.2}
-    DSM_T_MAX=${ABFLOW_SCOREFM_DSM_T_MAX:-0.8}
-    SI_GAMMA_SCALE=${ABFLOW_SI_GAMMA_SCALE:-0.25}
-    SI_SCORE_WEIGHT=${ABFLOW_SI_SCORE_WEIGHT:-0.002}
-    SI_VELOCITY_WEIGHT=${ABFLOW_SI_VELOCITY_WEIGHT:-0.0}
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
-    PROPOSAL_ADAPTER_START_ROUND=1
-    ;;
-
-  PCS_RC_LC_R1_SI_SCORE_FM)
-    # R1 strong baseline + stochastic-interpolant analytic score and velocity
-    # consistency. Retained as a historical diagnostic.
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=si_score_fm
-    T_SAMPLING=mid_t
-    DSM_T_MIN=${ABFLOW_SCOREFM_DSM_T_MIN:-0.2}
-    DSM_T_MAX=${ABFLOW_SCOREFM_DSM_T_MAX:-0.8}
-    SI_GAMMA_SCALE=${ABFLOW_SI_GAMMA_SCALE:-0.25}
-    SI_SCORE_WEIGHT=${ABFLOW_SI_SCORE_WEIGHT:-0.001}
-    SI_VELOCITY_WEIGHT=${ABFLOW_SI_VELOCITY_WEIGHT:-0.01}
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
-    PROPOSAL_ADAPTER_START_ROUND=1
-    ;;
-
-  PCS_RC_LC_R1_TRAJ)
-    # R1 strong baseline + local trajectory endpoint consistency.
-    # Endpoint loss remains primary. The same endpoint model is queried at
-    # Xt and at a short model-induced neighboring state Xt+dt.
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=traj_consistency
     T_SAMPLING=uniform
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
-    PROPOSAL_ADAPTER_START_ROUND=1
-    TRAJ_CONSISTENCY_WEIGHT=${ABFLOW_TRAJ_CONSISTENCY_WEIGHT:-0.05}
-    TRAJ_VELOCITY_WEIGHT=${ABFLOW_TRAJ_VELOCITY_WEIGHT:-0.0}
-    TRAJ_DELTA_T=${ABFLOW_TRAJ_DELTA_T:-0.15}
-    TRAJ_T_MIN=${ABFLOW_TRAJ_T_MIN:-0.05}
-    TRAJ_T_MAX=${ABFLOW_TRAJ_T_MAX:-0.80}
-    ;;
-
-  PCS_RC_LC_R1_TRAJ_FM)
-    # R1 strong baseline + trajectory endpoint consistency + induced velocity
-    # field consistency. This directly tests flow-field self-consistency without
-    # adding a score or velocity head.
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=traj_consistency_fm
-    T_SAMPLING=uniform
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
-    PROPOSAL_ADAPTER_START_ROUND=1
-    TRAJ_CONSISTENCY_WEIGHT=${ABFLOW_TRAJ_CONSISTENCY_WEIGHT:-0.03}
-    TRAJ_VELOCITY_WEIGHT=${ABFLOW_TRAJ_VELOCITY_WEIGHT:-0.01}
-    TRAJ_DELTA_T=${ABFLOW_TRAJ_DELTA_T:-0.15}
-    TRAJ_T_MIN=${ABFLOW_TRAJ_T_MIN:-0.05}
-    TRAJ_T_MAX=${ABFLOW_TRAJ_T_MAX:-0.80}
-    ;;
-
-  PCS_RC_LC_R1_SATC_LITE|PCS_RC_LC_R1_SCORE_AWARE_TRAJ_LITE)
-    # Recommended lightweight score-aware trajectory/tangent consistency.
-    # One forward per batch: the state is perturbed off the bridge by a known
-    # score direction, and the induced correction velocity is aligned with it.
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=score_aware_traj_lite
-    T_SAMPLING=uniform
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
-    PROPOSAL_ADAPTER_START_ROUND=1
-    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
-    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.08}
-    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.02}
-    SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.0}
-    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
-    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
-    ;;
-
-  PCS_RC_LC_R1_SATC_FM_LITE|PCS_RC_LC_R1_SCORE_AWARE_TRAJ_FM_LITE)
-    # Recommended score+velocity candidate.  It keeps one-forward efficiency
-    # and adds a small projected correction-magnitude term to make the
-    # endpoint-induced velocity field explicitly score-aware.
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=score_aware_traj_fm_lite
-    T_SAMPLING=uniform
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
-    PROPOSAL_ADAPTER_START_ROUND=1
-    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
-    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.08}
-    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.015}
-    SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.003}
-    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
-    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
-    ;;
-
-  PCS_RC_LC_R1_SATC_MAIN|PCS_RC_LC_R1_SCORE_AWARE_TRAJ_MAIN)
-    # Final recommended main method after the current SATC results.
-    # It is the successful direction-only score-aware tangent consistency: score
-    # appears as the analytic off-path direction and velocity appears as the
-    # endpoint-induced correction velocity aligned to that score direction.
-    # No extra forward, no independent score/velocity head, and no explicit
-    # velocity-magnitude forcing.
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=score_aware_traj_lite
-    T_SAMPLING=uniform
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
-    PROPOSAL_ADAPTER_START_ROUND=1
-    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
-    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.08}
-    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.02}
-    SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.0}
-    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
-    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
-    ;;
-
-  PCS_RC_LC_R1_SATC_FM_SOFT|PCS_RC_LC_R1_SCORE_AWARE_TRAJ_FM_SOFT)
-    # Soft velocity-magnitude diagnostic.  The v36 FM_LITE result improved
-    # AAR/CAAR but hurt H3 raw RMSD and DockQ; therefore v37 keeps the same
-    # score-aware tangent term and reduces the projected magnitude term.  This
-    # is the next controlled test of whether explicit velocity magnitude can be
-    # added without damaging placement.
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=score_aware_traj_fm_lite
-    T_SAMPLING=uniform
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
-    PROPOSAL_ADAPTER_START_ROUND=1
-    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
-    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.08}
-    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.018}
-    SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.001}
-    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
-    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
-    ;;
-
-  PCS_RC_LC_R1_SATC_FM_PRIMARY_ANNEAL|PCS_RC_LC_R1_SATC_FM_PRIMARY|PCS_RC_LC_R1_SATC_OPTIMAL)
-    # Main configuration after reviewing the current results.  FM_SOFT is used
-    # as the主体 because its middle-stage checkpoint gave the strongest AAR/CAAR
-    # and competitive interface metrics.  The key fix is not to keep the FM
-    # velocity-magnitude term at full strength until the end: it is annealed
-    # after the middle stage to prevent late DockQ/H3 degradation.
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=score_aware_traj_fm_lite
-    T_SAMPLING=uniform
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
-    PROPOSAL_ADAPTER_START_ROUND=1
-    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
-    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.08}
-    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.018}
-    SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.001}
-    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
-    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
-    SATC_SCHEDULE=${ABFLOW_SATC_SCHEDULE:-cosine_decay}
-    SATC_STEPS_PER_EPOCH=${ABFLOW_SATC_STEPS_PER_EPOCH:-52}
-    SATC_DECAY_START_EPOCH=${ABFLOW_SATC_DECAY_START_EPOCH:-115}
-    SATC_DECAY_END_EPOCH=${ABFLOW_SATC_DECAY_END_EPOCH:-145}
-    SATC_PERTURB_FINAL_SCALE=${ABFLOW_SATC_PERTURB_FINAL_SCALE:-0.15}
-    SATC_SCORE_FINAL_SCALE=${ABFLOW_SATC_SCORE_FINAL_SCALE:-0.20}
-    SATC_VELOCITY_FINAL_SCALE=${ABFLOW_SATC_VELOCITY_FINAL_SCALE:-0.02}
-    SATC_INTERFACE_WEIGHT_ALPHA=${ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA:-0.0}
-    ;;
-
-  PCS_RC_LC_R1_SATC_FM_DIRECTION_HYBRID|PCS_RC_LC_R1_SATC_HYBRID|PCS_RC_LC_R1_SATC_FM_STABLE_HYBRID)
-    # Fusion configuration.  It keeps FM_SOFT as the主体, but borrows the
-    # strongest part of SATC_MAIN: correction-direction alignment dominates and
-    # the projected velocity-magnitude term is reduced.  This is designed to
-    # keep FM_SOFT's sequence/contact recovery advantage while improving H3
-    # placement and DockQ stability.
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=score_aware_traj_fm_lite
-    T_SAMPLING=uniform
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
-    PROPOSAL_ADAPTER_START_ROUND=1
-    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
-    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.08}
-    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.020}
-    SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.0005}
-    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
-    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
-    SATC_SCHEDULE=${ABFLOW_SATC_SCHEDULE:-cosine_decay}
-    SATC_STEPS_PER_EPOCH=${ABFLOW_SATC_STEPS_PER_EPOCH:-52}
-    SATC_DECAY_START_EPOCH=${ABFLOW_SATC_DECAY_START_EPOCH:-105}
-    SATC_DECAY_END_EPOCH=${ABFLOW_SATC_DECAY_END_EPOCH:-135}
-    SATC_PERTURB_FINAL_SCALE=${ABFLOW_SATC_PERTURB_FINAL_SCALE:-0.18}
-    SATC_SCORE_FINAL_SCALE=${ABFLOW_SATC_SCORE_FINAL_SCALE:-0.25}
-    SATC_VELOCITY_FINAL_SCALE=${ABFLOW_SATC_VELOCITY_FINAL_SCALE:-0.02}
-    SATC_INTERFACE_WEIGHT_ALPHA=${ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA:-0.0}
-    ;;
-
-
-  PCS_RC_LC_R1_SATC_FM_BEST_E125|PCS_RC_LC_R1_SATC_FM_CANONICAL_E125)
-    # Main configuration after the latest evidence: keep the validated
-    # SATC_FM_SOFT objective exactly, but stop near the empirically best window
-    # instead of training until the loss-minimizing late regime.
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=score_aware_traj_fm_lite
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
-    PROPOSAL_ADAPTER_START_ROUND=1
     SAMPLER_MODE=bridge
-    T_SAMPLING=uniform
-    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
-    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.08}
-    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.018}
-    SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.001}
-    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
-    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
-    SATC_INTERFACE_WEIGHT_ALPHA=${ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA:-0.0}
-    SATC_SCHEDULE=${ABFLOW_SATC_SCHEDULE:-constant}
-    MAX_EPOCH=${ABFLOW_MAX_EPOCH:-125}
-    ;;
-
-  PCS_RC_LC_R1_SATC_FM_IF_GUARD_E125|PCS_RC_LC_R1_SATC_FM_IF_GUARD)
-    # Fusion configuration: FM_SOFT remains the backbone, while a weak
-    # interface weighting protects DockQ/H3 placement.  The interface weight is
-    # deliberately small; previous alpha=1.0 was too dominant for AAR/CAAR.
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=score_aware_traj_if_fm_lite
     COORD_PEP_AS_CONDITION=on
     SEQ_INPUT_MODE=pep_condition
-    PROPOSAL_ADAPTER_START_ROUND=1
+    SHADOW_SEQ_STATE=off
+    DUAL_SEQUENCE_STATE=off
+    PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-1}
+    SATC_APPLY_PROB=0.0
+    SATC_SCORE_WEIGHT=0.0
+    SATC_VELOCITY_WEIGHT=0.0
+    ;;
+
+  PCS_RC_LC_R1_DUAL_SEQ|DUAL_SEQ_CTRL|CTRL_V50)
+    # Corrected joint-state control.  S_pep remains the recurrent proposal
+    # context; S_t controls paratope residue/atom features and local atom masks.
+    # SATC is disabled so the state correction is independently attributable.
+    SOURCE_MODE=pcs_rc
+    RECURRENT_PROPOSAL_CONTEXT=on
+    LOSS_MODE=endpoint
+    T_SAMPLING=uniform
     SAMPLER_MODE=bridge
-    T_SAMPLING=uniform
-    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
-    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.08}
-    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.018}
-    SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.0008}
-    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
-    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
-    SATC_INTERFACE_WEIGHT_ALPHA=${ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA:-0.25}
-    SATC_INTERFACE_CUTOFF=${ABFLOW_SATC_INTERFACE_CUTOFF:-8.0}
-    SATC_INTERFACE_TEMPERATURE=${ABFLOW_SATC_INTERFACE_TEMPERATURE:-1.0}
-    SATC_INTERFACE_NORMALIZE=${ABFLOW_SATC_INTERFACE_NORMALIZE:-on}
-    SATC_SCHEDULE=${ABFLOW_SATC_SCHEDULE:-constant}
-    MAX_EPOCH=${ABFLOW_MAX_EPOCH:-125}
-    ;;
-
-  PCS_RC_LC_R1_SATC_NT_MAIN|PCS_RC_LC_R1_SCORE_AWARE_NT_MAIN)
-    # Final mechanism-level main candidate.  It keeps PCS_RC_LC_R1 and
-    # off-path score perturbation, but decomposes the endpoint-induced velocity
-    # into tangent transport and normal correction.  Only the normal projection
-    # is regularized, so the endpoint flow can still learn H3 placement/DockQ.
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=score_aware_traj_nt_lite
-    T_SAMPLING=uniform
     COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
+    SEQ_INPUT_MODE=state
+    SHADOW_SEQ_STATE=off
+    DUAL_SEQUENCE_STATE=on
     PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-1}
-    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
-    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.06}
-    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.010}
-    SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.0}
-    SATC_NT_MIN_PULL=${ABFLOW_SATC_NT_MIN_PULL:-0.15}
-    SATC_NT_PULL_CLIP=${ABFLOW_SATC_NT_PULL_CLIP:-2.0}
-    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
-    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
-    SATC_INTERFACE_WEIGHT_ALPHA=${ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA:-0.0}
-    SATC_SCHEDULE=${ABFLOW_SATC_SCHEDULE:-cosine_decay}
-    SATC_STEPS_PER_EPOCH=${ABFLOW_SATC_STEPS_PER_EPOCH:-52}
-    SATC_DECAY_START_EPOCH=${ABFLOW_SATC_DECAY_START_EPOCH:-130}
-    SATC_DECAY_END_EPOCH=${ABFLOW_SATC_DECAY_END_EPOCH:-170}
-    SATC_PERTURB_FINAL_SCALE=${ABFLOW_SATC_PERTURB_FINAL_SCALE:-0.25}
-    SATC_SCORE_FINAL_SCALE=${ABFLOW_SATC_SCORE_FINAL_SCALE:-0.35}
-    SATC_VELOCITY_FINAL_SCALE=${ABFLOW_SATC_VELOCITY_FINAL_SCALE:-0.0}
+    SATC_APPLY_PROB=0.0
+    SATC_SCORE_WEIGHT=0.0
+    SATC_VELOCITY_WEIGHT=0.0
+    MAX_EPOCH=${ABFLOW_MAX_EPOCH:-160}
+    FORCE_SCRATCH=on
     ;;
 
-  PCS_RC_LC_R1_SATC_NT_FM_SOFT|PCS_RC_LC_R1_SCORE_AWARE_NT_FM_SOFT)
-    # Score+velocity candidate.  It uses the same normal--tangent decomposition
-    # as NT_MAIN and adds only a very weak magnitude match on the normal
-    # correction projection, not on the full velocity vector.  This is designed
-    # to preserve the AAR/CAAR benefit of SATC_FM_SOFT while avoiding its late
-    # H3/DockQ damage.
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=score_aware_traj_nt_fm_lite
-    T_SAMPLING=uniform
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
-    PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-1}
-    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
-    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.06}
-    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.010}
-    SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.0003}
-    SATC_NT_MIN_PULL=${ABFLOW_SATC_NT_MIN_PULL:-0.10}
-    SATC_NT_PULL_CLIP=${ABFLOW_SATC_NT_PULL_CLIP:-2.0}
-    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
-    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
-    SATC_INTERFACE_WEIGHT_ALPHA=${ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA:-0.0}
-    SATC_SCHEDULE=${ABFLOW_SATC_SCHEDULE:-cosine_decay}
-    SATC_STEPS_PER_EPOCH=${ABFLOW_SATC_STEPS_PER_EPOCH:-52}
-    SATC_DECAY_START_EPOCH=${ABFLOW_SATC_DECAY_START_EPOCH:-115}
-    SATC_DECAY_END_EPOCH=${ABFLOW_SATC_DECAY_END_EPOCH:-160}
-    SATC_PERTURB_FINAL_SCALE=${ABFLOW_SATC_PERTURB_FINAL_SCALE:-0.20}
-    SATC_SCORE_FINAL_SCALE=${ABFLOW_SATC_SCORE_FINAL_SCALE:-0.30}
-    SATC_VELOCITY_FINAL_SCALE=${ABFLOW_SATC_VELOCITY_FINAL_SCALE:-0.03}
-    ;;
-
-  PCS_RC_LC_R1_SATC_IF_NT_TARGET|PCS_RC_LC_R1_TARGET_ALIGNED_SCORE)
-    # Mechanism-level replacement for the failed NT_MAIN schedule.
-    # First principles:
-    #   1) keep PCS_RC_LC_R1 as the transport base;
-    #   2) keep endpoint reconstruction as the main objective;
-    #   3) apply the score-aware normal correction mainly on native interface
-    #      residues, because DockQ/H3 placement are interface objectives;
-    #   4) keep the SATC signal constant, so the final top-k checkpoints still
-    #      represent the proposed idea instead of endpoint-only fine-tuning.
+  PCS_RC_LC_R1_DUAL_SEQ_SATC_IF_NT|DUAL_SEQ_SATC|MAIN_V50)
+    # Main idea: corrected joint sequence/structure state plus the existing
+    # one-forward SATC + native-interface weighting + normal-only correction.
+    # Magnitude matching and transport calibration are intentionally excluded
+    # because the two uploaded CSVs show that they lower validation loss while
+    # degrading CAAR/DockQ.
     SOURCE_MODE=pcs_rc
     RECURRENT_PROPOSAL_CONTEXT=on
     LOSS_MODE=score_aware_traj_if_nt_lite
     T_SAMPLING=uniform
+    SAMPLER_MODE=bridge
     COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
+    SEQ_INPUT_MODE=state
+    SHADOW_SEQ_STATE=off
+    DUAL_SEQUENCE_STATE=on
     PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-1}
     SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.60}
     SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.06}
+    SATC_TUBE_MODE=legacy_absolute
+    SATC_PROJECTION_BOUND_MODE=legacy_tanh
+    SATC_MAGNITUDE_LOSS_MODE=legacy_tanh
     SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.030}
-    SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.0}
+    SATC_VELOCITY_WEIGHT=0.0
     SATC_NT_MIN_PULL=${ABFLOW_SATC_NT_MIN_PULL:-0.18}
     SATC_NT_PULL_CLIP=${ABFLOW_SATC_NT_PULL_CLIP:-2.0}
     SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
@@ -607,108 +279,20 @@ case "$EXP_ID" in
     SATC_INTERFACE_CUTOFF=${ABFLOW_SATC_INTERFACE_CUTOFF:-8.0}
     SATC_INTERFACE_TEMPERATURE=${ABFLOW_SATC_INTERFACE_TEMPERATURE:-1.0}
     SATC_INTERFACE_NORMALIZE=${ABFLOW_SATC_INTERFACE_NORMALIZE:-on}
-    SATC_SCHEDULE=${ABFLOW_SATC_SCHEDULE:-constant}
+    SATC_SCHEDULE=constant
     SATC_STEPS_PER_EPOCH=${ABFLOW_SATC_STEPS_PER_EPOCH:-52}
-    SATC_DECAY_START_EPOCH=${ABFLOW_SATC_DECAY_START_EPOCH:-9999}
-    SATC_DECAY_END_EPOCH=${ABFLOW_SATC_DECAY_END_EPOCH:-10000}
-    SATC_PERTURB_FINAL_SCALE=${ABFLOW_SATC_PERTURB_FINAL_SCALE:-1.0}
-    SATC_SCORE_FINAL_SCALE=${ABFLOW_SATC_SCORE_FINAL_SCALE:-1.0}
-    SATC_VELOCITY_FINAL_SCALE=${ABFLOW_SATC_VELOCITY_FINAL_SCALE:-0.0}
+    SATC_DECAY_START_EPOCH=9999
+    SATC_DECAY_END_EPOCH=10000
+    SATC_PERTURB_FINAL_SCALE=1.0
+    SATC_SCORE_FINAL_SCALE=1.0
+    SATC_VELOCITY_FINAL_SCALE=0.0
     MAX_EPOCH=${ABFLOW_MAX_EPOCH:-160}
-    ;;
-
-  PCS_RC_LC_R1_SATC_IF_NT_FM_TARGET|PCS_RC_LC_R1_TARGET_ALIGNED_SCORE_FM)
-    # Velocity/flow ablation for the target-aligned score-aware objective.
-    # This is deliberately not a near-duplicate of the MAIN run: the velocity
-    # term is non-zero, non-decayed, and applied to the interface-weighted
-    # normal-projection ratio.  It remains soft and bounded, so it does not
-    # become the destructive full bridge-velocity loss.
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=score_aware_traj_if_nt_fm_lite
-    T_SAMPLING=uniform
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
-    PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-1}
-    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.60}
-    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.06}
-    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.030}
-    SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.0020}
-    SATC_NT_MIN_PULL=${ABFLOW_SATC_NT_MIN_PULL:-0.18}
-    SATC_NT_PULL_CLIP=${ABFLOW_SATC_NT_PULL_CLIP:-2.0}
-    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
-    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.75}
-    SATC_INTERFACE_WEIGHT_ALPHA=${ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA:-2.0}
-    SATC_INTERFACE_CUTOFF=${ABFLOW_SATC_INTERFACE_CUTOFF:-8.0}
-    SATC_INTERFACE_TEMPERATURE=${ABFLOW_SATC_INTERFACE_TEMPERATURE:-1.0}
-    SATC_INTERFACE_NORMALIZE=${ABFLOW_SATC_INTERFACE_NORMALIZE:-on}
-    SATC_SCHEDULE=${ABFLOW_SATC_SCHEDULE:-constant}
-    SATC_STEPS_PER_EPOCH=${ABFLOW_SATC_STEPS_PER_EPOCH:-52}
-    SATC_DECAY_START_EPOCH=${ABFLOW_SATC_DECAY_START_EPOCH:-9999}
-    SATC_DECAY_END_EPOCH=${ABFLOW_SATC_DECAY_END_EPOCH:-10000}
-    SATC_PERTURB_FINAL_SCALE=${ABFLOW_SATC_PERTURB_FINAL_SCALE:-1.0}
-    SATC_SCORE_FINAL_SCALE=${ABFLOW_SATC_SCORE_FINAL_SCALE:-1.0}
-    SATC_VELOCITY_FINAL_SCALE=${ABFLOW_SATC_VELOCITY_FINAL_SCALE:-1.0}
-    MAX_EPOCH=${ABFLOW_MAX_EPOCH:-160}
-    ;;
-
-  PCS_RC_LC_R1_SATC_IF_MAIN|PCS_RC_LC_R1_SCORE_AWARE_TRAJ_IF_MAIN)
-    # Interface-weighted SATC main candidate.  It keeps the validated
-    # SATC_MAIN direction-only mechanism and reweights only the SATC regularizer
-    # toward native interface/contact residues.  This targets DockQ/CAAR/LDDT
-    # without adding a second forward or a new score/velocity head.
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=score_aware_traj_if_lite
-    T_SAMPLING=uniform
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
-    PROPOSAL_ADAPTER_START_ROUND=1
-    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
-    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.08}
-    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.02}
-    SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.0}
-    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
-    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
-    SATC_INTERFACE_WEIGHT_ALPHA=${ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA:-1.0}
-    SATC_INTERFACE_CUTOFF=${ABFLOW_SATC_INTERFACE_CUTOFF:-8.0}
-    SATC_INTERFACE_TEMPERATURE=${ABFLOW_SATC_INTERFACE_TEMPERATURE:-1.0}
-    SATC_INTERFACE_NORMALIZE=${ABFLOW_SATC_INTERFACE_NORMALIZE:-on}
-    ;;
-
-  PCS_RC_LC_R1_SATC_IF_FM_SOFT|PCS_RC_LC_R1_SCORE_AWARE_TRAJ_IF_FM_SOFT)
-    # Interface-weighted SATC with very soft projected velocity magnitude.
-    # This is a controlled ablation for whether explicit velocity magnitude can
-    # improve AAR/CAAR while the interface weighting protects H3 placement/DockQ.
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=score_aware_traj_if_fm_lite
-    T_SAMPLING=uniform
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
-    PROPOSAL_ADAPTER_START_ROUND=1
-    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
-    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.08}
-    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.018}
-    SATC_VELOCITY_WEIGHT=${ABFLOW_SATC_VELOCITY_WEIGHT:-0.0005}
-    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
-    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
-    SATC_INTERFACE_WEIGHT_ALPHA=${ABFLOW_SATC_INTERFACE_WEIGHT_ALPHA:-1.0}
-    SATC_INTERFACE_CUTOFF=${ABFLOW_SATC_INTERFACE_CUTOFF:-8.0}
-    SATC_INTERFACE_TEMPERATURE=${ABFLOW_SATC_INTERFACE_TEMPERATURE:-1.0}
-    SATC_INTERFACE_NORMALIZE=${ABFLOW_SATC_INTERFACE_NORMALIZE:-on}
-    ;;
-
-  CORE)
-    SOURCE_MODE=reference
-    LOSS_MODE=analytic_core
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
+    FORCE_SCRATCH=on
     ;;
 
   *)
     echo "Unknown EXP_ID: $EXP_ID"
-    echo "Supported EXP_ID: REF REF_SEQ REF_COORD REF_COND PCS PCS_RC PCS_RC_COND PCS_RC_LC_R1 PCS_RC_LC_R2 PCS_RC_LC_R1_SI_SCORE PCS_RC_LC_R1_SI_SCORE_FM PCS_RC_LC_R1_TRAJ PCS_RC_LC_R1_TRAJ_FM PCS_RC_LC_R1_SATC_LITE PCS_RC_LC_R1_SATC_FM_LITE PCS_RC_LC_R1_SATC_MAIN PCS_RC_LC_R1_SATC_FM_SOFT PCS_RC_LC_R1_SATC_FM_PRIMARY_ANNEAL PCS_RC_LC_R1_SATC_FM_DIRECTION_HYBRID PCS_RC_LC_R1_SATC_FM_BEST_E125 PCS_RC_LC_R1_SATC_FM_IF_GUARD_E125 PCS_RC_LC_R1_SATC_IF_MAIN PCS_RC_LC_R1_SATC_IF_FM_SOFT PCS_RC_LC_R1_SATC_NT_MAIN PCS_RC_LC_R1_SATC_NT_FM_SOFT PCS_RC_LC_R1_SATC_IF_NT_TARGET PCS_RC_LC_R1_SATC_IF_NT_FM_TARGET CORE"
+    echo "Supported: PCS_RC_LC_R1, PCS_RC_LC_R1_DUAL_SEQ, PCS_RC_LC_R1_DUAL_SEQ_SATC_IF_NT"
     exit 2
     ;;
 esac
@@ -729,6 +313,8 @@ run_with_env() {
   ABFLOW_SCOREFM_SAMPLER_MODE="$SAMPLER_MODE" \
   ABFLOW_COORD_PEP_AS_CONDITION="$COORD_PEP_AS_CONDITION" \
   ABFLOW_SEQ_INPUT_MODE="$SEQ_INPUT_MODE" \
+  ABFLOW_SHADOW_SEQ_STATE="$SHADOW_SEQ_STATE" \
+  ABFLOW_DUAL_SEQUENCE_STATE="$DUAL_SEQUENCE_STATE" \
   ABFLOW_SEQ_CE_WEIGHT="$SEQ_CE_WEIGHT" \
   ABFLOW_PROPOSAL_ADAPTER_START_ROUND="$PROPOSAL_ADAPTER_START_ROUND" \
   ABFLOW_SI_GAMMA_SCALE="$SI_GAMMA_SCALE" \
@@ -741,6 +327,12 @@ run_with_env() {
   ABFLOW_TRAJ_T_MAX="$TRAJ_T_MAX" \
   ABFLOW_SATC_APPLY_PROB="$SATC_APPLY_PROB" \
   ABFLOW_SATC_GAMMA_SCALE="$SATC_GAMMA_SCALE" \
+  ABFLOW_SATC_TUBE_MODE="$SATC_TUBE_MODE" \
+  ABFLOW_SATC_TRANSPORT_RMS_MIN="$SATC_TRANSPORT_RMS_MIN" \
+  ABFLOW_SATC_TRANSPORT_RMS_MAX="$SATC_TRANSPORT_RMS_MAX" \
+  ABFLOW_SATC_GAMMA_ABS_MAX="$SATC_GAMMA_ABS_MAX" \
+  ABFLOW_SATC_PROJECTION_BOUND_MODE="$SATC_PROJECTION_BOUND_MODE" \
+  ABFLOW_SATC_MAGNITUDE_LOSS_MODE="$SATC_MAGNITUDE_LOSS_MODE" \
   ABFLOW_SATC_SCORE_WEIGHT="$SATC_SCORE_WEIGHT" \
   ABFLOW_SATC_VELOCITY_WEIGHT="$SATC_VELOCITY_WEIGHT" \
   ABFLOW_SATC_NT_MIN_PULL="$SATC_NT_MIN_PULL" \
@@ -759,7 +351,13 @@ run_with_env() {
   ABFLOW_SATC_SCORE_FINAL_SCALE="$SATC_SCORE_FINAL_SCALE" \
   ABFLOW_SATC_VELOCITY_FINAL_SCALE="$SATC_VELOCITY_FINAL_SCALE" \
   ABFLOW_CONDITION_DIAGNOSTICS="$CONDITION_DIAGNOSTICS" \
+  ABFLOW_DIAGNOSTIC_FILE="$DIAGNOSTIC_FILE" \
+  ABFLOW_DIAGNOSTIC_FILE_INTERVAL="$DIAGNOSTIC_FILE_INTERVAL" \
+  ABFLOW_DIAGNOSTIC_VALID_INTERVAL="$DIAGNOSTIC_VALID_INTERVAL" \
+  ABFLOW_GRAD_CONFLICT_DIAGNOSTICS="$GRAD_CONFLICT_DIAGNOSTICS" \
+  ABFLOW_GRAD_DIAGNOSTIC_INTERVAL="$GRAD_DIAGNOSTIC_INTERVAL" \
   ABFLOW_MAX_EPOCH="$MAX_EPOCH" \
+  ABFLOW_FORCE_SCRATCH="$FORCE_SCRATCH" \
   ABFLOW_AMP="$AMP" \
   ABFLOW_AMP_DTYPE="$AMP_DTYPE" \
   ABFLOW_ALLOW_TF32="$ALLOW_TF32" \
@@ -793,6 +391,8 @@ print_settings() {
   echo "SAMPLER_MODE=$SAMPLER_MODE"
   echo "COORD_PEP_AS_CONDITION=$COORD_PEP_AS_CONDITION"
   echo "SEQ_INPUT_MODE=$SEQ_INPUT_MODE"
+  echo "SHADOW_SEQ_STATE=$SHADOW_SEQ_STATE"
+  echo "DUAL_SEQUENCE_STATE=$DUAL_SEQUENCE_STATE"
   echo "SEQ_CE_WEIGHT=$SEQ_CE_WEIGHT"
   echo "PROPOSAL_ADAPTER_START_ROUND=$PROPOSAL_ADAPTER_START_ROUND"
   echo "SI_GAMMA_SCALE=$SI_GAMMA_SCALE"
@@ -805,6 +405,12 @@ print_settings() {
   echo "TRAJ_T_MAX=$TRAJ_T_MAX"
   echo "SATC_APPLY_PROB=$SATC_APPLY_PROB"
   echo "SATC_GAMMA_SCALE=$SATC_GAMMA_SCALE"
+  echo "SATC_TUBE_MODE=$SATC_TUBE_MODE"
+  echo "SATC_TRANSPORT_RMS_MIN=$SATC_TRANSPORT_RMS_MIN"
+  echo "SATC_TRANSPORT_RMS_MAX=$SATC_TRANSPORT_RMS_MAX"
+  echo "SATC_GAMMA_ABS_MAX=$SATC_GAMMA_ABS_MAX"
+  echo "SATC_PROJECTION_BOUND_MODE=$SATC_PROJECTION_BOUND_MODE"
+  echo "SATC_MAGNITUDE_LOSS_MODE=$SATC_MAGNITUDE_LOSS_MODE"
   echo "SATC_SCORE_WEIGHT=$SATC_SCORE_WEIGHT"
   echo "SATC_VELOCITY_WEIGHT=$SATC_VELOCITY_WEIGHT"
   echo "SATC_NT_MIN_PULL=$SATC_NT_MIN_PULL"
@@ -834,7 +440,13 @@ print_settings() {
   echo "TQDM_MININTERVAL=$TQDM_MININTERVAL"
   echo "SAVE_INTERVAL=$SAVE_INTERVAL"
   echo "MAX_EPOCH=${MAX_EPOCH:-<base_config>}"
+  echo "FORCE_SCRATCH=$FORCE_SCRATCH"
   echo "CONDITION_DIAGNOSTICS=$CONDITION_DIAGNOSTICS"
+  echo "DIAGNOSTIC_FILE=$DIAGNOSTIC_FILE"
+  echo "DIAGNOSTIC_FILE_INTERVAL=$DIAGNOSTIC_FILE_INTERVAL"
+  echo "DIAGNOSTIC_VALID_INTERVAL=$DIAGNOSTIC_VALID_INTERVAL"
+  echo "GRAD_CONFLICT_DIAGNOSTICS=$GRAD_CONFLICT_DIAGNOSTICS"
+  echo "GRAD_DIAGNOSTIC_INTERVAL=$GRAD_DIAGNOSTIC_INTERVAL"
 }
 
 
@@ -844,7 +456,7 @@ print_settings() {
 # Principle:
 #   The original training command remains unchanged:
 #     bash scripts/train/run_state_consistent_ablation.sh train <EXP_ID> <GPU_ID> <BASE_CONFIG>
-#   When ABFLOW_AUTO_TOPK_EVAL=on (default), the launcher automatically starts
+#   When ABFLOW_AUTO_TOPK_EVAL=on (explicit opt-in), the launcher automatically starts
 #   a background watcher if spare GPUs are available.  It reads topk_map.txt,
 #   evaluates new checkpoints with the existing test pipeline, and writes CSV
 #   next to topk_map.txt.  If no spare GPU is available, the launcher performs
@@ -1051,7 +663,7 @@ if [[ "$MODE" != "train" ]]; then
   echo "Train: bash $0 train <EXP_ID> <GPU_ID> <BASE_CONFIG>"
   echo "Test:  bash $0 test  <EXP_ID> <GPU_ID> <CKPT> <RESULT_DIR> [TEST_JSON]"
   echo "Attach current training auto-eval: bash $0 attach_eval <EXP_ID> <GPU_ID|auto> [EVAL_GPU_ID|auto]"
-  echo "Supported EXP_ID: REF REF_SEQ REF_COORD REF_COND PCS PCS_RC PCS_RC_COND PCS_RC_LC_R1 PCS_RC_LC_R2 PCS_RC_LC_R1_SI_SCORE PCS_RC_LC_R1_SI_SCORE_FM PCS_RC_LC_R1_TRAJ PCS_RC_LC_R1_TRAJ_FM PCS_RC_LC_R1_SATC_LITE PCS_RC_LC_R1_SATC_FM_LITE PCS_RC_LC_R1_SATC_MAIN PCS_RC_LC_R1_SATC_FM_SOFT PCS_RC_LC_R1_SATC_FM_PRIMARY_ANNEAL PCS_RC_LC_R1_SATC_FM_DIRECTION_HYBRID PCS_RC_LC_R1_SATC_FM_BEST_E125 PCS_RC_LC_R1_SATC_FM_IF_GUARD_E125 PCS_RC_LC_R1_SATC_IF_MAIN PCS_RC_LC_R1_SATC_IF_FM_SOFT PCS_RC_LC_R1_SATC_NT_MAIN PCS_RC_LC_R1_SATC_NT_FM_SOFT PCS_RC_LC_R1_SATC_IF_NT_TARGET PCS_RC_LC_R1_SATC_IF_NT_FM_TARGET CORE"
+  echo "Supported EXP_ID: PCS_RC_LC_R1, PCS_RC_LC_R1_DUAL_SEQ, PCS_RC_LC_R1_DUAL_SEQ_SATC_IF_NT"
   exit 2
 fi
 
@@ -1061,6 +673,17 @@ BASE_CONFIG=${4:-scripts/train/configs/single_cdr_design.json}
 RUN_ROOT=${ABFLOW_RUN_ROOT:-/home/data3/cjm/project/AbFlow/results_dtm}
 RUN_DIR="${RUN_ROOT}/${EXP_ID}"
 CONFIG_DIR="${RUN_ROOT}/generated_configs"
+
+# A from-scratch profile must not silently mix checkpoints/topk files from an
+# earlier run. Set ABFLOW_ALLOW_NONEMPTY_RUN_DIR=on only when intentionally
+# reusing the directory after manually cleaning it.
+if _is_on "$FORCE_SCRATCH" && [[ -d "$RUN_DIR" ]] && [[ -n "$(find "$RUN_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+  if ! _is_on "${ABFLOW_ALLOW_NONEMPTY_RUN_DIR:-off}"; then
+    echo "ERROR: from-scratch run directory is not empty: $RUN_DIR" >&2
+    echo "Use a new ABFLOW_RUN_ROOT or clean the directory. To override intentionally, set ABFLOW_ALLOW_NONEMPTY_RUN_DIR=on." >&2
+    exit 2
+  fi
+fi
 RUN_CONFIG="${CONFIG_DIR}/${EXP_ID}.json"
 RUNTIME_META="${RUN_DIR}/abflow_runtime.json"
 
@@ -1113,11 +736,14 @@ def _env_int(name, default):
 def _env_float(name, default):
     return float(os.environ.get(name, str(default)))
 
-# Resume logic:
-#   resume_checkpoint == ""       -> train from scratch
-#   resume_checkpoint == nonempty -> resume from that checkpoint
-# The launcher must not silently override this field.
-resume_ckpt = str(cfg.get("resume_checkpoint", "") or "").strip()
+# Resume logic.  The two calibrated profiles are defined as from-scratch
+# experiments, so ABFLOW_FORCE_SCRATCH=on explicitly clears any checkpoint that
+# may be present in the shared base JSON.  Other profiles retain old behavior.
+force_scratch = _env_on("ABFLOW_FORCE_SCRATCH", "off")
+if force_scratch:
+    resume_ckpt = ""
+else:
+    resume_ckpt = str(cfg.get("resume_checkpoint", "") or "").strip()
 cfg["resume_checkpoint"] = resume_ckpt
 if resume_ckpt and not os.path.isfile(resume_ckpt):
     raise FileNotFoundError(
@@ -1233,6 +859,8 @@ runtime = {
     "sampler_mode": os.environ.get("ABFLOW_SCOREFM_SAMPLER_MODE", ""),
     "coord_pep_as_condition": os.environ.get("ABFLOW_COORD_PEP_AS_CONDITION", ""),
     "seq_input_mode": os.environ.get("ABFLOW_SEQ_INPUT_MODE", ""),
+    "shadow_seq_state": os.environ.get("ABFLOW_SHADOW_SEQ_STATE", ""),
+    "dual_sequence_state": os.environ.get("ABFLOW_DUAL_SEQUENCE_STATE", ""),
     "seq_ce_weight": os.environ.get("ABFLOW_SEQ_CE_WEIGHT", ""),
     "proposal_adapter_start_round": os.environ.get("ABFLOW_PROPOSAL_ADAPTER_START_ROUND", ""),
     "si_gamma_scale": os.environ.get("ABFLOW_SI_GAMMA_SCALE", ""),
@@ -1245,6 +873,12 @@ runtime = {
     "traj_t_max": os.environ.get("ABFLOW_TRAJ_T_MAX", ""),
     "satc_apply_prob": os.environ.get("ABFLOW_SATC_APPLY_PROB", ""),
     "satc_gamma_scale": os.environ.get("ABFLOW_SATC_GAMMA_SCALE", ""),
+    "satc_tube_mode": os.environ.get("ABFLOW_SATC_TUBE_MODE", ""),
+    "satc_transport_rms_min": os.environ.get("ABFLOW_SATC_TRANSPORT_RMS_MIN", ""),
+    "satc_transport_rms_max": os.environ.get("ABFLOW_SATC_TRANSPORT_RMS_MAX", ""),
+    "satc_gamma_abs_max": os.environ.get("ABFLOW_SATC_GAMMA_ABS_MAX", ""),
+    "satc_projection_bound_mode": os.environ.get("ABFLOW_SATC_PROJECTION_BOUND_MODE", ""),
+    "satc_magnitude_loss_mode": os.environ.get("ABFLOW_SATC_MAGNITUDE_LOSS_MODE", ""),
     "satc_score_weight": os.environ.get("ABFLOW_SATC_SCORE_WEIGHT", ""),
     "satc_velocity_weight": os.environ.get("ABFLOW_SATC_VELOCITY_WEIGHT", ""),
     "satc_nt_min_pull": os.environ.get("ABFLOW_SATC_NT_MIN_PULL", ""),
@@ -1273,8 +907,14 @@ runtime = {
     "log_interval": os.environ.get("ABFLOW_LOG_INTERVAL", str(cfg.get("log_interval", 1))),
     "save_interval": os.environ.get("ABFLOW_SAVE_INTERVAL", str(cfg.get("save_interval", 1))),
     "condition_diagnostics": os.environ.get("ABFLOW_CONDITION_DIAGNOSTICS", "on"),
+    "diagnostic_file": os.environ.get("ABFLOW_DIAGNOSTIC_FILE", "on"),
+    "diagnostic_file_interval": os.environ.get("ABFLOW_DIAGNOSTIC_FILE_INTERVAL", "0"),
+    "diagnostic_valid_interval": os.environ.get("ABFLOW_DIAGNOSTIC_VALID_INTERVAL", "1"),
+    "grad_conflict_diagnostics": os.environ.get("ABFLOW_GRAD_CONFLICT_DIAGNOSTICS", "on"),
+    "grad_diagnostic_interval": os.environ.get("ABFLOW_GRAD_DIAGNOSTIC_INTERVAL", "0"),
     "max_epoch": os.environ.get("ABFLOW_MAX_EPOCH", str(cfg.get("max_epoch", ""))),
     "resume_checkpoint": resume_ckpt,
+    "force_scratch": force_scratch,
     "clean_reference_source": os.environ.get("ABFLOW_SOURCE_MODE", "") == "reference",
     "proposal_conditioned_source": os.environ.get("ABFLOW_SOURCE_MODE", "") in {"pcs", "pcs_rc"},
     "proposal_recurrent_context": os.environ.get("ABFLOW_RECURRENT_PROPOSAL_CONTEXT", "") == "on",
@@ -1284,8 +924,8 @@ runtime = {
     "independent_velocity_head": "false",
     "stochastic_interpolant_training": os.environ.get("ABFLOW_SCOREFM_LOSS_MODE", "") in {"si_score", "si_score_fm"},
     "trajectory_consistency_training": os.environ.get("ABFLOW_SCOREFM_LOSS_MODE", "") in {"traj_consistency", "traj_consistency_fm"},
-    "score_aware_trajectory_lite_training": os.environ.get("ABFLOW_SCOREFM_LOSS_MODE", "") in {"score_aware_traj_lite", "score_aware_traj_fm_lite", "score_aware_traj_if_lite", "score_aware_traj_if_fm_lite"},
-    "interface_weighted_satc": os.environ.get("ABFLOW_SCOREFM_LOSS_MODE", "") in {"score_aware_traj_if_lite", "score_aware_traj_if_fm_lite"},
+    "score_aware_trajectory_lite_training": os.environ.get("ABFLOW_SCOREFM_LOSS_MODE", "").startswith("score_aware_traj_"),
+    "interface_weighted_satc": "_if_" in os.environ.get("ABFLOW_SCOREFM_LOSS_MODE", ""),
     "pair_time_conditioning": "false",
     "coordinate_objective_stacking": "false",
     "true_path_endpoint": "1.0",
