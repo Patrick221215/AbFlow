@@ -1,17 +1,20 @@
-#!/bin/bash
-###
- # @Author: Patrick221215 1427584833@qq.com
- # @Date: 2026-06-13 19:33:31
- # @LastEditors: Patrick221215 1427584833@qq.com
- # @LastEditTime: 2026-07-13 17:26:37
- # @FilePath: /cjm/project/AbFlow/scripts/test/test.sh
- # @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
-### 
+#!/usr/bin/env bash
 set -euo pipefail
 
-########## adjust configs according to your needs ##########
-CODE_DIR=`realpath $(dirname "$0")/../..`
-NUM_WORKERS=8
+# Manual/formal AbFlow structure evaluation.
+#
+# This script writes generated structures and runs cal_metrics.py.  It is not
+# used by the train-time in-memory validation rollout.
+#
+# Important fix:
+#   valid.json -> valid.pkl + valid_surf.pkl
+#   test.json  -> test.pkl  + test_surf.pkl
+#
+# The previous script always used test.pkl/test_surf.pkl, even when TEST_SET was
+# valid.json, which caused missing-key errors such as KeyError: '6x4t'.
+
+CODE_DIR=$(realpath "$(dirname "$0")/../..")
+NUM_WORKERS="${NUM_WORKERS:-8}"
 BATCH_SIZE="${BATCH_SIZE:-20}"
 N_STEPS="${N_STEPS:-10}"
 SHOW_SAMPLE_PROGRESS="${SHOW_SAMPLE_PROGRESS:-1}"
@@ -20,103 +23,120 @@ GPU="${GPU:-0}"
 CKPT="${1:-}"
 TEST_SET="${2:-}"
 SAVE_DIR="${3:-}"
-TASK="${4:-}" 
-SURF_FILE="${5:-}"
+TASK="${4:-rabd}"
+SURF_FILE_ARG="${5:-}"
 
-# validity check
-if [ -z "$CKPT" ] || [ -z "$TEST_SET" ]; then
-    echo "Usage: bash $0 <checkpoint> <test set> [save_dir] [task] [surf_file]"
-    echo "  task: rabd (generate.py), igfold (struct_generate.py), or custom path"
-    exit 1
+if [[ -z "$CKPT" || -z "$TEST_SET" ]]; then
+    echo "Usage: bash $0 <checkpoint> <dataset.json> [save_dir] [task] [surf_file]"
+    echo "  task: rabd, igfold, or custom"
+    exit 2
 fi
 
-CKPT=`realpath "$CKPT"`
-TEST_SET=`realpath "$TEST_SET"`
+[[ -f "$CKPT" ]] || {
+    echo "[ERROR] Checkpoint not found: $CKPT" >&2
+    exit 2
+}
+[[ -f "$TEST_SET" ]] || {
+    echo "[ERROR] Dataset JSON not found: $TEST_SET" >&2
+    exit 2
+}
 
-if [ -z "$SAVE_DIR" ]; then
-    SAVE_DIR="$(dirname "$CKPT")/results"
+CKPT=$(realpath "$CKPT")
+TEST_SET=$(realpath "$TEST_SET")
+TEST_DIR=$(dirname "$TEST_SET")
+SPLIT_NAME=$(basename "$TEST_SET")
+SPLIT_NAME="${SPLIT_NAME%.json}"
+
+if [[ -z "$SAVE_DIR" ]]; then
+    SAVE_DIR="$(dirname "$CKPT")/results_${SPLIT_NAME}"
 fi
-SAVE_DIR=`realpath -m "$SAVE_DIR"`
+SAVE_DIR=$(realpath -m "$SAVE_DIR")
 
-TEST_DIR=`dirname "$TEST_SET"`
+SCRIPT="generate.py"
+PEP_FILE=""
+SURF_FILE=""
 
-if [ "$TASK" = "rabd" ]; then
-    PEP_ARG="--pep_file ${TEST_DIR}/test.pkl"
-    SURF_ARG="--surf_file ${TEST_DIR}/test_surf.pkl"
-    SCRIPT="generate.py"
-elif [ "$TASK" = "igfold" ]; then
-    PEP_ARG="--pep_file ${TEST_DIR}/test.pkl"
-    SURF_ARG="--surf_file ${TEST_DIR}/test_surf.pkl"
-    SCRIPT="struct_generate.py"
-else
-    PEP_ARG=""
-    SURF_ARG="${SURF_FILE:+--surf_file ${SURF_FILE}}" 
-    SCRIPT="generate.py"
+case "$TASK" in
+    rabd)
+        SCRIPT="generate.py"
+        PEP_FILE="${ABFLOW_PEP_FILE:-${TEST_DIR}/${SPLIT_NAME}.pkl}"
+        SURF_FILE="${ABFLOW_SURF_FILE:-${TEST_DIR}/${SPLIT_NAME}_surf.pkl}"
+        ;;
+    igfold)
+        SCRIPT="struct_generate.py"
+        PEP_FILE="${ABFLOW_PEP_FILE:-${TEST_DIR}/${SPLIT_NAME}.pkl}"
+        SURF_FILE="${ABFLOW_SURF_FILE:-${TEST_DIR}/${SPLIT_NAME}_surf.pkl}"
+        ;;
+    *)
+        SCRIPT="generate.py"
+        PEP_FILE="${ABFLOW_PEP_FILE:-}"
+        SURF_FILE="${ABFLOW_SURF_FILE:-${SURF_FILE_ARG}}"
+        ;;
+esac
+
+if [[ -n "$PEP_FILE" && ! -f "$PEP_FILE" ]]; then
+    echo "[ERROR] Proposal sidecar not found: $PEP_FILE" >&2
+    echo "For ${SPLIT_NAME}.json, expected ${SPLIT_NAME}.pkl." >&2
+    echo "Override explicitly with ABFLOW_PEP_FILE=/path/to/file.pkl." >&2
+    exit 2
 fi
-######### end of adjust ##########
-
-
-# validity check
-if [ -z "$CKPT" ]; then
-	echo "Usage: bash $0 <checkpoint> <test set> [save_dir] [task]"
-	echo "  task: rabd (generate.py), igfold (struct_generate.py), or custom path"
-	exit 1;
-else
-	CKPT=`realpath $CKPT`
-	SAVE_DIR=`realpath $SAVE_DIR`
+if [[ -n "$SURF_FILE" && ! -f "$SURF_FILE" ]]; then
+    echo "[ERROR] Surface sidecar not found: $SURF_FILE" >&2
+    echo "For ${SPLIT_NAME}.json, expected ${SPLIT_NAME}_surf.pkl." >&2
+    echo "Override explicitly with ABFLOW_SURF_FILE=/path/to/file.pkl." >&2
+    exit 2
 fi
 
-# echo Configurations
 echo "Locate the project folder at ${CODE_DIR}"
 echo "Using GPU: ${GPU}"
-echo "Evaluating ${CKPT}"
+echo "Evaluating: ${CKPT}"
+echo "Dataset: ${TEST_SET}"
+echo "Dataset split: ${SPLIT_NAME}"
 echo "Batch size: ${BATCH_SIZE}"
 echo "Sampling steps: ${N_STEPS}"
 echo "Show sample progress: ${SHOW_SAMPLE_PROGRESS}"
-echo "Test set: ${TEST_SET}"
-echo "Test dir: ${TEST_DIR}"
-echo "Pep arg: ${PEP_ARG}"
-echo "Surf arg: ${SURF_ARG}"
-echo "Results will be written to ${SAVE_DIR}"
-echo "Task: ${TASK:-none}"
+echo "Proposal sidecar: ${PEP_FILE:-<none>}"
+echo "Surface sidecar: ${SURF_FILE:-<none>}"
+echo "Results: ${SAVE_DIR}"
+echo "Task: ${TASK}"
 echo "Script: ${SCRIPT}"
 
-# set gpu
-export CUDA_VISIBLE_DEVICES=$GPU
+export CUDA_VISIBLE_DEVICES="$GPU"
+cd "$CODE_DIR"
+mkdir -p "$SAVE_DIR"
 
-# generate
-cd ${CODE_DIR}
+args=(
+    "$SCRIPT"
+    --ckpt "$CKPT"
+    --test_set "$TEST_SET"
+    --save_dir "$SAVE_DIR"
+    --batch_size "$BATCH_SIZE"
+    --gpu 0
+    --n_steps "$N_STEPS"
+)
 
-mkdir -p "${SAVE_DIR}"
-
-GEN_EXTRA_ARGS="--n_steps ${N_STEPS}"
-
-if [ "${SHOW_SAMPLE_PROGRESS}" = "1" ]; then
-    GEN_EXTRA_ARGS="${GEN_EXTRA_ARGS} --show_sample_progress"
+if [[ -n "$PEP_FILE" ]]; then
+    args+=(--pep_file "$PEP_FILE")
+fi
+if [[ -n "$SURF_FILE" ]]; then
+    args+=(--surf_file "$SURF_FILE")
+fi
+if [[ "$SHOW_SAMPLE_PROGRESS" == "1" ]]; then
+    args+=(--show_sample_progress)
 fi
 
-python ${SCRIPT} \
-    --ckpt ${CKPT} \
-    --test_set ${TEST_SET} \
-    --save_dir ${SAVE_DIR} \
-    --batch_size ${BATCH_SIZE} \
-    --gpu 0 \
-    ${PEP_ARG} \
-    ${SURF_ARG} \
-    ${GEN_EXTRA_ARGS}
+python "${args[@]}"
 
 echo "Done generation"
 
 SUMMARY_FILE="${SAVE_DIR}/summary.json"
-if [ ! -f "${SUMMARY_FILE}" ]; then
-    echo "[ERROR] Generation failed: ${SUMMARY_FILE} was not created."
+if [[ ! -f "$SUMMARY_FILE" ]]; then
+    echo "[ERROR] Generation failed: ${SUMMARY_FILE} was not created." >&2
     exit 1
 fi
 
-# calculate metrics
 OPENMM_CPU_THREADS=1 python cal_metrics.py \
-    --test_set ${SUMMARY_FILE} \
-    --num_workers ${NUM_WORKERS}
-    
+    --test_set "$SUMMARY_FILE" \
+    --num_workers "$NUM_WORKERS"
 
 echo "Done evaluation"

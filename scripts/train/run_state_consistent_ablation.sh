@@ -5,8 +5,18 @@ MODE=${1:-}
 EXP_ID=${2:-}
 GPU_ID=${3:-0}
 
+# Resolve the current launcher itself so AutoTopK evaluates with the same
+# experiment definitions used for training.  Do not hard-code the legacy
+# run_state_consistent_ablation.sh, which does not know v52 EXP_IDs.
+SELF_LAUNCHER=$(python - "${BASH_SOURCE[0]}" <<'PYSELF'
+import os, sys
+print(os.path.realpath(sys.argv[1]))
+PYSELF
+)
+
 # ============================================================
 # AbFlow v52 exact-state / graph-translation SATC launcher
+# + safe in-memory validation rollout (no train-time PDB generation)
 # ============================================================
 # Core experimental hierarchy:
 #
@@ -217,6 +227,17 @@ GRAD_DIAGNOSTIC_INTERVAL=${ABFLOW_GRAD_DIAGNOSTIC_INTERVAL:-0}
 MAX_EPOCH=${ABFLOW_MAX_EPOCH:-}
 FORCE_SCRATCH=${ABFLOW_FORCE_SCRATCH:-off}
 
+# Lightweight validation rollout executed inside AbFlowTrainer.
+# It uses the current model and fixed validation tensors; no PDB/checkpoint
+# reload/external metric process is involved.
+INMEM_ROLLOUT_VALIDATION=${ABFLOW_INMEM_ROLLOUT_VALIDATION:-on}
+INMEM_ROLLOUT_START_EPOCH=${ABFLOW_INMEM_ROLLOUT_START_EPOCH:-0}
+INMEM_ROLLOUT_INTERVAL_EPOCHS=${ABFLOW_INMEM_ROLLOUT_INTERVAL_EPOCHS:-5}
+INMEM_ROLLOUT_MAX_BATCHES=${ABFLOW_INMEM_ROLLOUT_MAX_BATCHES:-1}
+INMEM_ROLLOUT_N_STEPS=${ABFLOW_INMEM_ROLLOUT_N_STEPS:-10}
+INMEM_ROLLOUT_SEED=${ABFLOW_INMEM_ROLLOUT_SEED:-20260723}
+INMEM_ROLLOUT_CONTACT_CUTOFF=${ABFLOW_INMEM_ROLLOUT_CONTACT_CUTOFF:-8.0}
+
 case "$EXP_ID" in
   PCS_RC_LC_R1|R1)
     # Frozen strong baseline.  It is kept unchanged for reproducibility.
@@ -391,6 +412,13 @@ run_with_env() {
   ABFLOW_LOG_INTERVAL="$LOG_INTERVAL" \
   ABFLOW_TQDM_MININTERVAL="$TQDM_MININTERVAL" \
   ABFLOW_SAVE_INTERVAL="$SAVE_INTERVAL" \
+  ABFLOW_INMEM_ROLLOUT_VALIDATION="$INMEM_ROLLOUT_VALIDATION" \
+  ABFLOW_INMEM_ROLLOUT_START_EPOCH="$INMEM_ROLLOUT_START_EPOCH" \
+  ABFLOW_INMEM_ROLLOUT_INTERVAL_EPOCHS="$INMEM_ROLLOUT_INTERVAL_EPOCHS" \
+  ABFLOW_INMEM_ROLLOUT_MAX_BATCHES="$INMEM_ROLLOUT_MAX_BATCHES" \
+  ABFLOW_INMEM_ROLLOUT_N_STEPS="$INMEM_ROLLOUT_N_STEPS" \
+  ABFLOW_INMEM_ROLLOUT_SEED="$INMEM_ROLLOUT_SEED" \
+  ABFLOW_INMEM_ROLLOUT_CONTACT_CUTOFF="$INMEM_ROLLOUT_CONTACT_CUTOFF" \
   GPU="$GPU_ID" \
   "$@"
 }
@@ -477,20 +505,26 @@ print_settings() {
   echo "DIAGNOSTIC_VALID_INTERVAL=$DIAGNOSTIC_VALID_INTERVAL"
   echo "GRAD_CONFLICT_DIAGNOSTICS=$GRAD_CONFLICT_DIAGNOSTICS"
   echo "GRAD_DIAGNOSTIC_INTERVAL=$GRAD_DIAGNOSTIC_INTERVAL"
+  echo "INMEM_ROLLOUT_VALIDATION=$INMEM_ROLLOUT_VALIDATION"
+  echo "INMEM_ROLLOUT_START_EPOCH=$INMEM_ROLLOUT_START_EPOCH"
+  echo "INMEM_ROLLOUT_INTERVAL_EPOCHS=$INMEM_ROLLOUT_INTERVAL_EPOCHS"
+  echo "INMEM_ROLLOUT_MAX_BATCHES=$INMEM_ROLLOUT_MAX_BATCHES"
+  echo "INMEM_ROLLOUT_N_STEPS=$INMEM_ROLLOUT_N_STEPS"
+  echo "INMEM_ROLLOUT_SEED=$INMEM_ROLLOUT_SEED"
+  echo "INMEM_ROLLOUT_CONTACT_CUTOFF=$INMEM_ROLLOUT_CONTACT_CUTOFF"
 }
 
 
 # ============================================================
-# Automatic validation-rollout checkpoint evaluation helpers
+# Manual external structure evaluation helpers
 # ============================================================
 # Principle:
 #   The original training command remains unchanged:
 #     bash scripts/train/run_state_consistent_ablation.sh train <EXP_ID> <GPU_ID> <BASE_CONFIG>
-#   When ABFLOW_AUTO_TOPK_EVAL=on (explicit opt-in), the launcher automatically starts
-#   a background watcher if spare GPUs are available.  It reads topk_map.txt,
-#   evaluates new checkpoints on the validation JSON with the existing evaluation pipeline, and writes CSV
-#   next to topk_map.txt.  If no spare GPU is available, the launcher performs
-#   a final catch-up evaluation after training finishes.
+#   These helpers create PDB files and run the full external metric pipeline.
+#   They are retained only for explicit ``attach_eval`` or ``test`` commands.
+#   Train mode never starts them, even if ABFLOW_AUTO_TOPK_EVAL=on.
+#   Frequent train-time checking is handled by the in-memory trainer probe.
 
 PROJECT_ROOT=${ABFLOW_PROJECT_ROOT:-/home/data3/cjm/project/AbFlow}
 AUTO_TOPK_EVAL=${ABFLOW_AUTO_TOPK_EVAL:-off}
@@ -587,7 +621,7 @@ _start_auto_topk_watcher() {
       --test-json "$AUTO_TOPK_TEST_JSON" \
       --gpu-ids "$eval_gpus" \
       --project-root "$PROJECT_ROOT" \
-      --launcher "scripts/train/run_state_consistent_ablation.sh" \
+      --launcher "$SELF_LAUNCHER" \
       --watch \
       --poll-interval "$AUTO_TOPK_POLL_INTERVAL" \
       --max-new "$AUTO_TOPK_MAX_NEW" \
@@ -635,7 +669,7 @@ _run_auto_topk_once() {
     --test-json "$AUTO_TOPK_TEST_JSON" \
     --gpu-ids "$eval_gpus" \
     --project-root "$PROJECT_ROOT" \
-    --launcher "scripts/train/run_state_consistent_ablation.sh" \
+    --launcher "$SELF_LAUNCHER" \
     $( _is_on "$AUTO_TOPK_LATEST_ONLY" && echo --latest-only ) \
     $( _is_on "$AUTO_TOPK_FORCE" && echo --force ) \
     >> "$log_file" 2>&1 || true
@@ -656,7 +690,7 @@ if [[ "$MODE" == "attach_eval" ]]; then
     --test-json "$AUTO_TOPK_TEST_JSON" \
     --gpu-ids "$EVAL_GPUS_ARG" \
     --project-root "$PROJECT_ROOT" \
-    --launcher "scripts/train/run_state_consistent_ablation.sh" \
+    --launcher "$SELF_LAUNCHER" \
     --watch \
     --poll-interval "$AUTO_TOPK_POLL_INTERVAL" \
     --max-new "$AUTO_TOPK_MAX_NEW" \
@@ -950,6 +984,14 @@ runtime = {
     "diagnostic_valid_interval": os.environ.get("ABFLOW_DIAGNOSTIC_VALID_INTERVAL", "1"),
     "grad_conflict_diagnostics": os.environ.get("ABFLOW_GRAD_CONFLICT_DIAGNOSTICS", "on"),
     "grad_diagnostic_interval": os.environ.get("ABFLOW_GRAD_DIAGNOSTIC_INTERVAL", "0"),
+    "inmem_rollout_validation": os.environ.get("ABFLOW_INMEM_ROLLOUT_VALIDATION", "on"),
+    "inmem_rollout_start_epoch": os.environ.get("ABFLOW_INMEM_ROLLOUT_START_EPOCH", "0"),
+    "inmem_rollout_interval_epochs": os.environ.get("ABFLOW_INMEM_ROLLOUT_INTERVAL_EPOCHS", "5"),
+    "inmem_rollout_max_batches": os.environ.get("ABFLOW_INMEM_ROLLOUT_MAX_BATCHES", "1"),
+    "inmem_rollout_n_steps": os.environ.get("ABFLOW_INMEM_ROLLOUT_N_STEPS", "10"),
+    "inmem_rollout_seed": os.environ.get("ABFLOW_INMEM_ROLLOUT_SEED", "20260723"),
+    "inmem_rollout_contact_cutoff": os.environ.get("ABFLOW_INMEM_ROLLOUT_CONTACT_CUTOFF", "8.0"),
+    "train_mode_external_pdb_evaluation": "false",
     "max_epoch": os.environ.get("ABFLOW_MAX_EPOCH", str(cfg.get("max_epoch", ""))),
     "resume_checkpoint": resume_ckpt,
     "force_scratch": force_scratch,
@@ -1026,21 +1068,19 @@ if [[ "${ABFLOW_DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
-AUTO_EVAL_GPUS=$(_infer_spare_eval_gpus)
-_start_auto_topk_watcher "$AUTO_EVAL_GPUS" "$RUN_DIR"
+# Safety boundary:
+#   train mode never invokes evaluate_topk_map.py/test.sh/generate.py.
+#   ABFLOW_AUTO_TOPK_EVAL is ignored here to prevent accidental validation PDB
+#   generation.  Use the explicit attach_eval or test mode for a deliberate
+#   full structure evaluation.
+if _is_on "$AUTO_TOPK_EVAL"; then
+  echo "[ValidationSafety] ABFLOW_AUTO_TOPK_EVAL=$AUTO_TOPK_EVAL is ignored in train mode."
+  echo "[ValidationSafety] Using in-memory rollout probe; no PDB files will be generated."
+fi
 
 set +e
 run_with_env bash scripts/train/train.sh "$RUN_CONFIG"
 TRAIN_STATUS=$?
 set -e
 
-# Evaluate only after a successful training process.  A failed run has no valid
-# new checkpoint and must not launch a catch-up evaluation job that obscures the
-# original exception or consumes another GPU.
-if [[ "$TRAIN_STATUS" -eq 0 ]]; then
-  _run_auto_topk_once "${AUTO_EVAL_GPUS:-$GPU_ID}" "$RUN_DIR"
-else
-  echo "[AutoTopK] training failed with status=$TRAIN_STATUS; skipping final evaluation."
-fi
-_stop_auto_topk_watcher "$RUN_DIR"
 exit "$TRAIN_STATUS"
