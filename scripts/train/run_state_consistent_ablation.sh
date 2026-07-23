@@ -16,7 +16,6 @@ PYSELF
 
 # ============================================================
 # AbFlow v52 exact-state / graph-translation SATC launcher
-# + safe in-memory validation rollout (no train-time PDB generation)
 # ============================================================
 # Core experimental hierarchy:
 #
@@ -227,17 +226,6 @@ GRAD_DIAGNOSTIC_INTERVAL=${ABFLOW_GRAD_DIAGNOSTIC_INTERVAL:-0}
 MAX_EPOCH=${ABFLOW_MAX_EPOCH:-}
 FORCE_SCRATCH=${ABFLOW_FORCE_SCRATCH:-off}
 
-# Lightweight validation rollout executed inside AbFlowTrainer.
-# It uses the current model and fixed validation tensors; no PDB/checkpoint
-# reload/external metric process is involved.
-INMEM_ROLLOUT_VALIDATION=${ABFLOW_INMEM_ROLLOUT_VALIDATION:-on}
-INMEM_ROLLOUT_START_EPOCH=${ABFLOW_INMEM_ROLLOUT_START_EPOCH:-0}
-INMEM_ROLLOUT_INTERVAL_EPOCHS=${ABFLOW_INMEM_ROLLOUT_INTERVAL_EPOCHS:-5}
-INMEM_ROLLOUT_MAX_BATCHES=${ABFLOW_INMEM_ROLLOUT_MAX_BATCHES:-1}
-INMEM_ROLLOUT_N_STEPS=${ABFLOW_INMEM_ROLLOUT_N_STEPS:-10}
-INMEM_ROLLOUT_SEED=${ABFLOW_INMEM_ROLLOUT_SEED:-20260723}
-INMEM_ROLLOUT_CONTACT_CUTOFF=${ABFLOW_INMEM_ROLLOUT_CONTACT_CUTOFF:-8.0}
-
 case "$EXP_ID" in
   PCS_RC_LC_R1|R1)
     # Frozen strong baseline.  It is kept unchanged for reproducibility.
@@ -281,7 +269,6 @@ case "$EXP_ID" in
     SATC_SCORE_WEIGHT=0.0
     SATC_VELOCITY_WEIGHT=0.0
     MAX_EPOCH=${ABFLOW_MAX_EPOCH:-160}
-    FORCE_SCRATCH=on
     ;;
 
   PCS_RC_LC_R1_JOINT_EXACT_GT_SATC|JOINT_EXACT_GT_SATC|MAIN_V52)
@@ -322,7 +309,6 @@ case "$EXP_ID" in
     SATC_GT_INTERVAL=${ABFLOW_SATC_GT_INTERVAL:-4}
     SATC_GT_START_EPOCH=${ABFLOW_SATC_GT_START_EPOCH:-5}
     MAX_EPOCH=${ABFLOW_MAX_EPOCH:-160}
-    FORCE_SCRATCH=on
     ;;
 
   *)
@@ -412,13 +398,6 @@ run_with_env() {
   ABFLOW_LOG_INTERVAL="$LOG_INTERVAL" \
   ABFLOW_TQDM_MININTERVAL="$TQDM_MININTERVAL" \
   ABFLOW_SAVE_INTERVAL="$SAVE_INTERVAL" \
-  ABFLOW_INMEM_ROLLOUT_VALIDATION="$INMEM_ROLLOUT_VALIDATION" \
-  ABFLOW_INMEM_ROLLOUT_START_EPOCH="$INMEM_ROLLOUT_START_EPOCH" \
-  ABFLOW_INMEM_ROLLOUT_INTERVAL_EPOCHS="$INMEM_ROLLOUT_INTERVAL_EPOCHS" \
-  ABFLOW_INMEM_ROLLOUT_MAX_BATCHES="$INMEM_ROLLOUT_MAX_BATCHES" \
-  ABFLOW_INMEM_ROLLOUT_N_STEPS="$INMEM_ROLLOUT_N_STEPS" \
-  ABFLOW_INMEM_ROLLOUT_SEED="$INMEM_ROLLOUT_SEED" \
-  ABFLOW_INMEM_ROLLOUT_CONTACT_CUTOFF="$INMEM_ROLLOUT_CONTACT_CUTOFF" \
   GPU="$GPU_ID" \
   "$@"
 }
@@ -505,26 +484,20 @@ print_settings() {
   echo "DIAGNOSTIC_VALID_INTERVAL=$DIAGNOSTIC_VALID_INTERVAL"
   echo "GRAD_CONFLICT_DIAGNOSTICS=$GRAD_CONFLICT_DIAGNOSTICS"
   echo "GRAD_DIAGNOSTIC_INTERVAL=$GRAD_DIAGNOSTIC_INTERVAL"
-  echo "INMEM_ROLLOUT_VALIDATION=$INMEM_ROLLOUT_VALIDATION"
-  echo "INMEM_ROLLOUT_START_EPOCH=$INMEM_ROLLOUT_START_EPOCH"
-  echo "INMEM_ROLLOUT_INTERVAL_EPOCHS=$INMEM_ROLLOUT_INTERVAL_EPOCHS"
-  echo "INMEM_ROLLOUT_MAX_BATCHES=$INMEM_ROLLOUT_MAX_BATCHES"
-  echo "INMEM_ROLLOUT_N_STEPS=$INMEM_ROLLOUT_N_STEPS"
-  echo "INMEM_ROLLOUT_SEED=$INMEM_ROLLOUT_SEED"
-  echo "INMEM_ROLLOUT_CONTACT_CUTOFF=$INMEM_ROLLOUT_CONTACT_CUTOFF"
 }
 
 
 # ============================================================
-# Manual external structure evaluation helpers
+# Automatic topk-map test evaluation helpers
 # ============================================================
 # Principle:
 #   The original training command remains unchanged:
 #     bash scripts/train/run_state_consistent_ablation.sh train <EXP_ID> <GPU_ID> <BASE_CONFIG>
-#   These helpers create PDB files and run the full external metric pipeline.
-#   They are retained only for explicit ``attach_eval`` or ``test`` commands.
-#   Train mode never starts them, even if ABFLOW_AUTO_TOPK_EVAL=on.
-#   Frequent train-time checking is handled by the in-memory trainer probe.
+#   When ABFLOW_AUTO_TOPK_EVAL=on (explicit opt-in), the launcher automatically starts
+#   a background watcher if spare GPUs are available.  It reads topk_map.txt,
+#   evaluates new checkpoints with the original test pipeline and writes CSV
+#   next to topk_map.txt.  If no spare GPU is available, the launcher performs
+#   a final catch-up evaluation after training finishes.
 
 PROJECT_ROOT=${ABFLOW_PROJECT_ROOT:-/home/data3/cjm/project/AbFlow}
 AUTO_TOPK_EVAL=${ABFLOW_AUTO_TOPK_EVAL:-off}
@@ -532,7 +505,7 @@ AUTO_TOPK_POLL_INTERVAL=${ABFLOW_TOPK_POLL_INTERVAL:-300}
 AUTO_TOPK_MAX_NEW=${ABFLOW_TOPK_MAX_NEW:-1}
 AUTO_TOPK_LATEST_ONLY=${ABFLOW_TOPK_LATEST_ONLY:-off}
 AUTO_TOPK_MAX_EVAL_GPUS=${ABFLOW_AUTO_TOPK_MAX_EVAL_GPUS:-1}
-AUTO_TOPK_TEST_JSON=${ABFLOW_TOPK_TEST_JSON:-${PROJECT_ROOT}/datasets/RAbD/valid.json}
+AUTO_TOPK_TEST_JSON=${ABFLOW_TOPK_TEST_JSON:-${PROJECT_ROOT}/datasets/RAbD/test.json}
 AUTO_TOPK_EVAL_SCRIPT=${ABFLOW_TOPK_EVAL_SCRIPT:-scripts/test/evaluate_topk_map.py}
 AUTO_TOPK_FORCE=${ABFLOW_TOPK_FORCE:-off}
 
@@ -605,7 +578,7 @@ _start_auto_topk_watcher() {
     return 0
   fi
   if [[ ! -f "$AUTO_TOPK_TEST_JSON" ]]; then
-    echo "[AutoTopK] evaluation json not found: $AUTO_TOPK_TEST_JSON; auto evaluation disabled."
+    echo "[AutoTopK] test json not found: $AUTO_TOPK_TEST_JSON; auto evaluation disabled."
     return 0
   fi
   if [[ ! -f "$AUTO_TOPK_EVAL_SCRIPT" ]]; then
@@ -738,16 +711,67 @@ RUN_ROOT=${ABFLOW_RUN_ROOT:-/home/data3/cjm/project/AbFlow/results_dtm}
 RUN_DIR="${RUN_ROOT}/${EXP_ID}"
 CONFIG_DIR="${RUN_ROOT}/generated_configs"
 
-# A from-scratch profile must not silently mix checkpoints/topk files from an
-# earlier run. Set ABFLOW_ALLOW_NONEMPTY_RUN_DIR=on only when intentionally
-# reusing the directory after manually cleaning it.
-if _is_on "$FORCE_SCRATCH" && [[ -d "$RUN_DIR" ]] && [[ -n "$(find "$RUN_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
-  if ! _is_on "${ABFLOW_ALLOW_NONEMPTY_RUN_DIR:-off}"; then
-    echo "ERROR: from-scratch run directory is not empty: $RUN_DIR" >&2
-    echo "Use a new ABFLOW_RUN_ROOT or clean the directory. To override intentionally, set ABFLOW_ALLOW_NONEMPTY_RUN_DIR=on." >&2
+# Resume/scratch mode is determined by one source of truth:
+#   1) ABFLOW_FORCE_SCRATCH=on explicitly requests a fresh run and clears
+#      resume_checkpoint.
+#   2) Otherwise, a non-empty resume_checkpoint in BASE_CONFIG means resume.
+#   3) Otherwise, this is a fresh run.
+#
+# A resume is allowed to reuse the existing experiment directory.  A fresh run
+# is still protected from silently mixing with old checkpoints/logs.
+BASE_RESUME_CHECKPOINT=$(python - "$BASE_CONFIG" <<'PYRESUME'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+print(str(cfg.get("resume_checkpoint", "") or "").strip())
+PYRESUME
+)
+
+if _is_on "$FORCE_SCRATCH"; then
+  RUN_MODE="scratch"
+  EFFECTIVE_RESUME_CHECKPOINT=""
+elif [[ -n "$BASE_RESUME_CHECKPOINT" ]]; then
+  RUN_MODE="resume"
+  EFFECTIVE_RESUME_CHECKPOINT="$BASE_RESUME_CHECKPOINT"
+else
+  RUN_MODE="scratch"
+  EFFECTIVE_RESUME_CHECKPOINT=""
+fi
+
+if [[ "$RUN_MODE" == "resume" ]]; then
+  if [[ ! -f "$EFFECTIVE_RESUME_CHECKPOINT" ]]; then
+    echo "ERROR: resume checkpoint not found: $EFFECTIVE_RESUME_CHECKPOINT" >&2
     exit 2
   fi
+
+  EXPECTED_PREFIX="${RUN_DIR}/version_"
+  case "$(realpath "$EFFECTIVE_RESUME_CHECKPOINT")" in
+    "${EXPECTED_PREFIX}"*/checkpoint/last_step*.pt)
+      ;;
+    *)
+      echo "ERROR: resume checkpoint must be a last_step*.pt under:" >&2
+      echo "       ${RUN_DIR}/version_N/checkpoint/" >&2
+      echo "Got:   $EFFECTIVE_RESUME_CHECKPOINT" >&2
+      exit 2
+      ;;
+  esac
+else
+  if [[ -d "$RUN_DIR" ]] && [[ -n "$(find "$RUN_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+    if ! _is_on "${ABFLOW_ALLOW_NONEMPTY_RUN_DIR:-off}"; then
+      echo "ERROR: fresh-run directory is not empty: $RUN_DIR" >&2
+      echo "Set resume_checkpoint in BASE_CONFIG to resume, or use a new ABFLOW_RUN_ROOT." >&2
+      echo "ABFLOW_ALLOW_NONEMPTY_RUN_DIR=on is only for an intentional fresh overwrite." >&2
+      exit 2
+    fi
+  fi
 fi
+
+echo "Run mode: $RUN_MODE"
+echo "Effective resume checkpoint: ${EFFECTIVE_RESUME_CHECKPOINT:-<none>}"
+
 RUN_CONFIG="${CONFIG_DIR}/${EXP_ID}.json"
 RUNTIME_META="${RUN_DIR}/abflow_runtime.json"
 
@@ -800,9 +824,10 @@ def _env_int(name, default):
 def _env_float(name, default):
     return float(os.environ.get(name, str(default)))
 
-# Resume logic.  The two calibrated profiles are defined as from-scratch
-# experiments, so ABFLOW_FORCE_SCRATCH=on explicitly clears any checkpoint that
-# may be present in the shared base JSON.  Other profiles retain old behavior.
+# Resume logic:
+#   - BASE_CONFIG resume_checkpoint is preserved by default;
+#   - ABFLOW_FORCE_SCRATCH=on is the only explicit override that clears it.
+# Experiment profiles must never silently force scratch mode.
 force_scratch = _env_on("ABFLOW_FORCE_SCRATCH", "off")
 if force_scratch:
     resume_ckpt = ""
@@ -984,17 +1009,10 @@ runtime = {
     "diagnostic_valid_interval": os.environ.get("ABFLOW_DIAGNOSTIC_VALID_INTERVAL", "1"),
     "grad_conflict_diagnostics": os.environ.get("ABFLOW_GRAD_CONFLICT_DIAGNOSTICS", "on"),
     "grad_diagnostic_interval": os.environ.get("ABFLOW_GRAD_DIAGNOSTIC_INTERVAL", "0"),
-    "inmem_rollout_validation": os.environ.get("ABFLOW_INMEM_ROLLOUT_VALIDATION", "on"),
-    "inmem_rollout_start_epoch": os.environ.get("ABFLOW_INMEM_ROLLOUT_START_EPOCH", "0"),
-    "inmem_rollout_interval_epochs": os.environ.get("ABFLOW_INMEM_ROLLOUT_INTERVAL_EPOCHS", "5"),
-    "inmem_rollout_max_batches": os.environ.get("ABFLOW_INMEM_ROLLOUT_MAX_BATCHES", "1"),
-    "inmem_rollout_n_steps": os.environ.get("ABFLOW_INMEM_ROLLOUT_N_STEPS", "10"),
-    "inmem_rollout_seed": os.environ.get("ABFLOW_INMEM_ROLLOUT_SEED", "20260723"),
-    "inmem_rollout_contact_cutoff": os.environ.get("ABFLOW_INMEM_ROLLOUT_CONTACT_CUTOFF", "8.0"),
-    "train_mode_external_pdb_evaluation": "false",
     "max_epoch": os.environ.get("ABFLOW_MAX_EPOCH", str(cfg.get("max_epoch", ""))),
     "resume_checkpoint": resume_ckpt,
     "force_scratch": force_scratch,
+    "run_mode": "scratch" if force_scratch or not resume_ckpt else "resume",
     "clean_reference_source": os.environ.get("ABFLOW_SOURCE_MODE", "") == "reference",
     "proposal_conditioned_source": os.environ.get("ABFLOW_SOURCE_MODE", "") in {"pcs", "pcs_rc"},
     "proposal_recurrent_context": os.environ.get("ABFLOW_RECURRENT_PROPOSAL_CONTEXT", "") == "on",
@@ -1054,6 +1072,7 @@ for key in [
     "amp",
     "amp_dtype",
     "allow_tf32",
+    "max_epoch",
     "resume_checkpoint",
 ]:
     print(f"  {key}={cfg.get(key, '')}")
@@ -1068,19 +1087,21 @@ if [[ "${ABFLOW_DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
-# Safety boundary:
-#   train mode never invokes evaluate_topk_map.py/test.sh/generate.py.
-#   ABFLOW_AUTO_TOPK_EVAL is ignored here to prevent accidental validation PDB
-#   generation.  Use the explicit attach_eval or test mode for a deliberate
-#   full structure evaluation.
-if _is_on "$AUTO_TOPK_EVAL"; then
-  echo "[ValidationSafety] ABFLOW_AUTO_TOPK_EVAL=$AUTO_TOPK_EVAL is ignored in train mode."
-  echo "[ValidationSafety] Using in-memory rollout probe; no PDB files will be generated."
-fi
+AUTO_EVAL_GPUS=$(_infer_spare_eval_gpus)
+_start_auto_topk_watcher "$AUTO_EVAL_GPUS" "$RUN_DIR"
 
 set +e
 run_with_env bash scripts/train/train.sh "$RUN_CONFIG"
 TRAIN_STATUS=$?
 set -e
 
+# Evaluate only after a successful training process.  A failed run has no valid
+# new checkpoint and must not launch a catch-up evaluation job that obscures the
+# original exception or consumes another GPU.
+if [[ "$TRAIN_STATUS" -eq 0 ]]; then
+  _run_auto_topk_once "${AUTO_EVAL_GPUS:-$GPU_ID}" "$RUN_DIR"
+else
+  echo "[AutoTopK] training failed with status=$TRAIN_STATUS; skipping final evaluation."
+fi
+_stop_auto_topk_watcher "$RUN_DIR"
 exit "$TRAIN_STATUS"
