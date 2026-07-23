@@ -15,131 +15,29 @@ PYSELF
 )
 
 # ============================================================
-# AbFlow v52 exact-state / graph-translation SATC launcher
+# AbFlow v53 progressive one-factor ablation launcher
 # ============================================================
-# Core experimental hierarchy:
+# Frozen parent: PCS_RC_LC_R1.
 #
-#   REF:
-#       reference source, no peptide hidden condition.
+# This stage deliberately runs only two independent one-factor additions:
 #
-#   REF_COND:
-#       reference source + peptide hidden condition.
+#   PCS_RC_LC_R1_SEQ_STATE_HIDDEN
+#       R1 + explicit categorical S_t in hidden space only.
+#       It does not switch atom identities, atom masks, atom weights or edges.
 #
-#   PCS:
-#       proposal-conditioned source only. This tests whether using X_pep/S_pep
-#       as the declared source is enough.
+#   PCS_RC_LC_R1_GT_SATC
+#       R1 + graph-translation SATC only.
+#       It does not enable dual sequence state or alter sequence topology.
 #
-#   PCS_RC:
-#       proposal-conditioned source + recurrent proposal context. This is the
-#       recommended strong base: X_pep/S_pep define the source and also build
-#       the recurrent global proposal context at every _forward call, while the
-#       explicit generated state Xt/St is never overwritten.
+# No profile combines these modules.  hard_exact, context-off and integrated
+# endpoint readout are excluded from this stage because the previous joint
+# configuration changed several factors simultaneously and degraded R1.
 #
-#   PCS_RC_COND:
-#       PCS_RC plus unrestricted proposal-relative adapters from round 0.
-#       This is the already-tested upper local-correction endpoint.
+# Resume policy:
+#   - empty resume_checkpoint: fresh run;
+#   - non-empty last_step*.pt: resume;
+#   - ABFLOW_FORCE_SCRATCH=on: explicit fresh run.
 #
-#   PCS_RC_LC_R1:
-#       PCS_RC plus delayed local correction from round 1.  Round 0 is reserved
-#       for H3 placement; later rounds use proposal-relative adapters for local
-#       structure/sequence correction.
-#
-#   PCS_RC_LC_R2:
-#       PCS_RC plus late local correction from round 2.  With iter_round=3 this
-#       means only the final refinement round uses proposal-relative adapters.
-#
-#   PCS_RC_LC_R1_SI_SCORE:
-#       PCS_RC_LC_R1 plus stochastic-interpolant analytic score regularization.
-#       The score is induced from the endpoint head and known injected noise; no
-#       independent score head is added.
-#
-#   PCS_RC_LC_R1_SI_SCORE_FM:
-#       PCS_RC_LC_R1 plus stochastic-interpolant analytic score and velocity
-#       consistency. Retained as a historical diagnostic.
-#
-#   PCS_RC_LC_R1_TRAJ:
-#       PCS_RC_LC_R1 plus model-induced trajectory endpoint consistency.
-#       The same endpoint model is queried at Xt and at Xt+dt; no extra head is
-#       added. This tests dynamic self-consistency of the learned flow.
-#
-#   PCS_RC_LC_R1_TRAJ_FM:
-#       PCS_RC_LC_R1_TRAJ plus induced velocity-field consistency. This is a
-#       full two-query diagnostic and can be expensive.
-#
-#   PCS_RC_LC_R1_SATC_LITE:
-#       Lightweight score-aware trajectory/tangent consistency.  The model sees
-#       score-defined off-path states and learns a one-forward correction
-#       direction without an extra _forward call.
-#
-#   PCS_RC_LC_R1_SATC_FM_LITE:
-#       SATC_LITE plus a small projected velocity-correction consistency.
-#   PCS_RC_LC_R1_SATC_FM_PRIMARY_ANNEAL:
-#       Main optimized configuration.  It preserves the validated SATC_MAIN
-#       direction-only mechanism and only anneals late off-path perturbation to
-#       avoid over-regularization.
-#
-#   PCS_RC_LC_R1_SATC_FM_DIRECTION_HYBRID:
-#       Fusion configuration.  It keeps SATC_MAIN as the backbone and adds only
-#       a micro velocity-magnitude term borrowed from FM_SOFT, with aggressive
-#       late decay.
-#
-#
-#   PCS_RC_LC_R1_SATC_FM_BEST_E125:
-#       Canonical validated FM_SOFT mechanism with a finite training horizon.
-#       It preserves the observed epoch~122 advantage and stops before the
-#       late over-regularization regime.
-#
-#   PCS_RC_LC_R1_SATC_FM_IF_GUARD_E125:
-#       Fusion candidate: canonical FM_SOFT plus weak interface weighting as a
-#       DockQ guard.  It borrows the interface stability observed in IF_MAIN
-#       without letting interface weighting dominate AAR/CAAR.
-#   PCS_RC_LC_R1_SATC_IF_MAIN:
-#       Interface-weighted SATC main candidate for DockQ/CAAR/LDDT.
-#   PCS_RC_LC_R1_SATC_IF_FM_SOFT:
-#       Interface-weighted SATC plus very soft velocity-magnitude consistency.
-#
-#   PCS_RC_LC_R1_SATC_NT_MAIN:
-#       Normal--tangent decomposed score-aware flow.  The endpoint-induced
-#       velocity is split into tangent transport and normal score correction;
-#       only the normal projection is constrained.
-#
-#   PCS_RC_LC_R1_SATC_NT_FM_SOFT:
-#       NT_MAIN plus a very weak normal-correction magnitude term.  This is
-#       the score+velocity configuration that absorbs the useful FM_SOFT signal
-#       without constraining the full velocity vector.
-#
-#   PCS_RC_LC_R1_SATC_IF_NT_TARGET:
-#       Target-aligned score-aware flow.  It combines normal--tangent SATC
-#       with native-interface residue weighting, keeps the SATC signal active
-#       throughout training, and removes the late endpoint-only collapse.
-#
-#   PCS_RC_LC_R1_SATC_IF_NT_FM_TARGET:
-#       Same target-aligned score-aware flow plus a non-decayed soft normal
-#       velocity consistency term.  This is the only recommended velocity/flow
-#       ablation in this round.
-#
-#   PCS_RC_LC_R1_SATC_IF_NT_CALIBRATED:
-#       Main method. It preserves the complete PCS_RC_LC_R1 + SATC + IF + NT
-#       pipeline, but calibrates the iid stochastic-tube width to the current
-#       source-to-native transport RMS. Direction-only normal pull remains the
-#       main auxiliary signal; no magnitude term is used.
-#
-#   PCS_RC_LC_R1_SATC_IF_NT_MAG_CALIBRATED:
-#       One-factor ablation of the same method. It adds only an unbiased normal
-#       magnitude objective whose exact optimum is projection ratio 1.
-#
-#   CORE:
-#       reference source + analytic_core objective.
-#       Analytic score is currently valid only for reference source.
-#
-# Formal defaults:
-#   - full observability: LOG_INTERVAL=1, SAVE_INTERVAL=1
-#   - condition diagnostics on
-#   - train/valid DataLoader resources separated
-#   - resume behavior follows resume_checkpoint in BASE_CONFIG:
-#       ""       -> train from scratch
-#       nonempty -> resume from that checkpoint
-
 STATE_PATH=on
 PER_SAMPLE_T=on
 TIME_EMBED=on
@@ -158,9 +56,9 @@ COORD_PEP_AS_CONDITION=off
 SEQ_INPUT_MODE=state
 SHADOW_SEQ_STATE=${ABFLOW_SHADOW_SEQ_STATE:-off}
 DUAL_SEQUENCE_STATE=${ABFLOW_DUAL_SEQUENCE_STATE:-off}
-DUAL_SEQUENCE_ATOM_MODE=${ABFLOW_DUAL_SEQUENCE_ATOM_MODE:-hard_exact}
+DUAL_SEQUENCE_ATOM_MODE=${ABFLOW_DUAL_SEQUENCE_ATOM_MODE:-hidden_only}
 SEQUENCE_CONTEXT_MODE=${ABFLOW_SEQUENCE_CONTEXT_MODE:-legacy}
-FINAL_READOUT_MODE=${ABFLOW_FINAL_READOUT_MODE:-integrated_endpoint}
+FINAL_READOUT_MODE=${ABFLOW_FINAL_READOUT_MODE:-legacy_t1_query}
 SEQUENCE_DECODE_MODE=${ABFLOW_SEQUENCE_DECODE_MODE:-argmax}
 DETERMINISTIC_VALIDATION=${ABFLOW_DETERMINISTIC_VALIDATION:-on}
 SEQ_CE_WEIGHT=${ABFLOW_SEQ_CE_WEIGHT:-1.0}
@@ -226,9 +124,13 @@ GRAD_DIAGNOSTIC_INTERVAL=${ABFLOW_GRAD_DIAGNOSTIC_INTERVAL:-0}
 MAX_EPOCH=${ABFLOW_MAX_EPOCH:-}
 FORCE_SCRATCH=${ABFLOW_FORCE_SCRATCH:-off}
 
+ABLATION_PARENT=PCS_RC_LC_R1
+EXPERIMENT_FACTOR=unassigned
+SINGLE_FACTOR_ABLATION=true
+
 case "$EXP_ID" in
   PCS_RC_LC_R1|R1)
-    # Frozen strong baseline.  It is kept unchanged for reproducibility.
+    # Frozen parent definition.  Included only for reproducibility and test mode.
     SOURCE_MODE=pcs_rc
     RECURRENT_PROPOSAL_CONTEXT=on
     LOSS_MODE=endpoint
@@ -238,18 +140,32 @@ case "$EXP_ID" in
     SEQ_INPUT_MODE=pep_condition
     SHADOW_SEQ_STATE=off
     DUAL_SEQUENCE_STATE=off
+    DUAL_SEQUENCE_ATOM_MODE=hidden_only
+    SEQUENCE_CONTEXT_MODE=legacy
+    FINAL_READOUT_MODE=legacy_t1_query
+    SEQUENCE_DECODE_MODE=argmax
+    DETERMINISTIC_VALIDATION=on
     PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-1}
     SATC_APPLY_PROB=0.0
     SATC_SCORE_WEIGHT=0.0
     SATC_VELOCITY_WEIGHT=0.0
+    MAX_EPOCH=${ABFLOW_MAX_EPOCH:-160}
+    EXPERIMENT_FACTOR=frozen_parent
     ;;
 
-  PCS_RC_LC_R1_JOINT_EXACT_CTRL|JOINT_EXACT_CTRL|CTRL_V52)
-    # v52 causal control:
-    #   - preserve PCS_RC_LC_R1 source/context/endpoint backbone;
-    #   - S_t exactly controls H3 residue and atom semantics;
-    #   - S_pep remains a proposal condition through the original adapter;
-    #   - no stochastic tube auxiliary.
+  PCS_RC_LC_R1_SEQ_STATE_HIDDEN|R1_SEQ_STATE_HIDDEN|SEQ_STATE_HIDDEN)
+    # One-factor experiment A:
+    #   PCS_RC_LC_R1 + explicit S_t hidden-state residual only.
+    #
+    # Kept identical to R1:
+    #   source/context, endpoint loss, legacy context curriculum,
+    #   proposal conditions, atom topology, edge construction and final readout.
+    #
+    # Added factor:
+    #   DUAL_SEQUENCE_STATE=on with hidden_only.
+    #
+    # This tests whether the network benefits from observing categorical path
+    # state S_t before any risky atom-topology replacement is introduced.
     SOURCE_MODE=pcs_rc
     RECURRENT_PROPOSAL_CONTEXT=on
     LOSS_MODE=endpoint
@@ -259,9 +175,9 @@ case "$EXP_ID" in
     SEQ_INPUT_MODE=pep_condition
     SHADOW_SEQ_STATE=off
     DUAL_SEQUENCE_STATE=on
-    DUAL_SEQUENCE_ATOM_MODE=hard_exact
-    SEQUENCE_CONTEXT_MODE=off
-    FINAL_READOUT_MODE=integrated_endpoint
+    DUAL_SEQUENCE_ATOM_MODE=hidden_only
+    SEQUENCE_CONTEXT_MODE=legacy
+    FINAL_READOUT_MODE=legacy_t1_query
     SEQUENCE_DECODE_MODE=argmax
     DETERMINISTIC_VALIDATION=on
     PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-1}
@@ -269,15 +185,22 @@ case "$EXP_ID" in
     SATC_SCORE_WEIGHT=0.0
     SATC_VELOCITY_WEIGHT=0.0
     MAX_EPOCH=${ABFLOW_MAX_EPOCH:-160}
+    EXPERIMENT_FACTOR=explicit_categorical_state_hidden_only
     ;;
 
-  PCS_RC_LC_R1_JOINT_EXACT_GT_SATC|JOINT_EXACT_GT_SATC|MAIN_V52)
-    # v52 main method:
-    #   exact joint categorical state + H3 graph-translation stochastic tube.
-    # The primary endpoint objective stays on the clean bridge.  Every fourth
-    # training step after epoch 5, a second query receives a rigid translation
-    # of the whole H3 loop and is required to preserve the clean endpoint.
-    # No atom-internal noise, projection clipping, NT hinge or SO(3) process.
+  PCS_RC_LC_R1_GT_SATC|R1_GT_SATC|GT_SATC)
+    # One-factor experiment B:
+    #   PCS_RC_LC_R1 + graph-translation SATC only.
+    #
+    # Kept identical to R1:
+    #   proposal source/context, sequence path, atom topology and final readout.
+    #
+    # Added factor:
+    #   a weak scheduled H3 rigid-translation teacher query.
+    #
+    # Conservative scale:
+    #   at t=0.5, eta=0.05 gives an expected translation RMS of roughly
+    #   5% of source-to-target H3-centroid transport, capped at 1 Angstrom.
     SOURCE_MODE=pcs_rc
     RECURRENT_PROPOSAL_CONTEXT=on
     LOSS_MODE=score_aware_graph_translation_consistency
@@ -286,20 +209,20 @@ case "$EXP_ID" in
     COORD_PEP_AS_CONDITION=on
     SEQ_INPUT_MODE=pep_condition
     SHADOW_SEQ_STATE=off
-    DUAL_SEQUENCE_STATE=on
-    DUAL_SEQUENCE_ATOM_MODE=hard_exact
-    SEQUENCE_CONTEXT_MODE=off
-    FINAL_READOUT_MODE=integrated_endpoint
+    DUAL_SEQUENCE_STATE=off
+    DUAL_SEQUENCE_ATOM_MODE=hidden_only
+    SEQUENCE_CONTEXT_MODE=legacy
+    FINAL_READOUT_MODE=legacy_t1_query
     SEQUENCE_DECODE_MODE=argmax
     DETERMINISTIC_VALIDATION=on
     PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-1}
     SATC_APPLY_PROB=0.0
-    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.10}
+    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.05}
     SATC_TUBE_MODE=graph_translation_calibrated
     SATC_TRANSPORT_RMS_MIN=${ABFLOW_SATC_TRANSPORT_RMS_MIN:-1.0}
     SATC_TRANSPORT_RMS_MAX=${ABFLOW_SATC_TRANSPORT_RMS_MAX:-20.0}
-    SATC_GAMMA_ABS_MAX=${ABFLOW_SATC_GAMMA_ABS_MAX:-2.0}
-    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.05}
+    SATC_GAMMA_ABS_MAX=${ABFLOW_SATC_GAMMA_ABS_MAX:-1.0}
+    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.02}
     SATC_VELOCITY_WEIGHT=0.0
     SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
     SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
@@ -307,18 +230,22 @@ case "$EXP_ID" in
     SATC_SCHEDULE=constant
     SATC_STEPS_PER_EPOCH=${ABFLOW_SATC_STEPS_PER_EPOCH:-52}
     SATC_GT_INTERVAL=${ABFLOW_SATC_GT_INTERVAL:-4}
-    SATC_GT_START_EPOCH=${ABFLOW_SATC_GT_START_EPOCH:-5}
+    SATC_GT_START_EPOCH=${ABFLOW_SATC_GT_START_EPOCH:-10}
     MAX_EPOCH=${ABFLOW_MAX_EPOCH:-160}
+    EXPERIMENT_FACTOR=graph_translation_satc_only
     ;;
 
   *)
     echo "Unknown EXP_ID: $EXP_ID"
-    echo "Supported: PCS_RC_LC_R1, PCS_RC_LC_R1_JOINT_EXACT_CTRL, PCS_RC_LC_R1_JOINT_EXACT_GT_SATC"
+    echo "Supported: PCS_RC_LC_R1, PCS_RC_LC_R1_SEQ_STATE_HIDDEN, PCS_RC_LC_R1_GT_SATC"
     exit 2
     ;;
 esac
 
 run_with_env() {
+  ABFLOW_ABLATION_PARENT="$ABLATION_PARENT" \
+  ABFLOW_EXPERIMENT_FACTOR="$EXPERIMENT_FACTOR" \
+  ABFLOW_SINGLE_FACTOR_ABLATION="$SINGLE_FACTOR_ABLATION" \
   ABFLOW_SOURCE_MODE="$SOURCE_MODE" \
   ABFLOW_RECURRENT_PROPOSAL_CONTEXT="$RECURRENT_PROPOSAL_CONTEXT" \
   ABFLOW_COORD_PEP_SOURCE_WEIGHT="$COORD_PEP_SOURCE_WEIGHT" \
@@ -404,6 +331,9 @@ run_with_env() {
 
 print_settings() {
   echo "Experiment: $EXP_ID"
+  echo "ABLATION_PARENT=$ABLATION_PARENT"
+  echo "EXPERIMENT_FACTOR=$EXPERIMENT_FACTOR"
+  echo "SINGLE_FACTOR_ABLATION=$SINGLE_FACTOR_ABLATION"
   echo "GPU: $GPU_ID"
   echo "SOURCE_MODE=$SOURCE_MODE"
   echo "RECURRENT_PROPOSAL_CONTEXT=$RECURRENT_PROPOSAL_CONTEXT"
@@ -700,7 +630,7 @@ if [[ "$MODE" != "train" ]]; then
   echo "Train: bash $0 train <EXP_ID> <GPU_ID> <BASE_CONFIG>"
   echo "Test:  bash $0 test  <EXP_ID> <GPU_ID> <CKPT> <RESULT_DIR> [TEST_JSON]"
   echo "Attach current training auto-eval: bash $0 attach_eval <EXP_ID> <GPU_ID|auto> [EVAL_GPU_ID|auto]"
-  echo "Supported EXP_ID: PCS_RC_LC_R1, PCS_RC_LC_R1_JOINT_EXACT_CTRL, PCS_RC_LC_R1_JOINT_EXACT_GT_SATC"
+  echo "Supported EXP_ID: PCS_RC_LC_R1, PCS_RC_LC_R1_SEQ_STATE_HIDDEN, PCS_RC_LC_R1_GT_SATC"
   exit 2
 fi
 
@@ -933,6 +863,9 @@ for key in list(cfg.keys()):
 
 runtime = {
     "experiment_id": exp_id,
+    "ablation_parent": os.environ.get("ABFLOW_ABLATION_PARENT", "PCS_RC_LC_R1"),
+    "experiment_factor": os.environ.get("ABFLOW_EXPERIMENT_FACTOR", ""),
+    "single_factor_ablation": os.environ.get("ABFLOW_SINGLE_FACTOR_ABLATION", "true"),
     "source_mode": os.environ.get("ABFLOW_SOURCE_MODE", ""),
     "recurrent_proposal_context": os.environ.get("ABFLOW_RECURRENT_PROPOSAL_CONTEXT", ""),
     "coord_pep_source_weight": os.environ.get("ABFLOW_COORD_PEP_SOURCE_WEIGHT", ""),
