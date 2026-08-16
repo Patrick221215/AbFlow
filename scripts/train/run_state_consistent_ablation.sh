@@ -15,28 +15,64 @@ PYSELF
 )
 
 # ============================================================
-# AbFlow v53 progressive one-factor ablation launcher
+# AbFlow v38: module-by-module causal ladder
 # ============================================================
-# Frozen parent: PCS_RC_LC_R1.
+# Scientific rule:
+#   1) AbFlow paper numbers are EXTERNAL absolute references only.
+#   2) Module effects are judged ONLY against the matched CURRENT-CODE BASE.
+#   3) In one stage, every active module changes one coherent mechanism family
+#      relative to the same base.  Do not combine modules before each has earned
+#      its place independently.
 #
-# This stage deliberately runs only two independent one-factor additions:
+# External AbFlow-paper locator (NOT the causal baseline):
+#   AAR=0.4234 | CAAR=0.2824 | H3 raw RMSD=8.250 A | DockQ=0.4230
 #
-#   PCS_RC_LC_R1_SEQ_STATE_HIDDEN
-#       R1 + explicit categorical S_t in hidden space only.
-#       It does not switch atom identities, atom masks, atom weights or edges.
+# Historical current-code BASE snapshot from the 160-epoch matched CTRL
+# (diagnostic only; v38 formal runs use max_epoch from the JSON):
+#   AAR=0.3929 | CAAR=0.2565 | H3 raw RMSD=8.726 A | DockQ=0.3897
+#
+# Stage-1 active experiments (three parallel slots):
+#
+#   PCS_RC_LC_R1_BASE
+#     M00 / matched current-code base.
+#     Endpoint FM only; no score-aware auxiliary.
+#
+#   PCS_RC_LC_R1_SATC_CORE
+#     M01 / score-aware off-path correction.
+#     Adds the one-forward SATC direction objective only.
+#     This tests the central idea: can a time-dependent score-like correction
+#     improve an endpoint-FM field without changing the backbone or adding heads?
 #
 #   PCS_RC_LC_R1_GT_SATC
-#       R1 + graph-translation SATC only.
-#       It does not enable dual sequence state or alter sequence topology.
+#     M02 / placement-specific graph-translation consistency.
+#     Adds a rigid H3 translation perturbation + clean-endpoint teacher query.
+#     This tests whether constraining the physically relevant placement subspace
+#     is better than generic full-atom off-path correction.
 #
-# No profile combines these modules.  hard_exact, context-off and integrated
-# endpoint readout are excluded from this stage because the previous joint
-# configuration changed several factors simultaneously and degraded R1.
+# Historical M02 snapshot relative to the historical current-code BASE:
+#   BASE: AAR=0.3929 | CAAR=0.2565 | H3raw=8.726 | DockQ=0.3897
+#   M02 : AAR=0.3932 | CAAR=0.2532 | H3raw=8.653 | DockQ=0.3878
+#   Delta: AAR=+0.0003 | CAAR=-0.0033 | H3raw improvement=+0.073 A |
+#          DockQ=-0.0019
+# Interpretation: geometry signal exists, but interface/sequence benefit is not
+# yet established.  This is exactly why v38 separates modules before combining.
 #
-# Resume policy:
-#   - empty resume_checkpoint: fresh run;
-#   - non-empty last_step*.pt: resume;
-#   - ABFLOW_FORCE_SCRATCH=on: explicit fresh run.
+# Archived / deliberately inactive in Stage-1:
+#   - SEQ_STATE_HIDDEN / hard_exact / JOINT_EXACT:
+#       rejected because sequence-state injection caused major AAR/CAAR collapse.
+#   - IF (interface weighting):
+#       deferred until M01 or M02 independently beats BASE.
+#   - NT (normal-tangent decomposition):
+#       deferred until a score-aware parent is validated.
+#   - explicit velocity/magnitude term:
+#       deferred because historical runs could lower training loss while hurting
+#       H3 placement / DockQ.
+#   - integrated_endpoint readout:
+#       excluded from causal module tests; keep legacy_t1_query fixed.
+#
+# Training-horizon rule:
+#   MAX_EPOCH is NOT set by profiles.  The JSON is the source of truth.
+#   ABFLOW_MAX_EPOCH may override only when intentionally supplied by the user.
 #
 STATE_PATH=on
 PER_SAMPLE_T=on
@@ -127,10 +163,32 @@ FORCE_SCRATCH=${ABFLOW_FORCE_SCRATCH:-off}
 ABLATION_PARENT=PCS_RC_LC_R1
 EXPERIMENT_FACTOR=unassigned
 SINGLE_FACTOR_ABLATION=true
+MODULE_ID=unassigned
+MODULE_PARENT=unassigned
 
 case "$EXP_ID" in
-  PCS_RC_LC_R1|R1)
-    # Frozen parent definition.  Included only for reproducibility and test mode.
+  PCS_RC_LC_R1_BASE|R1_BASE|M00_BASE)
+    # ------------------------------------------------------------------
+    # M00 — INTERNAL CAUSAL BASE
+    # ------------------------------------------------------------------
+    # Role:
+    #   Defines "our base" for module attribution under the CURRENT code.
+    #   This is not the AbFlow-paper reference.
+    #
+    # Historical 160-epoch current-code snapshot:
+    #   AAR=0.3929 | CAAR=0.2565 | H3 raw RMSD=8.726 A | DockQ=0.3897
+    #
+    # External AbFlow-paper locator:
+    #   AAR=0.4234 | CAAR=0.2824 | H3 raw RMSD=8.250 A | DockQ=0.4230
+    #
+    # Formal v38 result:
+    #   TO BE FILLED from the matched v38 BASE run.  All module deltas must use
+    #   this result, not the paper values.
+    ABLATION_PARENT=NONE
+    EXPERIMENT_FACTOR=endpoint_fm_current_code_base
+    MODULE_ID=M00_BASE
+    MODULE_PARENT=NONE
+
     SOURCE_MODE=pcs_rc
     RECURRENT_PROPOSAL_CONTEXT=on
     LOSS_MODE=endpoint
@@ -146,61 +204,107 @@ case "$EXP_ID" in
     SEQUENCE_DECODE_MODE=argmax
     DETERMINISTIC_VALIDATION=on
     PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-1}
+
     SATC_APPLY_PROB=0.0
     SATC_SCORE_WEIGHT=0.0
     SATC_VELOCITY_WEIGHT=0.0
-    MAX_EPOCH=${ABFLOW_MAX_EPOCH:-160}
-    EXPERIMENT_FACTOR=frozen_parent
+    SATC_INTERFACE_WEIGHT_ALPHA=0.0
+    SATC_SCHEDULE=constant
     ;;
 
-  PCS_RC_LC_R1_SEQ_STATE_HIDDEN|R1_SEQ_STATE_HIDDEN|SEQ_STATE_HIDDEN)
-    # One-factor experiment A:
-    #   PCS_RC_LC_R1 + explicit S_t hidden-state residual only.
+  PCS_RC_LC_R1_SATC_CORE|SATC_CORE|M01_SATC_CORE)
+    # ------------------------------------------------------------------
+    # M01 — SCORE-AWARE OFF-PATH CORRECTION
+    # ------------------------------------------------------------------
+    # Parent:
+    #   M00 BASE.
     #
-    # Kept identical to R1:
-    #   source/context, endpoint loss, legacy context curriculum,
-    #   proposal conditions, atom topology, edge construction and final readout.
+    # Only coherent module added:
+    #   One-forward score-aware trajectory correction.  The endpoint head
+    #   induces the correction velocity; no independent score/velocity head.
     #
-    # Added factor:
-    #   DUAL_SEQUENCE_STATE=on with hidden_only.
+    # Mechanistic hypothesis:
+    #   Intermediate off-path states should be pulled toward a plausible local
+    #   trajectory rather than relying on endpoint reconstruction alone.
     #
-    # This tests whether the network benefits from observing categorical path
-    # state S_t before any risky atom-topology replacement is introduced.
+    # Expected signatures:
+    #   - scorefm_satc_rate > 0
+    #   - scorefm_satc_score > 0
+    #   - scorefm_satc_velocity == 0
+    #   - aux_to_endpoint preferably < 0.05, must remain < 0.10
+    #
+    # Success must be measured against M00, NOT against AbFlow paper:
+    #   maintain AAR/CAAR and improve H3raw and/or DockQ consistently.
+    #
+    # Historical matched v38 metrics:
+    #   NOT YET AVAILABLE.  Older SATC runs used different code/schedules and
+    #   are not promoted to causal evidence here.
+    ABLATION_PARENT=PCS_RC_LC_R1_BASE
+    EXPERIMENT_FACTOR=score_aware_off_path_direction_only
+    MODULE_ID=M01_SATC_CORE
+    MODULE_PARENT=M00_BASE
+
     SOURCE_MODE=pcs_rc
     RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=endpoint
+    LOSS_MODE=score_aware_traj_lite
     T_SAMPLING=uniform
     SAMPLER_MODE=bridge
     COORD_PEP_AS_CONDITION=on
     SEQ_INPUT_MODE=pep_condition
     SHADOW_SEQ_STATE=off
-    DUAL_SEQUENCE_STATE=on
+    DUAL_SEQUENCE_STATE=off
     DUAL_SEQUENCE_ATOM_MODE=hidden_only
     SEQUENCE_CONTEXT_MODE=legacy
     FINAL_READOUT_MODE=legacy_t1_query
     SEQUENCE_DECODE_MODE=argmax
     DETERMINISTIC_VALIDATION=on
     PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-1}
-    SATC_APPLY_PROB=0.0
-    SATC_SCORE_WEIGHT=0.0
+
+    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
+    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.08}
+    SATC_TUBE_MODE=legacy_absolute
+    SATC_GAMMA_ABS_MAX=${ABFLOW_SATC_GAMMA_ABS_MAX:-0.50}
+    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.02}
     SATC_VELOCITY_WEIGHT=0.0
-    MAX_EPOCH=${ABFLOW_MAX_EPOCH:-160}
-    EXPERIMENT_FACTOR=explicit_categorical_state_hidden_only
+    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
+    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
+    SATC_INTERFACE_WEIGHT_ALPHA=0.0
+    SATC_SCHEDULE=constant
     ;;
 
-  PCS_RC_LC_R1_GT_SATC|R1_GT_SATC|GT_SATC)
-    # One-factor experiment B:
-    #   PCS_RC_LC_R1 + graph-translation SATC only.
+  PCS_RC_LC_R1_GT_SATC|GT_SATC|M02_GT_SATC)
+    # ------------------------------------------------------------------
+    # M02 — GRAPH-TRANSLATION SATC / PLACEMENT CONSISTENCY
+    # ------------------------------------------------------------------
+    # Parent:
+    #   M00 BASE.
     #
-    # Kept identical to R1:
-    #   proposal source/context, sequence path, atom topology and final readout.
+    # Only coherent module added:
+    #   Rigid H3 graph-translation perturbation plus a scheduled second query.
+    #   All atoms in the H3 loop receive the same translation, preserving
+    #   intra-loop geometry and directly probing complex-frame placement.
     #
-    # Added factor:
-    #   a weak scheduled H3 rigid-translation teacher query.
+    # Mechanistic hypothesis:
+    #   The main residual failure is not local atom denoising but H3 placement.
+    #   Restricting the score-aware consistency signal to the 3D translation
+    #   subspace should improve H3 raw RMSD and DockQ without corrupting sequence.
     #
-    # Conservative scale:
-    #   at t=0.5, eta=0.05 gives an expected translation RMS of roughly
-    #   5% of source-to-target H3-centroid transport, capped at 1 Angstrom.
+    # Historical 160-epoch matched evidence vs current-code BASE:
+    #   BASE: AAR=0.3929 | CAAR=0.2565 | H3raw=8.726 | DockQ=0.3897
+    #   M02 : AAR=0.3932 | CAAR=0.2532 | H3raw=8.653 | DockQ=0.3878
+    #   Delta vs BASE:
+    #     AAR +0.0003 | CAAR -0.0033 | H3raw +0.073 A improvement |
+    #     DockQ -0.0019
+    #
+    # Interpretation of that snapshot:
+    #   positive placement signal, but not yet a successful module because
+    #   CAAR/DockQ did not improve.  v38 repeats it under the same JSON-controlled
+    #   training horizon as M00/M01.
+    ABLATION_PARENT=PCS_RC_LC_R1_BASE
+    EXPERIMENT_FACTOR=graph_translation_placement_consistency
+    MODULE_ID=M02_GT_SATC
+    MODULE_PARENT=M00_BASE
+
     SOURCE_MODE=pcs_rc
     RECURRENT_PROPOSAL_CONTEXT=on
     LOSS_MODE=score_aware_graph_translation_consistency
@@ -216,6 +320,7 @@ case "$EXP_ID" in
     SEQUENCE_DECODE_MODE=argmax
     DETERMINISTIC_VALIDATION=on
     PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-1}
+
     SATC_APPLY_PROB=0.0
     SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.05}
     SATC_TUBE_MODE=graph_translation_calibrated
@@ -231,13 +336,26 @@ case "$EXP_ID" in
     SATC_STEPS_PER_EPOCH=${ABFLOW_SATC_STEPS_PER_EPOCH:-52}
     SATC_GT_INTERVAL=${ABFLOW_SATC_GT_INTERVAL:-4}
     SATC_GT_START_EPOCH=${ABFLOW_SATC_GT_START_EPOCH:-10}
-    MAX_EPOCH=${ABFLOW_MAX_EPOCH:-160}
-    EXPERIMENT_FACTOR=graph_translation_satc_only
     ;;
 
+  # --------------------------------------------------------------------
+  # ARCHIVED / INACTIVE MODULES — intentionally not executable in Stage-1
+  # --------------------------------------------------------------------
+  # PCS_RC_LC_R1_SEQ_STATE_HIDDEN
+  # PCS_RC_LC_R1_JOINT_EXACT_CTRL
+  # PCS_RC_LC_R1_JOINT_EXACT_GT_SATC
+  # PCS_RC_LC_R1_SATC_IF_MAIN
+  # PCS_RC_LC_R1_SATC_NT_MAIN
+  # PCS_RC_LC_R1_SATC_IF_NT_TARGET
+  # PCS_RC_LC_R1_SATC_*_FM_*
+  #
+  # Why inactive:
+  #   They either failed prior causal checks or depend on an upstream SATC
+  #   mechanism that must first prove value in M01/M02.
+  #
   *)
     echo "Unknown EXP_ID: $EXP_ID"
-    echo "Supported: PCS_RC_LC_R1, PCS_RC_LC_R1_SEQ_STATE_HIDDEN, PCS_RC_LC_R1_GT_SATC"
+    echo "Stage-1 supported: PCS_RC_LC_R1_BASE, PCS_RC_LC_R1_SATC_CORE, PCS_RC_LC_R1_GT_SATC"
     exit 2
     ;;
 esac
@@ -246,6 +364,8 @@ run_with_env() {
   ABFLOW_ABLATION_PARENT="$ABLATION_PARENT" \
   ABFLOW_EXPERIMENT_FACTOR="$EXPERIMENT_FACTOR" \
   ABFLOW_SINGLE_FACTOR_ABLATION="$SINGLE_FACTOR_ABLATION" \
+  ABFLOW_MODULE_ID="$MODULE_ID" \
+  ABFLOW_MODULE_PARENT="$MODULE_PARENT" \
   ABFLOW_SOURCE_MODE="$SOURCE_MODE" \
   ABFLOW_RECURRENT_PROPOSAL_CONTEXT="$RECURRENT_PROPOSAL_CONTEXT" \
   ABFLOW_COORD_PEP_SOURCE_WEIGHT="$COORD_PEP_SOURCE_WEIGHT" \
@@ -334,6 +454,8 @@ print_settings() {
   echo "ABLATION_PARENT=$ABLATION_PARENT"
   echo "EXPERIMENT_FACTOR=$EXPERIMENT_FACTOR"
   echo "SINGLE_FACTOR_ABLATION=$SINGLE_FACTOR_ABLATION"
+  echo "MODULE_ID=$MODULE_ID"
+  echo "MODULE_PARENT=$MODULE_PARENT"
   echo "GPU: $GPU_ID"
   echo "SOURCE_MODE=$SOURCE_MODE"
   echo "RECURRENT_PROPOSAL_CONTEXT=$RECURRENT_PROPOSAL_CONTEXT"
@@ -422,7 +544,7 @@ print_settings() {
 # ============================================================
 # Principle:
 #   The original training command remains unchanged:
-#     bash scripts/train/run_state_consistent_ablation.sh train <EXP_ID> <GPU_ID> <BASE_CONFIG>
+#     bash scripts/train/run_gt_satc_matched_v55.sh train <EXP_ID> <GPU_ID> <BASE_CONFIG>
 #   When ABFLOW_AUTO_TOPK_EVAL=on (explicit opt-in), the launcher automatically starts
 #   a background watcher if spare GPUs are available.  It reads topk_map.txt,
 #   evaluates new checkpoints with the original test pipeline and writes CSV
@@ -630,7 +752,7 @@ if [[ "$MODE" != "train" ]]; then
   echo "Train: bash $0 train <EXP_ID> <GPU_ID> <BASE_CONFIG>"
   echo "Test:  bash $0 test  <EXP_ID> <GPU_ID> <CKPT> <RESULT_DIR> [TEST_JSON]"
   echo "Attach current training auto-eval: bash $0 attach_eval <EXP_ID> <GPU_ID|auto> [EVAL_GPU_ID|auto]"
-  echo "Supported EXP_ID: PCS_RC_LC_R1, PCS_RC_LC_R1_SEQ_STATE_HIDDEN, PCS_RC_LC_R1_GT_SATC"
+  echo "Stage-1 supported EXP_ID: PCS_RC_LC_R1_BASE, PCS_RC_LC_R1_SATC_CORE, PCS_RC_LC_R1_GT_SATC"
   exit 2
 fi
 
@@ -716,6 +838,16 @@ src, dst, save_dir, exp_id, runtime_meta = sys.argv[1:6]
 
 with open(src, "r", encoding="utf-8") as f:
     cfg = json.load(f)
+
+# v38 self-documenting configs may contain a private metadata block.
+# It is validated here and removed before train.sh converts JSON keys to CLI flags.
+meta = cfg.pop("_experiment", None)
+if isinstance(meta, dict):
+    expected = str(meta.get("exp_id", "") or "").strip()
+    if expected and expected != exp_id:
+        raise ValueError(
+            f"Config/EXP_ID mismatch: config expects {expected}, launcher got {exp_id}"
+        )
 
 # train.sh converts every top-level JSON key into --<key>.
 # Therefore uppercase keys such as VALID_NUM_WORKERS become
@@ -866,6 +998,9 @@ runtime = {
     "ablation_parent": os.environ.get("ABFLOW_ABLATION_PARENT", "PCS_RC_LC_R1"),
     "experiment_factor": os.environ.get("ABFLOW_EXPERIMENT_FACTOR", ""),
     "single_factor_ablation": os.environ.get("ABFLOW_SINGLE_FACTOR_ABLATION", "true"),
+    "module_id": os.environ.get("ABFLOW_MODULE_ID", ""),
+    "module_parent": os.environ.get("ABFLOW_MODULE_PARENT", ""),
+    "reference_policy": "module effects vs matched internal BASE; paper gaps are external only",
     "source_mode": os.environ.get("ABFLOW_SOURCE_MODE", ""),
     "recurrent_proposal_context": os.environ.get("ABFLOW_RECURRENT_PROPOSAL_CONTEXT", ""),
     "coord_pep_source_weight": os.environ.get("ABFLOW_COORD_PEP_SOURCE_WEIGHT", ""),

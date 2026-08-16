@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Compact watcher/evaluator for AbFlow topk_map.txt.
+Compact watcher/evaluator for AbFlow topk_map.txt (v37 paper-reference unified).
 
 Purpose:
   - accept --watch / --poll-interval / --max-new, so the training launcher can start AutoTopK safely;
@@ -25,25 +25,27 @@ METRIC_NAMES = [
 METRIC_RE = re.compile(r"^(?P<name>" + "|".join(re.escape(x) for x in METRIC_NAMES) + r"):\s*(?P<value>[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*$")
 DOCKQ_PROP_RE = re.compile(r"proportion of DockQ above 0\.23:\s*(?P<p23>[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?),\s*0\.49:\s*(?P<p49>[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?),\s*0\.8:\s*(?P<p80>[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)")
 
-# Validated PCS_RC_LC_R1 reference line from the current project notes.
-R1 = {
+# Reference policy (v38)
+# ----------------------
+# ABFLOW_PAPER is an EXTERNAL absolute benchmark locator only.
+# It must never be interpreted as the causal parent of a new module.
+ABFLOW_PAPER = {
     "AAR_mean": 0.4234,
     "CAAR_mean": 0.2824,
-    "RMSDCA_aligned_mean": 1.1144296254662673,
     "RMSDCA_CDRH3_mean": 8.25,
-    "RMSDCA_CDRH3_aligned_mean": 1.832687902128891,
     "TMscore_mean": 0.9736,
     "LDDT_mean": 0.8522,
     "DockQ_mean": 0.423,
-    "DockQ_above_0.23": 0.9333333333333333,
-    "DockQ_above_0.49": 0.2,
 }
-LOWER_BETTER = {"RMSDCA_aligned_mean", "RMSDCA_CDRH3_mean", "RMSDCA_CDRH3_aligned_mean"}
+LOWER_BETTER = {"RMSDCA_CDRH3_mean"}
+CORE_LOCATOR_FIELDS = ["AAR_mean", "CAAR_mean", "RMSDCA_CDRH3_mean", "DockQ_mean"]
 CORE_FIELDS = [
     "AAR_mean", "CAAR_mean", "RMSDCA_aligned_mean", "RMSDCA_CDRH3_mean",
     "RMSDCA_CDRH3_aligned_mean", "TMscore_mean", "LDDT_mean", "DockQ_mean",
     "DockQ_above_0.23", "DockQ_above_0.49", "DockQ_above_0.8",
 ]
+
+INTERNAL_BASE_EXP_ID = "PCS_RC_LC_R1_BASE"
 
 
 def metric_key(name: str) -> str:
@@ -57,25 +59,98 @@ def to_float(x):
         return None
 
 
-def add_gaps(row: Dict[str, str]) -> None:
-    vals = {}
-    for k, base in R1.items():
+def _core_string(row: Dict[str, str]) -> str:
+    vals = [to_float(row.get(k)) for k in CORE_LOCATOR_FIELDS]
+    if any(v is None for v in vals):
+        return ""
+    return (
+        f"AAR={vals[0]:.4f} | CAAR={vals[1]:.4f} | "
+        f"H3raw={vals[2]:.3f}A | DockQ={vals[3]:.4f}"
+    )
+
+
+def add_paper_gaps(row: Dict[str, str]) -> None:
+    """External absolute gap. Positive always means better than AbFlow paper."""
+    for k, base in ABFLOW_PAPER.items():
         v = to_float(row.get(k))
         if v is None:
             continue
         gap = (base - v) if k in LOWER_BETTER else (v - base)
-        row[f"gap_vs_R1_{k.replace('_mean','')}"] = f"{gap:.6g}"
-        vals[k] = v
-    required = ["DockQ_mean", "RMSDCA_CDRH3_mean", "CAAR_mean", "AAR_mean", "LDDT_mean"]
-    if all(k in vals for k in required):
-        score = 100.0 * (
-            0.35 * ((vals["DockQ_mean"] - R1["DockQ_mean"]) / R1["DockQ_mean"])
-            + 0.25 * ((R1["RMSDCA_CDRH3_mean"] - vals["RMSDCA_CDRH3_mean"]) / R1["RMSDCA_CDRH3_mean"])
-            + 0.20 * ((vals["CAAR_mean"] - R1["CAAR_mean"]) / R1["CAAR_mean"])
-            + 0.10 * ((vals["AAR_mean"] - R1["AAR_mean"]) / R1["AAR_mean"])
-            + 0.10 * ((vals["LDDT_mean"] - R1["LDDT_mean"]) / R1["LDDT_mean"])
+        row[f"gap_vs_abflow_paper_{k.replace('_mean','')}"] = f"{gap:.6g}"
+    row["core_metrics"] = _core_string(row)
+
+
+def _find_internal_base_best(run_dir: Optional[str]) -> Optional[Path]:
+    if not run_dir:
+        return None
+    run_dir = Path(run_dir).resolve()
+    root = run_dir.parent
+    candidates = list(
+        (root / INTERNAL_BASE_EXP_ID).glob(
+            "version_*/checkpoint/topk_eval_metrics_compact_best.json"
         )
-        row["diagnostic_score_vs_R1"] = f"{score:.6g}"
+    )
+    candidates = [p for p in candidates if p.exists()]
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+
+
+def _load_internal_base(run_dir: Optional[str], explicit: Optional[str] = None):
+    path = Path(explicit).resolve() if explicit else _find_internal_base_best(run_dir)
+    if path is None or not path.exists():
+        return None, None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None, None
+    vals = {}
+    for k in CORE_LOCATOR_FIELDS:
+        v = to_float(data.get(k))
+        if v is None:
+            return None, None
+        vals[k] = v
+    return vals, str(path)
+
+
+def add_internal_base_delta(
+    row: Dict[str, str],
+    base_vals: Optional[Dict[str, float]],
+    base_path: Optional[str],
+) -> None:
+    """Matched module delta. Positive always means improvement over OUR BASE."""
+    if not base_vals:
+        row["internal_base_status"] = "not_ready"
+        return
+    row["internal_base_status"] = "matched_base_loaded"
+    row["internal_base_reference"] = base_path or ""
+    for k, base in base_vals.items():
+        v = to_float(row.get(k))
+        if v is None:
+            continue
+        delta = (base - v) if k in LOWER_BETTER else (v - base)
+        row[f"delta_vs_internal_base_{k.replace('_mean','')}"] = f"{delta:.6g}"
+    a = row.get("delta_vs_internal_base_AAR", "")
+    c = row.get("delta_vs_internal_base_CAAR", "")
+    h = row.get("delta_vs_internal_base_RMSDCA_CDRH3", "")
+    d = row.get("delta_vs_internal_base_DockQ", "")
+    if all(x != "" for x in [a, c, h, d]):
+        row["module_delta_vs_base"] = (
+            f"dAAR={float(a):+.4f} | dCAAR={float(c):+.4f} | "
+            f"dH3raw_improve={float(h):+.3f}A | dDockQ={float(d):+.4f}"
+        )
+
+
+def add_references(row: Dict[str, str], args) -> None:
+    add_paper_gaps(row)
+    # The BASE run defines the reference; do not compare it against itself.
+    if row.get("exp_id") == INTERNAL_BASE_EXP_ID:
+        row["internal_base_status"] = "this_run_is_internal_base"
+        return
+    base_vals, base_path = _load_internal_base(
+        args.run_dir, getattr(args, "internal_base_json", None)
+    )
+    add_internal_base_delta(row, base_vals, base_path)
 
 
 @dataclass(frozen=True)
@@ -206,12 +281,17 @@ def append_csv(path: Path, row: Dict[str, str], lock: threading.Lock) -> None:
         "timestamp", "status", "exp_id", "epoch", "step", "topk_rank", "valid_loss",
         "checkpoint", "checkpoint_realpath", "result_dir", "log_file", "returncode", "elapsed_sec",
         "raw_topk_line",
-    ] + CORE_FIELDS + [
+    ] + CORE_FIELDS + ["core_metrics"] + [
         "gap_vs_R1_AAR", "gap_vs_R1_CAAR", "gap_vs_R1_RMSDCA_aligned",
         "gap_vs_R1_RMSDCA_CDRH3", "gap_vs_R1_RMSDCA_CDRH3_aligned",
         "gap_vs_R1_TMscore", "gap_vs_R1_LDDT", "gap_vs_R1_DockQ",
         "gap_vs_R1_DockQ_above_0.23", "gap_vs_R1_DockQ_above_0.49",
-        "diagnostic_score_vs_R1",
+        "core_metrics", "internal_base_status", "internal_base_reference",
+        "gap_vs_abflow_paper_AAR", "gap_vs_abflow_paper_CAAR",
+        "gap_vs_abflow_paper_RMSDCA_CDRH3", "gap_vs_abflow_paper_DockQ",
+        "delta_vs_internal_base_AAR", "delta_vs_internal_base_CAAR",
+        "delta_vs_internal_base_RMSDCA_CDRH3", "delta_vs_internal_base_DockQ",
+        "module_delta_vs_base",
     ]
     with lock:
         old_rows = []
@@ -241,10 +321,10 @@ def write_ranked(csv_path: Path) -> None:
         fields = reader.fieldnames or []
     def key(r):
         return (
-            to_float(r.get("diagnostic_score_vs_R1")) or -1e9,
             to_float(r.get("DockQ_mean")) or -1e9,
             -(to_float(r.get("RMSDCA_CDRH3_mean")) or 1e9),
             to_float(r.get("CAAR_mean")) or -1e9,
+            to_float(r.get("AAR_mean")) or -1e9,
         )
     rows = sorted(rows, key=key, reverse=True)
     ranked = csv_path.with_name("topk_eval_metrics_compact_ranked.csv")
@@ -301,7 +381,7 @@ def evaluate_one(entry: TopKEntry, gpu: str, args, lock: threading.Lock) -> Dict
     row.update(parse_metrics(log_file.read_text(encoding="utf-8", errors="replace")))
     row["status"] = "ok" if proc.returncode == 0 and row.get("DockQ_mean") else "failed"
     if row["status"] == "ok":
-        add_gaps(row)
+        add_references(row, args)
     append_csv(Path(args.csv), row, lock)
     update_state(Path(args.state_json), ckpt_real, row["status"])
     return row
@@ -316,7 +396,13 @@ def worker(gpu: str, q: "queue.Queue[TopKEntry]", args, lock: threading.Lock) ->
         try:
             print(f"[TopK evaluator] GPU {gpu}: {entry.short_name}", flush=True)
             row = evaluate_one(entry, gpu, args, lock)
-            print(f"[TopK evaluator] GPU {gpu}: {entry.short_name} status={row.get('status')} DockQ={row.get('DockQ_mean','')} H3={row.get('RMSDCA_CDRH3_mean','')} score={row.get('diagnostic_score_vs_R1','')}", flush=True)
+            print(
+                f"[TopK evaluator] GPU {gpu}: {entry.short_name} "
+                f"status={row.get('status')} "
+                f"{row.get('core_metrics','')} "
+                f"{row.get('module_delta_vs_base','')}",
+                flush=True,
+            )
         except Exception as exc:
             print(f"[TopK evaluator] ERROR GPU {gpu} {entry.ckpt}: {exc}", flush=True)
         finally:
@@ -364,6 +450,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--exp-id", required=True)
     p.add_argument("--test-json", required=True)
     p.add_argument("--run-dir", default=None)
+    p.add_argument("--internal-base-json", default=None, help="Optional matched BASE best.json; otherwise infer sibling PCS_RC_LC_R1_BASE.")
     p.add_argument("--topk-map", default=None)
     p.add_argument("--project-root", default="/home/data3/cjm/project/AbFlow")
     p.add_argument("--launcher", default="scripts/train/run_state_consistent_ablation.sh")
