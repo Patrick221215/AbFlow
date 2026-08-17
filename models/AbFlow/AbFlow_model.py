@@ -16,10 +16,12 @@ from utils.nn_utils import _knn_edges
 from evaluation.rmsd import kabsch_torch
 
 from ..modules.am_enc import AMEncoder
+from ..modules.am_enc_pair_time import AMEncoderPairTime
 from ..modules.am_egnn import AMEGNN
+from .abflow_conditional_matcher import AbFlowConditionalMatcher
 
 
-# v52: exact categorical state semantics plus graph-translation score-aware tube consistency.
+# v56 GT-dominant Stage-2: centralized CFM algebra + scoped zero-start pair-time.
 
 
 def _env_str(name, default):
@@ -162,11 +164,49 @@ class AbFlowModel(nn.Module):
                 nn.SiLU(),
                 nn.Linear(hidden_size, 1)
             )
-        self.gnn = AMEncoder(
-            embed_size, hidden_size, hidden_size, n_channel,
-            channel_nf=atom_embed_size, radial_nf=hidden_size,
-            in_edge_nf=0, num_verts=num_verts, n_layers=n_layers, residual=True,
-            dropout=dropout, dense=False)
+        # FoldFlow-inspired pair-level time conditioning.
+        #
+        # The scientific parent is now GT-SATC.  Pair-time is therefore a
+        # strictly optional child module:
+        #   off       : exact original AMEncoder architecture
+        #   interface : time-condition only true antibody-antigen local edges
+        #               and antigen-surface messages
+        #   context   : time-condition context/global/local-context messages only
+        #   all       : interface scope + context scope
+        #
+        # The pair-time encoder keeps all original GCL parameter shapes and adds
+        # only zero-initialized channel-wise time scales.  This makes the initial
+        # function exactly the base AMEncoder and avoids changing the RNG stream
+        # for later model parameters.
+        pair_scope = _env_str("ABFLOW_PAIR_TIME_SCOPE", "off").lower()
+        # Backward compatibility with the previous boolean Stage-2 prototype.
+        if (
+            pair_scope == "off"
+            and _env_flag("ABFLOW_PAIR_TIME_CONDITIONING", False)
+        ):
+            pair_scope = "all"
+        if pair_scope not in {"off", "interface", "context", "all"}:
+            raise ValueError(
+                "ABFLOW_PAIR_TIME_SCOPE must be off, interface, context, or all."
+            )
+        self.pair_time_scope = pair_scope
+        self.pair_time_conditioning = pair_scope != "off"
+
+        if self.pair_time_conditioning:
+            self.gnn = AMEncoderPairTime(
+                embed_size, hidden_size, hidden_size, n_channel,
+                channel_nf=atom_embed_size, radial_nf=hidden_size,
+                in_edge_nf=0, num_verts=num_verts, n_layers=n_layers,
+                residual=True, dropout=dropout, dense=False,
+                pair_time_scope=pair_scope,
+            )
+        else:
+            self.gnn = AMEncoder(
+                embed_size, hidden_size, hidden_size, n_channel,
+                channel_nf=atom_embed_size, radial_nf=hidden_size,
+                in_edge_nf=0, num_verts=num_verts, n_layers=n_layers, residual=True,
+                dropout=dropout, dense=False,
+            )
         
         self.normalizer = SeperatedCoordNormalizer()
 
@@ -199,6 +239,13 @@ class AbFlowModel(nn.Module):
             raise ValueError(
                 "ABFLOW_SCOREFM_MIN_SIGMA must be in (0, 1)."
             )
+        # Centralized deterministic conditional-flow algebra.  This object is
+        # parameter-free and RNG-free, so the refactor does not add a trainable
+        # module or consume random numbers.
+        self.flow_matcher = AbFlowConditionalMatcher(
+            min_sigma=self.scorefm_min_sigma,
+            eps=self.scorefm_eps,
+        )
 
         # Coordinate objective:
         #   endpoint:
@@ -1150,6 +1197,90 @@ class AbFlowModel(nn.Module):
         t = t.reshape(-1)
         return t[batch_id].clamp(0.0, 1.0)
 
+    def _pair_time_edge_attributes(
+            self, flow_t, batch_id, local_mask, ctx_edges,
+            local_ctx_edges, local_inter_edges, aligned_local_inter_edges,
+            ref_tensor):
+        """Build [t, enabled_mask] for each message edge.
+
+        interface scope:
+            ctx edges            -> disabled
+            local context edges  -> disabled
+            true Ab-Ag edges     -> enabled
+            surface Ab-Ag edges  -> enabled
+
+        context scope:
+            ctx edges            -> enabled
+            local context edges  -> enabled
+            true Ab-Ag edges     -> disabled
+            surface Ab-Ag edges  -> disabled
+
+        all scope:
+            every edge family above is enabled.
+
+        The explicit mask is important.  A zero time value is a valid flow time
+        and must not be overloaded to mean "this edge family is disabled".
+        """
+        scope = str(getattr(self, "pair_time_scope", "off")).lower()
+        if scope == "off":
+            return None, None, None
+
+        t_res = self._flow_time_values_for_residues(
+            flow_t, batch_id, ref_tensor
+        ).to(dtype=ref_tensor.dtype)
+        local_t = t_res[local_mask]
+
+        def pack(time_values, enabled):
+            time_values = time_values.reshape(-1, 1)
+            if isinstance(enabled, bool):
+                mask = torch.full_like(
+                    time_values, 1.0 if enabled else 0.0
+                )
+            else:
+                mask = enabled.to(
+                    device=time_values.device, dtype=time_values.dtype
+                ).reshape(-1, 1)
+            return torch.cat([time_values, mask], dim=-1)
+
+        # Global/context edges.
+        ctx_attr = pack(
+            t_res[ctx_edges[0]],
+            scope in {"context", "all"},
+        )
+
+        # local_edges in message_passing is exactly
+        # cat([local_ctx_edges, local_inter_edges], dim=1).
+        local_ctx_t = local_t[local_ctx_edges[0]]
+        local_inter_t = local_t[local_inter_edges[0]]
+        local_time = torch.cat([local_ctx_t, local_inter_t], dim=0)
+
+        if scope == "interface":
+            local_mask_attr = torch.cat(
+                [
+                    torch.zeros_like(local_ctx_t),
+                    torch.ones_like(local_inter_t),
+                ],
+                dim=0,
+            )
+        elif scope == "context":
+            local_mask_attr = torch.cat(
+                [
+                    torch.ones_like(local_ctx_t),
+                    torch.zeros_like(local_inter_t),
+                ],
+                dim=0,
+            )
+        else:
+            local_mask_attr = torch.ones_like(local_time)
+        local_attr = pack(local_time, local_mask_attr)
+
+        # aligned_local_inter_edges contains only true antigen-antibody edges.
+        surf_attr = pack(
+            local_t[aligned_local_inter_edges[0]],
+            scope in {"interface", "all"},
+        )
+        return ctx_attr, local_attr, surf_attr
+
     def _build_coord_pep_condition_for_residues(
             self, pep_X_model, interface_X, paratope_mask,
             pep_coord_valid=None):
@@ -1855,14 +1986,35 @@ class AbFlowModel(nn.Module):
         ):
             self._diagnostic_probe_tensor = H_0
 
+        # Explicit pair/edge-level time conditioning (F02 only).  The original
+        # model already conditions nodes on t.  Here the same scalar t is made
+        # directly available to the edge MLPs so an identical geometric pair
+        # can be interpreted differently at early vs late transport time.
+        ctx_time_attr, local_time_attr, surf_time_attr = (
+            self._pair_time_edge_attributes(
+                flow_t, batch_id, local_mask, ctx_edges,
+                local_ctx_edges, local_inter_edges,
+                aligned_local_inter_edges, H_0,
+            )
+        )
+
         # message passing
         # sme_start = time.time()
-        H, pred_X, pred_local_X = self.gnn(H_0, X, ctx_edges,
-                                           local_mask, local_X, surf, local_edges,
-                                           paratope_mask, local_is_ab,
-                                           aligned_local_inter_edges, epi_index,
-                                           channel_attr=atom_embeddings,
-                                           channel_weights=atom_weights)
+        if self.pair_time_conditioning:
+            H, pred_X, pred_local_X = self.gnn(
+                H_0, X, ctx_edges, local_mask, local_X, surf, local_edges,
+                paratope_mask, local_is_ab, aligned_local_inter_edges, epi_index,
+                channel_attr=atom_embeddings, channel_weights=atom_weights,
+                ctx_edge_attr=ctx_time_attr,
+                inter_edge_attr=local_time_attr,
+                surf_edge_attr=surf_time_attr,
+            )
+        else:
+            H, pred_X, pred_local_X = self.gnn(
+                H_0, X, ctx_edges, local_mask, local_X, surf, local_edges,
+                paratope_mask, local_is_ab, aligned_local_inter_edges, epi_index,
+                channel_attr=atom_embeddings, channel_weights=atom_weights,
+            )
         # self.timing_stats['sme_encoding'] += time.time() - sme_start
 
         interface_X = pred_local_X[local_is_ab]
@@ -2498,12 +2650,12 @@ class AbFlowModel(nn.Module):
                 dtype=endpoint_shift.dtype,
             ).reshape(-1)
             sigma = (1.0 - t).clamp_min(self.scorefm_min_sigma)
-            v_clean = (
-                clean_pred_centroid - clean_state_centroid
-            ) / sigma[:, None]
-            v_pert = (
-                pert_pred_centroid - pert_state_centroid
-            ) / sigma[:, None]
+            v_clean = self.flow_matcher.endpoint_velocity(
+                clean_state_centroid, clean_pred_centroid, t[:, None]
+            )
+            v_pert = self.flow_matcher.endpoint_velocity(
+                pert_state_centroid, pert_pred_centroid, t[:, None]
+            )
             response = v_pert - v_clean
             target = -perturb / sigma[:, None]
             dot = (response * target).sum(dim=-1)
@@ -2634,10 +2786,16 @@ class AbFlowModel(nn.Module):
             # Clean bridge velocity is X1 - X0.  The remaining component should
             # point back along the analytic score direction -epsilon because
             # Z_t = X_t^clean + gamma(t) epsilon.
-            pred_velocity = (pred_clean_X - Xt) / sigma_safe
-            clean_velocity = X1 - source_X0
+            pred_velocity = self.flow_matcher.endpoint_velocity(
+                Xt, pred_clean_X, t
+            )
+            clean_velocity = self.flow_matcher.clean_velocity(
+                source_X0, X1
+            )
             correction_pred = pred_velocity - clean_velocity
-            correction_true = -(gamma / sigma_safe) * eps
+            correction_true = self.flow_matcher.correction_target(
+                gamma, t, eps
+            )
 
             valid_atom = atom_mask.bool() & active_res[:, None]
             valid_res = valid_atom.any(dim=-1)
@@ -3088,8 +3246,12 @@ class AbFlowModel(nn.Module):
                 sigma_t, device=pred_clean_X.device, dtype=pred_clean_X.dtype
             ).clamp_min(self.scorefm_min_sigma)
 
-            pred_velocity = (pred_clean_X - Xt) / sigma_safe
-            true_velocity = (X1 - Xt) / sigma_safe
+            pred_velocity = self.flow_matcher.endpoint_velocity(
+                Xt, pred_clean_X, t
+            )
+            true_velocity = self.flow_matcher.endpoint_velocity(
+                Xt, X1, t
+            )
 
             velocity_per_graph, velocity_valid = (
                 self._masked_residue_smooth_l1_per_graph(
@@ -3855,7 +4017,9 @@ class AbFlowModel(nn.Module):
             base_weight_int = self._time_for_interface(base_weight_graph, interface_batch_id, interface_X)
             sigma_score_int = self._time_for_interface(sigma_score_graph, interface_batch_id, interface_X)
 
-            mu_t = base_weight_int * interface_X + t_int * gt_interface_X
+            mu_t = self.flow_matcher.interpolate(
+                interface_X, gt_interface_X, t_int
+            )
 
             si_gamma_int = None
             si_gamma_prime_int = None
@@ -4693,17 +4857,15 @@ class AbFlowModel(nn.Module):
             raw_residual = pred_clean_X - Xt
             if self.scorefm_sampler_mode == "residual":
                 dX = raw_residual
+                Xt = Xt + dX * dt
             elif self.scorefm_sampler_mode == "bridge":
-                sigma_t = (1.0 - t).clamp_min(
-                    self.scorefm_min_sigma
+                Xt = self.flow_matcher.bridge_step(
+                    Xt, pred_clean_X, t, dt
                 )
-                dX = raw_residual / sigma_t
             else:
                 raise ValueError(
                     f"Unknown sampler mode: {self.scorefm_sampler_mode}"
                 )
-
-            Xt = Xt + dX * dt
 
             if not self.struct_only:
                 cur_logits = r_pred_S_logits[-1][0][paratope_mask]
@@ -4711,9 +4873,8 @@ class AbFlowModel(nn.Module):
                     dim=-1, keepdim=True
                 )[0]
                 cur_probs = F.softmax(cur_logits, dim=-1)
-                refresh_prob = min(
-                    1.0,
-                    float(dt) / max(1e-8, 1.0 - float(t))
+                refresh_prob = self.flow_matcher.categorical_refresh_probability(
+                    t, dt
                 )
                 proposed_S = torch.multinomial(
                     cur_probs.clamp_min(1e-8), num_samples=1

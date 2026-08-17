@@ -1,0 +1,67 @@
+{
+  "train_set": "./datasets/RAbD/train.json",
+  "valid_set": "./datasets/RAbD/valid.json",
+  "save_dir": "./datasets/RAbD/models_single_cdr_design",
+  "train_pep": "./datasets/RAbD/train.pkl",
+  "valid_pep": "./datasets/RAbD/valid.pkl",
+  "train_surf": "./datasets/RAbD/train_surf.pkl",
+  "valid_surf": "./datasets/RAbD/valid_surf.pkl",
+  "cdr": "H3",
+  "max_epoch": 200,
+  "save_topk": 10,
+  "batch_size": 64,
+  "shuffle": true,
+  "model_type": "AbFlow",
+  "embed_dim": 64,
+  "hidden_size": 128,
+  "num_verts": 50,
+  "k_neighbors": 9,
+  "n_layers": 3,
+  "iter_round": 3,
+  "pep_seq": true,
+  "pep_struct": true,
+  "bind_dist_cutoff": 6.6,
+  "save_interval": 1,
+  "resume_checkpoint": "",
+  "use_ema": true,
+  "ema_decay": 0.999,
+  "num_workers": 8,
+  "prefetch_factor": 4,
+  "valid_num_workers": 4,
+  "valid_prefetch_factor": 2,
+  "amp": true,
+  "amp_dtype": "bf16",
+  "allow_tf32": true,
+  "log_interval": 1,
+  "tqdm_mininterval": 5.0,
+  "_experiment": {
+    "exp_id": "PCS_RC_LC_R1_GT_PAIR_TIME_CONTEXT",
+    "module_id": "P02_GT_PAIR_TIME_CONTEXT",
+    "parent": "PCS_RC_LC_R1_GT_SATC",
+    "reference_policy": {
+      "external_absolute_reference": {
+        "name": "AbFlow paper",
+        "metrics": {
+          "AAR": 0.4234,
+          "CAAR": 0.2824,
+          "H3_raw_RMSD": 8.25,
+          "DockQ": 0.423
+        },
+        "use": "absolute performance locator only; never a module-effect denominator"
+      },
+      "internal_causal_reference": {
+        "name": "PCS_RC_LC_R1_GT_SATC",
+        "use": "all new pair-time module effects/deltas must be computed against the matched GT-SATC parent"
+      }
+    },
+    "hypothesis": "Add explicit flow-time conditioning only to context/global and local-context messages on top of GT-SATC.",
+    "expected_effect": {
+      "AAR": "measure vs GT-SATC parent",
+      "CAAR": "measure vs GT-SATC parent",
+      "H3_raw_RMSD": "measure vs GT-SATC parent",
+      "DockQ": "measure vs GT-SATC parent"
+    },
+    "training_note": "max_epoch=200; keep data/model/optimizer/evaluation settings matched to the GT-SATC stage. Pair-time scope is controlled only by launcher EXP_ID.",
+    "interpretation": "Test whether time-aware proposal/framework/global context improves sequence-structure generation independently of direct interface-time conditioning."
+  }
+}
