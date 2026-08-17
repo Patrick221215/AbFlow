@@ -21,7 +21,7 @@ from ..modules.am_egnn import AMEGNN
 from .abflow_conditional_matcher import AbFlowConditionalMatcher
 
 
-# v56 GT-dominant Stage-2: centralized CFM algebra + scoped zero-start pair-time.
+# v57 Structured-Primary: global and orthogonal-local full-atom stochastic conditional flow.
 
 
 def _env_str(name, default):
@@ -380,6 +380,24 @@ class AbFlowModel(nn.Module):
             "h3_translation_satc",
         }:
             self.scorefm_loss_mode = "score_aware_graph_translation_consistency"
+        if self.scorefm_loss_mode in {
+            "structured_global_endpoint",
+            "structured_bridge_global_endpoint",
+            "ssf_global_endpoint",
+        }:
+            self.scorefm_loss_mode = "structured_global_endpoint"
+        if self.scorefm_loss_mode in {
+            "structured_global_cfm",
+            "structured_bridge_global_cfm",
+            "ssf_global_cfm",
+        }:
+            self.scorefm_loss_mode = "structured_global_cfm"
+        if self.scorefm_loss_mode in {
+            "structured_multiscale_cfm",
+            "structured_global_local_cfm",
+            "ssf_multiscale_cfm",
+        }:
+            self.scorefm_loss_mode = "structured_multiscale_cfm"
         if self.scorefm_loss_mode not in {
             "endpoint", "analytic_core", "velocity_core",
             "si_score", "si_score_fm",
@@ -389,6 +407,8 @@ class AbFlowModel(nn.Module):
             "score_aware_traj_nt_lite", "score_aware_traj_nt_fm_lite",
             "score_aware_traj_if_nt_lite", "score_aware_traj_if_nt_fm_lite",
             "score_aware_graph_translation_consistency",
+            "structured_global_endpoint", "structured_global_cfm",
+            "structured_multiscale_cfm",
         }:
             raise ValueError(
                 "Unknown ABFLOW_SCOREFM_LOSS_MODE="
@@ -399,7 +419,8 @@ class AbFlowModel(nn.Module):
                 "score_aware_traj_if_lite, score_aware_traj_if_fm_lite, "
                 "score_aware_traj_nt_lite, score_aware_traj_nt_fm_lite, "
                 "score_aware_traj_if_nt_lite, score_aware_traj_if_nt_fm_lite, "
-                "score_aware_graph_translation_consistency."
+                "score_aware_graph_translation_consistency, structured_global_endpoint, "
+                "structured_global_cfm, structured_multiscale_cfm."
             )
 
         # Stochastic-interpolant controls.  These regularizers keep the strong
@@ -414,6 +435,41 @@ class AbFlowModel(nn.Module):
         self.si_velocity_weight = _env_float("ABFLOW_SI_VELOCITY_WEIGHT", 0.01)
         if self.si_score_weight < 0.0 or self.si_velocity_weight < 0.0:
             raise ValueError("ABFLOW_SI_*_WEIGHT must be non-negative.")
+
+        # =========================================================
+        # Primary structured stochastic conditional path (v56)
+        # =========================================================
+        # This is the probability path itself, not an SATC/GT auxiliary.
+        # H3 is translated as one Cartesian block around the PCS-RC -> native
+        # interpolant, preserving every intra-H3 atom/residue distance.
+        self.structured_gamma_scale = _env_float(
+            "ABFLOW_STRUCTURED_GAMMA_SCALE", 0.05
+        )
+        self.structured_transport_max = _env_float(
+            "ABFLOW_STRUCTURED_TRANSPORT_MAX", 20.0
+        )
+        self.structured_gamma_abs_max = _env_float(
+            "ABFLOW_STRUCTURED_GAMMA_ABS_MAX", 1.0
+        )
+        if not (0.0 < self.structured_gamma_scale <= 1.0):
+            raise ValueError("ABFLOW_STRUCTURED_GAMMA_SCALE must be in (0, 1].")
+        if self.structured_transport_max <= 0.0:
+            raise ValueError("ABFLOW_STRUCTURED_TRANSPORT_MAX must be positive.")
+        if self.structured_gamma_abs_max <= 0.0:
+            raise ValueError("ABFLOW_STRUCTURED_GAMMA_ABS_MAX must be positive.")
+
+        # Orthogonal local path scale for S03.  This is dimensionless relative
+        # to the actual PCS-RC -> native local CA deformation after removing the
+        # graph-level translation component.  The default intentionally matches
+        # the global 0.05 scale so S03 adds a new geometric subspace rather than
+        # a new hand-tuned strength regime.
+        self.structured_local_gamma_scale = _env_float(
+            "ABFLOW_STRUCTURED_LOCAL_GAMMA_SCALE", 0.05
+        )
+        if not (0.0 < self.structured_local_gamma_scale <= 1.0):
+            raise ValueError(
+                "ABFLOW_STRUCTURED_LOCAL_GAMMA_SCALE must be in (0, 1]."
+            )
 
         # Trajectory-consistency controls.
         # These terms do not introduce a new score head or velocity head.
@@ -2296,6 +2352,254 @@ class AbFlowModel(nn.Module):
 
         return t_graph.clamp(0.0, 1.0), valid_graph
 
+    def _deterministic_standard_normal(self, shape, device, dtype):
+        """Stateless pseudo-Gaussian tensor for deterministic validation."""
+        n = 1
+        for dim in shape:
+            n *= int(dim)
+        idx = torch.arange(n, device=device, dtype=torch.float32) + 1.0
+        u = torch.frac(torch.sin(idx * 12.9898 + 78.233) * 43758.5453).abs()
+        u = u.clamp(1e-4, 1.0 - 1e-4)
+        z = math.sqrt(2.0) * torch.erfinv(2.0 * u - 1.0)
+        return z.reshape(*shape).to(dtype=dtype)
+
+    @torch.no_grad()
+    def _structured_global_primary_path(
+            self, mu_t, source_X0, target_X1, t_graph, interface_batch_id):
+        """Primary geometry-preserving H3 graph-translation stochastic path.
+
+        mu_t = (1-t)X0 + tX1
+        xi_g ~ N(0, a_g^2 I3), shared by every H3 atom in graph g
+        beta(t) = 4t(1-t)
+        Z_t = mu_t + beta(t) xi_g
+        u*_t = X1-X0 + beta'(t) xi_g
+
+        Existing AbFlow bridge sampling uses
+            v_theta = (Y_theta - Z_t)/(1-t).
+        Hence the exact endpoint-like target for conditional flow matching is
+            Y*_t = Z_t + (1-t)u*_t.
+        """
+        if interface_batch_id.numel() == 0:
+            zero = target_X1.new_zeros(1)
+            return mu_t, target_X1, {
+                "transport_mean": zero, "path_rms": zero, "target_shift_rms": zero
+            }
+
+        n_graph = int(interface_batch_id.max().item()) + 1
+        ca_idx = 1 if source_X0.shape[1] > 1 else 0
+        src_centroid = scatter_mean(source_X0[:, ca_idx].float(), interface_batch_id, dim=0, dim_size=n_graph)
+        tgt_centroid = scatter_mean(target_X1[:, ca_idx].float(), interface_batch_id, dim=0, dim_size=n_graph)
+        transport = torch.linalg.norm(tgt_centroid - src_centroid, dim=-1).clamp(
+            min=0.0, max=float(self.structured_transport_max)
+        )
+        amplitude = (
+            float(self.structured_gamma_scale) * transport / math.sqrt(3.0)
+        ).clamp(min=0.0, max=float(self.structured_gamma_abs_max))
+
+        if self.deterministic_validation and not self.training:
+            eps_graph = self._deterministic_standard_normal(
+                (n_graph, 3), target_X1.device, torch.float32
+            )
+        else:
+            eps_graph = torch.randn((n_graph, 3), device=target_X1.device, dtype=torch.float32)
+        xi_graph = amplitude[:, None] * eps_graph
+
+        t = torch.as_tensor(t_graph, device=target_X1.device, dtype=torch.float32).reshape(-1)
+        if t.numel() == 1 and n_graph > 1:
+            t = t.expand(n_graph)
+        if t.numel() != n_graph:
+            raise ValueError(f"structured global path expects {n_graph} graph times, got {t.numel()}.")
+
+        beta = 4.0 * t * (1.0 - t)
+        beta_prime = 4.0 * (1.0 - 2.0 * t)
+        path_shift_graph = beta[:, None] * xi_graph
+        velocity_noise_graph = beta_prime[:, None] * xi_graph
+
+        path_shift_int = path_shift_graph[interface_batch_id].to(mu_t.dtype)
+        Xt = mu_t + path_shift_int[:, None, :]
+
+        endpoint_shift_graph = path_shift_graph + (1.0 - t)[:, None] * velocity_noise_graph
+        endpoint_shift_int = endpoint_shift_graph[interface_batch_id].to(target_X1.dtype)
+        flow_endpoint_target = target_X1 + endpoint_shift_int[:, None, :]
+
+        return Xt, flow_endpoint_target, {
+            "transport_mean": transport.mean().to(target_X1.dtype),
+            "path_rms": torch.sqrt(path_shift_graph.pow(2).mean().clamp_min(0.0)).to(target_X1.dtype),
+            "target_shift_rms": torch.sqrt(endpoint_shift_graph.pow(2).mean().clamp_min(0.0)).to(target_X1.dtype),
+        }
+
+    @torch.no_grad()
+    def _structured_multiscale_primary_path(
+            self, mu_t, source_X0, target_X1, t_graph, interface_batch_id):
+        """Primary global + orthogonal local structured stochastic path.
+
+        Global mode (same as S02):
+            xi_g : one 3D translation shared by the complete H3 loop.
+
+        Local mode:
+            d_i = CA_i(X1) - CA_i(X0)
+            d_g = mean_{i in g} d_i
+            r_i = d_i - d_g
+
+        Hence mean_{i in g} r_i = 0 exactly.  We sample one scalar a_g per
+        complex and define
+            xi_i^local = eta_local * a_g * r_i.
+
+        Every atom in residue i receives the same xi_i^local, so the residue's
+        internal atom geometry is preserved.  Because the residual field has
+        zero graph centroid, local deformation cannot duplicate the global H3
+        placement mode.
+
+        The total path is
+            Z_t = mu_t + beta(t) (xi_g + xi_i^local),
+            beta(t)=4t(1-t).
+
+        Its exact conditional velocity is
+            u*_t = X1-X0 + beta'(t)(xi_g + xi_i^local),
+
+        and the current AbFlow endpoint-parameterized bridge sampler is matched
+        by the analytic target
+            Y*_t = Z_t + (1-t) u*_t.
+        """
+        if interface_batch_id.numel() == 0:
+            zero = target_X1.new_zeros(1)
+            return mu_t, target_X1, {
+                "transport_mean": zero,
+                "path_rms": zero,
+                "target_shift_rms": zero,
+                "local_transport_rms": zero,
+                "local_path_rms": zero,
+                "local_centroid_rms": zero,
+            }
+
+        n_graph = int(interface_batch_id.max().item()) + 1
+        ca_idx = 1 if source_X0.shape[1] > 1 else 0
+
+        src_ca = source_X0[:, ca_idx].float()
+        tgt_ca = target_X1[:, ca_idx].float()
+        ca_transport = tgt_ca - src_ca
+
+        global_vec = scatter_mean(
+            ca_transport, interface_batch_id, dim=0, dim_size=n_graph
+        )
+        global_dist = torch.linalg.norm(global_vec, dim=-1).clamp(
+            min=0.0, max=float(self.structured_transport_max)
+        )
+        global_amp = (
+            float(self.structured_gamma_scale)
+            * global_dist
+            / math.sqrt(3.0)
+        ).clamp(
+            min=0.0, max=float(self.structured_gamma_abs_max)
+        )
+
+        if self.deterministic_validation and not self.training:
+            eps_global = self._deterministic_standard_normal(
+                (n_graph, 3), target_X1.device, torch.float32
+            )
+            # Use a different deterministic stream from the 3D global draw.
+            eps_local_scalar = self._deterministic_standard_normal(
+                (n_graph, 2), target_X1.device, torch.float32
+            )[:, 1]
+        else:
+            eps_global = torch.randn(
+                (n_graph, 3), device=target_X1.device, dtype=torch.float32
+            )
+            eps_local_scalar = torch.randn(
+                (n_graph,), device=target_X1.device, dtype=torch.float32
+            )
+
+        xi_global_graph = global_amp[:, None] * eps_global
+
+        # Target-aligned local deformation mode after removing graph translation.
+        local_residual = ca_transport - global_vec[interface_batch_id]
+        local_residual_sq = local_residual.pow(2).sum(dim=-1) / 3.0
+        local_rms_graph = torch.sqrt(
+            scatter_mean(
+                local_residual_sq,
+                interface_batch_id,
+                dim=0,
+                dim_size=n_graph,
+            ).clamp_min(0.0)
+        )
+        xi_local_res = (
+            float(self.structured_local_gamma_scale)
+            * eps_local_scalar[interface_batch_id, None]
+            * local_residual
+        )
+
+        # Numerical zero-centroid projection.  Analytically local_residual is
+        # already centered; re-projecting prevents float accumulation from
+        # leaking local deformation into the global placement subspace.
+        local_mean = scatter_mean(
+            xi_local_res, interface_batch_id, dim=0, dim_size=n_graph
+        )
+        xi_local_res = (
+            xi_local_res - local_mean[interface_batch_id]
+        )
+
+        xi_total_res = (
+            xi_global_graph[interface_batch_id] + xi_local_res
+        )
+
+        t = torch.as_tensor(
+            t_graph, device=target_X1.device, dtype=torch.float32
+        ).reshape(-1)
+        if t.numel() == 1 and n_graph > 1:
+            t = t.expand(n_graph)
+        if t.numel() != n_graph:
+            raise ValueError(
+                f"structured multiscale path expects {n_graph} graph times, "
+                f"got {t.numel()}."
+            )
+
+        beta = 4.0 * t * (1.0 - t)
+        beta_prime = 4.0 * (1.0 - 2.0 * t)
+
+        beta_res = beta[interface_batch_id, None]
+        beta_prime_res = beta_prime[interface_batch_id, None]
+
+        path_shift_res = beta_res * xi_total_res
+        velocity_noise_res = beta_prime_res * xi_total_res
+
+        Xt = mu_t + path_shift_res.to(mu_t.dtype)[:, None, :]
+
+        endpoint_shift_res = (
+            path_shift_res
+            + (1.0 - t[interface_batch_id])[:, None] * velocity_noise_res
+        )
+        flow_endpoint_target = (
+            target_X1
+            + endpoint_shift_res.to(target_X1.dtype)[:, None, :]
+        )
+
+        with torch.no_grad():
+            local_path_shift_res = beta_res * xi_local_res
+            local_centroid = scatter_mean(
+                local_path_shift_res,
+                interface_batch_id,
+                dim=0,
+                dim_size=n_graph,
+            )
+            return Xt, flow_endpoint_target, {
+                "transport_mean": global_dist.mean().to(target_X1.dtype),
+                "path_rms": torch.sqrt(
+                    path_shift_res.pow(2).mean().clamp_min(0.0)
+                ).to(target_X1.dtype),
+                "target_shift_rms": torch.sqrt(
+                    endpoint_shift_res.pow(2).mean().clamp_min(0.0)
+                ).to(target_X1.dtype),
+                "local_transport_rms": local_rms_graph.mean().to(
+                    target_X1.dtype
+                ),
+                "local_path_rms": torch.sqrt(
+                    local_path_shift_res.pow(2).mean().clamp_min(0.0)
+                ).to(target_X1.dtype),
+                "local_centroid_rms": torch.sqrt(
+                    local_centroid.pow(2).mean().clamp_min(0.0)
+                ).to(target_X1.dtype),
+            }
+
     @torch.no_grad()
     def _satc_transport_calibrated_gamma(
             self, source_X0, target_X1, atom_mask, t_graph,
@@ -2692,7 +2996,8 @@ class AbFlowModel(nn.Module):
             sat_eps_t=None, sat_gamma_t=None, sat_active_t=None,
             satc_residue_weight=None, satc_score_weight_eff=None,
             satc_velocity_weight_eff=None, satc_schedule_info=None,
-            satc_transport_rms_graph=None, satc_gamma_graph=None):
+            satc_transport_rms_graph=None, satc_gamma_graph=None,
+            structured_endpoint_target=None, structured_path_details=None):
         """Coordinate objective for the shadow paratope.
 
         endpoint mode:
@@ -2707,18 +3012,32 @@ class AbFlowModel(nn.Module):
         analytic_core mode:
             Historical reference-source score diagnostic.
         """
+        primary_target = X1
+        if (
+            self.scorefm_loss_mode in {"structured_global_cfm", "structured_multiscale_cfm"}
+            and structured_endpoint_target is not None
+        ):
+            primary_target = structured_endpoint_target
+
         endpoint_per_graph, endpoint_valid = (
+            self._masked_residue_smooth_l1_per_graph(
+                pred_clean_X, primary_target, atom_mask, interface_batch_id
+            )
+        )
+        if endpoint_valid.any():
+            endpoint_loss = endpoint_per_graph[endpoint_valid].mean()
+        else:
+            endpoint_loss = pred_clean_X.new_tensor(0.0)
+
+        clean_endpoint_per_graph, clean_endpoint_valid = (
             self._masked_residue_smooth_l1_per_graph(
                 pred_clean_X, X1, atom_mask, interface_batch_id
             )
         )
-
-        if endpoint_valid.any():
-            endpoint_loss = endpoint_per_graph[
-                endpoint_valid
-            ].mean()
+        if clean_endpoint_valid.any():
+            clean_endpoint_loss = clean_endpoint_per_graph[clean_endpoint_valid].mean()
         else:
-            endpoint_loss = pred_clean_X.new_tensor(0.0)
+            clean_endpoint_loss = pred_clean_X.new_tensor(0.0)
 
         zero = endpoint_loss.detach() * 0.0
         # Keep differentiable objective components only until the trainer's
@@ -2729,10 +3048,39 @@ class AbFlowModel(nn.Module):
         if self.scorefm_loss_mode in {
             "endpoint", "traj_consistency", "traj_consistency_fm",
             "score_aware_graph_translation_consistency",
+            "structured_global_endpoint", "structured_global_cfm",
+            "structured_multiscale_cfm",
         }:
+            _spd = structured_path_details or {}
             details = {
                 "scorefm_total": endpoint_loss.detach(),
                 "scorefm_endpoint": endpoint_loss.detach(),
+                "scorefm_clean_endpoint": clean_endpoint_loss.detach(),
+                "scorefm_structured_primary": endpoint_loss.detach(),
+                "scorefm_structured_transport_mean": torch.as_tensor(
+                    _spd.get("transport_mean", 0.0), device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_structured_path_rms": torch.as_tensor(
+                    _spd.get("path_rms", 0.0), device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_structured_target_shift_rms": torch.as_tensor(
+                    _spd.get("target_shift_rms", 0.0), device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_structured_local_transport_rms": torch.as_tensor(
+                    _spd.get("local_transport_rms", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_structured_local_path_rms": torch.as_tensor(
+                    _spd.get("local_path_rms", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_structured_local_centroid_rms": torch.as_tensor(
+                    _spd.get("local_centroid_rms", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_structured_cfm": pred_clean_X.new_tensor(
+                    1.0 if self.scorefm_loss_mode in {"structured_global_cfm", "structured_multiscale_cfm"} else 0.0
+                ).detach(),
                 "scorefm_dsm": zero,
                 "scorefm_dsm_rate": zero,
                 "scorefm_velocity": zero,
@@ -4034,7 +4382,25 @@ class AbFlowModel(nn.Module):
             gt_satc_delta_graph = None
             gt_satc_active_graph = None
             gt_satc_transport_graph = None
-            if self.scorefm_loss_mode in {"si_score", "si_score_fm"}:
+            structured_endpoint_target = None
+            structured_path_details = None
+            if self.scorefm_loss_mode in {
+                "structured_global_endpoint", "structured_global_cfm"
+            }:
+                Xt, structured_endpoint_target, structured_path_details = (
+                    self._structured_global_primary_path(
+                        mu_t=mu_t, source_X0=interface_X, target_X1=gt_interface_X,
+                        t_graph=t_graph, interface_batch_id=interface_batch_id,
+                    )
+                )
+            elif self.scorefm_loss_mode == "structured_multiscale_cfm":
+                Xt, structured_endpoint_target, structured_path_details = (
+                    self._structured_multiscale_primary_path(
+                        mu_t=mu_t, source_X0=interface_X, target_X1=gt_interface_X,
+                        t_graph=t_graph, interface_batch_id=interface_batch_id,
+                    )
+                )
+            elif self.scorefm_loss_mode in {"si_score", "si_score_fm"}:
                 # Training-only stochastic interpolant around the PCS source-to-
                 # native bridge.  This creates an analytic score target without
                 # adding an independent score head:
@@ -4158,6 +4524,8 @@ class AbFlowModel(nn.Module):
             sigma_score_int = None
             si_gamma_int = None
             si_gamma_prime_int = None
+            structured_endpoint_target = None
+            structured_path_details = None
             sat_eps_int = None
             sat_gamma_int = None
             sat_active_int = None
@@ -4282,6 +4650,8 @@ class AbFlowModel(nn.Module):
                     satc_schedule_info=satc_runtime,
                     satc_transport_rms_graph=satc_transport_rms_graph,
                     satc_gamma_graph=satc_gamma_graph,
+                    structured_endpoint_target=structured_endpoint_target,
+                    structured_path_details=structured_path_details,
                 )
             )
         else:
