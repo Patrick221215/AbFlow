@@ -19,9 +19,10 @@ from ..modules.am_enc import AMEncoder
 from ..modules.am_enc_pair_time import AMEncoderPairTime
 from ..modules.am_egnn import AMEGNN
 from .abflow_conditional_matcher import AbFlowConditionalMatcher
+from .abflow_r3_matcher import AbFlowR3Matcher
 
 
-# v58 Structured-Primary: S01-centered FoldFlow-shaped schedule and clean-endpoint multiscale controls.
+# v59 FoldFlow-R3 adaptation: structured full-atom stochastic R3 paths with endpoint-parameterized CFM.
 
 
 def _env_str(name, default):
@@ -399,17 +400,20 @@ class AbFlowModel(nn.Module):
         }:
             self.scorefm_loss_mode = "structured_multiscale_cfm"
         if self.scorefm_loss_mode in {
-            "structured_global_ffsqrt_endpoint",
-            "structured_global_foldflow_endpoint",
-            "ssf_global_ffsqrt_endpoint",
+            "foldflow_r3_global_endpoint", "r3_global_endpoint",
+            "ff_r3_global_endpoint",
         }:
-            self.scorefm_loss_mode = "structured_global_ffsqrt_endpoint"
+            self.scorefm_loss_mode = "foldflow_r3_global_endpoint"
         if self.scorefm_loss_mode in {
-            "structured_multiscale_endpoint",
-            "structured_global_local_endpoint",
-            "ssf_multiscale_endpoint",
+            "foldflow_r3_residue_endpoint", "r3_residue_endpoint",
+            "ff_r3_residue_endpoint",
         }:
-            self.scorefm_loss_mode = "structured_multiscale_endpoint"
+            self.scorefm_loss_mode = "foldflow_r3_residue_endpoint"
+        if self.scorefm_loss_mode in {
+            "foldflow_r3_residue_cfm", "r3_residue_cfm",
+            "ff_r3_residue_cfm",
+        }:
+            self.scorefm_loss_mode = "foldflow_r3_residue_cfm"
         if self.scorefm_loss_mode not in {
             "endpoint", "analytic_core", "velocity_core",
             "si_score", "si_score_fm",
@@ -421,8 +425,9 @@ class AbFlowModel(nn.Module):
             "score_aware_graph_translation_consistency",
             "structured_global_endpoint", "structured_global_cfm",
             "structured_multiscale_cfm",
-            "structured_global_ffsqrt_endpoint",
-            "structured_multiscale_endpoint",
+            "foldflow_r3_global_endpoint",
+            "foldflow_r3_residue_endpoint",
+            "foldflow_r3_residue_cfm",
         }:
             raise ValueError(
                 "Unknown ABFLOW_SCOREFM_LOSS_MODE="
@@ -434,7 +439,8 @@ class AbFlowModel(nn.Module):
                 "score_aware_traj_nt_lite, score_aware_traj_nt_fm_lite, "
                 "score_aware_traj_if_nt_lite, score_aware_traj_if_nt_fm_lite, "
                 "score_aware_graph_translation_consistency, structured_global_endpoint, "
-                "structured_global_cfm, structured_multiscale_cfm."
+                "structured_global_cfm, structured_multiscale_cfm, foldflow_r3_global_endpoint, "
+                "foldflow_r3_residue_endpoint, foldflow_r3_residue_cfm."
             )
 
         # Stochastic-interpolant controls.  These regularizers keep the strong
@@ -484,6 +490,34 @@ class AbFlowModel(nn.Module):
             raise ValueError(
                 "ABFLOW_STRUCTURED_LOCAL_GAMMA_SCALE must be in (0, 1]."
             )
+
+        # =========================================================
+        # FoldFlow-R3-inspired primary path (v59)
+        # =========================================================
+        # transport_fraction is a path-width parameter, NOT a loss weight.
+        # It is kept at 0.05 by default solely to match S01's already-tested
+        # midpoint H3 displacement scale while changing the temporal profile to
+        # FoldFlow R3's sqrt(t(1-t)) variance law.
+        self.r3_transport_fraction = _env_float(
+            "ABFLOW_R3_TRANSPORT_FRACTION", 0.05
+        )
+        self.r3_path_min_sigma = _env_float(
+            "ABFLOW_R3_PATH_MIN_SIGMA", 0.0
+        )
+        self.r3_transport_max = _env_float(
+            "ABFLOW_R3_TRANSPORT_MAX", 20.0
+        )
+        if not (0.0 < self.r3_transport_fraction <= 1.0):
+            raise ValueError("ABFLOW_R3_TRANSPORT_FRACTION must be in (0,1].")
+        if self.r3_path_min_sigma < 0.0:
+            raise ValueError("ABFLOW_R3_PATH_MIN_SIGMA must be non-negative.")
+        if self.r3_transport_max <= 0.0:
+            raise ValueError("ABFLOW_R3_TRANSPORT_MAX must be positive.")
+        self.r3_matcher = AbFlowR3Matcher(
+            transport_fraction=self.r3_transport_fraction,
+            path_min_sigma=self.r3_path_min_sigma,
+            eps=self.scorefm_eps,
+        )
 
         # Trajectory-consistency controls.
         # These terms do not introduce a new score head or velocity head.
@@ -2378,6 +2412,127 @@ class AbFlowModel(nn.Module):
         return z.reshape(*shape).to(dtype=dtype)
 
     @torch.no_grad()
+    def _foldflow_r3_primary_path(
+            self, *, source_X0, target_X1, t_graph, t_int,
+            interface_batch_id, noise_scope, cfm_target):
+        """FoldFlow-R3-inspired primary stochastic state for H3.
+
+        Common mean:
+            mu_t = (1-t) X0 + t X1.
+
+        Temporal width follows uploaded FoldFlow R3:
+            sigma_t = sqrt(g^2 t(1-t) + sigma_min^2).
+
+        Adaptation to full-atom antibodies:
+          global  : one 3D translation shared by every H3 atom;
+          residue : one 3D translation per H3 residue, broadcast to all atoms
+                    in that residue.  This preserves intra-residue atom geometry.
+
+        We intentionally DO NOT apply FoldFlow's whole-chain COM recentering,
+        because H3/framework/antigen relative placement is itself a target signal.
+
+        Targets:
+          endpoint : clean native X1 (denoising endpoint regression).
+          cfm      : FoldFlow Euclidean CFM u*=X1-X0, encoded as
+                     Y*=Xt+(1-t)u* for AbFlow's endpoint parameterization.
+        """
+        mu_t = self.r3_matcher.linear_mean(source_X0, target_X1, t_int)
+        if interface_batch_id.numel() == 0:
+            zero = target_X1.new_zeros(1)
+            return mu_t, target_X1, {
+                "r3_transport_mean": zero,
+                "r3_sigma_mean": zero,
+                "r3_noise_rms": zero,
+                "r3_target_shift_rms": zero,
+                "r3_noise_scope": zero,
+                "r3_cfm_target": zero,
+            }
+
+        n_graph = int(interface_batch_id.max().item()) + 1
+        ca_idx = 1 if source_X0.shape[1] > 1 else 0
+        src_centroid = scatter_mean(
+            source_X0[:, ca_idx].float(), interface_batch_id,
+            dim=0, dim_size=n_graph,
+        )
+        tgt_centroid = scatter_mean(
+            target_X1[:, ca_idx].float(), interface_batch_id,
+            dim=0, dim_size=n_graph,
+        )
+        transport = torch.linalg.norm(
+            tgt_centroid - src_centroid, dim=-1
+        ).clamp(min=0.0, max=float(self.r3_transport_max))
+
+        g_graph = self.r3_matcher.graph_g_from_transport(transport)
+        t_graph_f = torch.as_tensor(
+            t_graph, device=target_X1.device, dtype=torch.float32
+        ).reshape(-1)
+        if t_graph_f.numel() == 1 and n_graph > 1:
+            t_graph_f = t_graph_f.expand(n_graph)
+        if t_graph_f.numel() != n_graph:
+            raise ValueError(
+                f"FoldFlow-R3 path expects {n_graph} graph times, "
+                f"got {t_graph_f.numel()}."
+            )
+        sigma_graph = self.r3_matcher.sigma_t(t_graph_f, g_graph)
+
+        if noise_scope == "global":
+            if self.deterministic_validation and not self.training:
+                eps_graph = self._deterministic_standard_normal(
+                    (n_graph, 3), target_X1.device, torch.float32
+                )
+            else:
+                eps_graph = torch.randn(
+                    (n_graph, 3), device=target_X1.device, dtype=torch.float32
+                )
+            shift_graph = sigma_graph[:, None] * eps_graph
+            shift_res = shift_graph[interface_batch_id]
+            scope_code = 0.0
+        elif noise_scope == "residue":
+            n_res = int(interface_batch_id.numel())
+            if self.deterministic_validation and not self.training:
+                eps_res = self._deterministic_standard_normal(
+                    (n_res, 3), target_X1.device, torch.float32
+                )
+            else:
+                eps_res = torch.randn(
+                    (n_res, 3), device=target_X1.device, dtype=torch.float32
+                )
+            # FoldFlow R3 acts on residue translations.  In our all-atom state,
+            # broadcast that residue translation to every atom in the residue.
+            shift_res = sigma_graph[interface_batch_id, None] * eps_res
+            scope_code = 1.0
+        else:
+            raise ValueError(f"Unknown R3 noise_scope={noise_scope}")
+
+        shift_res = shift_res.to(mu_t.dtype)
+        Xt = mu_t + shift_res[:, None, :]
+
+        if cfm_target:
+            clean_u = self.r3_matcher.clean_conditional_velocity(
+                source_X0, target_X1
+            )
+            target = self.r3_matcher.endpoint_target_for_velocity(
+                Xt, clean_u, t_int
+            )
+        else:
+            target = target_X1
+
+        with torch.no_grad():
+            target_shift = target - target_X1
+            return Xt, target, {
+                "r3_transport_mean": transport.mean().to(target_X1.dtype),
+                "r3_sigma_mean": sigma_graph.mean().to(target_X1.dtype),
+                "r3_noise_rms": torch.sqrt(
+                    shift_res.pow(2).sum(dim=-1).mean().clamp_min(0.0)
+                ).to(target_X1.dtype),
+                "r3_target_shift_rms": torch.sqrt(
+                    target_shift.pow(2).mean().clamp_min(0.0)
+                ).to(target_X1.dtype),
+                "r3_noise_scope": target_X1.new_tensor(scope_code),
+                "r3_cfm_target": target_X1.new_tensor(1.0 if cfm_target else 0.0),
+            }
+
+    @torch.no_grad()
     def _structured_global_primary_path(
             self, mu_t, source_X0, target_X1, t_graph, interface_batch_id):
         """Primary geometry-preserving H3 graph-translation stochastic path.
@@ -2440,94 +2595,6 @@ class AbFlowModel(nn.Module):
             "transport_mean": transport.mean().to(target_X1.dtype),
             "path_rms": torch.sqrt(path_shift_graph.pow(2).mean().clamp_min(0.0)).to(target_X1.dtype),
             "target_shift_rms": torch.sqrt(endpoint_shift_graph.pow(2).mean().clamp_min(0.0)).to(target_X1.dtype),
-        }
-
-    @torch.no_grad()
-    def _structured_global_ffsqrt_primary_path(
-            self, mu_t, source_X0, target_X1, t_graph,
-            interface_batch_id):
-        """S01 semantics with a FoldFlow-shaped stochastic-width schedule.
-
-        S01 uses beta(t)=4t(1-t).
-        S04 uses beta(t)=2*sqrt(t(1-t)).
-        Both equal one at t=0.5, so midpoint perturbation RMS is matched.
-        The target remains the true clean endpoint X1.
-
-        The square-root time profile is inspired by FoldFlow-SFM's
-        sigma_t proportional to sqrt(t(1-t)); the covariance itself remains
-        antibody-specific: one shared 3D translation for the complete H3 loop.
-        """
-        if interface_batch_id.numel() == 0:
-            zero = target_X1.new_zeros(1)
-            return mu_t, target_X1, {
-                "transport_mean": zero,
-                "path_rms": zero,
-                "target_shift_rms": zero,
-            }
-
-        n_graph = int(interface_batch_id.max().item()) + 1
-        ca_idx = 1 if source_X0.shape[1] > 1 else 0
-        src_centroid = scatter_mean(
-            source_X0[:, ca_idx].float(), interface_batch_id,
-            dim=0, dim_size=n_graph,
-        )
-        tgt_centroid = scatter_mean(
-            target_X1[:, ca_idx].float(), interface_batch_id,
-            dim=0, dim_size=n_graph,
-        )
-        transport = torch.linalg.norm(
-            tgt_centroid - src_centroid, dim=-1
-        ).clamp(
-            min=0.0, max=float(self.structured_transport_max)
-        )
-        amplitude = (
-            float(self.structured_gamma_scale)
-            * transport / math.sqrt(3.0)
-        ).clamp(
-            min=0.0, max=float(self.structured_gamma_abs_max)
-        )
-
-        if self.deterministic_validation and not self.training:
-            eps_graph = self._deterministic_standard_normal(
-                (n_graph, 3), target_X1.device, torch.float32
-            )
-        else:
-            eps_graph = torch.randn(
-                (n_graph, 3),
-                device=target_X1.device,
-                dtype=torch.float32,
-            )
-        xi_graph = amplitude[:, None] * eps_graph
-
-        t = torch.as_tensor(
-            t_graph, device=target_X1.device, dtype=torch.float32
-        ).reshape(-1)
-        if t.numel() == 1 and n_graph > 1:
-            t = t.expand(n_graph)
-        if t.numel() != n_graph:
-            raise ValueError(
-                f"structured ffsqrt path expects {n_graph} graph times, "
-                f"got {t.numel()}."
-            )
-
-        beta = 2.0 * torch.sqrt(
-            (t * (1.0 - t)).clamp_min(0.0)
-        )
-        path_shift_graph = beta[:, None] * xi_graph
-        path_shift_int = path_shift_graph[
-            interface_batch_id
-        ].to(mu_t.dtype)
-        Xt = mu_t + path_shift_int[:, None, :]
-
-        with torch.no_grad():
-            path_rms = torch.sqrt(
-                path_shift_graph.pow(2).mean().clamp_min(0.0)
-            )
-
-        return Xt, target_X1, {
-            "transport_mean": transport.mean().to(target_X1.dtype),
-            "path_rms": path_rms.to(target_X1.dtype),
-            "target_shift_rms": target_X1.new_tensor(0.0),
         }
 
     @torch.no_grad()
@@ -3116,7 +3183,10 @@ class AbFlowModel(nn.Module):
         """
         primary_target = X1
         if (
-            self.scorefm_loss_mode in {"structured_global_cfm", "structured_multiscale_cfm"}
+            self.scorefm_loss_mode in {
+                "structured_global_cfm", "structured_multiscale_cfm",
+                "foldflow_r3_residue_cfm",
+            }
             and structured_endpoint_target is not None
         ):
             primary_target = structured_endpoint_target
@@ -3141,6 +3211,31 @@ class AbFlowModel(nn.Module):
         else:
             clean_endpoint_loss = pred_clean_X.new_tensor(0.0)
 
+        # FoldFlow-style t-stratified diagnostics: observational only.
+        # This mirrors the useful diagnostic principle in experiments_utils.py
+        # without changing any gradient or training weight.
+        tbin_details = {}
+        try:
+            n_graph_diag = int(endpoint_per_graph.shape[0])
+            t_res_diag = torch.as_tensor(
+                t, device=pred_clean_X.device, dtype=torch.float32
+            ).reshape(interface_batch_id.numel(), -1).mean(dim=-1)
+            t_graph_diag = scatter_mean(
+                t_res_diag, interface_batch_id, dim=0, dim_size=n_graph_diag
+            )
+            for _bi, (_lo, _hi) in enumerate(
+                [(0.0,0.2),(0.2,0.4),(0.4,0.6),(0.6,0.8),(0.8,1.0001)]
+            ):
+                _m = endpoint_valid & (t_graph_diag >= _lo) & (t_graph_diag < _hi)
+                _v = (
+                    endpoint_per_graph[_m].mean().detach()
+                    if bool(_m.any()) else endpoint_loss.detach() * 0.0
+                )
+                tbin_details[f"scorefm_tbin_{_bi}_loss"] = _v
+        except Exception:
+            # Diagnostics must never change training behavior.
+            tbin_details = {}
+
         zero = endpoint_loss.detach() * 0.0
         # Keep differentiable objective components only until the trainer's
         # optional gradient-conflict probe has run.
@@ -3152,8 +3247,9 @@ class AbFlowModel(nn.Module):
             "score_aware_graph_translation_consistency",
             "structured_global_endpoint", "structured_global_cfm",
             "structured_multiscale_cfm",
-            "structured_global_ffsqrt_endpoint",
-            "structured_multiscale_endpoint",
+            "foldflow_r3_global_endpoint",
+            "foldflow_r3_residue_endpoint",
+            "foldflow_r3_residue_cfm",
         }:
             _spd = structured_path_details or {}
             details = {
@@ -3182,8 +3278,32 @@ class AbFlowModel(nn.Module):
                     _spd.get("local_centroid_rms", 0.0),
                     device=pred_clean_X.device, dtype=pred_clean_X.dtype
                 ).detach(),
+                "scorefm_r3_transport_mean": torch.as_tensor(
+                    _spd.get("r3_transport_mean", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_r3_sigma_mean": torch.as_tensor(
+                    _spd.get("r3_sigma_mean", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_r3_noise_rms": torch.as_tensor(
+                    _spd.get("r3_noise_rms", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_r3_target_shift_rms": torch.as_tensor(
+                    _spd.get("r3_target_shift_rms", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_r3_noise_scope": torch.as_tensor(
+                    _spd.get("r3_noise_scope", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_r3_cfm_target": torch.as_tensor(
+                    _spd.get("r3_cfm_target", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
                 "scorefm_structured_cfm": pred_clean_X.new_tensor(
-                    1.0 if self.scorefm_loss_mode in {"structured_global_cfm", "structured_multiscale_cfm"} else 0.0
+                    1.0 if self.scorefm_loss_mode in {"structured_global_cfm", "structured_multiscale_cfm", "foldflow_r3_residue_cfm"} else 0.0
                 ).detach(),
                 "scorefm_dsm": zero,
                 "scorefm_dsm_rate": zero,
@@ -3193,6 +3313,7 @@ class AbFlowModel(nn.Module):
                 "scorefm_traj_velocity": zero,
                 "scorefm_traj_rate": zero,
             }
+            details.update(tbin_details)
             return endpoint_loss, details
 
         if self.scorefm_loss_mode in {
@@ -4488,7 +4609,34 @@ class AbFlowModel(nn.Module):
             gt_satc_transport_graph = None
             structured_endpoint_target = None
             structured_path_details = None
-            if self.scorefm_loss_mode in {
+            if self.scorefm_loss_mode == "foldflow_r3_global_endpoint":
+                Xt, structured_endpoint_target, structured_path_details = (
+                    self._foldflow_r3_primary_path(
+                        source_X0=interface_X, target_X1=gt_interface_X,
+                        t_graph=t_graph, t_int=t_int,
+                        interface_batch_id=interface_batch_id,
+                        noise_scope="global", cfm_target=False,
+                    )
+                )
+            elif self.scorefm_loss_mode == "foldflow_r3_residue_endpoint":
+                Xt, structured_endpoint_target, structured_path_details = (
+                    self._foldflow_r3_primary_path(
+                        source_X0=interface_X, target_X1=gt_interface_X,
+                        t_graph=t_graph, t_int=t_int,
+                        interface_batch_id=interface_batch_id,
+                        noise_scope="residue", cfm_target=False,
+                    )
+                )
+            elif self.scorefm_loss_mode == "foldflow_r3_residue_cfm":
+                Xt, structured_endpoint_target, structured_path_details = (
+                    self._foldflow_r3_primary_path(
+                        source_X0=interface_X, target_X1=gt_interface_X,
+                        t_graph=t_graph, t_int=t_int,
+                        interface_batch_id=interface_batch_id,
+                        noise_scope="residue", cfm_target=True,
+                    )
+                )
+            elif self.scorefm_loss_mode in {
                 "structured_global_endpoint", "structured_global_cfm"
             }:
                 Xt, structured_endpoint_target, structured_path_details = (
@@ -4497,16 +4645,7 @@ class AbFlowModel(nn.Module):
                         t_graph=t_graph, interface_batch_id=interface_batch_id,
                     )
                 )
-            elif self.scorefm_loss_mode == "structured_global_ffsqrt_endpoint":
-                Xt, structured_endpoint_target, structured_path_details = (
-                    self._structured_global_ffsqrt_primary_path(
-                        mu_t=mu_t, source_X0=interface_X, target_X1=gt_interface_X,
-                        t_graph=t_graph, interface_batch_id=interface_batch_id,
-                    )
-                )
-            elif self.scorefm_loss_mode in {
-                "structured_multiscale_cfm", "structured_multiscale_endpoint"
-            }:
+            elif self.scorefm_loss_mode == "structured_multiscale_cfm":
                 Xt, structured_endpoint_target, structured_path_details = (
                     self._structured_multiscale_primary_path(
                         mu_t=mu_t, source_X0=interface_X, target_X1=gt_interface_X,
