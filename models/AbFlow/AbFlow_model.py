@@ -21,7 +21,7 @@ from ..modules.am_egnn import AMEGNN
 from .abflow_conditional_matcher import AbFlowConditionalMatcher
 
 
-# v57 Structured-Primary: global and orthogonal-local full-atom stochastic conditional flow.
+# v58 Structured-Primary: S01-centered FoldFlow-shaped schedule and clean-endpoint multiscale controls.
 
 
 def _env_str(name, default):
@@ -398,6 +398,18 @@ class AbFlowModel(nn.Module):
             "ssf_multiscale_cfm",
         }:
             self.scorefm_loss_mode = "structured_multiscale_cfm"
+        if self.scorefm_loss_mode in {
+            "structured_global_ffsqrt_endpoint",
+            "structured_global_foldflow_endpoint",
+            "ssf_global_ffsqrt_endpoint",
+        }:
+            self.scorefm_loss_mode = "structured_global_ffsqrt_endpoint"
+        if self.scorefm_loss_mode in {
+            "structured_multiscale_endpoint",
+            "structured_global_local_endpoint",
+            "ssf_multiscale_endpoint",
+        }:
+            self.scorefm_loss_mode = "structured_multiscale_endpoint"
         if self.scorefm_loss_mode not in {
             "endpoint", "analytic_core", "velocity_core",
             "si_score", "si_score_fm",
@@ -409,6 +421,8 @@ class AbFlowModel(nn.Module):
             "score_aware_graph_translation_consistency",
             "structured_global_endpoint", "structured_global_cfm",
             "structured_multiscale_cfm",
+            "structured_global_ffsqrt_endpoint",
+            "structured_multiscale_endpoint",
         }:
             raise ValueError(
                 "Unknown ABFLOW_SCOREFM_LOSS_MODE="
@@ -2429,6 +2443,94 @@ class AbFlowModel(nn.Module):
         }
 
     @torch.no_grad()
+    def _structured_global_ffsqrt_primary_path(
+            self, mu_t, source_X0, target_X1, t_graph,
+            interface_batch_id):
+        """S01 semantics with a FoldFlow-shaped stochastic-width schedule.
+
+        S01 uses beta(t)=4t(1-t).
+        S04 uses beta(t)=2*sqrt(t(1-t)).
+        Both equal one at t=0.5, so midpoint perturbation RMS is matched.
+        The target remains the true clean endpoint X1.
+
+        The square-root time profile is inspired by FoldFlow-SFM's
+        sigma_t proportional to sqrt(t(1-t)); the covariance itself remains
+        antibody-specific: one shared 3D translation for the complete H3 loop.
+        """
+        if interface_batch_id.numel() == 0:
+            zero = target_X1.new_zeros(1)
+            return mu_t, target_X1, {
+                "transport_mean": zero,
+                "path_rms": zero,
+                "target_shift_rms": zero,
+            }
+
+        n_graph = int(interface_batch_id.max().item()) + 1
+        ca_idx = 1 if source_X0.shape[1] > 1 else 0
+        src_centroid = scatter_mean(
+            source_X0[:, ca_idx].float(), interface_batch_id,
+            dim=0, dim_size=n_graph,
+        )
+        tgt_centroid = scatter_mean(
+            target_X1[:, ca_idx].float(), interface_batch_id,
+            dim=0, dim_size=n_graph,
+        )
+        transport = torch.linalg.norm(
+            tgt_centroid - src_centroid, dim=-1
+        ).clamp(
+            min=0.0, max=float(self.structured_transport_max)
+        )
+        amplitude = (
+            float(self.structured_gamma_scale)
+            * transport / math.sqrt(3.0)
+        ).clamp(
+            min=0.0, max=float(self.structured_gamma_abs_max)
+        )
+
+        if self.deterministic_validation and not self.training:
+            eps_graph = self._deterministic_standard_normal(
+                (n_graph, 3), target_X1.device, torch.float32
+            )
+        else:
+            eps_graph = torch.randn(
+                (n_graph, 3),
+                device=target_X1.device,
+                dtype=torch.float32,
+            )
+        xi_graph = amplitude[:, None] * eps_graph
+
+        t = torch.as_tensor(
+            t_graph, device=target_X1.device, dtype=torch.float32
+        ).reshape(-1)
+        if t.numel() == 1 and n_graph > 1:
+            t = t.expand(n_graph)
+        if t.numel() != n_graph:
+            raise ValueError(
+                f"structured ffsqrt path expects {n_graph} graph times, "
+                f"got {t.numel()}."
+            )
+
+        beta = 2.0 * torch.sqrt(
+            (t * (1.0 - t)).clamp_min(0.0)
+        )
+        path_shift_graph = beta[:, None] * xi_graph
+        path_shift_int = path_shift_graph[
+            interface_batch_id
+        ].to(mu_t.dtype)
+        Xt = mu_t + path_shift_int[:, None, :]
+
+        with torch.no_grad():
+            path_rms = torch.sqrt(
+                path_shift_graph.pow(2).mean().clamp_min(0.0)
+            )
+
+        return Xt, target_X1, {
+            "transport_mean": transport.mean().to(target_X1.dtype),
+            "path_rms": path_rms.to(target_X1.dtype),
+            "target_shift_rms": target_X1.new_tensor(0.0),
+        }
+
+    @torch.no_grad()
     def _structured_multiscale_primary_path(
             self, mu_t, source_X0, target_X1, t_graph, interface_batch_id):
         """Primary global + orthogonal local structured stochastic path.
@@ -3050,6 +3152,8 @@ class AbFlowModel(nn.Module):
             "score_aware_graph_translation_consistency",
             "structured_global_endpoint", "structured_global_cfm",
             "structured_multiscale_cfm",
+            "structured_global_ffsqrt_endpoint",
+            "structured_multiscale_endpoint",
         }:
             _spd = structured_path_details or {}
             details = {
@@ -4393,7 +4497,16 @@ class AbFlowModel(nn.Module):
                         t_graph=t_graph, interface_batch_id=interface_batch_id,
                     )
                 )
-            elif self.scorefm_loss_mode == "structured_multiscale_cfm":
+            elif self.scorefm_loss_mode == "structured_global_ffsqrt_endpoint":
+                Xt, structured_endpoint_target, structured_path_details = (
+                    self._structured_global_ffsqrt_primary_path(
+                        mu_t=mu_t, source_X0=interface_X, target_X1=gt_interface_X,
+                        t_graph=t_graph, interface_batch_id=interface_batch_id,
+                    )
+                )
+            elif self.scorefm_loss_mode in {
+                "structured_multiscale_cfm", "structured_multiscale_endpoint"
+            }:
                 Xt, structured_endpoint_target, structured_path_details = (
                     self._structured_multiscale_primary_path(
                         mu_t=mu_t, source_X0=interface_X, target_X1=gt_interface_X,
