@@ -1,11 +1,3 @@
-'''
-Author: Patrick221215 1427584833@qq.com
-Date: 2026-08-18 16:49:04
-LastEditors: Patrick221215 1427584833@qq.com
-LastEditTime: 2026-08-19 11:15:26
-FilePath: /cjm/project/AbFlow/models/AbFlow/abflow_r3_matcher.py
-Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
-'''
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
 """FoldFlow-R3-inspired stochastic conditional paths for AbFlow.
@@ -23,8 +15,6 @@ velocity target u*, its equivalent endpoint-like target is
 This lets us test FoldFlow's R3 conditional-flow target without adding a new
 velocity head or changing the sampler interface.
 """
-from __future__ import annotations
-
 import math
 import torch
 
