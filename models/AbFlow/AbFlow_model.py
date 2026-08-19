@@ -22,7 +22,7 @@ from .abflow_conditional_matcher import AbFlowConditionalMatcher
 from .abflow_r3_matcher import AbFlowR3Matcher
 
 
-# v59 FoldFlow-R3 adaptation: structured full-atom stochastic R3 paths with endpoint-parameterized CFM.
+# v60 F01-centered global-R3 stage: global endpoint anchor, global CFM target test, and optional interface pair-time.
 
 
 def _env_str(name, default):
@@ -167,7 +167,7 @@ class AbFlowModel(nn.Module):
             )
         # FoldFlow-inspired pair-level time conditioning.
         #
-        # The scientific parent is now GT-SATC.  Pair-time is therefore a
+        # In v60 the scientific parent is F01 global-R3. Pair-time is therefore a
         # strictly optional child module:
         #   off       : exact original AMEncoder architecture
         #   interface : time-condition only true antibody-antigen local edges
@@ -405,6 +405,11 @@ class AbFlowModel(nn.Module):
         }:
             self.scorefm_loss_mode = "foldflow_r3_global_endpoint"
         if self.scorefm_loss_mode in {
+            "foldflow_r3_global_cfm", "r3_global_cfm",
+            "ff_r3_global_cfm",
+        }:
+            self.scorefm_loss_mode = "foldflow_r3_global_cfm"
+        if self.scorefm_loss_mode in {
             "foldflow_r3_residue_endpoint", "r3_residue_endpoint",
             "ff_r3_residue_endpoint",
         }:
@@ -426,6 +431,7 @@ class AbFlowModel(nn.Module):
             "structured_global_endpoint", "structured_global_cfm",
             "structured_multiscale_cfm",
             "foldflow_r3_global_endpoint",
+            "foldflow_r3_global_cfm",
             "foldflow_r3_residue_endpoint",
             "foldflow_r3_residue_cfm",
         }:
@@ -440,7 +446,7 @@ class AbFlowModel(nn.Module):
                 "score_aware_traj_if_nt_lite, score_aware_traj_if_nt_fm_lite, "
                 "score_aware_graph_translation_consistency, structured_global_endpoint, "
                 "structured_global_cfm, structured_multiscale_cfm, foldflow_r3_global_endpoint, "
-                "foldflow_r3_residue_endpoint, foldflow_r3_residue_cfm."
+                "foldflow_r3_global_cfm, foldflow_r3_residue_endpoint, foldflow_r3_residue_cfm."
             )
 
         # Stochastic-interpolant controls.  These regularizers keep the strong
@@ -2090,7 +2096,7 @@ class AbFlowModel(nn.Module):
         ):
             self._diagnostic_probe_tensor = H_0
 
-        # Explicit pair/edge-level time conditioning (F02 only).  The original
+        # Explicit pair/edge-level time conditioning (v60 F05 when enabled).  The original
         # model already conditions nodes on t.  Here the same scalar t is made
         # directly available to the edge MLPs so an identical geometric pair
         # can be interpreted differently at early vs late transport time.
@@ -3185,7 +3191,7 @@ class AbFlowModel(nn.Module):
         if (
             self.scorefm_loss_mode in {
                 "structured_global_cfm", "structured_multiscale_cfm",
-                "foldflow_r3_residue_cfm",
+                "foldflow_r3_global_cfm", "foldflow_r3_residue_cfm",
             }
             and structured_endpoint_target is not None
         ):
@@ -3248,6 +3254,7 @@ class AbFlowModel(nn.Module):
             "structured_global_endpoint", "structured_global_cfm",
             "structured_multiscale_cfm",
             "foldflow_r3_global_endpoint",
+            "foldflow_r3_global_cfm",
             "foldflow_r3_residue_endpoint",
             "foldflow_r3_residue_cfm",
         }:
@@ -3303,7 +3310,7 @@ class AbFlowModel(nn.Module):
                     device=pred_clean_X.device, dtype=pred_clean_X.dtype
                 ).detach(),
                 "scorefm_structured_cfm": pred_clean_X.new_tensor(
-                    1.0 if self.scorefm_loss_mode in {"structured_global_cfm", "structured_multiscale_cfm", "foldflow_r3_residue_cfm"} else 0.0
+                    1.0 if self.scorefm_loss_mode in {"structured_global_cfm", "structured_multiscale_cfm", "foldflow_r3_global_cfm", "foldflow_r3_residue_cfm"} else 0.0
                 ).detach(),
                 "scorefm_dsm": zero,
                 "scorefm_dsm_rate": zero,
@@ -4616,6 +4623,20 @@ class AbFlowModel(nn.Module):
                         t_graph=t_graph, t_int=t_int,
                         interface_batch_id=interface_batch_id,
                         noise_scope="global", cfm_target=False,
+                    )
+                )
+            elif self.scorefm_loss_mode == "foldflow_r3_global_cfm":
+                # F04: exactly the F01 stochastic state geometry, but replace
+                # clean endpoint denoising with FoldFlow's Euclidean
+                # conditional velocity u*=X1-X0, encoded through the existing
+                # endpoint parameterization.  This isolates target semantics
+                # without the residue-R3 covariance used by historical F03.
+                Xt, structured_endpoint_target, structured_path_details = (
+                    self._foldflow_r3_primary_path(
+                        source_X0=interface_X, target_X1=gt_interface_X,
+                        t_graph=t_graph, t_int=t_int,
+                        interface_batch_id=interface_batch_id,
+                        noise_scope="global", cfm_target=True,
                     )
                 )
             elif self.scorefm_loss_mode == "foldflow_r3_residue_endpoint":
