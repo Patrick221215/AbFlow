@@ -235,3 +235,211 @@ class AbFlowR3Matcher:
             "mean_step_norm": torch.linalg.norm(mu1 - mu0, dim=-1),
         }
 
+    # ============================================================
+    # v68: direct-Flow / dual-field Score-Flow coupling
+    # ============================================================
+    def exact_global_step_from_scaled_score(
+            self, z_t, z0, mean_velocity, scaled_score,
+            t, t_next, score_min_sigma=1e-2, score_active=None):
+        """Exact global-R3 interval step using a learned *scaled score* q=sigma*s.
+
+        The direct Flow field predicts the mean transport
+            d_theta ~= z1-z0
+            z1_flow = z0 + d_theta.
+
+        For the Gaussian path
+            q_t = sigma_t s_t = -(z_t-mu_t)/sigma_t,
+        the score-implied mean satisfies
+            mu_t = z_t + sigma_t q_t.
+
+        Relative to the Flow-implied Gaussian score q_flow, an independent
+        learned q_score therefore implies an endpoint correction
+            delta z1 = sigma_hat / t * (q_score-q_flow).
+
+        This is exact when:
+          1) sigma_hat equals the path sigma,
+          2) q_score is the true scaled score.
+
+        To avoid the t=0 singularity and extrapolating an untrained score head,
+        score_active can disable score correction outside the training window.
+        The actual interval transport then uses the already-tested g-free exact
+        Gaussian residual ratio, so no oracle g is needed after z1_corrected is
+        formed.
+        """
+        if abs(float(self.path_min_sigma)) > self.eps:
+            raise ValueError(
+                "v68 exact global Score-Flow requires "
+                "ABFLOW_R3_PATH_MIN_SIGMA=0."
+            )
+        if z_t.numel() == 0:
+            return z_t, {}
+
+        n = z_t.shape[0]
+        dtype = z_t.dtype
+        device = z_t.device
+
+        t0 = torch.as_tensor(t, device=device, dtype=dtype).reshape(-1)
+        t1 = torch.as_tensor(t_next, device=device, dtype=dtype).reshape(-1)
+        if t0.numel() == 1:
+            t0 = t0.expand(n)
+        if t1.numel() == 1:
+            t1 = t1.expand(n)
+
+        d_theta = mean_velocity.to(dtype)
+        z1_flow = z0 + d_theta
+
+        # Inference-available scale estimated ONLY from the predicted Flow.
+        transport_hat = torch.linalg.norm(d_theta, dim=-1)
+        g_hat = self.graph_g_from_transport(transport_hat)
+        sigma_hat = self.score_sigma_t(
+            t0, g_hat.to(dtype), score_min_sigma
+        )
+
+        mu_flow = (1.0 - t0[:, None]) * z0 + t0[:, None] * z1_flow
+        q_flow = -(z_t - mu_flow) / sigma_hat[:, None]
+
+        if score_active is None:
+            active = t0 > self.eps
+        else:
+            active = torch.as_tensor(
+                score_active, device=device, dtype=torch.bool
+            ).reshape(-1)
+            if active.numel() == 1:
+                active = active.expand(n)
+            active = active & (t0 > self.eps)
+
+        # Score gives a correction to the endpoint implied by Flow.
+        delta_q = scaled_score.to(dtype) - q_flow
+        correction = torch.zeros_like(delta_q)
+        correction[active] = (
+            sigma_hat[active, None]
+            * delta_q[active]
+            / t0[active, None].clamp_min(self.eps)
+        )
+        z1_corrected = z1_flow + correction
+
+        z_next, diag = self.exact_global_scoreflow_step_gfree(
+            z_t=z_t,
+            z0=z0,
+            pred_z1=z1_corrected,
+            t=t0,
+            t_next=t1,
+        )
+        diag.update({
+            "score_active_rate": active.float().mean(),
+            "score_endpoint_correction_rms": torch.sqrt(
+                correction.pow(2).mean().clamp_min(0.0)
+            ),
+            "flow_transport_mean": transport_hat.mean(),
+        })
+        return z_next, diag
+
+
+    # ============================================================
+    # v70: SF²M-consistent stochastic global-R3 identities
+    # ============================================================
+    def sf2m_log_sigma_derivative(self, t_graph, t_eps=1e-2):
+        """d log sigma_t / dt for sigma_t = g*sqrt(t(1-t)).
+
+        This is exactly the coefficient used by Schrodinger-bridge CFM:
+            k(t) = (1-2t) / [2t(1-t)].
+
+        `t_eps` is a numerical sampling boundary, not a loss weight.
+        Formal v69 profiles sample t in [t_eps, 1-t_eps].
+        """
+        t = torch.as_tensor(t_graph)
+        t_safe = t.clamp(min=float(t_eps), max=1.0-float(t_eps))
+        return (1.0 - 2.0*t_safe) / (
+            2.0*t_safe*(1.0-t_safe)
+        )
+
+    def sf2m_global_probability_flow(
+            self, z_t, z0, z1, t_graph, t_eps=1e-2):
+        """Conditional probability-flow ODE target for the F01 Gaussian R3 path.
+
+        For
+            z_t = mu_t + sigma_t * eps
+            mu_t = (1-t)z0 + t z1
+            sigma_t = g sqrt(t(1-t)),
+
+        the exact conditional probability-flow field is
+            u_t^o = (z1-z0) + (sigma_dot/sigma)(z_t-mu_t).
+
+        This matches the Schrodinger-bridge CFM formula used by SF²M.
+        """
+        t = torch.as_tensor(
+            t_graph, device=z_t.device, dtype=z_t.dtype
+        ).reshape(-1)
+        if t.numel() == 1 and z_t.shape[0] > 1:
+            t = t.expand(z_t.shape[0])
+        mu = (1.0-t[:,None])*z0 + t[:,None]*z1
+        k = self.sf2m_log_sigma_derivative(
+            t, t_eps=t_eps
+        ).to(z_t.dtype)
+        return (z1-z0) + k[:,None]*(z_t-mu)
+
+    def sf2m_recover_mean_displacement(
+            self, z_t, z0, probability_flow, t_graph, t_eps=1e-2):
+        """Recover d=z1-z0 from the canonical stochastic probability-flow field.
+
+        Starting from
+            v = d + k(t)[z_t-z0-t d],
+        solve exactly:
+            d = [v-k(t)(z_t-z0)]/[1-k(t)t].
+
+        For the Brownian-bridge schedule,
+            1-k(t)t = 1/[2(1-t)] > 0,
+        so the inversion is unique on t in (0,1).
+        """
+        t = torch.as_tensor(
+            t_graph, device=z_t.device, dtype=z_t.dtype
+        ).reshape(-1)
+        if t.numel() == 1 and z_t.shape[0] > 1:
+            t = t.expand(z_t.shape[0])
+        t_safe = t.clamp(min=float(t_eps), max=1.0-float(t_eps))
+        k = self.sf2m_log_sigma_derivative(
+            t_safe, t_eps=t_eps
+        ).to(z_t.dtype)
+        denom = (1.0-k*t_safe).clamp_min(self.eps)
+        return (
+            probability_flow
+            - k[:,None]*(z_t-z0)
+        ) / denom[:,None]
+
+    @staticmethod
+    def sf2m_scaled_score_from_state(z_t, mu_t, sigma_t, eps=1e-8):
+        """Return q = sigma*s = -(z_t-mu_t)/sigma.
+
+        This is the unit-variance score target used by SF²M's weighting idea.
+        For z_t=mu_t+sigma_t*epsilon, q*=-epsilon.
+        """
+        sigma = torch.as_tensor(
+            sigma_t, device=z_t.device, dtype=z_t.dtype
+        ).reshape(-1).clamp_min(float(eps))
+        return -(z_t-mu_t)/sigma[:,None]
+
+    def sf2m_time_only_score_weight(self, t_graph, t_eps=1e-2):
+        """Time-only lambda(t)=2*sqrt(t(1-t)) for raw-score regression.
+
+        The factor 2 normalizes lambda(0.5)=1.  Critically, lambda does NOT
+        contain g_graph, because g_graph depends on the latent endpoint pair in
+        AbFlow's task-adaptive F01 path.  This preserves the standard
+        conditional-score-matching optimum for the marginal score.
+        """
+        t = torch.as_tensor(t_graph)
+        t_safe = t.clamp(min=float(t_eps), max=1.0-float(t_eps))
+        return 2.0*torch.sqrt((t_safe*(1.0-t_safe)).clamp_min(0.0))
+
+    @staticmethod
+    def sf2m_forward_sde_drift(probability_flow, raw_score, diffusion_g):
+        """SF²M forward SDE drift:
+            b_plus = v_probability_flow + 1/2 g^2 score.
+        """
+        g = torch.as_tensor(
+            diffusion_g,
+            device=probability_flow.device,
+            dtype=probability_flow.dtype,
+        ).reshape(-1)
+        return probability_flow + 0.5*g[:,None].square()*raw_score
+
+

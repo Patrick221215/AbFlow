@@ -86,6 +86,8 @@ def ensure_model_runtime_compat(model):
         'scorefm_inter_clash_cutoff': 2.0,
         'scorefm_intra_clash_cutoff': 1.5,
         'last_scorefm_losses': {},
+        'sf2m_t_eps': 0.01,
+        'sf2m_score_weight': 1.0,
     }
     for name, value in defaults.items():
         if not hasattr(model, name):
@@ -143,15 +145,11 @@ def generate(args):
     model = load_model_compat(args.ckpt, map_location='cpu')
     model = ensure_model_runtime_compat(model)
 
-    # v64 sampler override is inference-only.  This lets the SAME checkpoint
-    # be evaluated with bridge vs genuine g-free R3 Score-Flow, so a sampler
-    # ablation does not require retraining.
-    if args.sampler_mode != "checkpoint":
+    if getattr(args, 'sampler_mode', 'checkpoint') != 'checkpoint':
         model.scorefm_sampler_mode = args.sampler_mode
-    print_log(
-        f'Runtime sampler mode: '
-        f'{getattr(model, "scorefm_sampler_mode", "legacy")}'
-    )
+        print_log(
+            f'[Sampler override] scorefm_sampler_mode={args.sampler_mode}'
+        )
 
     device = torch.device('cpu' if args.gpu == -1 else f'cuda:{args.gpu}')
     
@@ -266,18 +264,24 @@ def parse():
                         help='Number of flow sampling steps')
     parser.add_argument('--show_sample_progress', action='store_true',
                         help='Show inner progress bar for flow sampling steps')
-
     parser.add_argument(
         '--sampler_mode',
         type=str,
-        choices=['checkpoint', 'bridge', 'r3_scoreflow', 'residual'],
         default='checkpoint',
+        choices=[
+            'checkpoint',
+            'sf2m_ode',
+            'sf2m_sde',
+            'bridge',
+            'r3_scoreflow',
+            'residual',
+        ],
         help=(
-            'Inference-only sampler override. "checkpoint" keeps the mode '
-            'stored in the model; bridge/r3_scoreflow enable a matched '
-            'same-checkpoint sampler ablation.'
-        )
+            'checkpoint: use sampler stored in checkpoint; '
+            'sf2m_ode/sf2m_sde are same-checkpoint v69 diagnostics.'
+        ),
     )
+
     parser.add_argument('--gpu', type=int, default=-1, help='GPU to use, -1 for cpu')
     
     parser.add_argument('--pep_file', type=str, nargs='?', const='all_data/RAbD/test.pkl', default=None)
@@ -285,5 +289,5 @@ def parse():
 
 
 if __name__ == '__main__':
-    setup_seed(42)
+    setup_seed(2023)
     generate(parse())
