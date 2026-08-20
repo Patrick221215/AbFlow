@@ -143,6 +143,16 @@ def generate(args):
     model = load_model_compat(args.ckpt, map_location='cpu')
     model = ensure_model_runtime_compat(model)
 
+    # v64 sampler override is inference-only.  This lets the SAME checkpoint
+    # be evaluated with bridge vs genuine g-free R3 Score-Flow, so a sampler
+    # ablation does not require retraining.
+    if args.sampler_mode != "checkpoint":
+        model.scorefm_sampler_mode = args.sampler_mode
+    print_log(
+        f'Runtime sampler mode: '
+        f'{getattr(model, "scorefm_sampler_mode", "legacy")}'
+    )
+
     device = torch.device('cpu' if args.gpu == -1 else f'cuda:{args.gpu}')
     
     model.to(device)
@@ -257,6 +267,17 @@ def parse():
     parser.add_argument('--show_sample_progress', action='store_true',
                         help='Show inner progress bar for flow sampling steps')
 
+    parser.add_argument(
+        '--sampler_mode',
+        type=str,
+        choices=['checkpoint', 'bridge', 'r3_scoreflow', 'residual'],
+        default='checkpoint',
+        help=(
+            'Inference-only sampler override. "checkpoint" keeps the mode '
+            'stored in the model; bridge/r3_scoreflow enable a matched '
+            'same-checkpoint sampler ablation.'
+        )
+    )
     parser.add_argument('--gpu', type=int, default=-1, help='GPU to use, -1 for cpu')
     
     parser.add_argument('--pep_file', type=str, nargs='?', const='all_data/RAbD/test.pkl', default=None)
@@ -264,5 +285,5 @@ def parse():
 
 
 if __name__ == '__main__':
-    setup_seed(2023)
+    setup_seed(42)
     generate(parse())
