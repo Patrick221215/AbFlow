@@ -8,10 +8,12 @@ Scientific policy:
 - test metrics are diagnostics only and are never fed back into training;
 - every successful test checkpoint is appended to CSV and additionally written
   into the same version_N TensorBoard run under the `Test/` namespace;
-- checkpoint `step` is used as TensorBoard global_step, so Train/Validation/Test
-  curves share the same x-axis;
-- an independent TensorBoard event file is created by the evaluator.  PyTorch's
-  training SummaryWriter is not modified or shared across processes.
+- test curves use checkpoint `epoch` as TensorBoard global_step by default;
+- one persistent SummaryWriter is reused for the lifetime of the evaluator
+  process, avoiding one new events.out file per evaluated checkpoint;
+- training and evaluator remain separate processes, so the evaluator does NOT
+  append to the training process's already-open physical event file. TensorBoard
+  merges event data found under the same run directory.
 
 This file is intentionally compatible with the existing launcher CLI used by
 run_foldflow_r3_v59.sh.
@@ -434,8 +436,12 @@ def write_ranked(csv_path: Path) -> None:
 # TensorBoard test-metric logging
 # --------------------------------------------------------------------------
 
-def _tb_state_path(topk_map: Path) -> Path:
-    return topk_map.resolve().parent / "test_tensorboard_state.json"
+def _tb_state_path(topk_map: Path, axis: str = "epoch") -> Path:
+    axis = str(axis).strip().lower()
+    return (
+        topk_map.resolve().parent
+        / f"test_tensorboard_state_{axis}_single_writer_v2.json"
+    )
 
 
 def _load_tb_done(path: Path) -> set:
@@ -470,16 +476,71 @@ def _tb_log_dir(args) -> Path:
     return Path(args.topk_map).resolve().parent.parent
 
 
+_TB_WRITERS: Dict[str, object] = {}
+
+
+def _tb_axis(args) -> str:
+    cli = str(getattr(args, "tensorboard_x_axis", "") or "").strip().lower()
+    env = os.environ.get("ABFLOW_TEST_TENSORBOARD_X_AXIS", "").strip().lower()
+    axis = cli or env or "epoch"
+    if axis not in {"epoch", "step"}:
+        raise ValueError(
+            "TensorBoard x-axis must be 'epoch' or 'step', "
+            f"got {axis!r}."
+        )
+    return axis
+
+
+def _tb_global_step(row: Dict[str, str], args) -> int:
+    key = "epoch" if _tb_axis(args) == "epoch" else "step"
+    return int(float(row.get(key) or 0))
+
+
+def _get_test_summary_writer(args):
+    """One persistent test SummaryWriter per evaluator process and log_dir."""
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except Exception as exc:
+        print(
+            "[TopK evaluator] TensorBoard unavailable; "
+            f"skip Test/* scalars without affecting evaluation: {exc}",
+            flush=True,
+        )
+        return None
+
+    log_dir = _tb_log_dir(args)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    axis = _tb_axis(args)
+    key = f"{log_dir}|{axis}"
+    writer = _TB_WRITERS.get(key)
+    if writer is None:
+        writer = SummaryWriter(
+            log_dir=str(log_dir),
+            filename_suffix=f".test_{axis}_metrics",
+        )
+        _TB_WRITERS[key] = writer
+    return writer
+
+
+def _close_test_summary_writers():
+    for writer in list(_TB_WRITERS.values()):
+        try:
+            writer.flush()
+            writer.close()
+        except Exception:
+            pass
+    _TB_WRITERS.clear()
+
+
 def write_test_tensorboard(
     row: Dict[str, str],
     args,
     lock: Optional[threading.Lock] = None,
 ) -> bool:
-    """Write one successful test row to version_N TensorBoard.
+    """Write one successful test row to TensorBoard.
 
-    Uses the checkpoint's training global step so Train/Validation/Test curves
-    line up on the same x-axis.  A separate event file is created; it is safe
-    for the training process to keep its own SummaryWriter open.
+    Default x-axis is checkpoint epoch.  One persistent evaluator writer is
+    reused across checkpoints in the same process.
     """
     if not _env_on("ABFLOW_TEST_TENSORBOARD", True):
         return False
@@ -493,7 +554,8 @@ def write_test_tensorboard(
     if not ckpt_key:
         return False
 
-    tb_state = _tb_state_path(Path(args.topk_map))
+    axis = _tb_axis(args)
+    tb_state = _tb_state_path(Path(args.topk_map), axis=axis)
     guard = lock if lock is not None else threading.Lock()
 
     with guard:
@@ -501,51 +563,32 @@ def write_test_tensorboard(
         if ckpt_key in done:
             return False
 
-        step = int(float(row.get("step") or 0))
-        log_dir = _tb_log_dir(args)
-        log_dir.mkdir(parents=True, exist_ok=True)
-
-        try:
-            from torch.utils.tensorboard import SummaryWriter
-        except Exception as exc:
-            print(
-                "[TopK evaluator] TensorBoard unavailable; "
-                f"skip Test/* scalars without affecting evaluation: {exc}",
-                flush=True,
-            )
+        x = _tb_global_step(row, args)
+        writer = _get_test_summary_writer(args)
+        if writer is None:
             return False
 
-        writer = SummaryWriter(
-            log_dir=str(log_dir),
-            filename_suffix=".test_metrics",
-        )
-        try:
-            for field, tag in TB_METRICS.items():
-                value = to_float(row.get(field))
-                if value is not None:
-                    writer.add_scalar(tag, value, step)
+        for field, tag in TB_METRICS.items():
+            value = to_float(row.get(field))
+            if value is not None:
+                writer.add_scalar(tag, value, x)
 
-            valid_loss = to_float(row.get("valid_loss"))
-            if valid_loss is not None:
-                writer.add_scalar(
-                    "Test/valid_loss_at_checkpoint", valid_loss, step
-                )
+        valid_loss = to_float(row.get("valid_loss"))
+        if valid_loss is not None:
+            writer.add_scalar("Test/valid_loss_at_checkpoint", valid_loss, x)
 
-            epoch = to_float(row.get("epoch"))
-            if epoch is not None:
-                writer.add_scalar("Test/checkpoint_epoch", epoch, step)
+        epoch = to_float(row.get("epoch"))
+        step = to_float(row.get("step"))
+        if epoch is not None:
+            writer.add_scalar("TestMeta/checkpoint_epoch", epoch, x)
+        if step is not None:
+            writer.add_scalar("TestMeta/checkpoint_train_step", step, x)
 
-            # External benchmark locator lines.  These are constants, useful for
-            # visual comparison only; they are never optimization targets.
-            writer.add_scalar("TestReference/AbFlowPaper_AAR", 0.4234, step)
-            writer.add_scalar("TestReference/AbFlowPaper_CAAR", 0.2824, step)
-            writer.add_scalar(
-                "TestReference/AbFlowPaper_H3_raw_RMSD", 8.25, step
-            )
-            writer.add_scalar("TestReference/AbFlowPaper_DockQ", 0.423, step)
-            writer.flush()
-        finally:
-            writer.close()
+        writer.add_scalar("TestReference/AbFlowPaper_AAR", 0.4234, x)
+        writer.add_scalar("TestReference/AbFlowPaper_CAAR", 0.2824, x)
+        writer.add_scalar("TestReference/AbFlowPaper_H3_raw_RMSD", 8.25, x)
+        writer.add_scalar("TestReference/AbFlowPaper_DockQ", 0.423, x)
+        writer.flush()
 
         done.add(ckpt_key)
         _save_tb_done(tb_state, done)
@@ -860,6 +903,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         ),
     )
     p.add_argument(
+        "--tensorboard-x-axis",
+        choices=["epoch", "step"],
+        default="epoch",
+        help=(
+            "TensorBoard x-axis for Test/* scalars. Default: epoch; "
+            "use step only for legacy compatibility."
+        ),
+    )
+    p.add_argument(
         "--sync-tensorboard-only",
         action="store_true",
         help=(
@@ -877,4 +929,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    finally:
+        _close_test_summary_writers()
