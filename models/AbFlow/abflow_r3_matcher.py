@@ -378,6 +378,41 @@ class AbFlowR3Matcher:
         ).to(z_t.dtype)
         return (z1-z0) + k[:,None]*(z_t-mu)
 
+    def sf2m_scoreflow_correction(
+            self, z_t, z0, z1, t_graph, t_eps=1e-2):
+        """Exact score-induced correction inside the Gaussian probability flow.
+
+        For
+            z_t = mu_t + sigma_t * eps,
+            mu_t = (1-t) z0 + t z1,
+            sigma_t = g * sqrt(t(1-t)),
+
+        raw conditional score:
+            s_t = -(z_t-mu_t) / sigma_t^2.
+
+        The exact Gaussian probability flow decomposes as
+            u_t^o = mu_dot - sigma_t * sigma_dot_t * s_t
+                  = (z1-z0) + k(t) * (z_t-mu_t),
+        where
+            k(t) = sigma_dot/sigma
+                 = (1-2t)/(2t(1-t)).
+
+        Therefore the score-induced FLOW correction is
+            c_t = -sigma_t*sigma_dot_t*s_t
+                = k(t)*(z_t-mu_t).
+
+        This quantity has VELOCITY units and avoids the raw-score 1/sigma
+        magnitude explosion.  It is the formal v72 F03 supervision target.
+        """
+        t = torch.as_tensor(
+            t_graph, device=z_t.device, dtype=z_t.dtype
+        ).reshape(-1)
+        if t.numel() == 1 and z_t.shape[0] > 1:
+            t = t.expand(z_t.shape[0])
+        mu = (1.0 - t[:, None]) * z0 + t[:, None] * z1
+        k = self.sf2m_log_sigma_derivative(t, t_eps=t_eps).to(z_t.dtype)
+        return k[:, None] * (z_t - mu)
+
     def sf2m_recover_mean_displacement(
             self, z_t, z0, probability_flow, t_graph, t_eps=1e-2):
         """Recover d=z1-z0 from the canonical stochastic probability-flow field.

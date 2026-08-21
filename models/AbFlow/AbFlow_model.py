@@ -465,6 +465,16 @@ class AbFlowModel(nn.Module):
         }:
             self.scorefm_loss_mode = "sf2m_r3_dualfield"
         if self.scorefm_loss_mode in {
+            "sf2m_r3_mean_flow_control", "sf2m_mean_flow_control",
+            "sf2m_r3_mean_flow",
+        }:
+            self.scorefm_loss_mode = "sf2m_r3_mean_flow_control"
+        if self.scorefm_loss_mode in {
+            "sf2m_r3_decomposed_score_flow", "sf2m_decomposed_score_flow",
+            "sf2m_r3_scoreflow_decomp",
+        }:
+            self.scorefm_loss_mode = "sf2m_r3_decomposed_score_flow"
+        if self.scorefm_loss_mode in {
             "foldflow_r3_global_cfm", "r3_global_cfm",
             "ff_r3_global_cfm",
         }:
@@ -500,6 +510,8 @@ class AbFlowModel(nn.Module):
             "sf2m_r3_flow",
             "sf2m_r3_analytic",
             "sf2m_r3_dualfield",
+            "sf2m_r3_mean_flow_control",
+            "sf2m_r3_decomposed_score_flow",
             "foldflow_r3_global_cfm",
             "foldflow_r3_residue_endpoint",
             "foldflow_r3_residue_cfm",
@@ -894,7 +906,7 @@ class AbFlowModel(nn.Module):
         if self.scorefm_sampler_mode not in {
             "residual", "bridge", "r3_scoreflow",
             "direct_flow", "analytic_scoreflow", "dualfield_scoreflow",
-            "sf2m_ode", "sf2m_sde"
+            "sf2m_ode", "sf2m_sde", "sf2m_decomposed_ode"
         }:
             raise ValueError(
                 "Unknown ABFLOW_SCOREFM_SAMPLER_MODE="
@@ -3494,6 +3506,25 @@ class AbFlowModel(nn.Module):
             dim=0, dim_size=n_graph,
         )
 
+    def _dualfield_equivariant_global_r3_vector(
+            self, *, shared_H, paratope_mask, Xt, source_X0,
+            interface_batch_id):
+        """Generic E(3)-equivariant global-R3 vector readout.
+
+        This reuses the v71 scalar-gate x geometric-vector construction.
+        In v72 F03 its SEMANTICS are no longer a raw 1/Angstrom score.
+        Instead it predicts the score-induced probability-flow correction
+            c_phi ~= -sigma_t * sigma_dot_t * s_t,
+        which has velocity units and is added directly to the mean Flow.
+        """
+        return self._dualfield_raw_score(
+            shared_H=shared_H,
+            paratope_mask=paratope_mask,
+            Xt=Xt,
+            source_X0=source_X0,
+            interface_batch_id=interface_batch_id,
+        )
+
     def _coordinate_training_objective(
             self, *, Xt, X1, pred_clean_X, atom_mask,
             interface_batch_id, t, sigma_t, source_ca_mean,
@@ -3583,6 +3614,8 @@ class AbFlowModel(nn.Module):
             "sf2m_r3_flow",
             "sf2m_r3_analytic",
             "sf2m_r3_dualfield",
+            "sf2m_r3_mean_flow_control",
+            "sf2m_r3_decomposed_score_flow",
         }:
             # ============================================================
             # v71: source-audited task-adapted conditional SF²M on AbFlow's ACTUAL F01 path.
@@ -3646,6 +3679,173 @@ class AbFlowModel(nn.Module):
             true_v = clean_v + stochastic_global_correction[
                 interface_batch_id, None, :
             ]
+
+            # ============================================================
+            # v72 replacement controls:
+            #
+            # F02 MEAN_FLOW_CONTROL
+            #   same stochastic X_t, but train only mu_dot = X1-X0.
+            #
+            # F03 DECOMPOSED_SCORE_FLOW
+            #   exact factorization:
+            #       u^o = mu_dot - sigma*sigma_dot*s
+            #           = mean_flow + score_flow_correction.
+            #
+            # Both terms live in VELOCITY units.  This removes the pathological
+            # raw-score scale (roughly 1/g) and the tied-route 1/g^4 error
+            # amplification without introducing an arbitrary score weight.
+            # ============================================================
+            if self.scorefm_loss_mode in {
+                "sf2m_r3_mean_flow_control",
+                "sf2m_r3_decomposed_score_flow",
+            }:
+                coord_scale = float(self.r3_flow_coordinate_scaling)
+
+                # Existing coordinate carrier predicts the CLEAN/MEAN transport.
+                pred_mean_v = pred_v
+                mean_diff = coord_scale * (pred_mean_v - clean_v)
+                mean_per_graph, mean_valid = self._masked_residue_mse_per_graph(
+                    mean_diff, atom_mask, interface_batch_id
+                )
+                mean_flow_loss = (
+                    mean_per_graph[mean_valid].mean()
+                    if bool(mean_valid.any())
+                    else pred_clean_X.new_tensor(0.0)
+                )
+
+                # Matched parameter count / DDP graph for F02.
+                dummy_score_head = sum(
+                    p.sum() for p in self.r3_dual_score_gate.parameters()
+                ) * 0.0
+
+                correction_true = self.r3_matcher.sf2m_scoreflow_correction(
+                    z_t=zt, z0=z0, z1=z1,
+                    t_graph=t_graph, t_eps=self.sf2m_t_eps,
+                ).to(pred_clean_X.dtype)
+
+                correction_pred = torch.zeros_like(correction_true)
+                correction_loss = mean_flow_loss * 0.0
+
+                if self.scorefm_loss_mode == "sf2m_r3_decomposed_score_flow":
+                    correction_pred = self._dualfield_equivariant_global_r3_vector(
+                        shared_H=shared_H,
+                        paratope_mask=paratope_mask,
+                        Xt=Xt,
+                        source_X0=source_X0,
+                        interface_batch_id=interface_batch_id,
+                    )
+                    corr_diff = coord_scale * (
+                        correction_pred - correction_true
+                    )
+                    correction_loss = corr_diff.square().mean()
+
+                    # No heuristic lambda: the two losses have identical
+                    # physical units and identical coordinate scaling.
+                    total = mean_flow_loss + correction_loss
+                else:
+                    total = mean_flow_loss + dummy_score_head
+
+                # Formal endpoint loss remains zero.
+                self._last_endpoint_objective_tensor = mean_flow_loss
+                self._last_satc_objective_tensor = (
+                    correction_loss
+                    if self.scorefm_loss_mode == "sf2m_r3_decomposed_score_flow"
+                    else mean_flow_loss * 0.0
+                )
+
+                with torch.no_grad():
+                    pred_mean_global = scatter_mean(
+                        pred_mean_v[:, ca_idx].float(),
+                        interface_batch_id, dim=0, dim_size=n_graph
+                    ).to(pred_clean_X.dtype)
+
+                    mean_cos = mean_flow_loss.detach() * 0.0
+                    pv = pred_mean_global[mean_valid]
+                    tv = clean_global_v[mean_valid]
+                    if pv.numel() > 0:
+                        mean_cos = (
+                            (pv * tv).sum(dim=-1)
+                            / (
+                                torch.linalg.norm(pv, dim=-1)
+                                * torch.linalg.norm(tv, dim=-1)
+                                + self.scorefm_eps
+                            )
+                        ).mean()
+
+                    corr_cos = mean_flow_loss.detach() * 0.0
+                    if self.scorefm_loss_mode == "sf2m_r3_decomposed_score_flow":
+                        cp = correction_pred[mean_valid]
+                        ct = correction_true[mean_valid]
+                        if cp.numel() > 0:
+                            corr_cos = (
+                                (cp * ct).sum(dim=-1)
+                                / (
+                                    torch.linalg.norm(cp, dim=-1)
+                                    * torch.linalg.norm(ct, dim=-1)
+                                    + self.scorefm_eps
+                                )
+                            ).mean()
+
+                    corr_to_mean = correction_loss.detach() / (
+                        mean_flow_loss.detach().abs() + self.scorefm_eps
+                    )
+                    true_corr_to_mean = torch.sqrt(
+                        correction_true.pow(2).mean()
+                        / (
+                            clean_global_v.pow(2).mean()
+                            + self.scorefm_eps
+                        )
+                    )
+
+                details = {
+                    "scorefm_total": total.detach(),
+                    "scorefm_endpoint": endpoint_loss.detach(),
+                    "scorefm_endpoint_train_weight":
+                        total.detach().new_tensor(0.0),
+
+                    "scorefm_sf2m_flow": mean_flow_loss.detach(),
+                    "scorefm_sf2m_score": correction_loss.detach(),
+                    "scorefm_sf2m_score_weight":
+                        total.detach().new_tensor(1.0),
+                    "scorefm_sf2m_score_to_flow": corr_to_mean.detach(),
+
+                    "scorefm_sf2m_mean_flow_cos": mean_cos.detach(),
+                    "scorefm_sf2m_correction_cos": corr_cos.detach(),
+                    "scorefm_sf2m_true_correction_to_mean_rms":
+                        true_corr_to_mean.detach(),
+
+                    "scorefm_sf2m_parameterization_is_raw_score":
+                        total.detach().new_tensor(0.0),
+                    "scorefm_sf2m_parameterization_is_score_flow_correction":
+                        total.detach().new_tensor(
+                            1.0 if self.scorefm_loss_mode
+                            == "sf2m_r3_decomposed_score_flow" else 0.0
+                        ),
+                    "scorefm_sf2m_tied_route_enabled":
+                        total.detach().new_tensor(0.0),
+
+                    # Backward-compatible diagnostic names.
+                    "scorefm_sf2m_flow_cos": mean_cos.detach(),
+                    "scorefm_sf2m_score_cos": corr_cos.detach(),
+                    "scorefm_sf2m_score_valid_rate":
+                        mean_valid.float().mean().detach(),
+                    "scorefm_sf2m_stochastic_to_clean_rms":
+                        true_corr_to_mean.detach(),
+                    "scorefm_sf2m_t_min": t_graph.min().detach(),
+                    "scorefm_sf2m_t_max": t_graph.max().detach(),
+                    "scorefm_flow_coordinate_scaling":
+                        total.detach().new_tensor(coord_scale),
+                    "scorefm_clean_endpoint": clean_endpoint_loss.detach(),
+                    "scorefm_dsm": correction_loss.detach(),
+                    "scorefm_dsm_rate": mean_valid.float().mean().detach(),
+                    "scorefm_velocity": mean_flow_loss.detach(),
+                    "scorefm_velocity_rate": mean_valid.float().mean().detach(),
+                    "scorefm_traj_consistency": zero,
+                    "scorefm_traj_velocity": zero,
+                    "scorefm_traj_rate": zero,
+                }
+                details.update(tbin_details)
+                return total, details
 
             # Keep the fixed FoldFlow R3 coordinate-unit convention in every
             # formal v71 configuration so F01/F02/F03 are directly comparable.
@@ -5652,6 +5852,8 @@ class AbFlowModel(nn.Module):
                 "sf2m_r3_flow",
                 "sf2m_r3_analytic",
                 "sf2m_r3_dualfield",
+                "sf2m_r3_mean_flow_control",
+                "sf2m_r3_decomposed_score_flow",
             }:
                 # Core stage: SAME F01 corruption state and clean endpoint target.
                 # Only genuine R3 score / canonical-flow consistency is added.
@@ -6532,7 +6734,9 @@ class AbFlowModel(nn.Module):
             # so never query the network at an unseen singular t=0/1 value.
             # The integration grid/state still starts at the exact PCS-RC source;
             # only the model time input is clipped, identically for F01/F02/F03.
-            if self.scorefm_sampler_mode in {"sf2m_ode", "sf2m_sde"}:
+            if self.scorefm_sampler_mode in {
+                "sf2m_ode", "sf2m_sde", "sf2m_decomposed_ode"
+            }:
                 t_model = t.clamp(
                     min=float(self.sf2m_t_eps),
                     max=1.0-float(self.sf2m_t_eps),
@@ -6563,6 +6767,34 @@ class AbFlowModel(nn.Module):
                 # sampler change.
                 pred_v = self._direct_flow_velocity(Xt, pred_clean_X)
                 Xt = Xt + pred_v*dt
+
+            elif self.scorefm_sampler_mode == "sf2m_decomposed_ode":
+                if self.scorefm_loss_mode != "sf2m_r3_decomposed_score_flow":
+                    raise RuntimeError(
+                        "sf2m_decomposed_ode requires "
+                        "sf2m_r3_decomposed_score_flow."
+                    )
+                pred_mean_v = self._direct_flow_velocity(Xt, pred_clean_X)
+                correction_pred = self._dualfield_equivariant_global_r3_vector(
+                    shared_H=H,
+                    paratope_mask=paratope_mask,
+                    Xt=Xt,
+                    source_X0=scoreflow_source_X0,
+                    interface_batch_id=interface_batch_id,
+                )
+                total_v = (
+                    pred_mean_v
+                    + correction_pred[interface_batch_id, None, :]
+                )
+                Xt = Xt + total_v * dt
+                self.last_scoreflow_sampler_diagnostics = {
+                    "sf2m_decomp_mean_rms": torch.sqrt(
+                        pred_mean_v.pow(2).mean().clamp_min(0.0)
+                    ).detach(),
+                    "sf2m_decomp_correction_rms": torch.sqrt(
+                        correction_pred.pow(2).mean().clamp_min(0.0)
+                    ).detach(),
+                }
 
             elif self.scorefm_sampler_mode == "sf2m_sde":
                 # Optional SAME-CHECKPOINT diagnostic for formal F03 only.
