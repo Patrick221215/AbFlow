@@ -475,6 +475,23 @@ class AbFlowModel(nn.Module):
         }:
             self.scorefm_loss_mode = "sf2m_r3_decomposed_score_flow"
         if self.scorefm_loss_mode in {
+            "clean_r3_mean_flow", "deterministic_r3_mean_flow",
+            "pcs_clean_mean_flow",
+        }:
+            self.scorefm_loss_mode = "clean_r3_mean_flow"
+        if self.scorefm_loss_mode in {
+            "clean_r3_factorized_mean_flow",
+            "factorized_r3_mean_flow",
+            "placement_local_mean_flow",
+        }:
+            self.scorefm_loss_mode = "clean_r3_factorized_mean_flow"
+        if self.scorefm_loss_mode in {
+            "clean_r3_factorized_ptc_mean_flow",
+            "factorized_ptc_mean_flow",
+            "paired_time_consistent_mean_flow",
+        }:
+            self.scorefm_loss_mode = "clean_r3_factorized_ptc_mean_flow"
+        if self.scorefm_loss_mode in {
             "foldflow_r3_global_cfm", "r3_global_cfm",
             "ff_r3_global_cfm",
         }:
@@ -512,6 +529,12 @@ class AbFlowModel(nn.Module):
             "sf2m_r3_dualfield",
             "sf2m_r3_mean_flow_control",
             "sf2m_r3_decomposed_score_flow",
+            "clean_r3_mean_flow",
+            "clean_r3_factorized_mean_flow",
+            "clean_r3_factorized_ptc_mean_flow",
+            "clean_r3_mean_flow",
+            "clean_r3_factorized_mean_flow",
+            "clean_r3_factorized_ptc_mean_flow",
             "foldflow_r3_global_cfm",
             "foldflow_r3_residue_endpoint",
             "foldflow_r3_residue_cfm",
@@ -530,7 +553,8 @@ class AbFlowModel(nn.Module):
                 "foldflow_r3_global_score, foldflow_r3_global_pathflow, "
                 "foldflow_r3_global_scoreflow, foldflow_r3_direct_flow, "
                 "foldflow_r3_analytic_score_flow, foldflow_r3_dualfield_score_flow, "
-                "foldflow_r3_global_cfm, "
+                "clean_r3_mean_flow, clean_r3_factorized_mean_flow, "
+                "clean_r3_factorized_ptc_mean_flow, foldflow_r3_global_cfm, "
                 "foldflow_r3_residue_endpoint, foldflow_r3_residue_cfm."
             )
 
@@ -1087,11 +1111,11 @@ class AbFlowModel(nn.Module):
             "ABFLOW_FINAL_READOUT_MODE", "integrated_endpoint"
         ).lower()
         if self.final_readout_mode not in {
-            "integrated_endpoint", "legacy_t1_query"
+            "integrated_state", "integrated_endpoint", "legacy_t1_query"
         }:
             raise ValueError(
-                "ABFLOW_FINAL_READOUT_MODE must be integrated_endpoint or "
-                "legacy_t1_query."
+                "ABFLOW_FINAL_READOUT_MODE must be integrated_state, "
+                "integrated_endpoint or legacy_t1_query."
             )
         self.sequence_decode_mode = _env_str(
             "ABFLOW_SEQUENCE_DECODE_MODE", "argmax"
@@ -1174,6 +1198,21 @@ class AbFlowModel(nn.Module):
         )
         nn.init.zeros_(self.r3_dual_score_gate[-1].weight)
         nn.init.zeros_(self.r3_dual_score_gate[-1].bias)
+
+        # F04/F05/F06 deliberately contain no independent score/correction
+        # field. Keeping this historical head trainable would register four
+        # parameters in DistributedDataParallel that never participate in the
+        # clean mean-flow loss, causing the next iteration to fail with
+        # "Expected to have finished reduction". Freeze before DDP wrapping so
+        # the optimizer/reducer parameter graph matches the declared method.
+        self.clean_meanflow_modes = {
+            "clean_r3_mean_flow",
+            "clean_r3_factorized_mean_flow",
+            "clean_r3_factorized_ptc_mean_flow",
+        }
+        if self.scorefm_loss_mode in self.clean_meanflow_modes:
+            for parameter in self.r3_dual_score_gate.parameters():
+                parameter.requires_grad_(False)
 
 
     def init_mask(self, X, S, cmask, smask, template):
@@ -2545,6 +2584,47 @@ class AbFlowModel(nn.Module):
         )
         return per_graph, valid_graph
 
+    def _factorized_mean_velocity_mse_per_graph(
+            self, pred_v, true_v, atom_mask, interface_batch_id):
+        """Decompose a clean mean velocity into placement and conformation.
+
+        For each complex, the CA-centroid velocity is the global H3 translation
+        in the antigen/framework coordinate system. Subtracting it from every
+        atom leaves a zero-mean local deformation velocity. Their sum is exactly
+        the original full-atom mean velocity, so training and ODE sampling still
+        operate on one physical object v=dX/dt=X1-X0.
+
+        The two subspaces are reduced once per complex. This prevents the three
+        placement degrees of freedom from being obscured by many local atom
+        coordinates, without introducing an arbitrary scalar loss weight.
+        """
+        if interface_batch_id.numel() == 0:
+            zero = pred_v.new_zeros(1)
+            valid = torch.zeros(1, device=pred_v.device, dtype=torch.bool)
+            return zero, zero, zero, valid
+
+        n_graph = int(interface_batch_id.max().item()) + 1
+        ca_idx = 1 if pred_v.shape[1] > 1 else 0
+        pred_global = scatter_mean(
+            pred_v[:, ca_idx].float(), interface_batch_id,
+            dim=0, dim_size=n_graph,
+        ).to(pred_v.dtype)
+        true_global = scatter_mean(
+            true_v[:, ca_idx].float(), interface_batch_id,
+            dim=0, dim_size=n_graph,
+        ).to(true_v.dtype)
+
+        global_per_graph = (pred_global - true_global).pow(2).mean(dim=-1)
+        pred_local = pred_v - pred_global[interface_batch_id, None, :]
+        true_local = true_v - true_global[interface_batch_id, None, :]
+        local_per_graph, valid_graph = self._masked_residue_mse_per_graph(
+            pred_local - true_local, atom_mask, interface_batch_id
+        )
+        # Equal average keeps the coordinate-objective scale comparable to F04;
+        # it does not introduce a tunable global/local lambda.
+        total_per_graph = 0.5 * (global_per_graph + local_per_graph)
+        return total_per_graph, global_per_graph, local_per_graph, valid_graph
+
     def _scorefm_time_per_graph(
             self, t, interface_batch_id, ref_tensor):
         """Convert scalar/graph/interface time to one value per complex."""
@@ -3698,25 +3778,61 @@ class AbFlowModel(nn.Module):
             if self.scorefm_loss_mode in {
                 "sf2m_r3_mean_flow_control",
                 "sf2m_r3_decomposed_score_flow",
+                "clean_r3_mean_flow",
+                "clean_r3_factorized_mean_flow",
+                "clean_r3_factorized_ptc_mean_flow",
             }:
                 coord_scale = float(self.r3_flow_coordinate_scaling)
 
                 # Existing coordinate carrier predicts the CLEAN/MEAN transport.
                 pred_mean_v = pred_v
-                mean_diff = coord_scale * (pred_mean_v - clean_v)
-                mean_per_graph, mean_valid = self._masked_residue_mse_per_graph(
-                    mean_diff, atom_mask, interface_batch_id
-                )
+                factorized_global_loss = pred_mean_v.new_tensor(0.0)
+                factorized_local_loss = pred_mean_v.new_tensor(0.0)
+                if self.scorefm_loss_mode in {
+                    "clean_r3_factorized_mean_flow",
+                    "clean_r3_factorized_ptc_mean_flow",
+                }:
+                    (
+                        mean_per_graph,
+                        global_per_graph,
+                        local_per_graph,
+                        mean_valid,
+                    ) = self._factorized_mean_velocity_mse_per_graph(
+                        coord_scale * pred_mean_v,
+                        coord_scale * clean_v,
+                        atom_mask,
+                        interface_batch_id,
+                    )
+                    if bool(mean_valid.any()):
+                        factorized_global_loss = global_per_graph[
+                            mean_valid
+                        ].mean()
+                        factorized_local_loss = local_per_graph[
+                            mean_valid
+                        ].mean()
+                else:
+                    mean_diff = coord_scale * (pred_mean_v - clean_v)
+                    mean_per_graph, mean_valid = (
+                        self._masked_residue_mse_per_graph(
+                            mean_diff, atom_mask, interface_batch_id
+                        )
+                    )
                 mean_flow_loss = (
                     mean_per_graph[mean_valid].mean()
                     if bool(mean_valid.any())
                     else pred_clean_X.new_tensor(0.0)
                 )
 
-                # Matched parameter count / DDP graph for F02.
-                dummy_score_head = sum(
-                    p.sum() for p in self.r3_dual_score_gate.parameters()
-                ) * 0.0
+                # Historical F02 kept the independent score head in the DDP
+                # graph for parameter-count matching. The new clean mean-flow
+                # modes freeze that absent module instead of creating a dummy
+                # zero-gradient dependency.
+                if self.scorefm_loss_mode in self.clean_meanflow_modes:
+                    dummy_score_head = mean_flow_loss * 0.0
+                else:
+                    dummy_score_head = sum(
+                        p.sum() for p in self.r3_dual_score_gate.parameters()
+                    ) * 0.0
 
                 correction_true = self.r3_matcher.sf2m_scoreflow_correction(
                     z_t=zt, z0=z0, z1=z1,
@@ -3840,6 +3956,18 @@ class AbFlowModel(nn.Module):
                     "scorefm_dsm_rate": mean_valid.float().mean().detach(),
                     "scorefm_velocity": mean_flow_loss.detach(),
                     "scorefm_velocity_rate": mean_valid.float().mean().detach(),
+                    "scorefm_meanflow_global": factorized_global_loss.detach(),
+                    "scorefm_meanflow_local": factorized_local_loss.detach(),
+                    "scorefm_meanflow_factorized": total.detach().new_tensor(
+                        1.0 if self.scorefm_loss_mode in {
+                            "clean_r3_factorized_mean_flow",
+                            "clean_r3_factorized_ptc_mean_flow",
+                        } else 0.0
+                    ),
+                    "scorefm_meanflow_paired_time": total.detach().new_tensor(
+                        1.0 if self.scorefm_loss_mode
+                        == "clean_r3_factorized_ptc_mean_flow" else 0.0
+                    ),
                     "scorefm_traj_consistency": zero,
                     "scorefm_traj_velocity": zero,
                     "scorefm_traj_rate": zero,
@@ -5843,6 +5971,45 @@ class AbFlowModel(nn.Module):
                     )
                 )
             elif self.scorefm_loss_mode in {
+                "clean_r3_mean_flow",
+                "clean_r3_factorized_mean_flow",
+                "clean_r3_factorized_ptc_mean_flow",
+            }:
+                # F02-theory cleanup: the state and target now describe the
+                # same deterministic straight path.
+                #   X_t = (1-t)X0 + tX1,  dX_t/dt = X1-X0.
+                # There is no Gaussian bridge noise and no omitted stochastic
+                # velocity correction. The coordinate carrier remains a direct
+                # velocity field v_theta=Y_theta-X_t.
+                Xt = mu_t
+                n_graph = int(interface_batch_id.max().item()) + 1
+                ca_idx = 1 if interface_X.shape[1] > 1 else 0
+                src_centroid = scatter_mean(
+                    interface_X[:, ca_idx].float(), interface_batch_id,
+                    dim=0, dim_size=n_graph,
+                ).to(interface_X.dtype)
+                tgt_centroid = scatter_mean(
+                    gt_interface_X[:, ca_idx].float(), interface_batch_id,
+                    dim=0, dim_size=n_graph,
+                ).to(gt_interface_X.dtype)
+                zero_graph = t_graph.new_zeros(t_graph.shape)
+                structured_endpoint_target = gt_interface_X
+                structured_path_details = {
+                    "r3_transport_mean": torch.linalg.norm(
+                        tgt_centroid - src_centroid, dim=-1
+                    ).mean().to(gt_interface_X.dtype),
+                    "r3_sigma_mean": zero_graph.mean().to(gt_interface_X.dtype),
+                    "r3_noise_rms": zero_graph.mean().to(gt_interface_X.dtype),
+                    "r3_target_shift_rms": zero_graph.mean().to(gt_interface_X.dtype),
+                    "r3_noise_scope": gt_interface_X.new_tensor(-1.0),
+                    "r3_cfm_target": gt_interface_X.new_tensor(1.0),
+                    "_r3_g_graph": zero_graph.to(gt_interface_X.dtype),
+                    "_r3_sigma_graph": zero_graph.to(gt_interface_X.dtype),
+                    "_r3_t_graph": t_graph.to(gt_interface_X.dtype),
+                    "_r3_source_centroid": src_centroid,
+                    "_r3_target_centroid": tgt_centroid,
+                }
+            elif self.scorefm_loss_mode in {
                 "foldflow_r3_global_score",
                 "foldflow_r3_global_pathflow",
                 "foldflow_r3_global_scoreflow",
@@ -6062,6 +6229,60 @@ class AbFlowModel(nn.Module):
             flow_t=t_graph if state_path else None
         )
 
+        # F06 paired-time clean mean-flow query. For a deterministic straight
+        # path, the conditional velocity X1-X0 is identical at t and 1-t. The
+        # second state is another exact on-path state, not a noisy/off-path
+        # perturbation and not an endpoint teacher.
+        paired_time_Xt = None
+        paired_time_t_graph = None
+        paired_time_t_int = None
+        paired_time_pred_X = None
+        paired_time_structured_details = None
+        if (
+            state_path
+            and self.scorefm_loss_mode
+            == "clean_r3_factorized_ptc_mean_flow"
+        ):
+            paired_time_t_graph = 1.0 - t_graph
+            paired_time_t_int = self._time_for_interface(
+                paired_time_t_graph, interface_batch_id, interface_X
+            )
+            paired_time_Xt = self.flow_matcher.interpolate(
+                interface_X, gt_interface_X, paired_time_t_int
+            )
+            # Hold the categorical state fixed across the paired coordinate
+            # query. Otherwise independently resampling S_t would confound time
+            # consistency with sequence-state noise. F06 regularizes only the
+            # structural mean-velocity field; sequence CE remains the primary
+            # single-time objective used by F04/F05.
+            paired_sequence_state = sequence_state_for_model
+
+            capture_saved = bool(getattr(self, "_diagnostic_capture", False))
+            probe_saved = self._diagnostic_probe_tensor
+            cond_diag_saved = dict(self._latest_condition_diagnostics)
+            self._diagnostic_capture = False
+            try:
+                (
+                    _H_pair, _pred_S_pair, _logits_pair, _pred_X_pair,
+                    r_interface_X_pair, _edge_pair, _prmsd_pair,
+                ) = self._forward(
+                    X, S, cmask, smask, paratope_mask, X_pep, S_pep,
+                    surface, residue_pos, template, lengths,
+                    interface_init=paired_time_Xt,
+                    sequence_init=paired_sequence_state,
+                    flow_t=paired_time_t_graph,
+                )
+                paired_time_pred_X = r_interface_X_pair[-1]
+            finally:
+                self._diagnostic_capture = capture_saved
+                self._diagnostic_probe_tensor = probe_saved
+                self._latest_condition_diagnostics = cond_diag_saved
+
+            paired_time_structured_details = dict(structured_path_details)
+            paired_time_structured_details["_r3_t_graph"] = (
+                paired_time_t_graph.to(gt_interface_X.dtype)
+            )
+
         # v52 score-aware graph-translation teacher query.  It is skipped
         # during validation and on non-scheduled training steps.  Diagnostic
         # capture is temporarily disabled so the primary clean-bridge activation
@@ -6169,6 +6390,84 @@ class AbFlowModel(nn.Module):
                     paratope_mask=paratope_mask,
                 )
             )
+
+            if paired_time_pred_X is not None:
+                paired_loss, paired_details = (
+                    self._coordinate_training_objective(
+                        Xt=paired_time_Xt,
+                        X1=gt_interface_X,
+                        pred_clean_X=paired_time_pred_X,
+                        atom_mask=interface_atom_mask,
+                        interface_batch_id=interface_batch_id,
+                        t=paired_time_t_int,
+                        sigma_t=sigma_score_int,
+                        source_ca_mean=source_ca_mean,
+                        source_X0=interface_X,
+                        structured_endpoint_target=gt_interface_X,
+                        structured_path_details=paired_time_structured_details,
+                        shared_H=None,
+                        paratope_mask=paratope_mask,
+                    )
+                )
+                coord_scale = float(self.r3_flow_coordinate_scaling)
+                primary_v = self._direct_flow_velocity(
+                    Xt, r_interface_X[-1]
+                )
+                paired_v = self._direct_flow_velocity(
+                    paired_time_Xt, paired_time_pred_X
+                )
+                (
+                    consistency_per_graph,
+                    consistency_global_per_graph,
+                    consistency_local_per_graph,
+                    consistency_valid,
+                ) = self._factorized_mean_velocity_mse_per_graph(
+                    coord_scale * primary_v,
+                    coord_scale * paired_v,
+                    interface_atom_mask,
+                    interface_batch_id,
+                )
+                if bool(consistency_valid.any()):
+                    consistency_loss = consistency_per_graph[
+                        consistency_valid
+                    ].mean()
+                    consistency_global = consistency_global_per_graph[
+                        consistency_valid
+                    ].mean()
+                    consistency_local = consistency_local_per_graph[
+                        consistency_valid
+                    ].mean()
+                else:
+                    consistency_loss = interface_loss * 0.0
+                    consistency_global = interface_loss * 0.0
+                    consistency_local = interface_loss * 0.0
+
+                primary_loss = interface_loss
+                # Three equal, same-unit constraints: accuracy at t, accuracy
+                # at 1-t, and invariance of the straight-path velocity.
+                interface_loss = (
+                    primary_loss + paired_loss + consistency_loss
+                ) / 3.0
+                self._last_endpoint_objective_tensor = interface_loss
+                self._last_satc_objective_tensor = consistency_loss
+                scorefm_details["scorefm_total"] = interface_loss.detach()
+                scorefm_details["scorefm_ptc_primary"] = primary_loss.detach()
+                scorefm_details["scorefm_ptc_paired"] = paired_loss.detach()
+                scorefm_details["scorefm_ptc_consistency"] = (
+                    consistency_loss.detach()
+                )
+                scorefm_details["scorefm_ptc_consistency_global"] = (
+                    consistency_global.detach()
+                )
+                scorefm_details["scorefm_ptc_consistency_local"] = (
+                    consistency_local.detach()
+                )
+                scorefm_details["scorefm_ptc_time_gap"] = (
+                    (paired_time_t_graph - t_graph).abs().mean().detach()
+                )
+                scorefm_details["scorefm_ptc_equal_unit_average"] = (
+                    interface_loss.detach().new_tensor(1.0)
+                )
         else:
             endpoint_per_graph, endpoint_valid = (
                 self._masked_residue_smooth_l1_per_graph(
@@ -6520,8 +6819,22 @@ class AbFlowModel(nn.Module):
                     device=X.device,
                 ),
                 "final_readout_integrated_endpoint": torch.as_tensor(
-                    1.0 if self.final_readout_mode == "integrated_endpoint"
+                    1.0 if self.final_readout_mode in {
+                        "integrated_state", "integrated_endpoint"
+                    }
                     else 0.0,
+                    device=X.device,
+                ),
+                "final_readout_integrated_state": torch.as_tensor(
+                    1.0 if self.final_readout_mode == "integrated_state"
+                    else 0.0,
+                    device=X.device,
+                ),
+                "r3_dual_score_head_trainable": torch.as_tensor(
+                    1.0 if any(
+                        p.requires_grad
+                        for p in self.r3_dual_score_gate.parameters()
+                    ) else 0.0,
                     device=X.device,
                 ),
                 "deterministic_validation": torch.as_tensor(
@@ -7029,7 +7342,8 @@ class AbFlowModel(nn.Module):
 
         # Terminal readout.
         #
-        # For the bridge sampler, the last interval has
+        # integrated_state returns the state obtained by integrating the chosen
+        # vector field. For the historical bridge sampler, the last interval has
         # dt = 1 - t, hence Xt <- Xt + (X1_hat-Xt)/(1-t)*dt = X1_hat.
         # The categorical linear path has the same integrated jump probability
         # dt/(1-t)=1 on the final interval.  Therefore the loop already produces
