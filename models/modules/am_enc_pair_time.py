@@ -1,74 +1,95 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
-"""Minimal zero-start pair-level flow-time conditioning for AbFlow.
+"""AbX-inspired zero-start semantic pair-time conditioning for AbFlow.
 
-Design goal
------------
-Preserve the full-atom AMEncoder as the base architecture and add the smallest
-possible explicit pair-time intervention.
+This file is the existing ``am_enc_pair_time.py`` implementation, revised in
+place.  No new pair-time module is introduced.
 
-For a base edge message m_ij, the module applies
+AbX does not multiply a geometric force by raw time.  It sinusoidally embeds
+the continuous timestep and appends that representation to sequence/pair
+features before Seqformer reasoning.  AbFlow already has node-level sinusoidal
+time conditioning, so this module tests the missing pair-level counterpart on
+true antibody-antigen interface messages.
 
-    m_ij(t) = m_ij * (1 + mask_ij * t * w_l)
+For each enabled edge:
+    tau(t) = fixed sinusoidal embedding of the graph-level continuous time
+    m_sem  = m_base + tau(t) * a_l
+where a_l is a zero-initialized learnable channel scale.
 
-where w_l is a learnable hidden-channel scale initialized to exactly zero.
-Therefore:
-  * at initialization the forward function is exactly the original AMEncoder;
-  * existing AM_E_GCL / MS_E_GCL parameter shapes are unchanged;
-  * the new parameters consume no random numbers (torch.zeros only);
-  * pair-time can be targeted only to true antibody-antigen edges.
+Crucially:
+    m_coord = m_base
+    m_node  = m_sem
 
-Scopes
-------
-interface:
-    - global/context GCL: unchanged
-    - local inter GCL: time modulation only on true Ab-Ag edges; local-context
-      edges are explicitly masked to zero
-    - antigen-surface GCL: time modulation enabled
+Thus pair-time does NOT directly enter the coordinate MLP of the same wrapped
+GCL.  It can still influence later coordinates indirectly through the updated
+node representation, which is the intended representation-conditioning
+mechanism.
 
-all:
-    - everything in "interface"
-    - global/context GCL and output context GCL are also time-conditioned
-    - local-context edges inside the local inter GCL are also enabled
-
-This is intentionally more conservative than concatenating a new learned time
-embedding into every edge MLP.  The experiment should test the scientific role
-of explicit pair-time, not a large capacity increase.
+The new parameters are created with ``torch.zeros`` only, so initialization is
+RNG-neutral and the step-0 function equals the original AMEncoder.
 """
+
+import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .am_enc import AMEncoder
 from .am_egnn import coord2radial, coord_SR
 
 
+def _pair_timestep_embedding(timesteps, embedding_dim, max_positions=10000):
+    """Fixed sinusoidal embedding matching the AbX/standard diffusion style."""
+    timesteps = timesteps.reshape(-1).float() * float(max_positions)
+    half_dim = embedding_dim // 2
+    if half_dim <= 1:
+        emb = timesteps[:, None]
+        return F.pad(emb, (0, max(0, embedding_dim - 1)))[:, :embedding_dim]
+    freq = math.log(max_positions) / float(half_dim - 1)
+    freq = torch.exp(
+        torch.arange(
+            half_dim, dtype=torch.float32, device=timesteps.device
+        ) * -freq
+    )
+    emb = timesteps[:, None] * freq[None, :]
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+    if embedding_dim % 2 == 1:
+        emb = F.pad(emb, (0, 1), mode="constant")
+    return emb
+
+
 class _ChannelTimeScale(nn.Module):
-    """Zero-start channel-wise edge-message modulation."""
+    """Zero-start AbX-style semantic time residual."""
 
     def __init__(self, hidden_nf):
         super().__init__()
-        # Zero initialization is deliberate: exact original forward at step 0
-        # and no RNG consumption that could shift initialization of later layers.
-        self.scale = nn.Parameter(torch.zeros(hidden_nf))
+        self.hidden_nf = int(hidden_nf)
+        # Same parameter budget as the historical pair-time prototype:
+        # one learned scale per hidden channel, initialized without RNG.
+        self.scale = nn.Parameter(torch.zeros(self.hidden_nf))
 
     def forward(self, edge_feat, pair_time_attr):
         if pair_time_attr is None:
-            return edge_feat
+            dummy = self.scale.sum()
+            return edge_feat + 0.0 * dummy
         if pair_time_attr.dim() != 2 or pair_time_attr.shape[-1] != 2:
             raise ValueError(
-                "pair_time_attr must have shape [E, 2] = [t, enabled_mask], "
-                f"got {tuple(pair_time_attr.shape)}"
+                "pair_time_attr must have shape [E,2]=[t,enabled_mask], got "
+                f"{tuple(pair_time_attr.shape)}"
             )
-        t = pair_time_attr[:, :1].to(
-            device=edge_feat.device, dtype=edge_feat.dtype
-        )
+        t = pair_time_attr[:, 0].to(device=edge_feat.device)
         enabled = pair_time_attr[:, 1:2].to(
             device=edge_feat.device, dtype=edge_feat.dtype
         )
-        return edge_feat * (
-            1.0 + enabled * t * self.scale.to(edge_feat.dtype).unsqueeze(0)
+        time_feat = _pair_timestep_embedding(
+            t, self.hidden_nf
+        ).to(device=edge_feat.device, dtype=edge_feat.dtype)
+        semantic_residual = (
+            time_feat
+            * self.scale.to(edge_feat.dtype).unsqueeze(0)
         )
+        return edge_feat + enabled * semantic_residual
 
 
 class _TimeWrappedAMEGCL(nn.Module):
@@ -91,15 +112,16 @@ class _TimeWrappedAMEGCL(nn.Module):
         )
         # Original edge model receives no extra edge attributes, so its
         # dimensions/weights remain exactly the same as the current AMEncoder.
-        edge_feat = self.base.edge_model(
+        base_edge_feat = self.base.edge_model(
             h[row], h[col], radial, edge_attr=None
         )
-        edge_feat = self.time_scale(edge_feat, edge_attr)
+        semantic_edge_feat = self.time_scale(base_edge_feat, edge_attr)
+        # Same wrapped GCL coordinate branch is exactly the parent message.
         coord = self.base.coord_model(
-            coord, edge_index, coord_diff, edge_feat, channel_weights
+            coord, edge_index, coord_diff, base_edge_feat, channel_weights
         )
         h, _ = self.base.node_model(
-            h, edge_index, edge_feat, node_attr
+            h, edge_index, semantic_edge_feat, node_attr
         )
         return h, coord
 
@@ -122,21 +144,22 @@ class _TimeWrappedMSGCL(nn.Module):
             edge_index, epi_index, coord, surf_verts, channel_attr,
             self.base.scale_linear, self.base.radial_linear,
         )
-        edge_feat = self.base.edge_model(
+        base_edge_feat = self.base.edge_model(
             h[row], h[col], radial, edge_attr=None
         )
-        edge_feat = self.time_scale(edge_feat, edge_attr)
+        semantic_edge_feat = self.time_scale(base_edge_feat, edge_attr)
+        # Same wrapped GCL coordinate branch is exactly the parent message.
         coord = self.base.coord_model(
-            coord, edge_index, abX, edge_feat, channel_weights
+            coord, edge_index, abX, base_edge_feat, channel_weights
         )
         h, _ = self.base.node_model(
-            h, edge_index, edge_feat, node_attr
+            h, edge_index, semantic_edge_feat, node_attr
         )
         return h, coord
 
 
 class AMEncoderPairTime(AMEncoder):
-    """Original AMEncoder + zero-start explicit pair-time modulation."""
+    """Original AMEncoder + zero-start AbX-inspired semantic pair-time."""
 
     def __init__(
         self, in_node_nf, hidden_nf, out_node_nf, n_channel, channel_nf,

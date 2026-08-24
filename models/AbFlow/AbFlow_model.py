@@ -17,14 +17,14 @@ from evaluation.rmsd import kabsch_torch
 
 from ..modules.am_enc import AMEncoder
 from ..modules.am_enc_pair_time import AMEncoderPairTime
-from ..modules.am_enc_score_pair import AMEncoderScorePair
+from ..modules.am_enc_scoreflow_pair import AMEncoderScoreFlowPair
 from ..modules.am_egnn import AMEGNN
 from .abflow_conditional_matcher import AbFlowConditionalMatcher
 from .abflow_r3_matcher import AbFlowR3Matcher
 
 
-# v80 matched Score-Flow stage: endpoint parameterization + current/osmotic Brownian dynamics
-# and a diagnosis-driven Brownian-uncertainty interface signal control.
+# v84: historical F01 FF-R3 Global Endpoint parent with three child tests:
+# AbX-inspired interface pair-time, Flow pair semantics, and stable Score--Flow.
 
 
 def _env_str(name, default):
@@ -167,20 +167,19 @@ class AbFlowModel(nn.Module):
                 nn.SiLU(),
                 nn.Linear(hidden_size, 1)
             )
-        # FoldFlow-inspired pair-level time conditioning.
+        # AbX-inspired pair-level time conditioning.
         #
-        # In v60 the scientific parent is F01 global-R3. Pair-time is therefore a
-        # strictly optional child module:
+        # The formal parent is the completed historical F01 Global Endpoint.
+        # Pair-time is an independent child ablation:
         #   off       : exact original AMEncoder architecture
-        #   interface : time-condition only true antibody-antigen local edges
-        #               and antigen-surface messages
-        #   context   : time-condition context/global/local-context messages only
-        #   all       : interface scope + context scope
+        #   interface : sinusoidal t conditions only true Ab-Ag semantic messages
+        #               and antigen-surface semantic messages
+        #   context/all remain legacy diagnostic scopes.
         #
-        # The pair-time encoder keeps all original GCL parameter shapes and adds
-        # only zero-initialized channel-wise time scales.  This makes the initial
-        # function exactly the base AMEncoder and avoids changing the RNG stream
-        # for later model parameters.
+        # The existing AMEncoderPairTime is zero-start and RNG-neutral.  Its
+        # revised v84 semantics leave the coordinate MLP of each wrapped GCL on
+        # the base edge message; time only changes the node semantic message
+        # directly, matching the representation-conditioning spirit of AbX.
         pair_scope = _env_str("ABFLOW_PAIR_TIME_SCOPE", "off").lower()
         # Backward compatibility with the previous boolean Stage-2 prototype.
         if (
@@ -195,38 +194,36 @@ class AbFlowModel(nn.Module):
         self.pair_time_scope = pair_scope
         self.pair_time_conditioning = pair_scope != "off"
 
-        # v80: separate trajectory direction (node-level t embedding) from
-        # interface reliability.  E02 used raw t directly on pair messages,
-        # although the Brownian global-R3 uncertainty is proportional to
-        # sqrt(t(1-t)).  The optional brownian_std signal therefore supplies
-        # rho(t)=2*sqrt(t(1-t)) in [0,1] to pair-message modulation: zero at
-        # both clean endpoints and maximal at the most uncertain midpoint.
-        # Node-level time embedding remains the original directional t.
-        self.pair_time_signal = _env_str(
-            "ABFLOW_PAIR_TIME_SIGNAL", "time"
-        ).lower()
-        if self.pair_time_signal in {"brownian", "brownian_phase", "noise"}:
-            self.pair_time_signal = "brownian_std"
-        if self.pair_time_signal not in {"time", "brownian_std"}:
+        # v83 keeps the verified PCS_RC_LC_R1_FF_R3_GLOBAL_ENDPOINT path,
+        # Endpoint objective, bridge sampler and terminal readout unchanged.
+        # Only an interface pair-representation adapter is added.  The three
+        # modes use one identical 5-channel architecture and differ solely in
+        # which information is supplied:
+        #   zero    : trainable parameter/capacity control with zero fields;
+        #   flow    : Endpoint-implied mean path tangent only;
+        #   coupled : mean Flow plus stable variance-scaled Score and agreement.
+        self.scoreflow_pair_mode = _env_str(
+            "ABFLOW_SCOREFLOW_PAIR_MODE", "off"
+        ).strip().lower()
+        if self.scoreflow_pair_mode not in {
+            "off", "zero", "flow", "coupled"
+        }:
             raise ValueError(
-                "ABFLOW_PAIR_TIME_SIGNAL must be time or brownian_std."
+                "ABFLOW_SCOREFLOW_PAIR_MODE must be off, zero, flow, or "
+                "coupled."
             )
-
-        # v81: analytic Score is not learned by another head.  When enabled,
-        # the previous refinement round's endpoint-induced *scaled Score* only
-        # conditions semantic Ab<-Ag pair messages.  Same-layer coordinate
-        # messages remain exactly the base AMEncoder messages.
-        self.pair_score_feedback = _env_flag(
-            "ABFLOW_PAIR_SCORE_FEEDBACK", False
+        self.scoreflow_pair_enabled = self.scoreflow_pair_mode != "off"
+        self.scoreflow_pair_stop_grad = _env_flag(
+            "ABFLOW_SCOREFLOW_PAIR_STOP_GRAD", True
         )
-        if self.pair_score_feedback and self.pair_time_conditioning:
+        if self.scoreflow_pair_enabled and self.pair_time_conditioning:
             raise ValueError(
-                "ABFLOW_PAIR_SCORE_FEEDBACK and ABFLOW_PAIR_TIME_SCOPE must "
-                "not be enabled together in the formal v81 comparison."
+                "Score--Flow pair feedback and historical pair-time cannot "
+                "be enabled together."
             )
 
-        if self.pair_score_feedback:
-            self.gnn = AMEncoderScorePair(
+        if self.scoreflow_pair_enabled:
+            self.gnn = AMEncoderScoreFlowPair(
                 embed_size, hidden_size, hidden_size, n_channel,
                 channel_nf=atom_embed_size, radial_nf=hidden_size,
                 in_edge_nf=0, num_verts=num_verts, n_layers=n_layers,
@@ -444,123 +441,6 @@ class AbFlowModel(nn.Module):
         }:
             self.scorefm_loss_mode = "foldflow_r3_global_endpoint"
         if self.scorefm_loss_mode in {
-            "foldflow_r3_global_score", "r3_global_score",
-            "ff_r3_global_score", "true_r3_score",
-        }:
-            self.scorefm_loss_mode = "foldflow_r3_global_score"
-        if self.scorefm_loss_mode in {
-            "foldflow_r3_global_pathflow", "r3_global_pathflow",
-            "ff_r3_global_pathflow", "canonical_r3_flow",
-        }:
-            self.scorefm_loss_mode = "foldflow_r3_global_pathflow"
-        if self.scorefm_loss_mode in {
-            "foldflow_r3_global_scoreflow", "r3_global_scoreflow",
-            "ff_r3_global_scoreflow", "true_r3_scoreflow",
-        }:
-            self.scorefm_loss_mode = "foldflow_r3_global_scoreflow"
-        if self.scorefm_loss_mode in {
-            "foldflow_r3_direct_flow", "r3_direct_flow",
-            "direct_flow", "foldflow_direct_flow",
-        }:
-            self.scorefm_loss_mode = "foldflow_r3_direct_flow"
-        if self.scorefm_loss_mode in {
-            "foldflow_r3_analytic_score_flow", "r3_analytic_score_flow",
-            "analytic_score_flow", "singlefield_score_flow",
-        }:
-            self.scorefm_loss_mode = "foldflow_r3_analytic_score_flow"
-        if self.scorefm_loss_mode in {
-            "foldflow_r3_dualfield_score_flow", "r3_dualfield_score_flow",
-            "dualfield_score_flow", "twofield_score_flow",
-        }:
-            self.scorefm_loss_mode = "foldflow_r3_dualfield_score_flow"
-        if self.scorefm_loss_mode in {
-            "sf2m_r3_flow", "sf2m_flow", "sb_cfm_r3_flow",
-        }:
-            self.scorefm_loss_mode = "sf2m_r3_flow"
-        if self.scorefm_loss_mode in {
-            "sf2m_r3_analytic", "sf2m_analytic",
-            "flow_induced_score_consistency",
-        }:
-            self.scorefm_loss_mode = "sf2m_r3_analytic"
-        if self.scorefm_loss_mode in {
-            "sf2m_r3_dualfield", "sf2m_dualfield",
-            "sf2m_shared_dualhead",
-        }:
-            self.scorefm_loss_mode = "sf2m_r3_dualfield"
-        if self.scorefm_loss_mode in {
-            "sf2m_r3_canonical_flow", "sf2m_canonical_flow",
-        }:
-            self.scorefm_loss_mode = "sf2m_r3_flow"
-        if self.scorefm_loss_mode in {
-            "sf2m_r3_tied_score_flow", "sf2m_tied_score_flow",
-        }:
-            self.scorefm_loss_mode = "sf2m_r3_analytic"
-        if self.scorefm_loss_mode in {
-            "sf2m_r3_tied_score_control", "sf2m_tied_score_control",
-        }:
-            self.scorefm_loss_mode = "sf2m_r3_analytic"
-        if self.scorefm_loss_mode in {
-            "sf2m_r3_dualfield_score_flow", "sf2m_dualfield_score_flow",
-        }:
-            self.scorefm_loss_mode = "sf2m_r3_dualfield"
-        if self.scorefm_loss_mode in {
-            "sf2m_r3_mean_flow_control", "sf2m_mean_flow_control",
-            "sf2m_r3_mean_flow",
-        }:
-            self.scorefm_loss_mode = "sf2m_r3_mean_flow_control"
-        if self.scorefm_loss_mode in {
-            "sf2m_r3_decomposed_score_flow", "sf2m_decomposed_score_flow",
-            "sf2m_r3_scoreflow_decomp",
-        }:
-            self.scorefm_loss_mode = "sf2m_r3_decomposed_score_flow"
-        if self.scorefm_loss_mode in {
-            "clean_r3_mean_flow", "deterministic_r3_mean_flow",
-            "pcs_clean_mean_flow",
-        }:
-            self.scorefm_loss_mode = "clean_r3_mean_flow"
-        if self.scorefm_loss_mode in {
-            "clean_r3_factorized_mean_flow",
-            "factorized_r3_mean_flow",
-            "placement_local_mean_flow",
-        }:
-            self.scorefm_loss_mode = "clean_r3_factorized_mean_flow"
-        if self.scorefm_loss_mode in {
-            "clean_r3_factorized_ptc_mean_flow",
-            "factorized_ptc_mean_flow",
-            "paired_time_consistent_mean_flow",
-        }:
-            self.scorefm_loss_mode = "clean_r3_factorized_ptc_mean_flow"
-        if self.scorefm_loss_mode in {
-            "clean_r3_dualspace_mean_flow",
-            "dualspace_r3_mean_flow",
-            "placement_conformation_dualspace_flow",
-        }:
-            self.scorefm_loss_mode = "clean_r3_dualspace_mean_flow"
-        if self.scorefm_loss_mode in {
-            "fixedg_r3_canonical_score_flow",
-            "fixedg_canonical_score_flow",
-        }:
-            self.scorefm_loss_mode = "fixedg_r3_canonical_score_flow"
-        if self.scorefm_loss_mode in {
-            "fixedg_r3_brownian_endpoint",
-            "fixedg_brownian_endpoint",
-            "current_osmotic_brownian_endpoint",
-        }:
-            self.scorefm_loss_mode = "fixedg_r3_brownian_endpoint"
-        if self.scorefm_loss_mode in {
-            "fixedg_r3_flow_conditioned_score_flow",
-            "fixedg_flow_conditioned_score_flow",
-            "flow_conditioned_scaled_score_flow",
-        }:
-            self.scorefm_loss_mode = (
-                "fixedg_r3_flow_conditioned_score_flow"
-            )
-        if self.scorefm_loss_mode in {
-            "foldflow_r3_global_cfm", "r3_global_cfm",
-            "ff_r3_global_cfm",
-        }:
-            self.scorefm_loss_mode = "foldflow_r3_global_cfm"
-        if self.scorefm_loss_mode in {
             "foldflow_r3_residue_endpoint", "r3_residue_endpoint",
             "ff_r3_residue_endpoint",
         }:
@@ -582,28 +462,6 @@ class AbFlowModel(nn.Module):
             "structured_global_endpoint", "structured_global_cfm",
             "structured_multiscale_cfm",
             "foldflow_r3_global_endpoint",
-            "foldflow_r3_global_score",
-            "foldflow_r3_global_pathflow",
-            "foldflow_r3_global_scoreflow",
-            "foldflow_r3_direct_flow",
-            "foldflow_r3_analytic_score_flow",
-            "foldflow_r3_dualfield_score_flow",
-            "sf2m_r3_flow",
-            "sf2m_r3_analytic",
-            "sf2m_r3_dualfield",
-            "sf2m_r3_mean_flow_control",
-            "sf2m_r3_decomposed_score_flow",
-            "clean_r3_mean_flow",
-            "clean_r3_factorized_mean_flow",
-            "clean_r3_factorized_ptc_mean_flow",
-            "clean_r3_dualspace_mean_flow",
-            "fixedg_r3_canonical_score_flow",
-            "fixedg_r3_brownian_endpoint",
-            "fixedg_r3_flow_conditioned_score_flow",
-            "clean_r3_mean_flow",
-            "clean_r3_factorized_mean_flow",
-            "clean_r3_factorized_ptc_mean_flow",
-            "foldflow_r3_global_cfm",
             "foldflow_r3_residue_endpoint",
             "foldflow_r3_residue_cfm",
         }:
@@ -618,14 +476,6 @@ class AbFlowModel(nn.Module):
                 "score_aware_traj_if_nt_lite, score_aware_traj_if_nt_fm_lite, "
                 "score_aware_graph_translation_consistency, structured_global_endpoint, "
                 "structured_global_cfm, structured_multiscale_cfm, foldflow_r3_global_endpoint, "
-                "foldflow_r3_global_score, foldflow_r3_global_pathflow, "
-                "foldflow_r3_global_scoreflow, foldflow_r3_direct_flow, "
-                "foldflow_r3_analytic_score_flow, foldflow_r3_dualfield_score_flow, "
-                "clean_r3_mean_flow, clean_r3_factorized_mean_flow, "
-                "clean_r3_factorized_ptc_mean_flow, "
-                "clean_r3_dualspace_mean_flow, foldflow_r3_global_cfm, "
-                "fixedg_r3_canonical_score_flow, fixedg_r3_brownian_endpoint, "
-                "fixedg_r3_flow_conditioned_score_flow, "
                 "foldflow_r3_residue_endpoint, foldflow_r3_residue_cfm."
             )
 
@@ -693,87 +543,17 @@ class AbFlowModel(nn.Module):
         self.r3_transport_max = _env_float(
             "ABFLOW_R3_TRANSPORT_MAX", 20.0
         )
-        # v76 uses one source/target-independent width for the formal
-        # Score--Flow experiments.  Unlike the historical pair-adaptive width,
-        # this value is known at inference, so sigma_dot and the score-induced
-        # probability-flow correction are exactly reproducible by the sampler.
-        # 0.5 Angstrom is pre-registered from the historical 0.05 x roughly
-        # 8--10 Angstrom transport scale; it must be frozen across F05/F06.
-        self.r3_fixed_g = _env_float("ABFLOW_R3_FIXED_G", 0.5)
         if not (0.0 < self.r3_transport_fraction <= 1.0):
             raise ValueError("ABFLOW_R3_TRANSPORT_FRACTION must be in (0,1].")
         if self.r3_path_min_sigma < 0.0:
             raise ValueError("ABFLOW_R3_PATH_MIN_SIGMA must be non-negative.")
         if self.r3_transport_max <= 0.0:
             raise ValueError("ABFLOW_R3_TRANSPORT_MAX must be positive.")
-        if self.r3_fixed_g <= 0.0:
-            raise ValueError("ABFLOW_R3_FIXED_G must be positive.")
         self.r3_matcher = AbFlowR3Matcher(
             transport_fraction=self.r3_transport_fraction,
             path_min_sigma=self.r3_path_min_sigma,
             eps=self.scorefm_eps,
         )
-
-        # v64 genuine global-R3 Score/Flow controls.
-        # 1e-2 follows the same numerical role as ABX score scaling protection:
-        # it protects score denominators only and never changes the physical F01 path.
-        self.r3_score_min_sigma = _env_float(
-            "ABFLOW_R3_SCORE_MIN_SIGMA", 1e-2
-        )
-        self.r3_score_dsm_weight = _env_float(
-            "ABFLOW_R3_SCORE_DSM_WEIGHT", 0.02
-        )
-        self.r3_pathflow_weight = _env_float(
-            "ABFLOW_R3_PATHFLOW_WEIGHT", 0.02
-        )
-        if self.r3_score_min_sigma <= 0.0:
-            raise ValueError("ABFLOW_R3_SCORE_MIN_SIGMA must be positive.")
-        if self.r3_score_dsm_weight < 0.0:
-            raise ValueError("ABFLOW_R3_SCORE_DSM_WEIGHT must be non-negative.")
-        if self.r3_pathflow_weight < 0.0:
-            raise ValueError("ABFLOW_R3_PATHFLOW_WEIGHT must be non-negative.")
-
-        # v68 direct-Flow coordinate unit.
-        # Uploaded FoldFlow uses R3 coordinate_scaling=0.1 and
-        # R3FM.vectorfield_scaling(t)=1.  We therefore compare direct
-        # vector fields in the same 0.1-scaled coordinate unit rather than
-        # inventing a new time-dependent loss weight.
-        self.r3_flow_coordinate_scaling = _env_float(
-            "ABFLOW_R3_FLOW_COORDINATE_SCALING", 0.1
-        )
-        if self.r3_flow_coordinate_scaling <= 0.0:
-            raise ValueError(
-                "ABFLOW_R3_FLOW_COORDINATE_SCALING must be positive."
-            )
-
-        # v71 SF²M controls.
-        # Core SF²M is L_flow + lambda(t)^2 L_score.  Our F01 corruption
-        # amplitude g_graph depends on the paired source/target transport.
-        # Therefore using q=sigma_graph*s as an unweighted target would create
-        # a latent-pair-dependent score weighting and would no longer inherit
-        # the conditional-to-marginal score-matching identity.  v71 instead
-        # predicts the RAW global-R3 score and uses a TIME-ONLY lambda(t).
-        self.sf2m_score_weight = _env_float(
-            "ABFLOW_SF2M_SCORE_WEIGHT", 1.0
-        )
-        if self.sf2m_score_weight < 0.0:
-            raise ValueError("ABFLOW_SF2M_SCORE_WEIGHT must be non-negative.")
-
-        self.sf2m_t_eps = _env_float(
-            "ABFLOW_SF2M_T_EPS", 0.01
-        )
-        if not (0.0 < self.sf2m_t_eps < 0.5):
-            raise ValueError("ABFLOW_SF2M_T_EPS must lie in (0,0.5).")
-
-        # Formal F01/F02/F03 comparison uses the probability-flow ODE (g=0 at
-        # inference), exactly as SF²M permits when flow and score are separately
-        # parameterized.  A non-zero time-only inference diffusion is exposed
-        # only as a SAME-CHECKPOINT F03 diagnostic.
-        self.sf2m_infer_g = _env_float(
-            "ABFLOW_SF2M_INFER_G", 0.0
-        )
-        if self.sf2m_infer_g < 0.0:
-            raise ValueError("ABFLOW_SF2M_INFER_G must be non-negative.")
 
         # Trajectory-consistency controls.
         # These terms do not introduce a new score head or velocity head.
@@ -991,8 +771,8 @@ class AbFlowModel(nn.Module):
             "ABFLOW_SCOREFM_STATE_PATH", True
         )
 
-        # Node-level time conditioning.  The v75 interface-time branch enables
-        # edge-level time only through the separately controlled pair scope.
+        # Node-level time conditioning. Pair-time conditioning is deliberately
+        # deferred so that the present experiments remain attributable.
         self.scorefm_time_embed = _env_flag(
             "ABFLOW_SCOREFM_TIME_EMBED", True
         )
@@ -1007,68 +787,10 @@ class AbFlowModel(nn.Module):
         self.scorefm_sampler_mode = _env_str(
             "ABFLOW_SCOREFM_SAMPLER_MODE", "bridge"
         ).lower()
-        if self.scorefm_sampler_mode not in {
-            "residual", "bridge", "r3_scoreflow",
-            "direct_flow", "analytic_scoreflow", "dualfield_scoreflow",
-            "sf2m_ode", "sf2m_sde", "sf2m_decomposed_ode",
-            "sf2m_dualspace_ode", "fixedg_scaled_score_ode",
-            "r3_current_osmotic_ode", "r3_current_osmotic_sde"
-        }:
+        if self.scorefm_sampler_mode not in {"residual", "bridge"}:
             raise ValueError(
                 "Unknown ABFLOW_SCOREFM_SAMPLER_MODE="
-                f"{self.scorefm_sampler_mode}. Choose from residual, bridge, "
-                "r3_scoreflow, direct_flow, analytic_scoreflow, dualfield_scoreflow."
-            )
-        if (
-            self.scorefm_loss_mode == "clean_r3_dualspace_mean_flow"
-            and self.scorefm_sampler_mode != "sf2m_dualspace_ode"
-        ):
-            raise ValueError(
-                "clean_r3_dualspace_mean_flow must be sampled with "
-                "sf2m_dualspace_ode so training and inference use the same "
-                "global-placement plus centered-local vector field."
-            )
-        if (
-            self.scorefm_sampler_mode == "sf2m_dualspace_ode"
-            and self.scorefm_loss_mode != "clean_r3_dualspace_mean_flow"
-        ):
-            raise ValueError(
-                "sf2m_dualspace_ode requires "
-                "clean_r3_dualspace_mean_flow."
-            )
-        if (
-            self.scorefm_loss_mode
-            == "fixedg_r3_flow_conditioned_score_flow"
-            and self.scorefm_sampler_mode != "fixedg_scaled_score_ode"
-        ):
-            raise ValueError(
-                "fixedg_r3_flow_conditioned_score_flow must use "
-                "fixedg_scaled_score_ode."
-            )
-        if (
-            self.scorefm_sampler_mode == "fixedg_scaled_score_ode"
-            and self.scorefm_loss_mode
-            != "fixedg_r3_flow_conditioned_score_flow"
-        ):
-            raise ValueError(
-                "fixedg_scaled_score_ode requires "
-                "fixedg_r3_flow_conditioned_score_flow."
-            )
-        if (
-            self.scorefm_loss_mode == "fixedg_r3_canonical_score_flow"
-            and self.scorefm_sampler_mode != "sf2m_ode"
-        ):
-            raise ValueError(
-                "fixedg_r3_canonical_score_flow must use sf2m_ode."
-            )
-
-        if (
-            self.scorefm_sampler_mode == "r3_current_osmotic_sde"
-            and self.scorefm_loss_mode != "fixedg_r3_brownian_endpoint"
-        ):
-            raise ValueError(
-                "r3_current_osmotic_sde requires fixedg_r3_brownian_endpoint "
-                "so the diffusion scale is inference-known and matches training."
+                f"{self.scorefm_sampler_mode}. Choose from residual, bridge."
             )
 
         # =========================================================
@@ -1244,11 +966,11 @@ class AbFlowModel(nn.Module):
             "ABFLOW_FINAL_READOUT_MODE", "integrated_endpoint"
         ).lower()
         if self.final_readout_mode not in {
-            "integrated_state", "integrated_endpoint", "legacy_t1_query"
+            "integrated_endpoint", "legacy_t1_query"
         }:
             raise ValueError(
-                "ABFLOW_FINAL_READOUT_MODE must be integrated_state, "
-                "integrated_endpoint or legacy_t1_query."
+                "ABFLOW_FINAL_READOUT_MODE must be integrated_endpoint or "
+                "legacy_t1_query."
             )
         self.sequence_decode_mode = _env_str(
             "ABFLOW_SEQUENCE_DECODE_MODE", "argmax"
@@ -1309,58 +1031,6 @@ class AbFlowModel(nn.Module):
         self.runtime_checks = _env_flag("ABFLOW_RUNTIME_CHECKS", False)
         self._last_condition_diagnostics = {}
         self._latest_condition_diagnostics = {}
-
-        # =========================================================
-        # v68 E(3)-equivariant global-R3 dual Score field
-        # =========================================================
-        # IMPORTANT: this module is instantiated AFTER every historical
-        # trainable module, so adding it cannot change the RNG initialization
-        # of the F01 backbone/proposal adapters.  It is present in all three
-        # v68 configurations so their parameter counts are matched.
-        #
-        # The MLP emits four invariant scalar gates per H3 residue.  The final
-        # global score vector is a weighted sum of four equivariant geometric
-        # bases (current/source CA-to-source-centroid and current N-CA/C-CA).
-        # Scalar x vector -> vector, hence the construction is E(3)-equivariant
-        # without a naive Linear(H)->R3 head.
-        self.r3_dual_score_gate = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, 4),
-        )
-        nn.init.zeros_(self.r3_dual_score_gate[-1].weight)
-        nn.init.zeros_(self.r3_dual_score_gate[-1].bias)
-
-        # F04 and the interface-time child deliberately contain no independent
-        # global vector head. Keeping this historical head trainable would register four
-        # parameters in DistributedDataParallel that never participate in the
-        # clean mean-flow loss, causing the next iteration to fail with
-        # "Expected to have finished reduction". Freeze before DDP wrapping so
-        # the optimizer/reducer parameter graph matches the declared method.
-        # Modes below do NOT train or use the historical independent global-R3
-        # score gate.  Freeze it before DDP wrapping so the reducer only tracks
-        # parameters that can actually contribute to the declared objective.
-        #
-        # v78 endpoint mainline:
-        #   endpoint                    -> E00
-        #   foldflow_r3_global_endpoint -> E01/E02
-        # Both obtain Score--Flow analytically from the endpoint at inference;
-        # therefore this learned score gate must remain frozen.
-        self.no_independent_score_head_modes = {
-            "endpoint",
-            "foldflow_r3_global_endpoint",
-            "clean_r3_mean_flow",
-            "clean_r3_factorized_mean_flow",
-            "clean_r3_factorized_ptc_mean_flow",
-            # F05 learns the complete canonical probability velocity in the
-            # coordinate carrier; it has no independent score head.
-            "fixedg_r3_canonical_score_flow",
-            "fixedg_r3_brownian_endpoint",
-        }
-        if self.scorefm_loss_mode in self.no_independent_score_head_modes:
-            for parameter in self.r3_dual_score_gate.parameters():
-                parameter.requires_grad_(False)
 
 
     def init_mask(self, X, S, cmask, smask, template):
@@ -1592,13 +1262,10 @@ class AbFlowModel(nn.Module):
                 t = 0.2 + 0.6 * t
             elif mode in {'late_t', 'late'}:
                 t = 0.55 + 0.35 * t
-            elif mode in {'sf2m_uniform', 'sf2m'}:
-                eps = float(getattr(self, 'sf2m_t_eps', 0.01))
-                t = eps + (1.0 - 2.0*eps) * t
             elif mode not in {'uniform', 'stratified', 'strat'}:
                 raise ValueError(
                     f"Unknown ABFLOW_SCOREFM_T_SAMPLING={mode}. "
-                    "Choose from uniform, low_t, stratified, mid_t, late_t, sf2m_uniform."
+                    "Choose from uniform, low_t, stratified, mid_t, late_t."
                 )
             return t.clamp(min=0.0, max=1.0)
 
@@ -1624,16 +1291,10 @@ class AbFlowModel(nn.Module):
         elif mode in {'late_t', 'late'}:
             t = 0.55 + 0.35 * torch.rand(n, device=device, dtype=dtype)
 
-        elif mode in {'sf2m_uniform', 'sf2m'}:
-            eps = float(getattr(self, 'sf2m_t_eps', 0.01))
-            t = eps + (1.0 - 2.0*eps) * torch.rand(
-                n, device=device, dtype=dtype
-            )
-
         else:
             raise ValueError(
                 f"Unknown ABFLOW_SCOREFM_T_SAMPLING={mode}. "
-                "Choose from uniform, low_t, stratified, mid_t, late_t, sf2m_uniform."
+                "Choose from uniform, low_t, stratified, mid_t, late_t."
             )
 
         return t.clamp(min=0.0, max=1.0)
@@ -1680,7 +1341,7 @@ class AbFlowModel(nn.Module):
             self, flow_t, batch_id, local_mask, ctx_edges,
             local_ctx_edges, local_inter_edges, aligned_local_inter_edges,
             ref_tensor):
-        """Build [pair_signal, enabled_mask] for each message edge.
+        """Build [t, enabled_mask] for each message edge.
 
         interface scope:
             ctx edges            -> disabled
@@ -1707,17 +1368,7 @@ class AbFlowModel(nn.Module):
         t_res = self._flow_time_values_for_residues(
             flow_t, batch_id, ref_tensor
         ).to(dtype=ref_tensor.dtype)
-        if getattr(self, "pair_time_signal", "time") == "brownian_std":
-            # Inference-known normalized Brownian standard-deviation profile.
-            # It intentionally excludes the native-dependent g_graph used by
-            # E01, avoiding target leakage while matching the path's reliability
-            # geometry: rho(0)=rho(1)=0 and rho(0.5)=1.
-            pair_res = 2.0 * torch.sqrt(
-                (t_res * (1.0 - t_res)).clamp_min(0.0)
-            )
-        else:
-            pair_res = t_res
-        local_t = pair_res[local_mask]
+        local_t = t_res[local_mask]
 
         def pack(time_values, enabled):
             time_values = time_values.reshape(-1, 1)
@@ -1733,7 +1384,7 @@ class AbFlowModel(nn.Module):
 
         # Global/context edges.
         ctx_attr = pack(
-            pair_res[ctx_edges[0]],
+            t_res[ctx_edges[0]],
             scope in {"context", "all"},
         )
 
@@ -1769,131 +1420,6 @@ class AbFlowModel(nn.Module):
             scope in {"interface", "all"},
         )
         return ctx_attr, local_attr, surf_attr
-
-    def _endpoint_induced_scaled_score_graph(
-            self, state_Xt, source_X0, pred_X1, flow_t,
-            interface_batch_id, source_valid=None):
-        """Analytic graph-level q=sigma*score from a predicted endpoint.
-
-        This is a *conditioning state*, not a trainable Score target/head.
-        All coordinates here are in AbFlow's normalized model frame, therefore
-        the fixed raw-Angstrom Brownian width is divided by normalizer.std.
-
-        q_t = -(z_t - [(1-t) z0 + t z1_hat]) / sigma_t
-        sigma_t = (g/std) * sqrt(t(1-t)).
-
-        The returned tensor is detached by the caller before it is fed to the
-        next refinement round, preventing a later round from changing an earlier
-        endpoint merely to manufacture easier conditioning features.
-        """
-        if (
-            state_Xt is None or source_X0 is None or pred_X1 is None
-            or interface_batch_id.numel() == 0
-        ):
-            return None
-
-        n_graph = int(interface_batch_id.max().item()) + 1
-        ca_idx = 1 if state_Xt.shape[1] > 1 else 0
-        t_graph, valid_graph = self._scorefm_time_per_graph(
-            flow_t, interface_batch_id, state_Xt
-        )
-
-        z_t = scatter_mean(
-            state_Xt[:, ca_idx].float(), interface_batch_id,
-            dim=0, dim_size=n_graph,
-        ).to(state_Xt.dtype)
-        z1_hat = scatter_mean(
-            pred_X1[:, ca_idx].float(), interface_batch_id,
-            dim=0, dim_size=n_graph,
-        ).to(state_Xt.dtype)
-
-        if source_valid is None:
-            z0 = scatter_mean(
-                source_X0[:, ca_idx].float(), interface_batch_id,
-                dim=0, dim_size=n_graph,
-            ).to(state_Xt.dtype)
-            source_graph_valid = valid_graph
-        else:
-            source_valid = source_valid.to(
-                device=state_Xt.device, dtype=torch.bool
-            )
-            if bool(source_valid.any()):
-                valid_ids = interface_batch_id[source_valid]
-                z0 = scatter_mean(
-                    source_X0[source_valid, ca_idx].float(), valid_ids,
-                    dim=0, dim_size=n_graph,
-                ).to(state_Xt.dtype)
-                counts = torch.zeros(
-                    n_graph, device=state_Xt.device, dtype=state_Xt.dtype
-                )
-                counts.index_add_(
-                    0, valid_ids, torch.ones_like(valid_ids, dtype=state_Xt.dtype)
-                )
-                source_graph_valid = valid_graph & (counts > 0)
-            else:
-                return state_Xt.new_zeros((n_graph, 3))
-
-        t = t_graph.to(dtype=state_Xt.dtype)
-        mu_hat = (1.0 - t[:, None]) * z0 + t[:, None] * z1_hat
-
-        norm_std = self.normalizer.std.to(
-            device=state_Xt.device, dtype=state_Xt.dtype
-        ).clamp_min(self.scorefm_eps)
-        g_model = state_Xt.new_tensor(float(self.r3_fixed_g)) / norm_std
-        sigma = g_model * torch.sqrt(
-            (t * (1.0 - t)).clamp_min(0.0)
-        )
-        # Numerical protection only; no score-loss time window or lambda(t).
-        sigma_floor = state_Xt.new_tensor(
-            float(self.r3_score_min_sigma)
-        ) / norm_std
-        sigma_safe = sigma.clamp_min(sigma_floor)
-
-        q = -(z_t - mu_hat) / sigma_safe[:, None]
-        active = source_graph_valid & (sigma > self.scorefm_eps)
-        q = torch.where(active[:, None], q, torch.zeros_like(q))
-        return q
-
-    def _pair_score_edge_attributes(
-            self, pair_score_graph, local_batch_id, local_X,
-            local_ctx_edges, local_inter_edges, local_is_ab):
-        """Build invariant Score pair features for local interaction edges.
-
-        Output rows align with cat([local_ctx_edges, local_inter_edges], dim=1):
-            [ ||q||, cos(q, r_ij), enabled_mask ].
-
-        Only antigen -> antibody messages are enabled.  The features are
-        rotationally/translation invariant: ||q|| is invariant and the cosine
-        is the dot product of two equivariant vectors after normalization.
-        """
-        n_ctx = int(local_ctx_edges.shape[1])
-        n_inter = int(local_inter_edges.shape[1])
-        out = local_X.new_zeros((n_ctx + n_inter, 3))
-        if pair_score_graph is None or n_inter == 0:
-            return out
-
-        row, col = local_inter_edges
-        graph_ids = local_batch_id[row]
-        q = pair_score_graph[graph_ids].to(
-            device=local_X.device, dtype=local_X.dtype
-        )
-        ca_idx = 1 if local_X.shape[1] > 1 else 0
-        edge_vec = local_X[row, ca_idx] - local_X[col, ca_idx]
-
-        q_norm = torch.linalg.norm(q, dim=-1)
-        edge_norm = torch.linalg.norm(edge_vec, dim=-1)
-        score_proj = (q * edge_vec).sum(dim=-1) / (
-            q_norm * edge_norm + self.scorefm_eps
-        )
-
-        # Message aggregation is col -> row.  Score describes how the H3 should
-        # move, so only antibody receivers from antigen senders are conditioned.
-        enabled = local_is_ab[row] & (~local_is_ab[col])
-        base = n_ctx
-        out[base:, 0] = q_norm
-        out[base:, 1] = score_proj.clamp(-1.0, 1.0)
-        out[base:, 2] = enabled.to(out.dtype)
-        return out
 
     def _build_coord_pep_condition_for_residues(
             self, pep_X_model, interface_X, paratope_mask,
@@ -2166,6 +1692,102 @@ class AbFlowModel(nn.Module):
             "tokens": safe_state,
         }
 
+    def _scoreflow_pair_features_for_cross_edges(
+            self, *, local_X, local_is_ab, local_batch_id, cross_edges,
+            condition):
+        """Build five bounded/invariant semantics for Ab--Ag edges.
+
+        Feature order:
+          0-1: log1p(||variance-scaled score||), cos(score, edge)
+          2-4: log1p(||Endpoint-implied mean Flow||), cos(flow, edge),
+               cos(score, flow)
+        Magnitudes are log-compressed, directions use cosine invariants, and no
+        feature multiplies a loss.  Thus this is representation conditioning,
+        not a hidden time-dependent objective weight.
+        """
+        if cross_edges.dim() != 2 or cross_edges.shape[0] != 2:
+            raise ValueError("cross_edges must have shape [2,E].")
+        edge_count = int(cross_edges.shape[1])
+        out = local_X.new_zeros((edge_count, 6))
+        if edge_count == 0 or condition is None:
+            return out
+
+        row, col = cross_edges
+        row_is_ab = local_is_ab[row]
+        col_is_ab = local_is_ab[col]
+        valid_cross = torch.logical_xor(row_is_ab, col_is_ab)
+        if not bool(valid_cross.all()):
+            raise RuntimeError("Score--Flow pair features require cross edges.")
+
+        ab_node = torch.where(row_is_ab, row, col)
+        ag_node = torch.where(row_is_ab, col, row)
+        graph_index = local_batch_id[ab_node]
+
+        ca_idx = 1 if local_X.shape[1] > 1 else 0
+        edge_vector = local_X[ab_node, ca_idx] - local_X[ag_node, ca_idx]
+        edge_norm = torch.linalg.norm(edge_vector, dim=-1, keepdim=True)
+        edge_unit = edge_vector / edge_norm.clamp_min(self.scorefm_eps)
+
+        score_vector = condition["global_score"][graph_index]
+        flow_vector = condition["global_flow"][graph_index]
+
+        def magnitude_and_unit(vector):
+            magnitude = torch.linalg.norm(vector, dim=-1, keepdim=True)
+            unit = vector / magnitude.clamp_min(self.scorefm_eps)
+            unit = torch.where(
+                magnitude > self.scorefm_eps, unit, torch.zeros_like(unit)
+            )
+            return torch.log1p(magnitude), unit
+
+        score_magnitude, score_unit = magnitude_and_unit(score_vector)
+        flow_magnitude, flow_unit = magnitude_and_unit(flow_vector)
+        features = torch.cat(
+            [
+                score_magnitude,
+                (score_unit * edge_unit).sum(dim=-1, keepdim=True),
+                flow_magnitude,
+                (flow_unit * edge_unit).sum(dim=-1, keepdim=True),
+                (score_unit * flow_unit).sum(dim=-1, keepdim=True),
+            ],
+            dim=-1,
+        )
+
+        mode = self.scoreflow_pair_mode
+        if mode == "zero":
+            channel_mask = features.new_zeros(5)
+        elif mode == "flow":
+            channel_mask = features.new_tensor(
+                [0, 0, 1, 1, 0]
+            )
+        elif mode == "coupled":
+            channel_mask = features.new_tensor(
+                [1, 1, 1, 1, 1]
+            )
+        else:
+            channel_mask = features.new_zeros(5)
+        out[:, :5] = features * channel_mask.unsqueeze(0)
+        out[:, 5] = 1.0 if bool(condition.get("enabled", False)) else 0.0
+        return out
+
+    def _scoreflow_pair_edge_attributes(
+            self, *, local_X, local_is_ab, local_batch_id,
+            local_ctx_edges, local_inter_edges, aligned_inter_edges,
+            condition):
+        """Package attributes in the exact edge order consumed by AMEncoder."""
+        inter_cross_attr = self._scoreflow_pair_features_for_cross_edges(
+            local_X=local_X, local_is_ab=local_is_ab,
+            local_batch_id=local_batch_id, cross_edges=local_inter_edges,
+            condition=condition,
+        )
+        ctx_attr = local_X.new_zeros((local_ctx_edges.shape[1], 6))
+        local_attr = torch.cat([ctx_attr, inter_cross_attr], dim=0)
+        surf_attr = self._scoreflow_pair_features_for_cross_edges(
+            local_X=local_X, local_is_ab=local_is_ab,
+            local_batch_id=local_batch_id, cross_edges=aligned_inter_edges,
+            condition=condition,
+        )
+        return local_attr, surf_attr
+
     def message_passing(self, X, S, residue_pos, interface_X, surf, paratope_mask,
                         batch_id, round_idx, memory_H=None, smooth_prob=None,
                         smooth_mask=None, flow_t=None,
@@ -2174,7 +1796,7 @@ class AbFlowModel(nn.Module):
                         seq_pep_condition=None,
                         seq_pep_condition_mask=None,
                         sequence_state_full=None,
-                        pair_score_graph=None):
+                        scoreflow_pair_condition=None):
         # embeddings, hidden state, (internal edges, external edges),
         # (A : c*d, w : c*1)
         H_0, (ctx_edges, inter_edges), (atom_embeddings, atom_weights) = self.aa_feature(
@@ -2601,7 +2223,7 @@ class AbFlowModel(nn.Module):
         ):
             self._diagnostic_probe_tensor = H_0
 
-        # Explicit pair/edge-level time conditioning (v60 F05 when enabled).  The original
+        # Explicit pair/edge-level time conditioning (F02 only).  The original
         # model already conditions nodes on t.  Here the same scalar t is made
         # directly available to the edge MLPs so an identical geometric pair
         # can be interpreted differently at early vs late transport time.
@@ -2612,25 +2234,31 @@ class AbFlowModel(nn.Module):
                 aligned_local_inter_edges, H_0,
             )
         )
-        pair_score_attr = None
-        if self.pair_score_feedback:
-            pair_score_attr = self._pair_score_edge_attributes(
-                pair_score_graph=pair_score_graph,
-                local_batch_id=local_batch_id,
-                local_X=local_X,
-                local_ctx_edges=local_ctx_edges,
-                local_inter_edges=local_inter_edges,
-                local_is_ab=local_is_ab,
+
+        scoreflow_local_attr = None
+        scoreflow_surf_attr = None
+        if self.scoreflow_pair_enabled:
+            scoreflow_local_attr, scoreflow_surf_attr = (
+                self._scoreflow_pair_edge_attributes(
+                    local_X=local_X,
+                    local_is_ab=local_is_ab,
+                    local_batch_id=local_batch_id,
+                    local_ctx_edges=local_ctx_edges,
+                    local_inter_edges=local_inter_edges,
+                    aligned_inter_edges=aligned_local_inter_edges,
+                    condition=scoreflow_pair_condition,
+                )
             )
 
         # message passing
         # sme_start = time.time()
-        if self.pair_score_feedback:
+        if self.scoreflow_pair_enabled:
             H, pred_X, pred_local_X = self.gnn(
                 H_0, X, ctx_edges, local_mask, local_X, surf, local_edges,
                 paratope_mask, local_is_ab, aligned_local_inter_edges, epi_index,
                 channel_attr=atom_embeddings, channel_weights=atom_weights,
-                inter_edge_attr=pair_score_attr,
+                inter_edge_attr=scoreflow_local_attr,
+                surf_edge_attr=scoreflow_surf_attr,
             )
         elif self.pair_time_conditioning:
             H, pred_X, pred_local_X = self.gnn(
@@ -2885,107 +2513,6 @@ class AbFlowModel(nn.Module):
         )
         return per_graph, valid_graph
 
-    def _factorized_mean_velocity_mse_per_graph(
-            self, pred_v, true_v, atom_mask, interface_batch_id):
-        """Decompose a clean mean velocity into placement and conformation.
-
-        For each complex, the CA-centroid velocity is the global H3 translation
-        in the antigen/framework coordinate system. Subtracting it from every
-        atom leaves a zero-mean local deformation velocity. Their sum is exactly
-        the original full-atom mean velocity, so training and ODE sampling still
-        operate on one physical object v=dX/dt=X1-X0.
-
-        The two subspaces are reduced once per complex. This prevents the three
-        placement degrees of freedom from being obscured by many local atom
-        coordinates, without introducing an arbitrary scalar loss weight.
-        """
-        if interface_batch_id.numel() == 0:
-            zero = pred_v.new_zeros(1)
-            valid = torch.zeros(1, device=pred_v.device, dtype=torch.bool)
-            return zero, zero, zero, valid
-
-        n_graph = int(interface_batch_id.max().item()) + 1
-        ca_idx = 1 if pred_v.shape[1] > 1 else 0
-        pred_global = scatter_mean(
-            pred_v[:, ca_idx].float(), interface_batch_id,
-            dim=0, dim_size=n_graph,
-        ).to(pred_v.dtype)
-        true_global = scatter_mean(
-            true_v[:, ca_idx].float(), interface_batch_id,
-            dim=0, dim_size=n_graph,
-        ).to(true_v.dtype)
-
-        global_per_graph = (pred_global - true_global).pow(2).mean(dim=-1)
-        pred_local = pred_v - pred_global[interface_batch_id, None, :]
-        true_local = true_v - true_global[interface_batch_id, None, :]
-        local_per_graph, valid_graph = self._masked_residue_mse_per_graph(
-            pred_local - true_local, atom_mask, interface_batch_id
-        )
-        # Equal average keeps the coordinate-objective scale comparable to F04;
-        # it does not introduce a tunable global/local lambda.
-        total_per_graph = 0.5 * (global_per_graph + local_per_graph)
-        return total_per_graph, global_per_graph, local_per_graph, valid_graph
-
-    def _dualspace_mean_velocity_mse_per_graph(
-            self, carrier_v, global_v, true_v, atom_mask,
-            interface_batch_id):
-        """Product-space objective for H3 translation and centered geometry.
-
-        The coordinate carrier is projected onto the zero-CA-centroid local
-        space.  A separate E(3)-equivariant graph vector predicts the H3 CA
-        centroid velocity.  The centered residual still contains orientation
-        changes and internal conformation; it is not claimed to be a pure
-        internal-shape coordinate.  Their direct sum is the effective
-        full-atom field:
-
-            v_theta = v_global + (v_carrier - mean_CA(v_carrier)).
-
-        Unlike the historical loss-only factorization, this changes the model
-        parameterization and the sampled vector field.  Each branch has one
-        unambiguous target in the same velocity units.
-        """
-        if interface_batch_id.numel() == 0:
-            zero = carrier_v.new_zeros(1)
-            valid = torch.zeros(1, device=carrier_v.device, dtype=torch.bool)
-            return zero, zero, zero, valid, carrier_v
-
-        n_graph = int(interface_batch_id.max().item()) + 1
-        ca_idx = 1 if carrier_v.shape[1] > 1 else 0
-        carrier_global = scatter_mean(
-            carrier_v[:, ca_idx].float(), interface_batch_id,
-            dim=0, dim_size=n_graph,
-        ).to(carrier_v.dtype)
-        true_global = scatter_mean(
-            true_v[:, ca_idx].float(), interface_batch_id,
-            dim=0, dim_size=n_graph,
-        ).to(true_v.dtype)
-
-        pred_local = (
-            carrier_v - carrier_global[interface_batch_id, None, :]
-        )
-        true_local = true_v - true_global[interface_batch_id, None, :]
-        local_per_graph, valid_graph = self._masked_residue_mse_per_graph(
-            pred_local - true_local, atom_mask, interface_batch_id
-        )
-        global_per_graph = (global_v - true_global).pow(2).mean(dim=-1)
-        # Equal averaging keeps the aggregate structure-loss scale comparable
-        # to F04.  This removes loss-amplitude as an experimental confound while
-        # still giving the three-dimensional placement subspace an explicit,
-        # independently parameterized objective.
-        total_per_graph = 0.5 * (
-            global_per_graph + local_per_graph
-        )
-        effective_v = (
-            global_v[interface_batch_id, None, :] + pred_local
-        )
-        return (
-            total_per_graph,
-            global_per_graph,
-            local_per_graph,
-            valid_graph,
-            effective_v,
-        )
-
     def _scorefm_time_per_graph(
             self, t, interface_batch_id, ref_tensor):
         """Convert scalar/graph/interface time to one value per complex."""
@@ -3091,19 +2618,7 @@ class AbFlowModel(nn.Module):
             tgt_centroid - src_centroid, dim=-1
         ).clamp(min=0.0, max=float(self.r3_transport_max))
 
-        if self.scorefm_loss_mode in {
-            "fixedg_r3_canonical_score_flow",
-            "fixedg_r3_brownian_endpoint",
-            "fixedg_r3_flow_conditioned_score_flow",
-        }:
-            # A native-dependent g cannot be reconstructed during generation.
-            # The formal v76 comparison therefore uses one pre-registered,
-            # source/target-independent width in both training and sampling.
-            g_graph = torch.full_like(
-                transport, float(self.r3_fixed_g)
-            )
-        else:
-            g_graph = self.r3_matcher.graph_g_from_transport(transport)
+        g_graph = self.r3_matcher.graph_g_from_transport(transport)
         t_graph_f = torch.as_tensor(
             t_graph, device=target_X1.device, dtype=torch.float32
         ).reshape(-1)
@@ -3114,17 +2629,7 @@ class AbFlowModel(nn.Module):
                 f"FoldFlow-R3 path expects {n_graph} graph times, "
                 f"got {t_graph_f.numel()}."
             )
-        if self.scorefm_loss_mode in {
-            "fixedg_r3_canonical_score_flow",
-            "fixedg_r3_flow_conditioned_score_flow",
-        }:
-            # v76 is a source-noise Gaussian path:
-            #   z_t=(1-t)z0+t*z1+g*(1-t)*eps.
-            # It starts from a distribution that can be sampled exactly at
-            # inference and contracts to the clean native endpoint at t=1.
-            sigma_graph = g_graph * (1.0 - t_graph_f)
-        else:
-            sigma_graph = self.r3_matcher.sigma_t(t_graph_f, g_graph)
+        sigma_graph = self.r3_matcher.sigma_t(t_graph_f, g_graph)
 
         if noise_scope == "global":
             if self.deterministic_validation and not self.training:
@@ -3181,20 +2686,6 @@ class AbFlowModel(nn.Module):
                 ).to(target_X1.dtype),
                 "r3_noise_scope": target_X1.new_tensor(scope_code),
                 "r3_cfm_target": target_X1.new_tensor(1.0 if cfm_target else 0.0),
-
-                # Private training tensors for genuine score/path-flow losses.
-                # They are generated by this exact F01 path; no second noise tube.
-                "_r3_g_graph": g_graph.to(target_X1.dtype),
-                "_r3_sigma_graph": sigma_graph.to(target_X1.dtype),
-                "_r3_t_graph": t_graph_f.to(target_X1.dtype),
-                "_r3_source_centroid": src_centroid.to(target_X1.dtype),
-                "_r3_target_centroid": tgt_centroid.to(target_X1.dtype),
-                "_r3_fixed_source_noise": target_X1.new_tensor(
-                    1.0 if self.scorefm_loss_mode in {
-                        "fixedg_r3_canonical_score_flow",
-                        "fixedg_r3_flow_conditioned_score_flow",
-                    } else 0.0
-                ),
             }
 
     @torch.no_grad()
@@ -3823,279 +3314,6 @@ class AbFlowModel(nn.Module):
             "scorefm_gt_satc_aux_to_endpoint": aux_ratio.detach(),
         }
 
-    def _direct_flow_velocity(self, Xt, pred_carrier_X):
-        """Direct full-atom Flow field used by v68.
-
-        FoldFlow trains a vector field directly.  AbFlow's existing EGNN emits
-        a coordinate-like shadow output, so the minimal equivariant direct field
-        is the displacement from the CURRENT state:
-            v_theta = Y_theta - X_t.
-
-        No division by (1-t), and no clean-endpoint interpretation.
-        """
-        return pred_carrier_X - Xt
-
-    def _dualfield_scaled_score(
-            self, *, shared_H, paratope_mask, Xt, source_X0,
-            interface_batch_id):
-        """Predict a dimensionless E(3)-equivariant graph-level scaled score q.
-
-        q = sigma * score is dimensionless and has a well-conditioned target
-        q* = -(z_t-mu_t)/sigma.
-
-        Invariant hidden states produce scalar gates.  Gates multiply E(3)
-        vectors, so rotation/translation equivariance is preserved.
-        """
-        if shared_H is None or paratope_mask is None:
-            raise RuntimeError(
-                "dual-field score requires shared_H and paratope_mask."
-            )
-        if interface_batch_id.numel() == 0:
-            return Xt.new_zeros((1, 3))
-
-        n_graph = int(interface_batch_id.max().item()) + 1
-        ca_idx = 1 if Xt.shape[1] > 1 else 0
-
-        h_int = shared_H[paratope_mask]
-        if h_int.shape[0] != Xt.shape[0]:
-            raise RuntimeError(
-                "dual-field H3 hidden/coordinate size mismatch: "
-                f"{h_int.shape[0]} vs {Xt.shape[0]}."
-            )
-        gates = self.r3_dual_score_gate(h_int)  # [N_int, 4]
-
-        cur_ca = Xt[:, ca_idx]
-        src_ca = source_X0[:, ca_idx]
-        z0 = scatter_mean(
-            src_ca.float(), interface_batch_id,
-            dim=0, dim_size=n_graph
-        ).to(Xt.dtype)
-
-        b0 = cur_ca - z0[interface_batch_id]
-        b1 = src_ca - z0[interface_batch_id]
-
-        if Xt.shape[1] >= 3:
-            b2 = Xt[:, 0] - Xt[:, ca_idx]   # current N-CA
-            b3 = Xt[:, 2] - Xt[:, ca_idx]   # current C-CA
-        else:
-            b2 = torch.zeros_like(b0)
-            b3 = torch.zeros_like(b0)
-
-        bases = [b0, b1, b2, b3]
-        normalized = []
-        for basis in bases:
-            per_res_sq = basis.float().pow(2).mean(dim=-1)
-            rms_g = torch.sqrt(
-                scatter_mean(
-                    per_res_sq, interface_batch_id,
-                    dim=0, dim_size=n_graph
-                ).clamp_min(self.scorefm_eps)
-            ).to(Xt.dtype).clamp_min(1e-3)
-            normalized.append(
-                basis / rms_g[interface_batch_id, None]
-            )
-
-        q_res = (
-            gates[:, 0:1] * normalized[0]
-            + gates[:, 1:2] * normalized[1]
-            + gates[:, 2:3] * normalized[2]
-            + gates[:, 3:4] * normalized[3]
-        )
-        return scatter_mean(
-            q_res, interface_batch_id,
-            dim=0, dim_size=n_graph
-        )
-
-    def _dualfield_raw_score(
-            self, *, shared_H, paratope_mask, Xt, source_X0,
-            interface_batch_id):
-        """E(3)-equivariant RAW global-R3 score field for formal v71 F03.
-
-        The output transforms as a vector and has the semantics
-            s_phi(z_t,t,c) ~= grad_z log p_t(z_t|c)
-        in the actual non-degenerate H3 global-translation R3 subspace.
-
-        Hidden features only emit invariant scalar gates.  Those gates multiply
-        translation-invariant / rotation-equivariant geometric basis vectors.
-        A naive Linear(H)->R3 head is deliberately avoided.
-        """
-        if shared_H is None or paratope_mask is None:
-            raise RuntimeError("dual-field raw score requires shared_H/paratope_mask")
-        if interface_batch_id.numel() == 0:
-            return Xt.new_zeros((1, 3))
-
-        n_graph = int(interface_batch_id.max().item()) + 1
-        ca_idx = 1 if Xt.shape[1] > 1 else 0
-        h_int = shared_H[paratope_mask]
-        if h_int.shape[0] != Xt.shape[0]:
-            raise RuntimeError(
-                "dual-field H3 hidden/coordinate size mismatch: "
-                f"{h_int.shape[0]} vs {Xt.shape[0]}"
-            )
-        gates = self.r3_dual_score_gate(h_int)
-
-        cur_ca = Xt[:, ca_idx]
-        src_ca = source_X0[:, ca_idx]
-        z0 = scatter_mean(
-            src_ca.float(), interface_batch_id,
-            dim=0, dim_size=n_graph,
-        ).to(Xt.dtype)
-
-        # Four equivariant vectors.  They are normalized only by invariant RMS
-        # magnitudes; the learned scalar gate then carries the physical 1/Angstrom
-        # score scale.
-        b0 = cur_ca - z0[interface_batch_id]
-        b1 = src_ca - z0[interface_batch_id]
-        if Xt.shape[1] >= 3:
-            b2 = Xt[:, 0] - Xt[:, ca_idx]
-            b3 = Xt[:, 2] - Xt[:, ca_idx]
-        else:
-            b2 = torch.zeros_like(b0)
-            b3 = torch.zeros_like(b0)
-
-        normalized = []
-        for basis in (b0, b1, b2, b3):
-            per_res_sq = basis.float().pow(2).mean(dim=-1)
-            rms_g = torch.sqrt(
-                scatter_mean(
-                    per_res_sq, interface_batch_id,
-                    dim=0, dim_size=n_graph,
-                ).clamp_min(self.scorefm_eps)
-            ).to(Xt.dtype).clamp_min(1e-3)
-            normalized.append(basis / rms_g[interface_batch_id, None])
-
-        s_res = (
-            gates[:, 0:1] * normalized[0]
-            + gates[:, 1:2] * normalized[1]
-            + gates[:, 2:3] * normalized[2]
-            + gates[:, 3:4] * normalized[3]
-        )
-        return scatter_mean(
-            s_res, interface_batch_id,
-            dim=0, dim_size=n_graph,
-        )
-
-    def _fixedg_sigma_dot(self, t_graph, ref_tensor):
-        """Derivative of the v76 source-noise path sigma(t)=g*(1-t)."""
-        t = torch.as_tensor(
-            t_graph, device=ref_tensor.device, dtype=ref_tensor.dtype
-        )
-        return torch.full_like(t, -float(self.r3_fixed_g))
-
-    def _flow_conditioned_scaled_score(
-            self, *, shared_H, paratope_mask, Xt, source_X0,
-            pred_mean_v, t_graph, interface_batch_id):
-        """Predict q=sigma*score from the mean-Flow-implied residual.
-
-        The old correction head had to infer the unknown endpoint transport a
-        second time from shared hidden states.  Here the score readout receives
-        an explicit equivariant residual to the mean path implied by the Flow:
-
-            r_flow = z_t - (z_0 + t * mean_CA(m_theta)).
-
-        ``pred_mean_v`` is detached in this conditioning route.  This blocks a
-        direct high-gain score gradient through the coordinate carrier; the two
-        objectives still interact through shared_H, and the sampled field is
-        genuinely coupled through
-
-            u_theta = m_theta - sigma_dot(t) * q_theta.
-
-        The target q*=sigma*s*=-(z_t-mu_t)/sigma is dimensionless and O(1),
-        avoiding both raw-score 1/g scaling and the tiny-gradient velocity-
-        correction parameterization used by the historical F03.
-        """
-        if shared_H is None or paratope_mask is None:
-            raise RuntimeError(
-                "flow-conditioned score requires shared_H/paratope_mask."
-            )
-        if interface_batch_id.numel() == 0:
-            return Xt.new_zeros((1, 3))
-
-        n_graph = int(interface_batch_id.max().item()) + 1
-        ca_idx = 1 if Xt.shape[1] > 1 else 0
-        h_int = shared_H[paratope_mask]
-        if h_int.shape[0] != Xt.shape[0]:
-            raise RuntimeError(
-                "flow-conditioned H3 hidden/coordinate size mismatch: "
-                f"{h_int.shape[0]} vs {Xt.shape[0]}."
-            )
-        gates = self.r3_dual_score_gate(h_int)
-
-        cur_ca = Xt[:, ca_idx]
-        src_ca = source_X0[:, ca_idx]
-        zt = scatter_mean(
-            cur_ca.float(), interface_batch_id,
-            dim=0, dim_size=n_graph,
-        ).to(Xt.dtype)
-        z0 = scatter_mean(
-            src_ca.float(), interface_batch_id,
-            dim=0, dim_size=n_graph,
-        ).to(Xt.dtype)
-        mean_global = scatter_mean(
-            pred_mean_v[:, ca_idx].detach().float(), interface_batch_id,
-            dim=0, dim_size=n_graph,
-        ).to(Xt.dtype)
-        t_graph = torch.as_tensor(
-            t_graph, device=Xt.device, dtype=Xt.dtype
-        ).reshape(-1)
-        mu_flow = z0 + t_graph[:, None] * mean_global
-        flow_residual = zt - mu_flow
-
-        # The first basis supplies the theoretically relevant score direction.
-        # The remaining bases retain antigen-conditioned equivariant capacity
-        # for errors in the Flow-implied mean and nontrivial marginalization.
-        b0 = flow_residual[interface_batch_id]
-        b1 = cur_ca - z0[interface_batch_id]
-        if Xt.shape[1] >= 3:
-            b2 = Xt[:, 0] - Xt[:, ca_idx]
-            b3 = Xt[:, 2] - Xt[:, ca_idx]
-        else:
-            b2 = torch.zeros_like(b0)
-            b3 = torch.zeros_like(b0)
-
-        normalized = []
-        for basis in (b0, b1, b2, b3):
-            per_res_sq = basis.float().pow(2).mean(dim=-1)
-            rms_g = torch.sqrt(
-                scatter_mean(
-                    per_res_sq, interface_batch_id,
-                    dim=0, dim_size=n_graph,
-                ).clamp_min(self.scorefm_eps)
-            ).to(Xt.dtype).clamp_min(1e-3)
-            normalized.append(
-                basis / rms_g[interface_batch_id, None]
-            )
-
-        q_res = (
-            gates[:, 0:1] * normalized[0]
-            + gates[:, 1:2] * normalized[1]
-            + gates[:, 2:3] * normalized[2]
-            + gates[:, 3:4] * normalized[3]
-        )
-        return scatter_mean(
-            q_res, interface_batch_id,
-            dim=0, dim_size=n_graph,
-        )
-
-    def _dualfield_equivariant_global_r3_vector(
-            self, *, shared_H, paratope_mask, Xt, source_X0,
-            interface_batch_id):
-        """Generic E(3)-equivariant global-R3 vector readout.
-
-        This reuses the v71 scalar-gate x geometric-vector construction.
-        In v72 F03 its SEMANTICS are no longer a raw 1/Angstrom score.
-        Instead it predicts the score-induced probability-flow correction
-            c_phi ~= -sigma_t * sigma_dot_t * s_t,
-        which has velocity units and is added directly to the mean Flow.
-        """
-        return self._dualfield_raw_score(
-            shared_H=shared_H,
-            paratope_mask=paratope_mask,
-            Xt=Xt,
-            source_X0=source_X0,
-            interface_batch_id=interface_batch_id,
-        )
-
     def _coordinate_training_objective(
             self, *, Xt, X1, pred_clean_X, atom_mask,
             interface_batch_id, t, sigma_t, source_ca_mean,
@@ -4104,8 +3322,7 @@ class AbFlowModel(nn.Module):
             satc_residue_weight=None, satc_score_weight_eff=None,
             satc_velocity_weight_eff=None, satc_schedule_info=None,
             satc_transport_rms_graph=None, satc_gamma_graph=None,
-            structured_endpoint_target=None, structured_path_details=None,
-            shared_H=None, paratope_mask=None):
+            structured_endpoint_target=None, structured_path_details=None):
         """Coordinate objective for the shadow paratope.
 
         endpoint mode:
@@ -4124,7 +3341,7 @@ class AbFlowModel(nn.Module):
         if (
             self.scorefm_loss_mode in {
                 "structured_global_cfm", "structured_multiscale_cfm",
-                "foldflow_r3_global_cfm", "foldflow_r3_residue_cfm",
+                "foldflow_r3_residue_cfm",
             }
             and structured_endpoint_target is not None
         ):
@@ -4182,1135 +3399,11 @@ class AbFlowModel(nn.Module):
         self._last_satc_objective_tensor = endpoint_loss * 0.0
 
         if self.scorefm_loss_mode in {
-            "sf2m_r3_flow",
-            "sf2m_r3_analytic",
-            "sf2m_r3_dualfield",
-            "sf2m_r3_mean_flow_control",
-            "sf2m_r3_decomposed_score_flow",
-            "clean_r3_mean_flow",
-            "fixedg_r3_canonical_score_flow",
-            "fixedg_r3_flow_conditioned_score_flow",
-        }:
-            # ============================================================
-            # v71: source-audited task-adapted conditional SF²M on AbFlow's ACTUAL F01 path.
-            #
-            # Path:
-            #   z_t = (1-t)z0 + t z1 + g_graph sqrt(t(1-t)) epsilon.
-            #
-            # Exact CONDITIONAL probability-flow target:
-            #   u^o = (z1-z0) + k(t)(z_t-mu_t)
-            #   k(t) = (1-2t) / [2 t(1-t)].
-            #
-            # The 1/2 is not optional. It follows from differentiating the
-            # Gaussian standard deviation and agrees with the uploaded
-            # SBCFMLitModule implementation. A doubled coefficient does not
-            # reproduce the chosen Gaussian marginal covariance.
-            #
-            # Endpoint coordinate regression has exactly zero training weight.
-            # ============================================================
-            if source_X0 is None:
-                raise RuntimeError(
-                    f"{self.scorefm_loss_mode} requires fixed PCS-RC source X0."
-                )
-
-            _spd = structured_path_details or {}
-            required = [
-                "_r3_g_graph", "_r3_sigma_graph", "_r3_t_graph",
-                "_r3_source_centroid", "_r3_target_centroid",
-            ]
-            if not all(k in _spd for k in required):
-                raise RuntimeError(
-                    f"{self.scorefm_loss_mode} requires exact F01 global-R3 path tensors."
-                )
-
-            g_graph = _spd["_r3_g_graph"].to(pred_clean_X.dtype)
-            sigma_graph = _spd["_r3_sigma_graph"].to(pred_clean_X.dtype)
-            t_graph = _spd["_r3_t_graph"].to(pred_clean_X.dtype)
-            z0 = _spd["_r3_source_centroid"].to(pred_clean_X.dtype)
-            z1 = _spd["_r3_target_centroid"].to(pred_clean_X.dtype)
-            n_graph = int(z0.shape[0])
-            ca_idx = 1 if pred_clean_X.shape[1] > 1 else 0
-
-            zt = scatter_mean(
-                Xt[:, ca_idx].float(), interface_batch_id,
-                dim=0, dim_size=n_graph,
-            ).to(pred_clean_X.dtype)
-            mu_true = (1.0-t_graph[:,None])*z0 + t_graph[:,None]*z1
-
-            # Existing equivariant coordinate output is ONLY a vector-field
-            # carrier: v_theta = Y_theta-X_t. No endpoint semantics remain.
-            pred_v = self._direct_flow_velocity(Xt, pred_clean_X)
-
-            clean_v = self.r3_matcher.clean_conditional_velocity(
-                source_X0, X1
-            ).to(pred_v.dtype)
-            clean_global_v = z1-z0
-            if self.scorefm_loss_mode in {
-                "fixedg_r3_canonical_score_flow",
-                "fixedg_r3_flow_conditioned_score_flow",
-            }:
-                # For sigma(t)=g(1-t), q*=sigma*s*=-eps and
-                # u*=mean-sigma_dot*q*=mean-g*eps.
-                sigma_safe_v76 = sigma_graph.clamp_min(
-                    float(self.scorefm_eps)
-                )
-                eps_true_v76 = (
-                    zt - mu_true
-                ) / sigma_safe_v76[:, None]
-                true_global_v = (
-                    clean_global_v
-                    - float(self.r3_fixed_g) * eps_true_v76
-                )
-            else:
-                true_global_v = self.r3_matcher.sf2m_global_probability_flow(
-                    z_t=zt, z0=z0, z1=z1,
-                    t_graph=t_graph, t_eps=self.sf2m_t_eps,
-                )
-            stochastic_global_correction = true_global_v-clean_global_v
-            true_v = clean_v + stochastic_global_correction[
-                interface_batch_id, None, :
-            ]
-
-            # ============================================================
-            # v76 F06: explicit, normalized Score--Flow factorization.
-            #
-            #   q* = sigma*s* = -(z_t-mu_t)/sigma             (O(1))
-            #   u_theta = m_theta - sigma_dot(t)*q_theta
-            #
-            # F05 below learns the same fixed source-noise canonical u* in one
-            # coordinate carrier. F06 changes only the parameterization:
-            # clean mean Flow plus a standardized score field conditioned on
-            # the Flow-implied residual. No endpoint loss or terminal projection
-            # is introduced.
-            # ============================================================
-            if (
-                self.scorefm_loss_mode
-                == "fixedg_r3_flow_conditioned_score_flow"
-            ):
-                coord_scale = float(self.r3_flow_coordinate_scaling)
-                pred_mean_v = pred_v
-                mean_diff = coord_scale * (pred_mean_v - clean_v)
-                mean_per_graph, mean_valid = (
-                    self._masked_residue_mse_per_graph(
-                        mean_diff, atom_mask, interface_batch_id
-                    )
-                )
-
-                # q is standardized noise, not a raw score denominator.  It
-                # remains O(1) near t=1, so only a machine-epsilon floor is
-                # appropriate here.
-                sigma_safe = sigma_graph.clamp_min(
-                    float(self.scorefm_eps)
-                )
-                q_true = -(zt - mu_true) / sigma_safe[:, None]
-                q_pred = self._flow_conditioned_scaled_score(
-                    shared_H=shared_H,
-                    paratope_mask=paratope_mask,
-                    Xt=Xt,
-                    source_X0=source_X0,
-                    pred_mean_v=pred_mean_v,
-                    t_graph=t_graph,
-                    interface_batch_id=interface_batch_id,
-                )
-                score_valid = (
-                    mean_valid
-                    & torch.isfinite(q_true).all(dim=-1)
-                    & torch.isfinite(q_pred).all(dim=-1)
-                )
-                score_per_graph = (q_pred - q_true.detach()).square().mean(
-                    dim=-1
-                )
-
-                # Both targets are standardized: mean velocity uses FoldFlow's
-                # 0.1 coordinate unit and q is dimensionless with unit Gaussian
-                # target. Equal averaging keeps the total objective scale stable.
-                combined = mean_per_graph.clone()
-                combined[score_valid] = 0.5 * (
-                    mean_per_graph[score_valid]
-                    + score_per_graph[score_valid]
-                )
-                total = (
-                    combined[mean_valid].mean()
-                    if bool(mean_valid.any())
-                    else pred_clean_X.new_tensor(0.0)
-                )
-                mean_flow_loss = (
-                    mean_per_graph[mean_valid].mean()
-                    if bool(mean_valid.any())
-                    else total * 0.0
-                )
-                score_loss = (
-                    score_per_graph[score_valid].mean()
-                    if bool(score_valid.any())
-                    else total * 0.0
-                )
-
-                self._last_endpoint_objective_tensor = mean_flow_loss
-                self._last_satc_objective_tensor = score_loss
-
-                sigma_dot = self._fixedg_sigma_dot(
-                    t_graph, pred_clean_X
-                )
-                correction_pred = -sigma_dot[:, None] * q_pred
-                correction_true = -sigma_dot[:, None] * q_true
-
-                with torch.no_grad():
-                    pred_mean_global = scatter_mean(
-                        pred_mean_v[:, ca_idx].float(),
-                        interface_batch_id, dim=0, dim_size=n_graph,
-                    ).to(pred_clean_X.dtype)
-
-                    def _cosine(pred, target, valid):
-                        if not bool(valid.any()):
-                            return total.detach() * 0.0
-                        p = pred[valid]
-                        y = target[valid]
-                        return (
-                            (p * y).sum(dim=-1)
-                            / (
-                                torch.linalg.norm(p, dim=-1)
-                                * torch.linalg.norm(y, dim=-1)
-                                + self.scorefm_eps
-                            )
-                        ).mean()
-
-                    mean_cos = _cosine(
-                        pred_mean_global, clean_global_v, mean_valid
-                    )
-                    q_cos = _cosine(q_pred, q_true, score_valid)
-                    corr_cos = _cosine(
-                        correction_pred, correction_true, score_valid
-                    )
-                    score_to_flow = score_loss.detach() / (
-                        mean_flow_loss.detach().abs() + self.scorefm_eps
-                    )
-                    true_corr_to_mean = torch.sqrt(
-                        correction_true[score_valid].pow(2).mean()
-                        / (
-                            clean_global_v[score_valid].pow(2).mean()
-                            + self.scorefm_eps
-                        )
-                    ) if bool(score_valid.any()) else total.detach() * 0.0
-
-                details = {
-                    "scorefm_total": total.detach(),
-                    "scorefm_endpoint": endpoint_loss.detach(),
-                    "scorefm_endpoint_train_weight":
-                        total.detach().new_tensor(0.0),
-                    "scorefm_sf2m_flow": mean_flow_loss.detach(),
-                    "scorefm_sf2m_score": score_loss.detach(),
-                    "scorefm_sf2m_score_weight":
-                        total.detach().new_tensor(0.5),
-                    "scorefm_sf2m_score_to_flow": score_to_flow.detach(),
-                    "scorefm_sf2m_mean_flow_cos": mean_cos.detach(),
-                    "scorefm_sf2m_scaled_score_cos": q_cos.detach(),
-                    "scorefm_sf2m_correction_cos": corr_cos.detach(),
-                    "scorefm_sf2m_true_correction_to_mean_rms":
-                        true_corr_to_mean.detach(),
-                    "scorefm_sf2m_fixed_g":
-                        total.detach().new_tensor(float(self.r3_fixed_g)),
-                    "scorefm_sf2m_parameterization_is_scaled_score":
-                        total.detach().new_tensor(1.0),
-                    "scorefm_sf2m_flow_condition_detached":
-                        total.detach().new_tensor(1.0),
-                    "scorefm_sf2m_score_valid_rate":
-                        score_valid.float().mean().detach(),
-                    "scorefm_sf2m_t_min": t_graph.min().detach(),
-                    "scorefm_sf2m_t_max": t_graph.max().detach(),
-                    "scorefm_flow_coordinate_scaling":
-                        total.detach().new_tensor(coord_scale),
-                    "scorefm_clean_endpoint": clean_endpoint_loss.detach(),
-                    "scorefm_dsm": score_loss.detach(),
-                    "scorefm_dsm_rate": score_valid.float().mean().detach(),
-                    "scorefm_velocity": mean_flow_loss.detach(),
-                    "scorefm_velocity_rate": mean_valid.float().mean().detach(),
-                    "scorefm_traj_consistency": zero,
-                    "scorefm_traj_velocity": zero,
-                    "scorefm_traj_rate": zero,
-                }
-                details.update(tbin_details)
-                return total, details
-
-            # ============================================================
-            # v72 replacement controls:
-            #
-            # F02 MEAN_FLOW_CONTROL
-            #   same stochastic X_t, but train only mu_dot = X1-X0.
-            #
-            # F03 DECOMPOSED_SCORE_FLOW
-            #   exact factorization:
-            #       u^o = mu_dot - sigma*sigma_dot*s
-            #           = mean_flow + score_flow_correction.
-            #
-            # Both terms live in VELOCITY units.  This removes the pathological
-            # raw-score scale (roughly 1/g) and the tied-route 1/g^4 error
-            # amplification without introducing an arbitrary score weight.
-            # ============================================================
-            if self.scorefm_loss_mode in {
-                "sf2m_r3_mean_flow_control",
-                "sf2m_r3_decomposed_score_flow",
-                "clean_r3_mean_flow",
-                "clean_r3_factorized_mean_flow",
-                "clean_r3_factorized_ptc_mean_flow",
-                "clean_r3_dualspace_mean_flow",
-            }:
-                coord_scale = float(self.r3_flow_coordinate_scaling)
-
-                # Existing coordinate carrier predicts the CLEAN/MEAN transport.
-                pred_mean_v = pred_v
-                pred_effective_v = pred_mean_v
-                factorized_global_loss = pred_mean_v.new_tensor(0.0)
-                factorized_local_loss = pred_mean_v.new_tensor(0.0)
-                if self.scorefm_loss_mode == "clean_r3_dualspace_mean_flow":
-                    global_pred = self._dualfield_equivariant_global_r3_vector(
-                        shared_H=shared_H,
-                        paratope_mask=paratope_mask,
-                        Xt=Xt,
-                        source_X0=source_X0,
-                        interface_batch_id=interface_batch_id,
-                    )
-                    (
-                        mean_per_graph,
-                        global_per_graph,
-                        local_per_graph,
-                        mean_valid,
-                        pred_effective_v,
-                    ) = self._dualspace_mean_velocity_mse_per_graph(
-                        coord_scale * pred_mean_v,
-                        coord_scale * global_pred,
-                        coord_scale * clean_v,
-                        atom_mask,
-                        interface_batch_id,
-                    )
-                    if bool(mean_valid.any()):
-                        factorized_global_loss = global_per_graph[
-                            mean_valid
-                        ].mean()
-                        factorized_local_loss = local_per_graph[
-                            mean_valid
-                        ].mean()
-                elif self.scorefm_loss_mode in {
-                    "clean_r3_factorized_mean_flow",
-                    "clean_r3_factorized_ptc_mean_flow",
-                }:
-                    (
-                        mean_per_graph,
-                        global_per_graph,
-                        local_per_graph,
-                        mean_valid,
-                    ) = self._factorized_mean_velocity_mse_per_graph(
-                        coord_scale * pred_mean_v,
-                        coord_scale * clean_v,
-                        atom_mask,
-                        interface_batch_id,
-                    )
-                    if bool(mean_valid.any()):
-                        factorized_global_loss = global_per_graph[
-                            mean_valid
-                        ].mean()
-                        factorized_local_loss = local_per_graph[
-                            mean_valid
-                        ].mean()
-                else:
-                    mean_diff = coord_scale * (pred_mean_v - clean_v)
-                    mean_per_graph, mean_valid = (
-                        self._masked_residue_mse_per_graph(
-                            mean_diff, atom_mask, interface_batch_id
-                        )
-                    )
-                mean_flow_loss = (
-                    mean_per_graph[mean_valid].mean()
-                    if bool(mean_valid.any())
-                    else pred_clean_X.new_tensor(0.0)
-                )
-
-                # Historical F02 kept the independent score head in the DDP
-                # graph for parameter-count matching. The new clean mean-flow
-                # modes freeze that absent module instead of creating a dummy
-                # zero-gradient dependency.
-                if (
-                    self.scorefm_loss_mode in self.clean_meanflow_modes
-                    or self.scorefm_loss_mode
-                    == "clean_r3_dualspace_mean_flow"
-                ):
-                    dummy_score_head = mean_flow_loss * 0.0
-                else:
-                    dummy_score_head = sum(
-                        p.sum() for p in self.r3_dual_score_gate.parameters()
-                    ) * 0.0
-
-                correction_true = self.r3_matcher.sf2m_scoreflow_correction(
-                    z_t=zt, z0=z0, z1=z1,
-                    t_graph=t_graph, t_eps=self.sf2m_t_eps,
-                ).to(pred_clean_X.dtype)
-
-                correction_pred = torch.zeros_like(correction_true)
-                correction_loss = mean_flow_loss * 0.0
-
-                if self.scorefm_loss_mode == "sf2m_r3_decomposed_score_flow":
-                    correction_pred = self._dualfield_equivariant_global_r3_vector(
-                        shared_H=shared_H,
-                        paratope_mask=paratope_mask,
-                        Xt=Xt,
-                        source_X0=source_X0,
-                        interface_batch_id=interface_batch_id,
-                    )
-                    corr_diff = coord_scale * (
-                        correction_pred - correction_true
-                    )
-                    correction_loss = corr_diff.square().mean()
-
-                    # No heuristic lambda: the two losses have identical
-                    # physical units and identical coordinate scaling.
-                    total = mean_flow_loss + correction_loss
-                else:
-                    total = mean_flow_loss + dummy_score_head
-
-                # Formal endpoint loss remains zero.
-                self._last_endpoint_objective_tensor = mean_flow_loss
-                self._last_satc_objective_tensor = (
-                    correction_loss
-                    if self.scorefm_loss_mode == "sf2m_r3_decomposed_score_flow"
-                    else mean_flow_loss * 0.0
-                )
-
-                with torch.no_grad():
-                    pred_mean_global = scatter_mean(
-                        pred_effective_v[:, ca_idx].float(),
-                        interface_batch_id, dim=0, dim_size=n_graph
-                    ).to(pred_clean_X.dtype)
-
-                    mean_cos = mean_flow_loss.detach() * 0.0
-                    pv = pred_mean_global[mean_valid]
-                    tv = clean_global_v[mean_valid]
-                    if pv.numel() > 0:
-                        mean_cos = (
-                            (pv * tv).sum(dim=-1)
-                            / (
-                                torch.linalg.norm(pv, dim=-1)
-                                * torch.linalg.norm(tv, dim=-1)
-                                + self.scorefm_eps
-                            )
-                        ).mean()
-
-                    corr_cos = mean_flow_loss.detach() * 0.0
-                    if self.scorefm_loss_mode == "sf2m_r3_decomposed_score_flow":
-                        cp = correction_pred[mean_valid]
-                        ct = correction_true[mean_valid]
-                        if cp.numel() > 0:
-                            corr_cos = (
-                                (cp * ct).sum(dim=-1)
-                                / (
-                                    torch.linalg.norm(cp, dim=-1)
-                                    * torch.linalg.norm(ct, dim=-1)
-                                    + self.scorefm_eps
-                                )
-                            ).mean()
-
-                    corr_to_mean = correction_loss.detach() / (
-                        mean_flow_loss.detach().abs() + self.scorefm_eps
-                    )
-                    true_corr_to_mean = torch.sqrt(
-                        correction_true.pow(2).mean()
-                        / (
-                            clean_global_v.pow(2).mean()
-                            + self.scorefm_eps
-                        )
-                    )
-
-                details = {
-                    "scorefm_total": total.detach(),
-                    "scorefm_endpoint": endpoint_loss.detach(),
-                    "scorefm_endpoint_train_weight":
-                        total.detach().new_tensor(0.0),
-
-                    "scorefm_sf2m_flow": mean_flow_loss.detach(),
-                    "scorefm_sf2m_score": correction_loss.detach(),
-                    "scorefm_sf2m_score_weight":
-                        total.detach().new_tensor(1.0),
-                    "scorefm_sf2m_score_to_flow": corr_to_mean.detach(),
-
-                    "scorefm_sf2m_mean_flow_cos": mean_cos.detach(),
-                    "scorefm_sf2m_correction_cos": corr_cos.detach(),
-                    "scorefm_sf2m_true_correction_to_mean_rms":
-                        true_corr_to_mean.detach(),
-
-                    "scorefm_sf2m_parameterization_is_raw_score":
-                        total.detach().new_tensor(0.0),
-                    "scorefm_sf2m_parameterization_is_score_flow_correction":
-                        total.detach().new_tensor(
-                            1.0 if self.scorefm_loss_mode
-                            == "sf2m_r3_decomposed_score_flow" else 0.0
-                        ),
-                    "scorefm_sf2m_tied_route_enabled":
-                        total.detach().new_tensor(0.0),
-
-                    # Backward-compatible diagnostic names.
-                    "scorefm_sf2m_flow_cos": mean_cos.detach(),
-                    "scorefm_sf2m_score_cos": corr_cos.detach(),
-                    "scorefm_sf2m_score_valid_rate":
-                        mean_valid.float().mean().detach(),
-                    "scorefm_sf2m_stochastic_to_clean_rms":
-                        true_corr_to_mean.detach(),
-                    "scorefm_sf2m_t_min": t_graph.min().detach(),
-                    "scorefm_sf2m_t_max": t_graph.max().detach(),
-                    "scorefm_flow_coordinate_scaling":
-                        total.detach().new_tensor(coord_scale),
-                    "scorefm_clean_endpoint": clean_endpoint_loss.detach(),
-                    "scorefm_dsm": correction_loss.detach(),
-                    "scorefm_dsm_rate": mean_valid.float().mean().detach(),
-                    "scorefm_velocity": mean_flow_loss.detach(),
-                    "scorefm_velocity_rate": mean_valid.float().mean().detach(),
-                    "scorefm_meanflow_global": factorized_global_loss.detach(),
-                    "scorefm_meanflow_local": factorized_local_loss.detach(),
-                    "scorefm_meanflow_factorized": total.detach().new_tensor(
-                        1.0 if self.scorefm_loss_mode in {
-                            "clean_r3_factorized_mean_flow",
-                            "clean_r3_factorized_ptc_mean_flow",
-                            "clean_r3_dualspace_mean_flow",
-                        } else 0.0
-                    ),
-                    "scorefm_meanflow_dualspace": total.detach().new_tensor(
-                        1.0 if self.scorefm_loss_mode
-                        == "clean_r3_dualspace_mean_flow" else 0.0
-                    ),
-                    "scorefm_meanflow_paired_time": total.detach().new_tensor(
-                        1.0 if self.scorefm_loss_mode
-                        == "clean_r3_factorized_ptc_mean_flow" else 0.0
-                    ),
-                    "scorefm_traj_consistency": zero,
-                    "scorefm_traj_velocity": zero,
-                    "scorefm_traj_rate": zero,
-                }
-                details.update(tbin_details)
-                return total, details
-
-            # Keep the fixed FoldFlow R3 coordinate-unit convention in every
-            # formal v71 configuration so F01/F02/F03 are directly comparable.
-            coord_scale = float(self.r3_flow_coordinate_scaling)
-            flow_diff = coord_scale*(pred_v-true_v)
-            flow_per_graph, flow_valid = self._masked_residue_mse_per_graph(
-                flow_diff, atom_mask, interface_batch_id
-            )
-            direct_flow_loss = (
-                flow_per_graph[flow_valid].mean()
-                if bool(flow_valid.any())
-                else pred_clean_X.new_tensor(0.0)
-            )
-
-            # Formal endpoint-free coordinate objective.
-            self._last_endpoint_objective_tensor = endpoint_loss*0.0
-            self._last_satc_objective_tensor = direct_flow_loss
-
-            # ------------------------------------------------------------
-            # Score matching: RAW score + TIME-ONLY lambda(t).
-            # ------------------------------------------------------------
-            # Conditional Gaussian score in the only non-degenerate stochastic
-            # subspace (global H3 translation R3):
-            #   s* = -(z_t-mu_t)/sigma_t^2.
-            #
-            # Critical v70 correction:
-            # sigma_t contains pair-dependent g_graph.  Regressing q=sigma*s
-            # with unweighted MSE would implicitly weight score errors by
-            # g_graph^2 and therefore would not be the standard conditional
-            # score-matching objective for the marginal score.  We instead use
-            # lambda(t)=2 sqrt(t(1-t)), which depends ONLY on time.
-            sigma_safe = sigma_graph.clamp_min(float(self.r3_score_min_sigma))
-            score_floor = sigma_graph < float(self.r3_score_min_sigma)
-            s_true = -(
-                zt-mu_true
-            ) / sigma_safe[:,None].square()
-
-            score_lambda = self.r3_matcher.sf2m_time_only_score_weight(
-                t_graph, t_eps=self.sf2m_t_eps
-            ).to(pred_clean_X.dtype)
-            score_valid = (
-                flow_valid
-                & torch.isfinite(sigma_graph)
-                & torch.isfinite(s_true).all(dim=-1)
-            )
-
-            pred_global_v = scatter_mean(
-                pred_v[:, ca_idx].float(), interface_batch_id,
-                dim=0, dim_size=n_graph,
-            ).to(pred_clean_X.dtype)
-
-            s_pred = torch.zeros_like(s_true)
-            score_loss = direct_flow_loss*0.0
-            score_per_graph = flow_per_graph*0.0
-
-            if self.scorefm_loss_mode == "sf2m_r3_analytic":
-                # Route A: TIED / SINGLE-FIELD CONSISTENCY CONTROL.
-                # --------------------------------------------------------
-                # This is OUR control, not the formal SF²M score estimator.
-                # If every latent pair shared the same Gaussian width, the
-                # marginal probability-flow field would algebraically recover
-                # E[d|z_t,c], and the tied Gaussian score would equal the
-                # marginal score.  F01 instead uses a pair-adaptive g_graph,
-                # so flow alone does not identify the inverse-variance-weighted
-                # posterior moments required by the exact marginal score.
-                # Therefore this branch tests useful density-consistency only;
-                # it must NOT be reported as a theorem-backed SF²M marginal
-                # score field.
-                # --------------------------------------------------------
-                # Recover a mean displacement from the learned probability
-                # flow, then construct the corresponding tied component score.
-                # No extra score representational capacity is added.
-                d_hat = self.r3_matcher.sf2m_recover_mean_displacement(
-                    z_t=zt, z0=z0,
-                    probability_flow=pred_global_v,
-                    t_graph=t_graph, t_eps=self.sf2m_t_eps,
-                )
-                mu_hat = z0 + t_graph[:,None]*d_hat
-                s_pred = -(
-                    zt-mu_hat
-                ) / sigma_safe[:,None].square()
-
-            elif self.scorefm_loss_mode == "sf2m_r3_dualfield":
-                # Route B: distinct score field, shared AbFlow representation.
-                # The head is E(3)-equivariant by construction and predicts the
-                # raw marginal-score regression target in global H3 R3.
-                s_pred = self._dualfield_raw_score(
-                    shared_H=shared_H,
-                    paratope_mask=paratope_mask,
-                    Xt=Xt,
-                    source_X0=source_X0,
-                    interface_batch_id=interface_batch_id,
-                )
-
-            # Matched parameter counts / DDP graph for F01/F02.
-            dummy_score_head = sum(
-                p.sum() for p in self.r3_dual_score_gate.parameters()
-            )*0.0
-
-            if self.scorefm_loss_mode in {
-                "sf2m_r3_analytic", "sf2m_r3_dualfield"
-            }:
-                weighted_residual = score_lambda[:,None]*(s_pred-s_true)
-                score_per_graph = weighted_residual.square().mean(dim=-1)
-                if bool(score_valid.any()):
-                    score_loss = score_per_graph[score_valid].mean()
-                # Match the source objective structure:
-                # L = L_flow + score_weight * lambda(t)^2 L_score.
-                total = direct_flow_loss + float(self.sf2m_score_weight)*score_loss
-                if self.scorefm_loss_mode == "sf2m_r3_analytic":
-                    total = total + dummy_score_head
-            else:
-                total = direct_flow_loss + dummy_score_head
-
-            # ------------------------------------------------------------
-            # Observational gradient-geometry audit.
-            # The historical diagnostic slots are reused ONLY as labels:
-            #   endpoint slot -> direct probability-flow objective
-            #   satc slot     -> score objective
-            # This does not change total loss. It lets the existing AMP/DDP-safe
-            # probe report whether the shared representation sees aligned or
-            # conflicting Flow/Score gradients before an expensive long run.
-            self._last_endpoint_objective_tensor = direct_flow_loss
-            if self.scorefm_loss_mode in {
-                "sf2m_r3_analytic", "sf2m_r3_dualfield"
-            }:
-                self._last_satc_objective_tensor = (
-                    float(self.sf2m_score_weight) * score_loss
-                )
-            else:
-                self._last_satc_objective_tensor = direct_flow_loss * 0.0
-
-            with torch.no_grad():
-                pv = pred_global_v[flow_valid]
-                tv = true_global_v[flow_valid]
-                flow_cos = direct_flow_loss.detach()*0.0
-                if pv.numel() > 0:
-                    flow_cos = (
-                        (pv*tv).sum(dim=-1)
-                        / (
-                            torch.linalg.norm(pv, dim=-1)
-                            * torch.linalg.norm(tv, dim=-1)
-                            + self.scorefm_eps
-                        )
-                    ).mean()
-
-                score_cos = direct_flow_loss.detach()*0.0
-                raw_score_rms = direct_flow_loss.detach()*0.0
-                weighted_score_rms = direct_flow_loss.detach()*0.0
-                if (
-                    self.scorefm_loss_mode != "sf2m_r3_flow"
-                    and bool(score_valid.any())
-                ):
-                    sp = s_pred[score_valid]
-                    st = s_true[score_valid]
-                    score_cos = (
-                        (sp*st).sum(dim=-1)
-                        / (
-                            torch.linalg.norm(sp, dim=-1)
-                            * torch.linalg.norm(st, dim=-1)
-                            + self.scorefm_eps
-                        )
-                    ).mean()
-                    raw_score_rms = torch.sqrt(
-                        (sp-st).pow(2).mean().clamp_min(0.0)
-                    )
-                    weighted_score_rms = torch.sqrt(
-                        score_per_graph[score_valid].mean().clamp_min(0.0)
-                    )
-
-                stochastic_ratio = torch.sqrt(
-                    stochastic_global_correction.pow(2).mean()
-                    / (clean_global_v.pow(2).mean()+self.scorefm_eps)
-                )
-                score_to_flow = score_loss.detach() / (
-                    direct_flow_loss.detach().abs()+self.scorefm_eps
-                )
-
-            details = {
-                "scorefm_total": total.detach(),
-                "scorefm_endpoint": endpoint_loss.detach(),
-                "scorefm_endpoint_train_weight": total.detach().new_tensor(0.0),
-                "scorefm_sf2m_flow": direct_flow_loss.detach(),
-                "scorefm_sf2m_score": score_loss.detach(),
-                "scorefm_sf2m_score_weight": total.detach().new_tensor(
-                    float(self.sf2m_score_weight)
-                ),
-                "scorefm_sf2m_score_to_flow": score_to_flow.detach(),
-                "scorefm_sf2m_tied_is_exact_marginal": total.detach().new_tensor(
-                    0.0 if self.scorefm_loss_mode == "sf2m_r3_analytic" else 1.0
-                ),
-                "scorefm_sf2m_grad_probe_endpoint_slot_is_flow": total.detach().new_tensor(1.0),
-                "scorefm_sf2m_grad_probe_satc_slot_is_score": total.detach().new_tensor(
-                    1.0 if self.scorefm_loss_mode != "sf2m_r3_flow" else 0.0
-                ),
-                "scorefm_sf2m_flow_cos": flow_cos.detach(),
-                "scorefm_sf2m_score_cos": score_cos.detach(),
-                "scorefm_sf2m_raw_score_error_rms": raw_score_rms.detach(),
-                "scorefm_sf2m_weighted_score_error_rms": weighted_score_rms.detach(),
-                "scorefm_sf2m_score_valid_rate": score_valid.float().mean().detach(),
-                "scorefm_sf2m_score_sigma_floor_rate": score_floor.float().mean().detach(),
-                "scorefm_sf2m_lambda_mean": score_lambda.mean().detach(),
-                "scorefm_sf2m_stochastic_to_clean_rms": stochastic_ratio.detach(),
-                "scorefm_sf2m_t_min": t_graph.min().detach(),
-                "scorefm_sf2m_t_max": t_graph.max().detach(),
-                "scorefm_flow_coordinate_scaling": total.detach().new_tensor(coord_scale),
-                "scorefm_clean_endpoint": clean_endpoint_loss.detach(),
-                "scorefm_dsm": score_loss.detach(),
-                "scorefm_dsm_rate": score_valid.float().mean().detach(),
-                "scorefm_velocity": direct_flow_loss.detach(),
-                "scorefm_velocity_rate": flow_valid.float().mean().detach(),
-                "scorefm_traj_consistency": zero,
-                "scorefm_traj_velocity": zero,
-                "scorefm_traj_rate": zero,
-            }
-            details.update(tbin_details)
-            return total, details
-
-        if self.scorefm_loss_mode in {
-            "foldflow_r3_direct_flow",
-            "foldflow_r3_analytic_score_flow",
-            "foldflow_r3_dualfield_score_flow",
-        }:
-            # ============================================================
-            # v68: endpoint-free direct Flow + two Score-Flow couplings
-            # ============================================================
-            # FoldFlow translation code trains:
-            #   MSE(pred_trans_v_t, gt_trans_u_t)
-            # directly in vector-field space, with R3 vectorfield_scaling=1.
-            #
-            # Here:
-            #   v_theta = pred_carrier_X - X_t
-            #   u*      = X1 - X0
-            #
-            # The historical unique shadow endpoint loss is DIAGNOSTIC ONLY
-            # and contributes exactly zero to this branch.
-            if source_X0 is None:
-                raise RuntimeError(
-                    f"{self.scorefm_loss_mode} requires fixed PCS-RC source X0."
-                )
-
-            _spd = structured_path_details or {}
-            required = [
-                "_r3_g_graph", "_r3_sigma_graph", "_r3_t_graph",
-                "_r3_source_centroid", "_r3_target_centroid",
-            ]
-            if not all(k in _spd for k in required):
-                raise RuntimeError(
-                    f"{self.scorefm_loss_mode} requires the exact F01 "
-                    "global-R3 primary-path details."
-                )
-
-            g_graph = _spd["_r3_g_graph"].to(pred_clean_X.dtype)
-            sigma_graph = _spd["_r3_sigma_graph"].to(pred_clean_X.dtype)
-            t_graph = _spd["_r3_t_graph"].to(pred_clean_X.dtype)
-            z0 = _spd["_r3_source_centroid"].to(pred_clean_X.dtype)
-            z1 = _spd["_r3_target_centroid"].to(pred_clean_X.dtype)
-            n_graph = int(z0.shape[0])
-            ca_idx = 1 if pred_clean_X.shape[1] > 1 else 0
-
-            pred_v = self._direct_flow_velocity(Xt, pred_clean_X)
-            true_v = self.r3_matcher.clean_conditional_velocity(
-                source_X0, X1
-            ).to(pred_v.dtype)
-
-            # Match FoldFlow's R3 coordinate unit (0.1) and its
-            # vectorfield_scaling(t)=1.  This is a coordinate re-scaling,
-            # NOT a tuned auxiliary weight.
-            coord_scale = float(self.r3_flow_coordinate_scaling)
-            flow_diff = coord_scale * (pred_v - true_v)
-            flow_per_graph, flow_valid = self._masked_residue_mse_per_graph(
-                flow_diff, atom_mask, interface_batch_id
-            )
-            if bool(flow_valid.any()):
-                direct_flow_loss = flow_per_graph[flow_valid].mean()
-            else:
-                direct_flow_loss = pred_clean_X.new_tensor(0.0)
-
-            # Endpoint loss remains visible only as a diagnostic.
-            self._last_endpoint_objective_tensor = endpoint_loss * 0.0
-            self._last_satc_objective_tensor = direct_flow_loss
-
-            # Keep the score head "used" for DDP in the matched F01/F02
-            # configs, without changing their forward value or gradients.
-            dummy_score_head = sum(
-                p.sum() for p in self.r3_dual_score_gate.parameters()
-            ) * 0.0
-
-            score_loss = direct_flow_loss * 0.0
-            score_per_graph = flow_per_graph * 0.0
-            active = (
-                flow_valid
-                & (t_graph >= float(self.scorefm_dsm_t_min))
-                & (t_graph <= float(self.scorefm_dsm_t_max))
-                & (sigma_graph >= float(self.r3_score_min_sigma))
-            )
-
-            zt = scatter_mean(
-                Xt[:, ca_idx].float(), interface_batch_id,
-                dim=0, dim_size=n_graph
-            ).to(pred_clean_X.dtype)
-            pred_d = scatter_mean(
-                pred_v[:, ca_idx].float(), interface_batch_id,
-                dim=0, dim_size=n_graph
-            ).to(pred_clean_X.dtype)
-
-            # True dimensionless scaled score:
-            #   q* = sigma*s* = -(z_t-mu_true)/sigma.
-            mu_true = (
-                (1.0 - t_graph[:, None]) * z0
-                + t_graph[:, None] * z1
-            )
-            sigma_true_safe = sigma_graph.clamp_min(
-                float(self.r3_score_min_sigma)
-            )
-            q_true = -(
-                zt - mu_true
-            ) / sigma_true_safe[:, None]
-
-            q_pred = torch.zeros_like(q_true)
-
-            if self.scorefm_loss_mode == "foldflow_r3_analytic_score_flow":
-                # Route B / single-field:
-                # derive the score analytically from the SAME direct Flow.
-                z1_flow = z0 + pred_d
-                g_hat = self.r3_matcher.graph_g_from_transport(
-                    torch.linalg.norm(pred_d, dim=-1).clamp(
-                        max=float(self.r3_transport_max)
-                    )
-                )
-                sigma_hat = self.r3_matcher.score_sigma_t(
-                    t_graph, g_hat.to(pred_clean_X.dtype),
-                    self.r3_score_min_sigma
-                )
-                mu_hat = (
-                    (1.0 - t_graph[:, None]) * z0
-                    + t_graph[:, None] * z1_flow
-                )
-                q_pred = -(zt - mu_hat) / sigma_hat[:, None]
-
-            elif self.scorefm_loss_mode == "foldflow_r3_dualfield_score_flow":
-                # Route A / dual-field:
-                # independent score representation, shared backbone.
-                q_pred = self._dualfield_scaled_score(
-                    shared_H=shared_H,
-                    paratope_mask=paratope_mask,
-                    Xt=Xt,
-                    source_X0=source_X0,
-                    interface_batch_id=interface_batch_id,
-                )
-
-            if self.scorefm_loss_mode in {
-                "foldflow_r3_analytic_score_flow",
-                "foldflow_r3_dualfield_score_flow",
-            }:
-                score_per_graph = (
-                    q_pred - q_true.detach()
-                ).square().mean(dim=-1)
-                if bool(active.any()):
-                    score_loss = score_per_graph[active].mean()
-
-                # Both terms have already been standardized:
-                # - Flow uses FoldFlow's 0.1 R3 coordinate unit;
-                # - Score uses q=sigma*s, whose target is O(1).
-                #
-                # Use a fixed equal-budget mean in the score-valid interval,
-                # not endpoint + tiny auxiliary weight stacking.
-                combined = flow_per_graph.clone()
-                combined[active] = 0.5 * (
-                    flow_per_graph[active] + score_per_graph[active]
-                )
-                valid_combined = flow_valid
-                total = (
-                    combined[valid_combined].mean()
-                    if bool(valid_combined.any())
-                    else direct_flow_loss
-                )
-                # F02 does not train the independent dual-score head, but all
-                # three v68 configs intentionally instantiate the same module
-                # for matched parameter counts. Mark it as used for DDP without
-                # changing the objective. F03 already uses it through q_pred.
-                if self.scorefm_loss_mode == "foldflow_r3_analytic_score_flow":
-                    total = total + dummy_score_head
-            else:
-                total = direct_flow_loss + dummy_score_head
-
-            with torch.no_grad():
-                q_cos = direct_flow_loss.detach() * 0.0
-                if bool(active.any()) and self.scorefm_loss_mode != "foldflow_r3_direct_flow":
-                    qp = q_pred[active]
-                    qt = q_true[active]
-                    q_cos = (
-                        (qp * qt).sum(dim=-1)
-                        / (
-                            torch.linalg.norm(qp, dim=-1)
-                            * torch.linalg.norm(qt, dim=-1)
-                            + self.scorefm_eps
-                        )
-                    ).mean()
-
-                flow_cos = direct_flow_loss.detach() * 0.0
-                true_ca = scatter_mean(
-                    true_v[:, ca_idx].float(), interface_batch_id,
-                    dim=0, dim_size=n_graph
-                ).to(pred_clean_X.dtype)
-                pv = pred_d[flow_valid]
-                tv = true_ca[flow_valid]
-                if pv.numel() > 0:
-                    flow_cos = (
-                        (pv * tv).sum(dim=-1)
-                        / (
-                            torch.linalg.norm(pv, dim=-1)
-                            * torch.linalg.norm(tv, dim=-1)
-                            + self.scorefm_eps
-                        )
-                    ).mean()
-
-            details = {
-                "scorefm_total": total.detach(),
-                "scorefm_endpoint": endpoint_loss.detach(),
-                "scorefm_endpoint_train_weight":
-                    total.detach().new_tensor(0.0),
-                "scorefm_direct_flow": direct_flow_loss.detach(),
-                "scorefm_direct_flow_train_weight":
-                    total.detach().new_tensor(1.0),
-                "scorefm_scaled_score": score_loss.detach(),
-                "scorefm_score_active_rate": active.float().mean().detach(),
-                "scorefm_scaled_score_cos": q_cos.detach(),
-                "scorefm_direct_flow_cos": flow_cos.detach(),
-                "scorefm_flow_coordinate_scaling":
-                    total.detach().new_tensor(coord_scale),
-                "scorefm_clean_endpoint": clean_endpoint_loss.detach(),
-                "scorefm_dsm": score_loss.detach(),
-                "scorefm_dsm_rate": active.float().mean().detach(),
-                "scorefm_velocity": direct_flow_loss.detach(),
-                "scorefm_velocity_rate": flow_valid.float().mean().detach(),
-                "scorefm_traj_consistency": zero,
-                "scorefm_traj_velocity": zero,
-                "scorefm_traj_rate": zero,
-            }
-            details.update(tbin_details)
-            return total, details
-
-        if self.scorefm_loss_mode in {
-            "foldflow_r3_global_score",
-            "foldflow_r3_global_pathflow",
-            "foldflow_r3_global_scoreflow",
-        }:
-            # ------------------------------------------------------------
-            # Genuine F01 global-R3 Score / canonical Gaussian Flow.
-            #
-            # The stochastic state is EXACTLY F01:
-            #   z_t=(1-t)z0+t z1 + sigma_t eps, sigma_t=g sqrt(t(1-t)).
-            #
-            # SCORE:
-            #   s*=-(z_t-mu_true)/sigma^2
-            #   sθ=-(z_t-mu_pred)/sigma^2
-            #   L_DSM=||sigma(sθ-s*)||^2   (ABX-style scaling)
-            #
-            # FLOW:
-            #   u*=z1-z0 + (d log sigma/dt)(z_t-mu_true)
-            #   uθ=pred_z1-z0 + (d log sigma/dt)(z_t-mu_pred)
-            #
-            # No score head, no velocity head, no second forward/noise path.
-            # ------------------------------------------------------------
-            _spd = structured_path_details or {}
-            required = [
-                "_r3_g_graph", "_r3_sigma_graph", "_r3_t_graph",
-                "_r3_source_centroid", "_r3_target_centroid",
-            ]
-            if not all(k in _spd for k in required):
-                raise RuntimeError(
-                    f"{self.scorefm_loss_mode} requires graph tensors from "
-                    "the exact F01 global-R3 primary path."
-                )
-
-            g_graph = _spd["_r3_g_graph"].to(pred_clean_X.dtype)
-            sigma_graph = _spd["_r3_sigma_graph"].to(pred_clean_X.dtype)
-            t_graph = _spd["_r3_t_graph"].to(pred_clean_X.dtype)
-            z0 = _spd["_r3_source_centroid"].to(pred_clean_X.dtype)
-            z1 = _spd["_r3_target_centroid"].to(pred_clean_X.dtype)
-            n_graph = int(z0.shape[0])
-            ca_idx = 1 if pred_clean_X.shape[1] > 1 else 0
-
-            zt = scatter_mean(
-                Xt[:, ca_idx].float(), interface_batch_id,
-                dim=0, dim_size=n_graph,
-            ).to(pred_clean_X.dtype)
-            pred_z1 = scatter_mean(
-                pred_clean_X[:, ca_idx].float(), interface_batch_id,
-                dim=0, dim_size=n_graph,
-            ).to(pred_clean_X.dtype)
-
-            active = (
-                (t_graph >= float(self.scorefm_dsm_t_min))
-                & (t_graph <= float(self.scorefm_dsm_t_max))
-                & (sigma_graph >= float(self.r3_score_min_sigma))
-            )
-
-            r3_dsm = endpoint_loss * 0.0
-            pred_score = zt * 0.0
-            true_score = zt * 0.0
-            if self.scorefm_loss_mode in {
-                "foldflow_r3_global_score",
-                "foldflow_r3_global_scoreflow",
-            }:
-                scaled_residual, pred_score, true_score = (
-                    self.r3_matcher.scaled_score_residual(
-                        z_t=zt, z0=z0, true_z1=z1, pred_z1=pred_z1,
-                        t_graph=t_graph, g_graph=g_graph,
-                        score_min_sigma=self.r3_score_min_sigma,
-                    )
-                )
-                per_graph_dsm = scaled_residual.square().mean(dim=-1)
-                if bool(active.any()):
-                    r3_dsm = per_graph_dsm[active].mean()
-
-            r3_pathflow = endpoint_loss * 0.0
-            pred_u = zt * 0.0
-            true_u = zt * 0.0
-            if self.scorefm_loss_mode in {
-                "foldflow_r3_global_pathflow",
-                "foldflow_r3_global_scoreflow",
-            }:
-                true_u = self.r3_matcher.canonical_global_velocity_gfree(
-                    z_t=zt, z0=z0, z1=z1, t_graph=t_graph
-                ).detach()
-                pred_u = self.r3_matcher.canonical_global_velocity_gfree(
-                    z_t=zt, z0=z0, z1=pred_z1, t_graph=t_graph
-                )
-                per_graph_flow = F.smooth_l1_loss(
-                    pred_u, true_u, reduction="none"
-                ).mean(dim=-1)
-                if bool(active.any()):
-                    r3_pathflow = per_graph_flow[active].mean()
-
-            weighted_score = (
-                float(self.r3_score_dsm_weight) * r3_dsm
-                if self.scorefm_loss_mode in {
-                    "foldflow_r3_global_score",
-                    "foldflow_r3_global_scoreflow",
-                }
-                else endpoint_loss * 0.0
-            )
-            weighted_flow = (
-                float(self.r3_pathflow_weight) * r3_pathflow
-                if self.scorefm_loss_mode in {
-                    "foldflow_r3_global_pathflow",
-                    "foldflow_r3_global_scoreflow",
-                }
-                else endpoint_loss * 0.0
-            )
-            total = endpoint_loss + weighted_score + weighted_flow
-
-            self._last_endpoint_objective_tensor = endpoint_loss
-            self._last_satc_objective_tensor = weighted_score + weighted_flow
-
-            with torch.no_grad():
-                score_cos = endpoint_loss.detach() * 0.0
-                if bool(active.any()) and self.scorefm_loss_mode in {
-                    "foldflow_r3_global_score",
-                    "foldflow_r3_global_scoreflow",
-                }:
-                    ps = pred_score[active]
-                    ts = true_score[active]
-                    score_cos = (
-                        (ps * ts).sum(dim=-1)
-                        / (
-                            torch.linalg.norm(ps, dim=-1)
-                            * torch.linalg.norm(ts, dim=-1)
-                            + self.scorefm_eps
-                        )
-                    ).mean()
-                flow_cos = endpoint_loss.detach() * 0.0
-                if bool(active.any()) and self.scorefm_loss_mode in {
-                    "foldflow_r3_global_pathflow",
-                    "foldflow_r3_global_scoreflow",
-                }:
-                    pu = pred_u[active]
-                    tu = true_u[active]
-                    flow_cos = (
-                        (pu * tu).sum(dim=-1)
-                        / (
-                            torch.linalg.norm(pu, dim=-1)
-                            * torch.linalg.norm(tu, dim=-1)
-                            + self.scorefm_eps
-                        )
-                    ).mean()
-
-            details = {
-                "scorefm_total": total.detach(),
-                "scorefm_endpoint": endpoint_loss.detach(),
-                "scorefm_clean_endpoint": clean_endpoint_loss.detach(),
-                "scorefm_r3_dsm": r3_dsm.detach(),
-                "scorefm_r3_pathflow": r3_pathflow.detach(),
-                "scorefm_r3_score_weight": endpoint_loss.detach().new_tensor(
-                    float(self.r3_score_dsm_weight)
-                ),
-                "scorefm_r3_pathflow_weight": endpoint_loss.detach().new_tensor(
-                    float(self.r3_pathflow_weight)
-                ),
-                "scorefm_r3_score_active_rate": active.float().mean().detach(),
-                "scorefm_r3_score_cos": score_cos.detach(),
-                "scorefm_r3_pathflow_cos": flow_cos.detach(),
-                "scorefm_r3_sigma_mean": sigma_graph.mean().detach(),
-                "scorefm_r3_transport_mean": torch.as_tensor(
-                    _spd.get("r3_transport_mean", 0.0),
-                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
-                ).detach(),
-                "scorefm_velocity": r3_pathflow.detach(),
-                "scorefm_dsm": r3_dsm.detach(),
-                "scorefm_dsm_rate": active.float().mean().detach(),
-                "scorefm_traj_consistency": zero,
-                "scorefm_traj_velocity": zero,
-                "scorefm_traj_rate": zero,
-            }
-            details.update(tbin_details)
-            return total, details
-
-        if self.scorefm_loss_mode in {
             "endpoint", "traj_consistency", "traj_consistency_fm",
             "score_aware_graph_translation_consistency",
             "structured_global_endpoint", "structured_global_cfm",
             "structured_multiscale_cfm",
             "foldflow_r3_global_endpoint",
-            "fixedg_r3_brownian_endpoint",
-            "foldflow_r3_global_cfm",
             "foldflow_r3_residue_endpoint",
             "foldflow_r3_residue_cfm",
         }:
@@ -5366,7 +3459,7 @@ class AbFlowModel(nn.Module):
                     device=pred_clean_X.device, dtype=pred_clean_X.dtype
                 ).detach(),
                 "scorefm_structured_cfm": pred_clean_X.new_tensor(
-                    1.0 if self.scorefm_loss_mode in {"structured_global_cfm", "structured_multiscale_cfm", "foldflow_r3_global_cfm", "foldflow_r3_residue_cfm"} else 0.0
+                    1.0 if self.scorefm_loss_mode in {"structured_global_cfm", "structured_multiscale_cfm", "foldflow_r3_residue_cfm"} else 0.0
                 ).detach(),
                 "scorefm_dsm": zero,
                 "scorefm_dsm_rate": zero,
@@ -6002,9 +4095,62 @@ class AbFlowModel(nn.Module):
         }
         return total, details
 
+    def _scoreflow_round_condition(
+            self, *, state_X, source_X, endpoint_X, flow_t,
+            interface_batch_id):
+        """Construct stable fields from the exact FF-R3 Endpoint parent.
+
+        The verified parent has a Gaussian only in graph-level H3 translation.
+        For that non-degenerate subspace,
+
+            sigma_t^2 * score_hat = mu_hat_t - z_t,
+            mu_hat_t = (1-t) z_0 + t z_1_hat.
+
+        This variance-scaled conditional score needs neither unknown g_graph nor
+        division by sigma_t.  For the linear path mean, the exact Endpoint-
+        implied tangent is d(mu_hat_t)/dt=z_1_hat-z_0, so no 1/(1-t)
+        reconstruction is needed.
+        """
+        if source_X is None or flow_t is None:
+            return None
+        ca_idx = 1 if state_X.shape[1] > 1 else 0
+        state_ca = state_X[:, ca_idx].float()
+        source_ca = source_X[:, ca_idx].float()
+        endpoint_ca = endpoint_X[:, ca_idx].float()
+        if interface_batch_id.numel() == 0:
+            return None
+        n_graph = int(interface_batch_id.max().item()) + 1
+        state_centroid = scatter_mean(
+            state_ca, interface_batch_id, dim=0, dim_size=n_graph
+        )
+        source_centroid = scatter_mean(
+            source_ca, interface_batch_id, dim=0, dim_size=n_graph
+        )
+        endpoint_centroid = scatter_mean(
+            endpoint_ca, interface_batch_id, dim=0, dim_size=n_graph
+        )
+        t_graph, valid_graph = self._scorefm_time_per_graph(
+            flow_t, interface_batch_id, state_X
+        )
+        mean_hat = (
+            (1.0 - t_graph[:, None]) * source_centroid
+            + t_graph[:, None] * endpoint_centroid
+        )
+        global_score = mean_hat - state_centroid
+        global_flow = endpoint_centroid - source_centroid
+        if self.scoreflow_pair_stop_grad:
+            global_score = global_score.detach()
+            global_flow = global_flow.detach()
+        return {
+            "global_score": global_score.to(state_X.dtype),
+            "global_flow": global_flow.to(state_X.dtype),
+            "enabled": bool(valid_graph.any()),
+        }
+
     def _forward(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep,
                  surface, residue_pos, template, lengths, init_noise=None,
-                 interface_init=None, sequence_init=None, flow_t=None):
+                 interface_init=None, sequence_init=None, flow_t=None,
+                 flow_source_init=None):
         """Evaluate f_theta(X_t, S_t, t, proposal context).
 
         interface_init/sequence_init are the explicit generated state Xt/St.
@@ -6091,6 +4237,21 @@ class AbFlowModel(nn.Module):
                 interface_X, interface_S, X_pep, S_pep
             )
 
+        # Keep the queried transport state fixed across the three refinement
+        # rounds.  The previous round's Endpoint changes; X_t and X_0 do not.
+        scoreflow_state_X = interface_X.clone()
+        scoreflow_source_X = None
+        if flow_source_init is not None:
+            if flow_source_init.shape != interface_X.shape:
+                raise ValueError(
+                    "flow_source_init/interface shape mismatch: "
+                    f"{tuple(flow_source_init.shape)} vs "
+                    f"{tuple(interface_X.shape)}"
+                )
+            scoreflow_source_X = self._raw_interface_to_model_frame(
+                flow_source_init, paratope_mask, batch_id
+            )
+
         # Convert X_pep once to the internal frame. Its relation to the current
         # interface state is recomputed after every refinement round. Proposal
         # validity is tracked per residue so missing/invalid proposal coordinates
@@ -6117,16 +4278,6 @@ class AbFlowModel(nn.Module):
                 pep_X_model = self._raw_interface_to_model_frame(
                     pep_X_raw, paratope_mask, batch_id
                 )
-
-        # v81 Score-conditioned pair self-conditioning.  The stochastic state
-        # seen by the network is fixed across the internal refinement rounds;
-        # each round predicts a cleaner endpoint.  Starting from round 1, the
-        # previous endpoint analytically induces q=sigma*score, which conditions
-        # only semantic antigen->antibody pair reasoning in the next round.
-        score_pair_state_X = (
-            interface_X.clone() if self.pair_score_feedback else None
-        )
-        pair_score_graph = None
 
         if self.seq_pep_condition_embedding is not None:
             seq_ref_tensor = interface_X.new_zeros(
@@ -6184,6 +4335,18 @@ class AbFlowModel(nn.Module):
                 seq_pep_condition_this = None
                 seq_pep_condition_mask_this = None
 
+            scoreflow_pair_condition = None
+            if self.scoreflow_pair_enabled and round_idx > 0:
+                scoreflow_pair_condition = self._scoreflow_round_condition(
+                    state_X=scoreflow_state_X,
+                    source_X=scoreflow_source_X,
+                    endpoint_X=interface_X,
+                    flow_t=flow_t,
+                    interface_batch_id=self.batch_constants[
+                        "interface_batch_id"
+                    ],
+                )
+
             pred_S_logits, pred_X, interface_X, H, edge_dist = self.message_passing(
                 X, S, residue_pos, interface_X, surface, paratope_mask,
                 batch_id, round_idx, memory_H, pred_S_dist, smask,
@@ -6193,7 +4356,7 @@ class AbFlowModel(nn.Module):
                 seq_pep_condition=seq_pep_condition_this,
                 seq_pep_condition_mask=seq_pep_condition_mask_this,
                 sequence_state_full=sequence_state_full,
-                pair_score_graph=pair_score_graph,
+                scoreflow_pair_condition=scoreflow_pair_condition,
             )
 
             if condition_diag_rounds is not None:
@@ -6206,18 +4369,6 @@ class AbFlowModel(nn.Module):
             r_interface_X.append(interface_X.clone())
             r_pred_S_logits.append((pred_S_logits, smask))
             r_edge_dist.append(edge_dist)
-
-            if self.pair_score_feedback:
-                pair_score_graph = self._endpoint_induced_scaled_score_graph(
-                    state_Xt=score_pair_state_X,
-                    source_X0=pep_X_model,
-                    pred_X1=interface_X,
-                    flow_t=flow_t,
-                    interface_batch_id=self.batch_constants["interface_batch_id"],
-                    source_valid=pep_coord_valid,
-                )
-                if pair_score_graph is not None:
-                    pair_score_graph = pair_score_graph.detach()
 
             X = X.clone()
             X[cmask] = pred_X[cmask]
@@ -6695,95 +4846,13 @@ class AbFlowModel(nn.Module):
             gt_satc_transport_graph = None
             structured_endpoint_target = None
             structured_path_details = None
-            if self.scorefm_loss_mode in {
-                "foldflow_r3_global_endpoint",
-                "fixedg_r3_brownian_endpoint",
-            }:
+            if self.scorefm_loss_mode == "foldflow_r3_global_endpoint":
                 Xt, structured_endpoint_target, structured_path_details = (
                     self._foldflow_r3_primary_path(
                         source_X0=interface_X, target_X1=gt_interface_X,
                         t_graph=t_graph, t_int=t_int,
                         interface_batch_id=interface_batch_id,
                         noise_scope="global", cfm_target=False,
-                    )
-                )
-            elif self.scorefm_loss_mode in {
-                "clean_r3_mean_flow",
-                "clean_r3_factorized_mean_flow",
-                "clean_r3_factorized_ptc_mean_flow",
-                "clean_r3_dualspace_mean_flow",
-            }:
-                # F02-theory cleanup: the state and target now describe the
-                # same deterministic straight path.
-                #   X_t = (1-t)X0 + tX1,  dX_t/dt = X1-X0.
-                # There is no Gaussian bridge noise and no omitted stochastic
-                # velocity correction. The coordinate carrier remains a direct
-                # velocity field v_theta=Y_theta-X_t.
-                Xt = mu_t
-                n_graph = int(interface_batch_id.max().item()) + 1
-                ca_idx = 1 if interface_X.shape[1] > 1 else 0
-                src_centroid = scatter_mean(
-                    interface_X[:, ca_idx].float(), interface_batch_id,
-                    dim=0, dim_size=n_graph,
-                ).to(interface_X.dtype)
-                tgt_centroid = scatter_mean(
-                    gt_interface_X[:, ca_idx].float(), interface_batch_id,
-                    dim=0, dim_size=n_graph,
-                ).to(gt_interface_X.dtype)
-                zero_graph = t_graph.new_zeros(t_graph.shape)
-                structured_endpoint_target = gt_interface_X
-                structured_path_details = {
-                    "r3_transport_mean": torch.linalg.norm(
-                        tgt_centroid - src_centroid, dim=-1
-                    ).mean().to(gt_interface_X.dtype),
-                    "r3_sigma_mean": zero_graph.mean().to(gt_interface_X.dtype),
-                    "r3_noise_rms": zero_graph.mean().to(gt_interface_X.dtype),
-                    "r3_target_shift_rms": zero_graph.mean().to(gt_interface_X.dtype),
-                    "r3_noise_scope": gt_interface_X.new_tensor(-1.0),
-                    "r3_cfm_target": gt_interface_X.new_tensor(1.0),
-                    "_r3_g_graph": zero_graph.to(gt_interface_X.dtype),
-                    "_r3_sigma_graph": zero_graph.to(gt_interface_X.dtype),
-                    "_r3_t_graph": t_graph.to(gt_interface_X.dtype),
-                    "_r3_source_centroid": src_centroid,
-                    "_r3_target_centroid": tgt_centroid,
-                }
-            elif self.scorefm_loss_mode in {
-                "foldflow_r3_global_score",
-                "foldflow_r3_global_pathflow",
-                "foldflow_r3_global_scoreflow",
-                "foldflow_r3_direct_flow",
-                "foldflow_r3_analytic_score_flow",
-                "foldflow_r3_dualfield_score_flow",
-                "sf2m_r3_flow",
-                "sf2m_r3_analytic",
-                "sf2m_r3_dualfield",
-                "sf2m_r3_mean_flow_control",
-                "sf2m_r3_decomposed_score_flow",
-                "fixedg_r3_canonical_score_flow",
-                "fixedg_r3_flow_conditioned_score_flow",
-            }:
-                # Core stage: SAME F01 corruption state and clean endpoint target.
-                # Only genuine R3 score / canonical-flow consistency is added.
-                Xt, structured_endpoint_target, structured_path_details = (
-                    self._foldflow_r3_primary_path(
-                        source_X0=interface_X, target_X1=gt_interface_X,
-                        t_graph=t_graph, t_int=t_int,
-                        interface_batch_id=interface_batch_id,
-                        noise_scope="global", cfm_target=False,
-                    )
-                )
-            elif self.scorefm_loss_mode == "foldflow_r3_global_cfm":
-                # F04: exactly the F01 stochastic state geometry, but replace
-                # clean endpoint denoising with FoldFlow's Euclidean
-                # conditional velocity u*=X1-X0, encoded through the existing
-                # endpoint parameterization.  This isolates target semantics
-                # without the residue-R3 covariance used by historical F03.
-                Xt, structured_endpoint_target, structured_path_details = (
-                    self._foldflow_r3_primary_path(
-                        source_X0=interface_X, target_X1=gt_interface_X,
-                        t_graph=t_graph, t_int=t_int,
-                        interface_batch_id=interface_batch_id,
-                        noise_scope="global", cfm_target=True,
                     )
                 )
             elif self.scorefm_loss_mode == "foldflow_r3_residue_endpoint":
@@ -6966,62 +5035,9 @@ class AbFlowModel(nn.Module):
             surface, residue_pos, template, lengths,
             interface_init=Xt if state_path else None,
             sequence_init=sequence_state_for_model if state_path else None,
-            flow_t=t_graph if state_path else None
+            flow_t=t_graph if state_path else None,
+            flow_source_init=interface_X if state_path else None,
         )
-
-        # F06 paired-time clean mean-flow query. For a deterministic straight
-        # path, the conditional velocity X1-X0 is identical at t and 1-t. The
-        # second state is another exact on-path state, not a noisy/off-path
-        # perturbation and not an endpoint teacher.
-        paired_time_Xt = None
-        paired_time_t_graph = None
-        paired_time_t_int = None
-        paired_time_pred_X = None
-        paired_time_structured_details = None
-        if (
-            state_path
-            and self.scorefm_loss_mode
-            == "clean_r3_factorized_ptc_mean_flow"
-        ):
-            paired_time_t_graph = 1.0 - t_graph
-            paired_time_t_int = self._time_for_interface(
-                paired_time_t_graph, interface_batch_id, interface_X
-            )
-            paired_time_Xt = self.flow_matcher.interpolate(
-                interface_X, gt_interface_X, paired_time_t_int
-            )
-            # Hold the categorical state fixed across the paired coordinate
-            # query. Otherwise independently resampling S_t would confound time
-            # consistency with sequence-state noise. F06 regularizes only the
-            # structural mean-velocity field; sequence CE remains the primary
-            # single-time objective used by F04/F05.
-            paired_sequence_state = sequence_state_for_model
-
-            capture_saved = bool(getattr(self, "_diagnostic_capture", False))
-            probe_saved = self._diagnostic_probe_tensor
-            cond_diag_saved = dict(self._latest_condition_diagnostics)
-            self._diagnostic_capture = False
-            try:
-                (
-                    _H_pair, _pred_S_pair, _logits_pair, _pred_X_pair,
-                    r_interface_X_pair, _edge_pair, _prmsd_pair,
-                ) = self._forward(
-                    X, S, cmask, smask, paratope_mask, X_pep, S_pep,
-                    surface, residue_pos, template, lengths,
-                    interface_init=paired_time_Xt,
-                    sequence_init=paired_sequence_state,
-                    flow_t=paired_time_t_graph,
-                )
-                paired_time_pred_X = r_interface_X_pair[-1]
-            finally:
-                self._diagnostic_capture = capture_saved
-                self._diagnostic_probe_tensor = probe_saved
-                self._latest_condition_diagnostics = cond_diag_saved
-
-            paired_time_structured_details = dict(structured_path_details)
-            paired_time_structured_details["_r3_t_graph"] = (
-                paired_time_t_graph.to(gt_interface_X.dtype)
-            )
 
         # v52 score-aware graph-translation teacher query.  It is skipped
         # during validation and on non-scheduled training steps.  Diagnostic
@@ -7126,88 +5142,8 @@ class AbFlowModel(nn.Module):
                     satc_gamma_graph=satc_gamma_graph,
                     structured_endpoint_target=structured_endpoint_target,
                     structured_path_details=structured_path_details,
-                    shared_H=H,
-                    paratope_mask=paratope_mask,
                 )
             )
-
-            if paired_time_pred_X is not None:
-                paired_loss, paired_details = (
-                    self._coordinate_training_objective(
-                        Xt=paired_time_Xt,
-                        X1=gt_interface_X,
-                        pred_clean_X=paired_time_pred_X,
-                        atom_mask=interface_atom_mask,
-                        interface_batch_id=interface_batch_id,
-                        t=paired_time_t_int,
-                        sigma_t=sigma_score_int,
-                        source_ca_mean=source_ca_mean,
-                        source_X0=interface_X,
-                        structured_endpoint_target=gt_interface_X,
-                        structured_path_details=paired_time_structured_details,
-                        shared_H=None,
-                        paratope_mask=paratope_mask,
-                    )
-                )
-                coord_scale = float(self.r3_flow_coordinate_scaling)
-                primary_v = self._direct_flow_velocity(
-                    Xt, r_interface_X[-1]
-                )
-                paired_v = self._direct_flow_velocity(
-                    paired_time_Xt, paired_time_pred_X
-                )
-                (
-                    consistency_per_graph,
-                    consistency_global_per_graph,
-                    consistency_local_per_graph,
-                    consistency_valid,
-                ) = self._factorized_mean_velocity_mse_per_graph(
-                    coord_scale * primary_v,
-                    coord_scale * paired_v,
-                    interface_atom_mask,
-                    interface_batch_id,
-                )
-                if bool(consistency_valid.any()):
-                    consistency_loss = consistency_per_graph[
-                        consistency_valid
-                    ].mean()
-                    consistency_global = consistency_global_per_graph[
-                        consistency_valid
-                    ].mean()
-                    consistency_local = consistency_local_per_graph[
-                        consistency_valid
-                    ].mean()
-                else:
-                    consistency_loss = interface_loss * 0.0
-                    consistency_global = interface_loss * 0.0
-                    consistency_local = interface_loss * 0.0
-
-                primary_loss = interface_loss
-                # Three equal, same-unit constraints: accuracy at t, accuracy
-                # at 1-t, and invariance of the straight-path velocity.
-                interface_loss = (
-                    primary_loss + paired_loss + consistency_loss
-                ) / 3.0
-                self._last_endpoint_objective_tensor = interface_loss
-                self._last_satc_objective_tensor = consistency_loss
-                scorefm_details["scorefm_total"] = interface_loss.detach()
-                scorefm_details["scorefm_ptc_primary"] = primary_loss.detach()
-                scorefm_details["scorefm_ptc_paired"] = paired_loss.detach()
-                scorefm_details["scorefm_ptc_consistency"] = (
-                    consistency_loss.detach()
-                )
-                scorefm_details["scorefm_ptc_consistency_global"] = (
-                    consistency_global.detach()
-                )
-                scorefm_details["scorefm_ptc_consistency_local"] = (
-                    consistency_local.detach()
-                )
-                scorefm_details["scorefm_ptc_time_gap"] = (
-                    (paired_time_t_graph - t_graph).abs().mean().detach()
-                )
-                scorefm_details["scorefm_ptc_equal_unit_average"] = (
-                    interface_loss.detach().new_tensor(1.0)
-                )
         else:
             endpoint_per_graph, endpoint_valid = (
                 self._masked_residue_smooth_l1_per_graph(
@@ -7559,33 +5495,8 @@ class AbFlowModel(nn.Module):
                     device=X.device,
                 ),
                 "final_readout_integrated_endpoint": torch.as_tensor(
-                    1.0 if self.final_readout_mode in {
-                        "integrated_state", "integrated_endpoint"
-                    }
+                    1.0 if self.final_readout_mode == "integrated_endpoint"
                     else 0.0,
-                    device=X.device,
-                ),
-                "final_readout_integrated_state": torch.as_tensor(
-                    1.0 if self.final_readout_mode == "integrated_state"
-                    else 0.0,
-                    device=X.device,
-                ),
-                "r3_dual_score_head_trainable": torch.as_tensor(
-                    1.0 if any(
-                        p.requires_grad
-                        for p in self.r3_dual_score_gate.parameters()
-                    ) else 0.0,
-                    device=X.device,
-                ),
-                "dualspace_global_head_trainable": torch.as_tensor(
-                    1.0 if (
-                        self.scorefm_loss_mode
-                        == "clean_r3_dualspace_mean_flow"
-                        and any(
-                            p.requires_grad
-                            for p in self.r3_dual_score_gate.parameters()
-                        )
-                    ) else 0.0,
                     device=X.device,
                 ),
                 "deterministic_validation": torch.as_tensor(
@@ -7774,40 +5685,8 @@ class AbFlowModel(nn.Module):
         time_grid = self._sampling_time_grid(
             n_steps, device=X.device, dtype=X.dtype
         )
+        flow_source_X0 = interface_X.clone()
         Xt = interface_X.clone()
-        # Fixed source coordinate of the conditional path.  This is available
-        # at inference because it is exactly the PCS-RC/source state.
-        scoreflow_source_X0 = interface_X.clone()
-        if self.scorefm_loss_mode in {
-            "fixedg_r3_canonical_score_flow",
-            "fixedg_r3_flow_conditioned_score_flow",
-        }:
-            # Match the v76 training boundary exactly:
-            #   X_0^path = X_PCS-RC + g*epsilon.
-            # One global R3 shift is shared by every H3 atom, so internal H3
-            # geometry is unchanged. Deterministic validation uses a stateless
-            # Gaussian draw for checkpoint comparability.
-            if self.deterministic_validation and not self.training:
-                source_eps = self._deterministic_standard_normal(
-                    (batch_size, 3), Xt.device, torch.float32
-                )
-            else:
-                source_eps = torch.randn(
-                    (batch_size, 3), device=Xt.device,
-                    dtype=torch.float32,
-                )
-            source_shift = (
-                float(self.r3_fixed_g) * source_eps
-            ).to(Xt.dtype)
-            Xt = Xt + source_shift[
-                interface_batch_id, None, :
-            ]
-            self.last_scoreflow_sampler_diagnostics = {
-                "fixedg_source_noise_rms": torch.sqrt(
-                    source_shift.pow(2).mean().clamp_min(0.0)
-                ).detach(),
-                "fixedg_value": Xt.new_tensor(float(self.r3_fixed_g)),
-            }
         St = interface_S.clone()
 
         step_iter = range(n_steps)
@@ -7822,31 +5701,7 @@ class AbFlowModel(nn.Module):
             t = time_grid[i]
             t_next = time_grid[i + 1]
             dt = t_next - t
-            # v71 numerical boundary policy for the sqrt(t(1-t)) path.
-            # Training samples only t in [eps,1-eps].  The exact probability
-            # flow has an integrable but numerically singular endpoint limit,
-            # so never query the network at an unseen singular t=0/1 value.
-            # The integration grid/state still starts at the exact PCS-RC source;
-            # only the model time input is clipped, identically for F01/F02/F03.
-            if self.scorefm_loss_mode in {
-                "fixedg_r3_canonical_score_flow",
-                "fixedg_r3_flow_conditioned_score_flow",
-            }:
-                # sigma(t)=g(1-t) has finite derivative and the sampler starts
-                # from its exact noisy source distribution; no boundary time
-                # clipping is required.
-                t_model = t
-            elif self.scorefm_sampler_mode in {
-                "sf2m_ode", "sf2m_sde", "sf2m_decomposed_ode",
-                "sf2m_dualspace_ode", "fixedg_scaled_score_ode"
-            }:
-                t_model = t.clamp(
-                    min=float(self.sf2m_t_eps),
-                    max=1.0-float(self.sf2m_t_eps),
-                )
-            else:
-                t_model = t
-            flow_t_graph = t_model.reshape(1).expand(batch_size)
+            flow_t_graph = t.reshape(1).expand(batch_size)
             if show_progress and hasattr(step_iter, 'set_postfix'):
                 step_iter.set_postfix(t=f'{float(t):.2f}')
 
@@ -7856,7 +5711,8 @@ class AbFlowModel(nn.Module):
                 surface, residue_pos, template, lengths,
                 interface_init=Xt,
                 sequence_init=sequence_state_for_model,
-                flow_t=flow_t_graph
+                flow_t=flow_t_graph,
+                flow_source_init=flow_source_X0,
             )
             pred_clean_X = r_interface_X[-1]
 
@@ -7864,428 +5720,10 @@ class AbFlowModel(nn.Module):
             if self.scorefm_sampler_mode == "residual":
                 dX = raw_residual
                 Xt = Xt + dX * dt
-            elif self.scorefm_sampler_mode == "sf2m_ode":
-                # Probability-flow ODE.  This is the formal sampler shared by
-                # F01/F02/F03 so training comparisons are not confounded by a
-                # sampler change.
-                pred_v = self._direct_flow_velocity(Xt, pred_clean_X)
-                Xt = Xt + pred_v*dt
-
-            elif self.scorefm_sampler_mode == "fixedg_scaled_score_ode":
-                if (
-                    self.scorefm_loss_mode
-                    != "fixedg_r3_flow_conditioned_score_flow"
-                ):
-                    raise RuntimeError(
-                        "fixedg_scaled_score_ode requires "
-                        "fixedg_r3_flow_conditioned_score_flow."
-                    )
-                pred_mean_v = self._direct_flow_velocity(
-                    Xt, pred_clean_X
-                )
-                q_pred = self._flow_conditioned_scaled_score(
-                    shared_H=H,
-                    paratope_mask=paratope_mask,
-                    Xt=Xt,
-                    source_X0=scoreflow_source_X0,
-                    pred_mean_v=pred_mean_v,
-                    t_graph=flow_t_graph,
-                    interface_batch_id=interface_batch_id,
-                )
-                sigma_dot = self._fixedg_sigma_dot(
-                    flow_t_graph, Xt
-                )
-                score_correction = -sigma_dot[:, None] * q_pred
-                total_v = (
-                    pred_mean_v
-                    + score_correction[interface_batch_id, None, :]
-                )
-                Xt = Xt + total_v * dt
-                self.last_scoreflow_sampler_diagnostics = {
-                    "fixedg_scaled_score_rms": torch.sqrt(
-                        q_pred.pow(2).mean().clamp_min(0.0)
-                    ).detach(),
-                    "fixedg_score_correction_rms": torch.sqrt(
-                        score_correction.pow(2).mean().clamp_min(0.0)
-                    ).detach(),
-                    "fixedg_mean_flow_rms": torch.sqrt(
-                        pred_mean_v.pow(2).mean().clamp_min(0.0)
-                    ).detach(),
-                    "fixedg_sigma_dot_abs_mean":
-                        sigma_dot.abs().mean().detach(),
-                    "fixedg_value": Xt.new_tensor(
-                        float(self.r3_fixed_g)
-                    ),
-                }
-
-            elif self.scorefm_sampler_mode == "sf2m_dualspace_ode":
-                if self.scorefm_loss_mode != "clean_r3_dualspace_mean_flow":
-                    raise RuntimeError(
-                        "sf2m_dualspace_ode requires "
-                        "clean_r3_dualspace_mean_flow."
-                    )
-                carrier_v = self._direct_flow_velocity(Xt, pred_clean_X)
-                ca_idx = 1 if carrier_v.shape[1] > 1 else 0
-                n_graph = int(interface_batch_id.max().item()) + 1
-                carrier_global = scatter_mean(
-                    carrier_v[:, ca_idx].float(), interface_batch_id,
-                    dim=0, dim_size=n_graph,
-                ).to(carrier_v.dtype)
-                local_v = (
-                    carrier_v
-                    - carrier_global[interface_batch_id, None, :]
-                )
-                global_v = self._dualfield_equivariant_global_r3_vector(
-                    shared_H=H,
-                    paratope_mask=paratope_mask,
-                    Xt=Xt,
-                    source_X0=scoreflow_source_X0,
-                    interface_batch_id=interface_batch_id,
-                )
-                total_v = (
-                    global_v[interface_batch_id, None, :] + local_v
-                )
-                Xt = Xt + total_v * dt
-                self.last_scoreflow_sampler_diagnostics = {
-                    "dualspace_global_rms": torch.sqrt(
-                        global_v.pow(2).mean().clamp_min(0.0)
-                    ).detach(),
-                    "dualspace_local_rms": torch.sqrt(
-                        local_v.pow(2).mean().clamp_min(0.0)
-                    ).detach(),
-                    "dualspace_local_ca_centroid_rms": torch.sqrt(
-                        scatter_mean(
-                            local_v[:, ca_idx].float(),
-                            interface_batch_id,
-                            dim=0,
-                            dim_size=n_graph,
-                        ).pow(2).mean().clamp_min(0.0)
-                    ).detach(),
-                }
-
-            elif self.scorefm_sampler_mode == "sf2m_decomposed_ode":
-                if self.scorefm_loss_mode != "sf2m_r3_decomposed_score_flow":
-                    raise RuntimeError(
-                        "sf2m_decomposed_ode requires "
-                        "sf2m_r3_decomposed_score_flow."
-                    )
-                pred_mean_v = self._direct_flow_velocity(Xt, pred_clean_X)
-                correction_pred = self._dualfield_equivariant_global_r3_vector(
-                    shared_H=H,
-                    paratope_mask=paratope_mask,
-                    Xt=Xt,
-                    source_X0=scoreflow_source_X0,
-                    interface_batch_id=interface_batch_id,
-                )
-                total_v = (
-                    pred_mean_v
-                    + correction_pred[interface_batch_id, None, :]
-                )
-                Xt = Xt + total_v * dt
-                self.last_scoreflow_sampler_diagnostics = {
-                    "sf2m_decomp_mean_rms": torch.sqrt(
-                        pred_mean_v.pow(2).mean().clamp_min(0.0)
-                    ).detach(),
-                    "sf2m_decomp_correction_rms": torch.sqrt(
-                        correction_pred.pow(2).mean().clamp_min(0.0)
-                    ).detach(),
-                }
-
-            elif self.scorefm_sampler_mode == "sf2m_sde":
-                # Optional SAME-CHECKPOINT diagnostic for formal F03 only.
-                # SF²M relation:
-                #   b_plus = v_probability_flow + 0.5*g_infer(t)^2*s_phi
-                #   dX = b_plus dt + g_infer(t) dW.
-                #
-                # With separate flow/score fields, SF²M permits an arbitrary
-                # inference diffusion schedule.  Therefore v70 DOES NOT estimate
-                # the native-dependent training g_graph at inference.  A single
-                # time-only constant is exposed; default 0 keeps the formal ODE.
-                if self.scorefm_loss_mode != "sf2m_r3_dualfield":
-                    raise RuntimeError(
-                        "sf2m_sde is only valid for the formal dual-field F03 model."
-                    )
-                pred_v = self._direct_flow_velocity(Xt, pred_clean_X)
-                n_graph = batch_size
-                raw_score = self._dualfield_raw_score(
-                    shared_H=H,
-                    paratope_mask=paratope_mask,
-                    Xt=Xt,
-                    source_X0=scoreflow_source_X0,
-                    interface_batch_id=interface_batch_id,
-                )
-                g_infer = float(self.sf2m_infer_g)
-                score_drift = 0.5*(g_infer**2)*raw_score
-                noise = torch.randn_like(raw_score)
-                global_increment = (
-                    score_drift*dt
-                    + g_infer*math.sqrt(float(dt))*noise
-                )
-                Xt = (
-                    Xt + pred_v*dt
-                    + global_increment[interface_batch_id, None, :]
-                )
-                self.last_scoreflow_sampler_diagnostics = {
-                    "sf2m_infer_g": Xt.new_tensor(g_infer),
-                    "sf2m_score_drift_rms": torch.sqrt(
-                        score_drift.pow(2).mean().clamp_min(0.0)
-                    ).detach(),
-                    "sf2m_noise_rms": torch.sqrt(
-                        (g_infer*math.sqrt(float(dt))*noise)
-                        .pow(2).mean().clamp_min(0.0)
-                    ).detach(),
-                    "sf2m_inference_g_is_time_only": Xt.new_tensor(1.0),
-                }
-
-            elif self.scorefm_sampler_mode == "direct_flow":
-                # F01: FoldFlow-style direct vector-field Euler integration.
-                pred_v = self._direct_flow_velocity(Xt, pred_clean_X)
-                Xt = Xt + pred_v * dt
-            elif self.scorefm_sampler_mode in {
-                "analytic_scoreflow", "dualfield_scoreflow"
-            }:
-                # F02/F03 share the SAME direct full-atom Flow integrator.
-                # They differ only in how global-R3 Score is represented.
-                pred_v = self._direct_flow_velocity(Xt, pred_clean_X)
-                flow_next = Xt + pred_v * dt
-
-                n_graph = batch_size
-                ca_idx = 1 if Xt.shape[1] > 1 else 0
-                z_t = scatter_mean(
-                    Xt[:, ca_idx].float(), interface_batch_id,
-                    dim=0, dim_size=n_graph
-                ).to(Xt.dtype)
-                z0 = scatter_mean(
-                    scoreflow_source_X0[:, ca_idx].float(),
-                    interface_batch_id, dim=0, dim_size=n_graph
-                ).to(Xt.dtype)
-                pred_d = scatter_mean(
-                    pred_v[:, ca_idx].float(), interface_batch_id,
-                    dim=0, dim_size=n_graph
-                ).to(Xt.dtype)
-
-                # Analytic single-field q derived from the Flow-implied mean.
-                z1_flow = z0 + pred_d
-                g_hat = self.r3_matcher.graph_g_from_transport(
-                    torch.linalg.norm(pred_d, dim=-1).clamp(
-                        max=float(self.r3_transport_max)
-                    )
-                )
-                sigma_hat = self.r3_matcher.score_sigma_t(
-                    t.reshape(1).expand(n_graph),
-                    g_hat.to(Xt.dtype),
-                    self.r3_score_min_sigma,
-                )
-                mu_flow = (
-                    (1.0 - t) * z0 + t * z1_flow
-                )
-                q_flow = -(z_t - mu_flow) / sigma_hat[:, None]
-
-                if self.scorefm_sampler_mode == "dualfield_scoreflow":
-                    q_used = self._dualfield_scaled_score(
-                        shared_H=H,
-                        paratope_mask=paratope_mask,
-                        Xt=Xt,
-                        source_X0=scoreflow_source_X0,
-                        interface_batch_id=interface_batch_id,
-                    )
-                    score_active = torch.full(
-                        (n_graph,),
-                        bool(
-                            float(t) >= float(self.scorefm_dsm_t_min)
-                            and float(t) <= float(self.scorefm_dsm_t_max)
-                        ),
-                        device=Xt.device, dtype=torch.bool,
-                    )
-                else:
-                    q_used = q_flow
-                    score_active = torch.zeros(
-                        (n_graph,), device=Xt.device, dtype=torch.bool
-                    )
-
-                z_next, sf_diag = (
-                    self.r3_matcher.exact_global_step_from_scaled_score(
-                        z_t=z_t,
-                        z0=z0,
-                        mean_velocity=pred_d,
-                        scaled_score=q_used,
-                        t=t.reshape(1).expand(n_graph),
-                        t_next=t_next.reshape(1).expand(n_graph),
-                        score_min_sigma=self.r3_score_min_sigma,
-                        score_active=score_active,
-                    )
-                )
-
-                flow_z_next = scatter_mean(
-                    flow_next[:, ca_idx].float(), interface_batch_id,
-                    dim=0, dim_size=n_graph
-                ).to(Xt.dtype)
-                global_shift = z_next - flow_z_next
-                Xt = flow_next + global_shift[
-                    interface_batch_id, None, :
-                ]
-                self.last_scoreflow_sampler_diagnostics = {
-                    "score_active_rate":
-                        sf_diag["score_active_rate"].detach(),
-                    "score_endpoint_correction_rms":
-                        sf_diag["score_endpoint_correction_rms"].detach(),
-                    "global_shift_rms": torch.sqrt(
-                        global_shift.pow(2).mean().clamp_min(0.0)
-                    ).detach(),
-                }
             elif self.scorefm_sampler_mode == "bridge":
                 Xt = self.flow_matcher.bridge_step(
                     Xt, pred_clean_X, t, dt
                 )
-            elif self.scorefm_sampler_mode in {
-                "r3_scoreflow", "r3_current_osmotic_ode"
-            }:
-                # --------------------------------------------------------
-                # Factorized full-atom TRUE Score-Flow sampler.
-                #
-                # Local/internal all-atom deformation:
-                #     proven F01 endpoint bridge.
-                #
-                # Stochastic rank-3 global H3 translation:
-                #     exact canonical Gaussian Score-Flow.
-                #
-                # For sigma=g*sqrt(t(1-t)), the exact residual ratio is
-                # independent of g, so inference needs NO native endpoint and
-                # NO g predictor.  A shared translation recombines the two
-                # subspaces without changing any internal H3 distances.
-                # --------------------------------------------------------
-                bridge_next = self.flow_matcher.bridge_step(
-                    Xt, pred_clean_X, t, dt
-                )
-                n_graph = batch_size
-                ca_idx = 1 if Xt.shape[1] > 1 else 0
-                z_t = scatter_mean(
-                    Xt[:, ca_idx].float(), interface_batch_id,
-                    dim=0, dim_size=n_graph,
-                ).to(Xt.dtype)
-                z0 = scatter_mean(
-                    scoreflow_source_X0[:, ca_idx].float(),
-                    interface_batch_id, dim=0, dim_size=n_graph,
-                ).to(Xt.dtype)
-                pred_z1 = scatter_mean(
-                    pred_clean_X[:, ca_idx].float(), interface_batch_id,
-                    dim=0, dim_size=n_graph,
-                ).to(Xt.dtype)
-
-                z_next, sf_diag = (
-                    self.r3_matcher.exact_global_scoreflow_step_gfree(
-                        z_t=z_t,
-                        z0=z0,
-                        pred_z1=pred_z1,
-                        t=t.reshape(1).expand(n_graph),
-                        t_next=t_next.reshape(1).expand(n_graph),
-                    )
-                )
-                bridge_z_next = scatter_mean(
-                    bridge_next[:, ca_idx].float(), interface_batch_id,
-                    dim=0, dim_size=n_graph,
-                ).to(Xt.dtype)
-                global_shift = z_next - bridge_z_next
-                Xt = bridge_next + global_shift[
-                    interface_batch_id, None, :
-                ]
-
-                co = self.r3_matcher.brownian_current_osmotic_fields(
-                    z_t=z_t, z0=z0, pred_z1=pred_z1,
-                    t_graph=t.reshape(1).expand(n_graph),
-                )
-                interior = co["interior"]
-                if bool(interior.any()):
-                    current_rms = torch.sqrt(
-                        co["current_velocity"][interior].pow(2).mean().clamp_min(0.0)
-                    )
-                    osmotic_rms = torch.sqrt(
-                        co["osmotic_velocity"][interior].pow(2).mean().clamp_min(0.0)
-                    )
-                else:
-                    current_rms = z_t.new_zeros(())
-                    osmotic_rms = z_t.new_zeros(())
-                self.last_scoreflow_sampler_diagnostics = {
-                    "residual_ratio_mean": sf_diag[
-                        "residual_ratio"
-                    ].mean().detach(),
-                    "residual_norm_mean": sf_diag[
-                        "residual_norm"
-                    ].mean().detach(),
-                    "global_shift_rms": torch.sqrt(
-                        global_shift.pow(2).mean().clamp_min(0.0)
-                    ).detach(),
-                    "current_velocity_rms": current_rms.detach(),
-                    "osmotic_velocity_rms": osmotic_rms.detach(),
-                    "osmotic_to_current_rms": (
-                        osmotic_rms / (current_rms + self.scorefm_eps)
-                    ).detach(),
-                }
-            elif self.scorefm_sampler_mode == "r3_current_osmotic_sde":
-                # Exact fixed-g Brownian-bridge SDE in the global H3 placement
-                # subspace. Local/full-atom deformation keeps AbFlow endpoint
-                # refinement.  The stochastic global drift equals
-                # current_velocity + osmotic_velocity, so Flow and Score are
-                # coupled by the bridge process rather than by an ad-hoc weight.
-                bridge_next = self.flow_matcher.bridge_step(
-                    Xt, pred_clean_X, t, dt
-                )
-                n_graph = batch_size
-                ca_idx = 1 if Xt.shape[1] > 1 else 0
-                z_t = scatter_mean(
-                    Xt[:, ca_idx].float(), interface_batch_id,
-                    dim=0, dim_size=n_graph,
-                ).to(Xt.dtype)
-                z0 = scatter_mean(
-                    scoreflow_source_X0[:, ca_idx].float(),
-                    interface_batch_id, dim=0, dim_size=n_graph,
-                ).to(Xt.dtype)
-                pred_z1 = scatter_mean(
-                    pred_clean_X[:, ca_idx].float(), interface_batch_id,
-                    dim=0, dim_size=n_graph,
-                ).to(Xt.dtype)
-                g_graph = torch.full(
-                    (n_graph,), float(self.r3_fixed_g),
-                    device=Xt.device, dtype=Xt.dtype,
-                )
-                z_next, sde_diag = self.r3_matcher.exact_fixedg_brownian_bridge_step(
-                    z_t=z_t, pred_z1=pred_z1,
-                    t=t.reshape(1).expand(n_graph),
-                    t_next=t_next.reshape(1).expand(n_graph),
-                    g_graph=g_graph,
-                )
-                bridge_z_next = scatter_mean(
-                    bridge_next[:, ca_idx].float(), interface_batch_id,
-                    dim=0, dim_size=n_graph,
-                ).to(Xt.dtype)
-                global_shift = z_next - bridge_z_next
-                Xt = bridge_next + global_shift[interface_batch_id, None, :]
-                co = self.r3_matcher.brownian_current_osmotic_fields(
-                    z_t=z_t, z0=z0, pred_z1=pred_z1,
-                    t_graph=t.reshape(1).expand(n_graph),
-                )
-                interior = co["interior"]
-                if bool(interior.any()):
-                    current_rms = torch.sqrt(
-                        co["current_velocity"][interior].pow(2).mean().clamp_min(0.0)
-                    )
-                    osmotic_rms = torch.sqrt(
-                        co["osmotic_velocity"][interior].pow(2).mean().clamp_min(0.0)
-                    )
-                else:
-                    current_rms = z_t.new_zeros(())
-                    osmotic_rms = z_t.new_zeros(())
-                self.last_scoreflow_sampler_diagnostics = {
-                    "current_velocity_rms": current_rms.detach(),
-                    "osmotic_velocity_rms": osmotic_rms.detach(),
-                    "osmotic_to_current_rms": (
-                        osmotic_rms / (current_rms + self.scorefm_eps)
-                    ).detach(),
-                    "sde_step_std_mean": sde_diag["bridge_std"].mean().detach(),
-                    "global_shift_rms": torch.sqrt(
-                        global_shift.pow(2).mean().clamp_min(0.0)
-                    ).detach(),
-                }
             else:
                 raise ValueError(
                     f"Unknown sampler mode: {self.scorefm_sampler_mode}"
@@ -8311,8 +5749,7 @@ class AbFlowModel(nn.Module):
 
         # Terminal readout.
         #
-        # integrated_state returns the state obtained by integrating the chosen
-        # vector field. For the historical bridge sampler, the last interval has
+        # For the bridge sampler, the last interval has
         # dt = 1 - t, hence Xt <- Xt + (X1_hat-Xt)/(1-t)*dt = X1_hat.
         # The categorical linear path has the same integrated jump probability
         # dt/(1-t)=1 on the final interval.  Therefore the loop already produces
@@ -8336,6 +5773,7 @@ class AbFlowModel(nn.Module):
                 interface_init=Xt,
                 sequence_init=sequence_state_for_model,
                 flow_t=final_flow_t_graph,
+                flow_source_init=flow_source_X0,
             )
             interface_X_final = r_interface_X_final[-1]
             final_logits_full = (

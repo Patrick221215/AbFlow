@@ -1,71 +1,112 @@
 #!/usr/bin/python
-# -*- coding:utf-8 -*-
+# -*- coding: utf-8 -*-
+
+# Author: Patrick221215 <1427584833@qq.com>
+# Date: 2026-08-18 16:49:04
+# LastEditors: Patrick221215 <1427584833@qq.com>
+# LastEditTime: 2026-08-24 15:45:30
+# FilePath: /cjm/project/AbFlow/models/AbFlow/abflow_r3_matcher.py
+
 """FoldFlow-R3-inspired stochastic conditional paths for AbFlow.
 
-Only Euclidean translation ideas are absorbed.  No SO(3), SE(3), OT, ESM,
-IPA replacement, or whole-complex COM recentering is introduced.
+This module preserves only the Euclidean R3 translation component used by the
+historical PCS_RC_LC_R1_FF_R3_GLOBAL_ENDPOINT baseline.
 
-AbFlow time convention:
-    t=0 : PCS-RC proposal/source X0
-    t=1 : native endpoint X1
-
-The current AbFlow network stays endpoint-parameterized.  For an arbitrary
-velocity target u*, its equivalent endpoint-like target is
-    Y* = Xt + (1-t) u*.
-This lets us test FoldFlow's R3 conditional-flow target without adding a new
-velocity head or changing the sampler interface.
+No SO(3)/SE(3) rotational or manifold branch, optimal transport, ESM,
+IPA replacement, or whole-complex center-of-mass recentering is introduced.
 """
+
+from __future__ import annotations
+
 import math
+
 import torch
 
 
 class AbFlowR3Matcher:
-    def __init__(self, *, transport_fraction=0.05, path_min_sigma=0.0, eps=1e-8):
+    """R3 stochastic-path helper for proposal-conditioned AbFlow training."""
+
+    def __init__(
+        self,
+        *,
+        transport_fraction=0.05,
+        path_min_sigma=0.0,
+        eps=1e-8,
+    ):
         self.transport_fraction = float(transport_fraction)
         self.path_min_sigma = float(path_min_sigma)
         self.eps = float(eps)
+
         if not (0.0 < self.transport_fraction <= 1.0):
-            raise ValueError('transport_fraction must be in (0, 1].')
+            raise ValueError("transport_fraction must be in (0, 1].")
+
         if self.path_min_sigma < 0.0:
-            raise ValueError('path_min_sigma must be non-negative.')
+            raise ValueError("path_min_sigma must be non-negative.")
+
         if self.eps <= 0.0:
-            raise ValueError('eps must be positive.')
+            raise ValueError("eps must be positive.")
 
     def graph_g_from_transport(self, transport):
-        """FoldFlow g calibrated to preserve S01 midpoint RMS.
+        """Convert graph-level transport distance to the Brownian path width.
 
-        S01 midpoint vector RMS was eta * D, with eta=transport_fraction.
-        FoldFlow-R3 uses sigma(t)=sqrt(g^2 t(1-t)+sigma_min^2) per coordinate.
-        Choose g so the *total* midpoint vector RMS matches eta*D whenever the
-        requested width is above the numerical sigma floor.
+        The midpoint coordinate-wise RMS is calibrated to
+
+            transport_fraction * transport / sqrt(3).
+
+        For sigma_t^2 = g^2 * t * (1-t) + sigma_min^2,
+        t = 0.5 gives sigma_mid^2 = g^2 / 4 + sigma_min^2.
         """
-        target_mid_coord = self.transport_fraction * transport / math.sqrt(3.0)
-        floor = torch.as_tensor(
-            self.path_min_sigma, device=transport.device, dtype=transport.dtype
+        target_mid_coord = (
+            self.transport_fraction
+            * transport
+            / math.sqrt(3.0)
         )
-        dynamic_sq = (target_mid_coord.square() - floor.square()).clamp_min(0.0)
+
+        floor = torch.as_tensor(
+            self.path_min_sigma,
+            device=transport.device,
+            dtype=transport.dtype,
+        )
+
+        dynamic_sq = (
+            target_mid_coord.square() - floor.square()
+        ).clamp_min(0.0)
+
         return 2.0 * torch.sqrt(dynamic_sq)
 
     def sigma_t(self, t_graph, g_graph):
-        """FoldFlow R3 temporal width: sqrt(g^2 t(1-t)+min_sigma^2)."""
-        t = torch.as_tensor(t_graph, device=g_graph.device, dtype=g_graph.dtype)
-        return torch.sqrt(
-            (g_graph.square() * t * (1.0 - t)).clamp_min(0.0)
+        """Return the stochastic-path standard deviation at continuous time t."""
+        t = torch.as_tensor(
+            t_graph,
+            device=g_graph.device,
+            dtype=g_graph.dtype,
+        )
+
+        variance = (
+            g_graph.square() * t * (1.0 - t)
             + self.path_min_sigma ** 2
         )
 
+        return torch.sqrt(variance.clamp_min(0.0))
+
     @staticmethod
     def linear_mean(x0, x1, t_int):
+        """Linear conditional-path mean: mu_t = (1-t) x0 + t x1."""
         return (1.0 - t_int) * x0 + t_int * x1
 
     @staticmethod
     def clean_conditional_velocity(x0, x1):
-        """FoldFlow/CFM Euclidean target: u_t = x1 - x0."""
+        """Clean linear-path conditional velocity: u_t = x1 - x0."""
         return x1 - x0
 
     @staticmethod
     def endpoint_target_for_velocity(xt, velocity, t_int):
-        """Encode a velocity target through AbFlow's endpoint parameterization."""
+        """Recover the endpoint implied by a velocity at state x_t.
+
+        For a linear conditional path,
+
+            x1 = x_t + (1-t) * u_t.
+        """
         return xt + (1.0 - t_int) * velocity
 
     # ============================================================
