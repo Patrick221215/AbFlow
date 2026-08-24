@@ -236,6 +236,94 @@ class AbFlowR3Matcher:
         }
 
     # ============================================================
+    # v79: current--osmotic Brownian-bridge decomposition
+    # ============================================================
+    def brownian_current_osmotic_fields(
+            self, z_t, z0, pred_z1, t_graph):
+        """Decompose a Brownian bridge into current and osmotic velocities.
+
+        For the fixed-endpoint Brownian bridge
+            dz_t = b_plus(z_t,t) dt + g dW_t,
+            b_plus = (z1-z_t)/(1-t),
+        the time-reversed drift is
+            b_minus = (z_t-z0)/t.
+
+        Nelson/Schrodinger decomposition gives
+            v_current  = 0.5 * (b_plus + b_minus),
+            v_osmotic  = 0.5 * (b_plus - b_minus)
+                       = 0.5 * g^2 * score.
+
+        Thus Flow and Score are not two learned heads: they are the symmetric
+        and antisymmetric parts of the same bidirectional bridge dynamics.
+        The decomposition is defined only for interior t in (0,1); callers
+        should use the existing analytic boundary rules at t=0/1.
+        """
+        t = torch.as_tensor(
+            t_graph, device=z_t.device, dtype=z_t.dtype
+        ).reshape(-1)
+        if t.numel() == 1 and z_t.shape[0] > 1:
+            t = t.expand(z_t.shape[0])
+        t_safe = t.clamp(min=self.eps, max=1.0 - self.eps)
+        b_plus = (pred_z1 - z_t) / (1.0 - t_safe)[:, None]
+        b_minus = (z_t - z0) / t_safe[:, None]
+        current = 0.5 * (b_plus + b_minus)
+        osmotic = 0.5 * (b_plus - b_minus)
+        interior = (t > self.eps) & (t < 1.0 - self.eps)
+        return {
+            "forward_drift": b_plus,
+            "backward_drift": b_minus,
+            "current_velocity": current,
+            "osmotic_velocity": osmotic,
+            "interior": interior,
+        }
+
+    def exact_fixedg_brownian_bridge_step(
+            self, z_t, pred_z1, t, t_next, g_graph, noise=None):
+        """Exact conditional transition of a fixed-g Brownian bridge.
+
+        With endpoint pred_z1 frozen on [t,t_next], the Brownian bridge
+            dz = (pred_z1-z)/(1-t) dt + g dW
+        has exact transition
+            E[z_next|z_t] = z_t + a (pred_z1-z_t),
+            a = (t_next-t)/(1-t),
+            Var[z_next|z_t] = g^2 (t_next-t)(1-t_next)/(1-t).
+
+        This provides a train/inference-matched stochastic sampler when g is
+        fixed and known at inference.  No score head is needed: equivalently,
+        b_plus = v_current + v_osmotic and v_osmotic=(g^2/2) score.
+        """
+        if z_t.numel() == 0:
+            return z_t, {}
+        n = z_t.shape[0]
+        t0 = torch.as_tensor(t, device=z_t.device, dtype=z_t.dtype).reshape(-1)
+        t1 = torch.as_tensor(t_next, device=z_t.device, dtype=z_t.dtype).reshape(-1)
+        if t0.numel() == 1:
+            t0 = t0.expand(n)
+        if t1.numel() == 1:
+            t1 = t1.expand(n)
+        g = torch.as_tensor(g_graph, device=z_t.device, dtype=z_t.dtype).reshape(-1)
+        if g.numel() == 1:
+            g = g.expand(n)
+        remain = (1.0 - t0).clamp_min(self.eps)
+        delta = (t1 - t0).clamp_min(0.0)
+        alpha = (delta / remain).clamp(0.0, 1.0)
+        mean = z_t + alpha[:, None] * (pred_z1 - z_t)
+        var = g.square() * delta * (1.0 - t1).clamp_min(0.0) / remain
+        std = torch.sqrt(var.clamp_min(0.0))
+        if noise is None:
+            noise = torch.randn_like(z_t)
+        z_next = mean + std[:, None] * noise
+        final = t1 >= 1.0 - self.eps
+        z_next = torch.where(final[:, None], pred_z1, z_next)
+        return z_next, {
+            "bridge_alpha": alpha,
+            "bridge_std": std,
+            "stochastic_step_rms": torch.sqrt(
+                (std.square()).mean().clamp_min(0.0)
+            ),
+        }
+
+    # ============================================================
     # v68: direct-Flow / dual-field Score-Flow coupling
     # ============================================================
     def exact_global_step_from_scaled_score(
