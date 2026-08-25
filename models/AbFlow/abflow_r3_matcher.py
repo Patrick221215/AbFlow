@@ -1,112 +1,71 @@
 #!/usr/bin/python
-# -*- coding: utf-8 -*-
-
-# Author: Patrick221215 <1427584833@qq.com>
-# Date: 2026-08-18 16:49:04
-# LastEditors: Patrick221215 <1427584833@qq.com>
-# LastEditTime: 2026-08-24 15:45:30
-# FilePath: /cjm/project/AbFlow/models/AbFlow/abflow_r3_matcher.py
-
+# -*- coding:utf-8 -*-
 """FoldFlow-R3-inspired stochastic conditional paths for AbFlow.
 
-This module preserves only the Euclidean R3 translation component used by the
-historical PCS_RC_LC_R1_FF_R3_GLOBAL_ENDPOINT baseline.
+Only Euclidean translation ideas are absorbed.  No SO(3), SE(3), OT, ESM,
+IPA replacement, or whole-complex COM recentering is introduced.
 
-No SO(3)/SE(3) rotational or manifold branch, optimal transport, ESM,
-IPA replacement, or whole-complex center-of-mass recentering is introduced.
+AbFlow time convention:
+    t=0 : PCS-RC proposal/source X0
+    t=1 : native endpoint X1
+
+The current AbFlow network stays endpoint-parameterized.  For an arbitrary
+velocity target u*, its equivalent endpoint-like target is
+    Y* = Xt + (1-t) u*.
+This lets us test FoldFlow's R3 conditional-flow target without adding a new
+velocity head or changing the sampler interface.
 """
-
-from __future__ import annotations
-
 import math
-
 import torch
 
 
 class AbFlowR3Matcher:
-    """R3 stochastic-path helper for proposal-conditioned AbFlow training."""
-
-    def __init__(
-        self,
-        *,
-        transport_fraction=0.05,
-        path_min_sigma=0.0,
-        eps=1e-8,
-    ):
+    def __init__(self, *, transport_fraction=0.05, path_min_sigma=0.0, eps=1e-8):
         self.transport_fraction = float(transport_fraction)
         self.path_min_sigma = float(path_min_sigma)
         self.eps = float(eps)
-
         if not (0.0 < self.transport_fraction <= 1.0):
-            raise ValueError("transport_fraction must be in (0, 1].")
-
+            raise ValueError('transport_fraction must be in (0, 1].')
         if self.path_min_sigma < 0.0:
-            raise ValueError("path_min_sigma must be non-negative.")
-
+            raise ValueError('path_min_sigma must be non-negative.')
         if self.eps <= 0.0:
-            raise ValueError("eps must be positive.")
+            raise ValueError('eps must be positive.')
 
     def graph_g_from_transport(self, transport):
-        """Convert graph-level transport distance to the Brownian path width.
+        """FoldFlow g calibrated to preserve S01 midpoint RMS.
 
-        The midpoint coordinate-wise RMS is calibrated to
-
-            transport_fraction * transport / sqrt(3).
-
-        For sigma_t^2 = g^2 * t * (1-t) + sigma_min^2,
-        t = 0.5 gives sigma_mid^2 = g^2 / 4 + sigma_min^2.
+        S01 midpoint vector RMS was eta * D, with eta=transport_fraction.
+        FoldFlow-R3 uses sigma(t)=sqrt(g^2 t(1-t)+sigma_min^2) per coordinate.
+        Choose g so the *total* midpoint vector RMS matches eta*D whenever the
+        requested width is above the numerical sigma floor.
         """
-        target_mid_coord = (
-            self.transport_fraction
-            * transport
-            / math.sqrt(3.0)
-        )
-
+        target_mid_coord = self.transport_fraction * transport / math.sqrt(3.0)
         floor = torch.as_tensor(
-            self.path_min_sigma,
-            device=transport.device,
-            dtype=transport.dtype,
+            self.path_min_sigma, device=transport.device, dtype=transport.dtype
         )
-
-        dynamic_sq = (
-            target_mid_coord.square() - floor.square()
-        ).clamp_min(0.0)
-
+        dynamic_sq = (target_mid_coord.square() - floor.square()).clamp_min(0.0)
         return 2.0 * torch.sqrt(dynamic_sq)
 
     def sigma_t(self, t_graph, g_graph):
-        """Return the stochastic-path standard deviation at continuous time t."""
-        t = torch.as_tensor(
-            t_graph,
-            device=g_graph.device,
-            dtype=g_graph.dtype,
-        )
-
-        variance = (
-            g_graph.square() * t * (1.0 - t)
+        """FoldFlow R3 temporal width: sqrt(g^2 t(1-t)+min_sigma^2)."""
+        t = torch.as_tensor(t_graph, device=g_graph.device, dtype=g_graph.dtype)
+        return torch.sqrt(
+            (g_graph.square() * t * (1.0 - t)).clamp_min(0.0)
             + self.path_min_sigma ** 2
         )
 
-        return torch.sqrt(variance.clamp_min(0.0))
-
     @staticmethod
     def linear_mean(x0, x1, t_int):
-        """Linear conditional-path mean: mu_t = (1-t) x0 + t x1."""
         return (1.0 - t_int) * x0 + t_int * x1
 
     @staticmethod
     def clean_conditional_velocity(x0, x1):
-        """Clean linear-path conditional velocity: u_t = x1 - x0."""
+        """FoldFlow/CFM Euclidean target: u_t = x1 - x0."""
         return x1 - x0
 
     @staticmethod
     def endpoint_target_for_velocity(xt, velocity, t_int):
-        """Recover the endpoint implied by a velocity at state x_t.
-
-        For a linear conditional path,
-
-            x1 = x_t + (1-t) * u_t.
-        """
+        """Encode a velocity target through AbFlow's endpoint parameterization."""
         return xt + (1.0 - t_int) * velocity
 
     # ============================================================
@@ -277,92 +236,123 @@ class AbFlowR3Matcher:
         }
 
     # ============================================================
-    # v79: current--osmotic Brownian-bridge decomposition
+    # v85: F01 single-field endpoint-like canonical carrier
     # ============================================================
-    def brownian_current_osmotic_fields(
-            self, z_t, z0, pred_z1, t_graph):
-        """Decompose a Brownian bridge into current and osmotic velocities.
+    @staticmethod
+    def _broadcast_time_like(t, ref):
+        tt = torch.as_tensor(t, device=ref.device, dtype=ref.dtype)
+        if tt.dim() == 0 or tt.numel() == 1:
+            shape = [1] * ref.dim()
+            return tt.reshape(*shape)
+        tt = tt.reshape(-1)
+        if tt.numel() != ref.shape[0]:
+            raise ValueError(
+                f"Expected scalar time or {ref.shape[0]} leading times, "
+                f"got {tt.numel()}."
+            )
+        return tt.reshape(ref.shape[0], *([1] * (ref.dim() - 1)))
 
-        For the fixed-endpoint Brownian bridge
-            dz_t = b_plus(z_t,t) dt + g dW_t,
-            b_plus = (z1-z_t)/(1-t),
-        the time-reversed drift is
-            b_minus = (z_t-z0)/t.
+    def canonical_carrier_target_gfree(
+            self, x_t, x0, x1, t, boundary_eps=5e-2):
+        """Endpoint-like carrier for the F01 canonical Score--Flow field.
 
-        Nelson/Schrodinger decomposition gives
-            v_current  = 0.5 * (b_plus + b_minus),
-            v_osmotic  = 0.5 * (b_plus - b_minus)
-                       = 0.5 * g^2 * score.
+        F01 stochastic state:
+            x_t = mu_t + g*sqrt(t(1-t))*eps
+            mu_t = (1-t)x0 + t x1
 
-        Thus Flow and Score are not two learned heads: they are the symmetric
-        and antisymmetric parts of the same bidirectional bridge dynamics.
-        The decomposition is defined only for interior t in (0,1); callers
-        should use the existing analytic boundary rules at t=0/1.
+        Canonical conditional probability-flow velocity:
+            u* = (x1-x0) + k(t)(x_t-mu_t),
+            k(t)=(1-2t)/(2t(1-t)).
+
+        Existing AbFlow bridge parameterization decodes a coordinate carrier Y
+        as u=(Y-x_t)/(1-t).  Therefore the exact carrier target is
+            Y* = x_t + (1-t)u*
+               = x1 + (x_t-mu_t)/(2t).
+
+        g cancels.  ``boundary_eps`` is used only to keep the unused t->0
+        expression finite before the caller replaces that boundary with the
+        clean Endpoint target.  It is not a loss weight and does not alter the
+        physical F01 corruption path.
         """
-        t = torch.as_tensor(
-            t_graph, device=z_t.device, dtype=z_t.dtype
-        ).reshape(-1)
-        if t.numel() == 1 and z_t.shape[0] > 1:
-            t = t.expand(z_t.shape[0])
-        t_safe = t.clamp(min=self.eps, max=1.0 - self.eps)
-        b_plus = (pred_z1 - z_t) / (1.0 - t_safe)[:, None]
-        b_minus = (z_t - z0) / t_safe[:, None]
-        current = 0.5 * (b_plus + b_minus)
-        osmotic = 0.5 * (b_plus - b_minus)
-        interior = (t > self.eps) & (t < 1.0 - self.eps)
-        return {
-            "forward_drift": b_plus,
-            "backward_drift": b_minus,
-            "current_velocity": current,
-            "osmotic_velocity": osmotic,
-            "interior": interior,
-        }
+        if abs(float(self.path_min_sigma)) > self.eps:
+            raise ValueError(
+                "g-free F01 canonical carrier requires path_min_sigma=0."
+            )
+        t_b = self._broadcast_time_like(t, x_t)
+        mu = (1.0 - t_b) * x0 + t_b * x1
+        residual = x_t - mu
+        t_safe = t_b.clamp_min(float(boundary_eps))
+        return x1 + residual / (2.0 * t_safe)
 
-    def exact_fixedg_brownian_bridge_step(
-            self, z_t, pred_z1, t, t_next, g_graph, noise=None):
-        """Exact conditional transition of a fixed-g Brownian bridge.
+    def endpoint_from_canonical_carrier_gfree(
+            self, x_t, x0, carrier, t, boundary_eps=5e-2):
+        """Invert the v85 canonical carrier to the endpoint it implies.
 
-        With endpoint pred_z1 frozen on [t,t_next], the Brownian bridge
-            dz = (pred_z1-z)/(1-t) dt + g dW
-        has exact transition
-            E[z_next|z_t] = z_t + a (pred_z1-z_t),
-            a = (t_next-t)/(1-t),
-            Var[z_next|z_t] = g^2 (t_next-t)(1-t_next)/(1-t).
-
-        This provides a train/inference-matched stochastic sampler when g is
-        fixed and known at inference.  No score head is needed: equivalently,
-        b_plus = v_current + v_osmotic and v_osmotic=(g^2/2) score.
+        From Y = X1 + (Xt-mu_t)/(2t),
+            X1 = 2Y - [Xt-(1-t)X0]/t.
+        This uses only inference-known Xt, X0, t and network carrier Y.
         """
-        if z_t.numel() == 0:
-            return z_t, {}
-        n = z_t.shape[0]
-        t0 = torch.as_tensor(t, device=z_t.device, dtype=z_t.dtype).reshape(-1)
-        t1 = torch.as_tensor(t_next, device=z_t.device, dtype=z_t.dtype).reshape(-1)
-        if t0.numel() == 1:
-            t0 = t0.expand(n)
-        if t1.numel() == 1:
-            t1 = t1.expand(n)
-        g = torch.as_tensor(g_graph, device=z_t.device, dtype=z_t.dtype).reshape(-1)
-        if g.numel() == 1:
-            g = g.expand(n)
-        remain = (1.0 - t0).clamp_min(self.eps)
-        delta = (t1 - t0).clamp_min(0.0)
-        alpha = (delta / remain).clamp(0.0, 1.0)
-        mean = z_t + alpha[:, None] * (pred_z1 - z_t)
-        var = g.square() * delta * (1.0 - t1).clamp_min(0.0) / remain
-        std = torch.sqrt(var.clamp_min(0.0))
-        if noise is None:
-            noise = torch.randn_like(z_t)
-        z_next = mean + std[:, None] * noise
-        final = t1 >= 1.0 - self.eps
-        z_next = torch.where(final[:, None], pred_z1, z_next)
-        return z_next, {
-            "bridge_alpha": alpha,
-            "bridge_std": std,
-            "stochastic_step_rms": torch.sqrt(
-                (std.square()).mean().clamp_min(0.0)
-            ),
-        }
+        t_b = self._broadcast_time_like(t, x_t)
+        t_safe = t_b.clamp_min(float(boundary_eps))
+        return 2.0 * carrier - (x_t - (1.0 - t_b) * x0) / t_safe
+
+    def exact_carrier_scoreflow_step_gfree(
+            self, x_t, x0, carrier, t, t_next, canonical_t_min=5e-2):
+        """Matched F01 step for the v85 single-field coordinate carrier.
+
+        Boundary region t<canonical_t_min:
+            ``carrier`` is trained as clean Endpoint, so use the historical
+            endpoint bridge update.
+
+        Canonical region:
+            1. invert carrier -> predicted clean endpoint;
+            2. freeze that endpoint over [t,t_next];
+            3. evolve the Gaussian residual exactly with
+               sqrt[t_next(1-t_next)/(t(1-t))].
+
+        The residual ratio contains no g, hence no native-dependent path width
+        is required at inference.  At t_next=1 the ratio is exactly zero and
+        the state lands on the endpoint implied by the carrier.
+        """
+        if abs(float(self.path_min_sigma)) > self.eps:
+            raise ValueError(
+                "g-free exact carrier Score--Flow step requires "
+                "path_min_sigma=0."
+            )
+        t_b = self._broadcast_time_like(t, x_t)
+        tn_b = self._broadcast_time_like(t_next, x_t)
+        active = t_b >= float(canonical_t_min)
+
+        # Historical Endpoint bridge for the mathematically singular early
+        # boundary.  This is exact for the target used in that region.
+        one_minus_t = (1.0 - t_b).clamp_min(self.eps)
+        bridge_alpha = (tn_b - t_b) / one_minus_t
+        endpoint_next = x_t + bridge_alpha * (carrier - x_t)
+
+        pred_x1 = self.endpoint_from_canonical_carrier_gfree(
+            x_t, x0, carrier, t_b, boundary_eps=canonical_t_min
+        )
+        mu0 = (1.0 - t_b) * x0 + t_b * pred_x1
+        mu1 = (1.0 - tn_b) * x0 + tn_b * pred_x1
+        residual = x_t - mu0
+        base0 = (t_b * (1.0 - t_b)).clamp_min(0.0)
+        base1 = (tn_b * (1.0 - tn_b)).clamp_min(0.0)
+        ratio = torch.zeros_like(base0)
+        interior = base0 > self.eps
+        ratio = torch.where(
+            interior, torch.sqrt(base1 / base0.clamp_min(self.eps)), ratio
+        )
+        canonical_next = mu1 + ratio * residual
+        x_next = torch.where(active, canonical_next, endpoint_next)
+
+        with torch.no_grad():
+            return x_next, {
+                "canonical_active_rate": active.to(x_t.dtype).mean(),
+                "canonical_residual_rms": torch.sqrt(
+                    residual.pow(2).mean().clamp_min(0.0)
+                ),
+                "canonical_ratio_mean": ratio.mean(),
+            }
 
     # ============================================================
     # v68: direct-Flow / dual-field Score-Flow coupling

@@ -17,14 +17,12 @@ from evaluation.rmsd import kabsch_torch
 
 from ..modules.am_enc import AMEncoder
 from ..modules.am_enc_pair_time import AMEncoderPairTime
-from ..modules.am_enc_scoreflow_pair import AMEncoderScoreFlowPair
 from ..modules.am_egnn import AMEGNN
 from .abflow_conditional_matcher import AbFlowConditionalMatcher
 from .abflow_r3_matcher import AbFlowR3Matcher
 
 
-# v84: historical F01 FF-R3 Global Endpoint parent with three child tests:
-# AbX-inspired interface pair-time, Flow pair semantics, and stable Score--Flow.
+# v59 FoldFlow-R3 adaptation: structured full-atom stochastic R3 paths with endpoint-parameterized CFM.
 
 
 def _env_str(name, default):
@@ -167,19 +165,20 @@ class AbFlowModel(nn.Module):
                 nn.SiLU(),
                 nn.Linear(hidden_size, 1)
             )
-        # AbX-inspired pair-level time conditioning.
+        # FoldFlow-inspired pair-level time conditioning.
         #
-        # The formal parent is the completed historical F01 Global Endpoint.
-        # Pair-time is an independent child ablation:
+        # The scientific parent is now GT-SATC.  Pair-time is therefore a
+        # strictly optional child module:
         #   off       : exact original AMEncoder architecture
-        #   interface : sinusoidal t conditions only true Ab-Ag semantic messages
-        #               and antigen-surface semantic messages
-        #   context/all remain legacy diagnostic scopes.
+        #   interface : time-condition only true antibody-antigen local edges
+        #               and antigen-surface messages
+        #   context   : time-condition context/global/local-context messages only
+        #   all       : interface scope + context scope
         #
-        # The existing AMEncoderPairTime is zero-start and RNG-neutral.  Its
-        # revised v84 semantics leave the coordinate MLP of each wrapped GCL on
-        # the base edge message; time only changes the node semantic message
-        # directly, matching the representation-conditioning spirit of AbX.
+        # The pair-time encoder keeps all original GCL parameter shapes and adds
+        # only zero-initialized channel-wise time scales.  This makes the initial
+        # function exactly the base AMEncoder and avoids changing the RNG stream
+        # for later model parameters.
         pair_scope = _env_str("ABFLOW_PAIR_TIME_SCOPE", "off").lower()
         # Backward compatibility with the previous boolean Stage-2 prototype.
         if (
@@ -187,49 +186,14 @@ class AbFlowModel(nn.Module):
             and _env_flag("ABFLOW_PAIR_TIME_CONDITIONING", False)
         ):
             pair_scope = "all"
-        if pair_scope not in {"off", "interface", "context", "all"}:
+        if pair_scope not in {"off", "interface", "context", "residue", "all"}:
             raise ValueError(
-                "ABFLOW_PAIR_TIME_SCOPE must be off, interface, context, or all."
+                "ABFLOW_PAIR_TIME_SCOPE must be off, interface, context, residue, or all."
             )
         self.pair_time_scope = pair_scope
         self.pair_time_conditioning = pair_scope != "off"
 
-        # v83 keeps the verified PCS_RC_LC_R1_FF_R3_GLOBAL_ENDPOINT path,
-        # Endpoint objective, bridge sampler and terminal readout unchanged.
-        # Only an interface pair-representation adapter is added.  The three
-        # modes use one identical 5-channel architecture and differ solely in
-        # which information is supplied:
-        #   zero    : trainable parameter/capacity control with zero fields;
-        #   flow    : Endpoint-implied mean path tangent only;
-        #   coupled : mean Flow plus stable variance-scaled Score and agreement.
-        self.scoreflow_pair_mode = _env_str(
-            "ABFLOW_SCOREFLOW_PAIR_MODE", "off"
-        ).strip().lower()
-        if self.scoreflow_pair_mode not in {
-            "off", "zero", "flow", "coupled"
-        }:
-            raise ValueError(
-                "ABFLOW_SCOREFLOW_PAIR_MODE must be off, zero, flow, or "
-                "coupled."
-            )
-        self.scoreflow_pair_enabled = self.scoreflow_pair_mode != "off"
-        self.scoreflow_pair_stop_grad = _env_flag(
-            "ABFLOW_SCOREFLOW_PAIR_STOP_GRAD", True
-        )
-        if self.scoreflow_pair_enabled and self.pair_time_conditioning:
-            raise ValueError(
-                "Score--Flow pair feedback and historical pair-time cannot "
-                "be enabled together."
-            )
-
-        if self.scoreflow_pair_enabled:
-            self.gnn = AMEncoderScoreFlowPair(
-                embed_size, hidden_size, hidden_size, n_channel,
-                channel_nf=atom_embed_size, radial_nf=hidden_size,
-                in_edge_nf=0, num_verts=num_verts, n_layers=n_layers,
-                residual=True, dropout=dropout, dense=False,
-            )
-        elif self.pair_time_conditioning:
+        if self.pair_time_conditioning:
             self.gnn = AMEncoderPairTime(
                 embed_size, hidden_size, hidden_size, n_channel,
                 channel_nf=atom_embed_size, radial_nf=hidden_size,
@@ -441,6 +405,18 @@ class AbFlowModel(nn.Module):
         }:
             self.scorefm_loss_mode = "foldflow_r3_global_endpoint"
         if self.scorefm_loss_mode in {
+            "f01_r3_canonical_carrier",
+            "ff_r3_canonical_carrier",
+            "f01_canonical_scoreflow_carrier",
+        }:
+            self.scorefm_loss_mode = "f01_r3_canonical_carrier"
+        if self.scorefm_loss_mode in {
+            "f01_r3_endpoint_canonical_hybrid",
+            "ff_r3_endpoint_canonical_hybrid",
+            "f01_endpoint_scoreflow_hybrid",
+        }:
+            self.scorefm_loss_mode = "f01_r3_endpoint_canonical_hybrid"
+        if self.scorefm_loss_mode in {
             "foldflow_r3_residue_endpoint", "r3_residue_endpoint",
             "ff_r3_residue_endpoint",
         }:
@@ -462,6 +438,8 @@ class AbFlowModel(nn.Module):
             "structured_global_endpoint", "structured_global_cfm",
             "structured_multiscale_cfm",
             "foldflow_r3_global_endpoint",
+            "f01_r3_canonical_carrier",
+            "f01_r3_endpoint_canonical_hybrid",
             "foldflow_r3_residue_endpoint",
             "foldflow_r3_residue_cfm",
         }:
@@ -476,6 +454,7 @@ class AbFlowModel(nn.Module):
                 "score_aware_traj_if_nt_lite, score_aware_traj_if_nt_fm_lite, "
                 "score_aware_graph_translation_consistency, structured_global_endpoint, "
                 "structured_global_cfm, structured_multiscale_cfm, foldflow_r3_global_endpoint, "
+                "f01_r3_canonical_carrier, f01_r3_endpoint_canonical_hybrid, "
                 "foldflow_r3_residue_endpoint, foldflow_r3_residue_cfm."
             )
 
@@ -554,6 +533,36 @@ class AbFlowModel(nn.Module):
             path_min_sigma=self.r3_path_min_sigma,
             eps=self.scorefm_eps,
         )
+
+        # =========================================================
+        # v85 F01-anchored single-field Score--Flow carrier
+        # =========================================================
+        # The physical F01 adaptive-g stochastic path is unchanged.  The new
+        # modes change ONLY the coordinate target/field parameterization.
+        #
+        # For sigma_t = g*sqrt(t(1-t)):
+        #   u* = (X1-X0) + k(t)*(Xt-mu_t),
+        #   k(t) = (1-2t)/(2t(1-t)).
+        # g cancels from k(t).  The same AbFlow coordinate head predicts an
+        # endpoint-like carrier Y and no score/velocity head is added.
+        #
+        # U01 uses a small mathematical boundary where the conditional bridge
+        # carrier is singular as t->0.  U02 deliberately extends the clean
+        # Endpoint anchor to the historical DSM lower boundary t=0.20.
+        self.f01_canonical_t_min = _env_float(
+            "ABFLOW_F01_CANONICAL_T_MIN", 0.05
+        )
+        self.f01_hybrid_t_min = _env_float(
+            "ABFLOW_F01_HYBRID_T_MIN", 0.20
+        )
+        if not (0.0 < self.f01_canonical_t_min < 1.0):
+            raise ValueError(
+                "ABFLOW_F01_CANONICAL_T_MIN must be in (0,1)."
+            )
+        if not (0.0 < self.f01_hybrid_t_min < 1.0):
+            raise ValueError(
+                "ABFLOW_F01_HYBRID_T_MIN must be in (0,1)."
+            )
 
         # Trajectory-consistency controls.
         # These terms do not introduce a new score head or velocity head.
@@ -787,10 +796,13 @@ class AbFlowModel(nn.Module):
         self.scorefm_sampler_mode = _env_str(
             "ABFLOW_SCOREFM_SAMPLER_MODE", "bridge"
         ).lower()
-        if self.scorefm_sampler_mode not in {"residual", "bridge"}:
+        if self.scorefm_sampler_mode not in {
+            "residual", "bridge", "f01_canonical_carrier"
+        }:
             raise ValueError(
                 "Unknown ABFLOW_SCOREFM_SAMPLER_MODE="
-                f"{self.scorefm_sampler_mode}. Choose from residual, bridge."
+                f"{self.scorefm_sampler_mode}. Choose from residual, bridge, "
+                "f01_canonical_carrier."
             )
 
         # =========================================================
@@ -1355,6 +1367,12 @@ class AbFlowModel(nn.Module):
             true Ab-Ag edges     -> disabled
             surface Ab-Ag edges  -> disabled
 
+        residue scope (v85 AbX-style):
+            ctx edges            -> enabled
+            local context edges  -> enabled
+            true Ab-Ag edges     -> enabled
+            surface Ab-Ag edges  -> disabled
+
         all scope:
             every edge family above is enabled.
 
@@ -1385,7 +1403,7 @@ class AbFlowModel(nn.Module):
         # Global/context edges.
         ctx_attr = pack(
             t_res[ctx_edges[0]],
-            scope in {"context", "all"},
+            scope in {"context", "residue", "all"},
         )
 
         # local_edges in message_passing is exactly
@@ -1410,6 +1428,10 @@ class AbFlowModel(nn.Module):
                 ],
                 dim=0,
             )
+        elif scope == "residue":
+            # AbX-style residue-pair scope: both context and true Ab-Ag
+            # residue edges see time, while the antigen-surface branch does not.
+            local_mask_attr = torch.ones_like(local_time)
         else:
             local_mask_attr = torch.ones_like(local_time)
         local_attr = pack(local_time, local_mask_attr)
@@ -1692,102 +1714,6 @@ class AbFlowModel(nn.Module):
             "tokens": safe_state,
         }
 
-    def _scoreflow_pair_features_for_cross_edges(
-            self, *, local_X, local_is_ab, local_batch_id, cross_edges,
-            condition):
-        """Build five bounded/invariant semantics for Ab--Ag edges.
-
-        Feature order:
-          0-1: log1p(||variance-scaled score||), cos(score, edge)
-          2-4: log1p(||Endpoint-implied mean Flow||), cos(flow, edge),
-               cos(score, flow)
-        Magnitudes are log-compressed, directions use cosine invariants, and no
-        feature multiplies a loss.  Thus this is representation conditioning,
-        not a hidden time-dependent objective weight.
-        """
-        if cross_edges.dim() != 2 or cross_edges.shape[0] != 2:
-            raise ValueError("cross_edges must have shape [2,E].")
-        edge_count = int(cross_edges.shape[1])
-        out = local_X.new_zeros((edge_count, 6))
-        if edge_count == 0 or condition is None:
-            return out
-
-        row, col = cross_edges
-        row_is_ab = local_is_ab[row]
-        col_is_ab = local_is_ab[col]
-        valid_cross = torch.logical_xor(row_is_ab, col_is_ab)
-        if not bool(valid_cross.all()):
-            raise RuntimeError("Score--Flow pair features require cross edges.")
-
-        ab_node = torch.where(row_is_ab, row, col)
-        ag_node = torch.where(row_is_ab, col, row)
-        graph_index = local_batch_id[ab_node]
-
-        ca_idx = 1 if local_X.shape[1] > 1 else 0
-        edge_vector = local_X[ab_node, ca_idx] - local_X[ag_node, ca_idx]
-        edge_norm = torch.linalg.norm(edge_vector, dim=-1, keepdim=True)
-        edge_unit = edge_vector / edge_norm.clamp_min(self.scorefm_eps)
-
-        score_vector = condition["global_score"][graph_index]
-        flow_vector = condition["global_flow"][graph_index]
-
-        def magnitude_and_unit(vector):
-            magnitude = torch.linalg.norm(vector, dim=-1, keepdim=True)
-            unit = vector / magnitude.clamp_min(self.scorefm_eps)
-            unit = torch.where(
-                magnitude > self.scorefm_eps, unit, torch.zeros_like(unit)
-            )
-            return torch.log1p(magnitude), unit
-
-        score_magnitude, score_unit = magnitude_and_unit(score_vector)
-        flow_magnitude, flow_unit = magnitude_and_unit(flow_vector)
-        features = torch.cat(
-            [
-                score_magnitude,
-                (score_unit * edge_unit).sum(dim=-1, keepdim=True),
-                flow_magnitude,
-                (flow_unit * edge_unit).sum(dim=-1, keepdim=True),
-                (score_unit * flow_unit).sum(dim=-1, keepdim=True),
-            ],
-            dim=-1,
-        )
-
-        mode = self.scoreflow_pair_mode
-        if mode == "zero":
-            channel_mask = features.new_zeros(5)
-        elif mode == "flow":
-            channel_mask = features.new_tensor(
-                [0, 0, 1, 1, 0]
-            )
-        elif mode == "coupled":
-            channel_mask = features.new_tensor(
-                [1, 1, 1, 1, 1]
-            )
-        else:
-            channel_mask = features.new_zeros(5)
-        out[:, :5] = features * channel_mask.unsqueeze(0)
-        out[:, 5] = 1.0 if bool(condition.get("enabled", False)) else 0.0
-        return out
-
-    def _scoreflow_pair_edge_attributes(
-            self, *, local_X, local_is_ab, local_batch_id,
-            local_ctx_edges, local_inter_edges, aligned_inter_edges,
-            condition):
-        """Package attributes in the exact edge order consumed by AMEncoder."""
-        inter_cross_attr = self._scoreflow_pair_features_for_cross_edges(
-            local_X=local_X, local_is_ab=local_is_ab,
-            local_batch_id=local_batch_id, cross_edges=local_inter_edges,
-            condition=condition,
-        )
-        ctx_attr = local_X.new_zeros((local_ctx_edges.shape[1], 6))
-        local_attr = torch.cat([ctx_attr, inter_cross_attr], dim=0)
-        surf_attr = self._scoreflow_pair_features_for_cross_edges(
-            local_X=local_X, local_is_ab=local_is_ab,
-            local_batch_id=local_batch_id, cross_edges=aligned_inter_edges,
-            condition=condition,
-        )
-        return local_attr, surf_attr
-
     def message_passing(self, X, S, residue_pos, interface_X, surf, paratope_mask,
                         batch_id, round_idx, memory_H=None, smooth_prob=None,
                         smooth_mask=None, flow_t=None,
@@ -1795,8 +1721,7 @@ class AbFlowModel(nn.Module):
                         coord_pep_condition_mask=None,
                         seq_pep_condition=None,
                         seq_pep_condition_mask=None,
-                        sequence_state_full=None,
-                        scoreflow_pair_condition=None):
+                        sequence_state_full=None):
         # embeddings, hidden state, (internal edges, external edges),
         # (A : c*d, w : c*1)
         H_0, (ctx_edges, inter_edges), (atom_embeddings, atom_weights) = self.aa_feature(
@@ -2235,32 +2160,9 @@ class AbFlowModel(nn.Module):
             )
         )
 
-        scoreflow_local_attr = None
-        scoreflow_surf_attr = None
-        if self.scoreflow_pair_enabled:
-            scoreflow_local_attr, scoreflow_surf_attr = (
-                self._scoreflow_pair_edge_attributes(
-                    local_X=local_X,
-                    local_is_ab=local_is_ab,
-                    local_batch_id=local_batch_id,
-                    local_ctx_edges=local_ctx_edges,
-                    local_inter_edges=local_inter_edges,
-                    aligned_inter_edges=aligned_local_inter_edges,
-                    condition=scoreflow_pair_condition,
-                )
-            )
-
         # message passing
         # sme_start = time.time()
-        if self.scoreflow_pair_enabled:
-            H, pred_X, pred_local_X = self.gnn(
-                H_0, X, ctx_edges, local_mask, local_X, surf, local_edges,
-                paratope_mask, local_is_ab, aligned_local_inter_edges, epi_index,
-                channel_attr=atom_embeddings, channel_weights=atom_weights,
-                inter_edge_attr=scoreflow_local_attr,
-                surf_edge_attr=scoreflow_surf_attr,
-            )
-        elif self.pair_time_conditioning:
+        if self.pair_time_conditioning:
             H, pred_X, pred_local_X = self.gnn(
                 H_0, X, ctx_edges, local_mask, local_X, surf, local_edges,
                 paratope_mask, local_is_ab, aligned_local_inter_edges, epi_index,
@@ -2686,6 +2588,50 @@ class AbFlowModel(nn.Module):
                 ).to(target_X1.dtype),
                 "r3_noise_scope": target_X1.new_tensor(scope_code),
                 "r3_cfm_target": target_X1.new_tensor(1.0 if cfm_target else 0.0),
+            }
+
+    @torch.no_grad()
+    def _f01_unified_scoreflow_target(
+            self, *, Xt, source_X0, target_X1, t_int, t_min):
+        """Single coordinate target that couples F01 mean Flow and Score.
+
+        The historical F01 stochastic state is kept exactly:
+            Xt = mu_t + g*sqrt(t(1-t))*eps.
+
+        Its conditional Gaussian probability-flow field is
+            u* = (X1-X0) + k(t)*(Xt-mu_t),
+            k(t)=(1-2t)/(2t(1-t)).
+
+        Instead of a score head, flow head, or weighted auxiliary losses, the
+        existing coordinate head predicts the endpoint-like carrier
+            Y* = Xt + (1-t)u*
+               = X1 + (Xt-mu_t)/(2t).
+
+        The latter identity is g-free.  The clean Endpoint target is used only
+        below t_min because the *conditional* Brownian-bridge field has a true
+        t->0 singularity.  This is target replacement: every sample has one
+        coordinate target, never Endpoint + Score + Flow losses simultaneously.
+        """
+        canonical = self.r3_matcher.canonical_carrier_target_gfree(
+            Xt, source_X0, target_X1, t_int,
+            boundary_eps=float(t_min),
+        )
+        t_res = torch.as_tensor(
+            t_int, device=Xt.device, dtype=Xt.dtype
+        )
+        while t_res.dim() < Xt.dim():
+            t_res = t_res.unsqueeze(-1)
+        active = t_res >= float(t_min)
+        target = torch.where(active, canonical, target_X1)
+        with torch.no_grad():
+            target_shift = target - target_X1
+            active_res = active.reshape(active.shape[0], -1).any(dim=-1)
+            return target, {
+                "r3_canonical_active_rate": active_res.float().mean(),
+                "r3_canonical_target_shift_rms": torch.sqrt(
+                    target_shift.pow(2).mean().clamp_min(0.0)
+                ),
+                "r3_canonical_t_min": target_X1.new_tensor(float(t_min)),
             }
 
     @torch.no_grad()
@@ -3342,6 +3288,8 @@ class AbFlowModel(nn.Module):
             self.scorefm_loss_mode in {
                 "structured_global_cfm", "structured_multiscale_cfm",
                 "foldflow_r3_residue_cfm",
+                "f01_r3_canonical_carrier",
+                "f01_r3_endpoint_canonical_hybrid",
             }
             and structured_endpoint_target is not None
         ):
@@ -3404,6 +3352,8 @@ class AbFlowModel(nn.Module):
             "structured_global_endpoint", "structured_global_cfm",
             "structured_multiscale_cfm",
             "foldflow_r3_global_endpoint",
+            "f01_r3_canonical_carrier",
+            "f01_r3_endpoint_canonical_hybrid",
             "foldflow_r3_residue_endpoint",
             "foldflow_r3_residue_cfm",
         }:
@@ -3457,6 +3407,24 @@ class AbFlowModel(nn.Module):
                 "scorefm_r3_cfm_target": torch.as_tensor(
                     _spd.get("r3_cfm_target", 0.0),
                     device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_r3_canonical_active_rate": torch.as_tensor(
+                    _spd.get("r3_canonical_active_rate", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_r3_canonical_target_shift_rms": torch.as_tensor(
+                    _spd.get("r3_canonical_target_shift_rms", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_r3_canonical_t_min": torch.as_tensor(
+                    _spd.get("r3_canonical_t_min", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_r3_unified_scoreflow": pred_clean_X.new_tensor(
+                    1.0 if self.scorefm_loss_mode in {
+                        "f01_r3_canonical_carrier",
+                        "f01_r3_endpoint_canonical_hybrid",
+                    } else 0.0
                 ).detach(),
                 "scorefm_structured_cfm": pred_clean_X.new_tensor(
                     1.0 if self.scorefm_loss_mode in {"structured_global_cfm", "structured_multiscale_cfm", "foldflow_r3_residue_cfm"} else 0.0
@@ -4095,62 +4063,9 @@ class AbFlowModel(nn.Module):
         }
         return total, details
 
-    def _scoreflow_round_condition(
-            self, *, state_X, source_X, endpoint_X, flow_t,
-            interface_batch_id):
-        """Construct stable fields from the exact FF-R3 Endpoint parent.
-
-        The verified parent has a Gaussian only in graph-level H3 translation.
-        For that non-degenerate subspace,
-
-            sigma_t^2 * score_hat = mu_hat_t - z_t,
-            mu_hat_t = (1-t) z_0 + t z_1_hat.
-
-        This variance-scaled conditional score needs neither unknown g_graph nor
-        division by sigma_t.  For the linear path mean, the exact Endpoint-
-        implied tangent is d(mu_hat_t)/dt=z_1_hat-z_0, so no 1/(1-t)
-        reconstruction is needed.
-        """
-        if source_X is None or flow_t is None:
-            return None
-        ca_idx = 1 if state_X.shape[1] > 1 else 0
-        state_ca = state_X[:, ca_idx].float()
-        source_ca = source_X[:, ca_idx].float()
-        endpoint_ca = endpoint_X[:, ca_idx].float()
-        if interface_batch_id.numel() == 0:
-            return None
-        n_graph = int(interface_batch_id.max().item()) + 1
-        state_centroid = scatter_mean(
-            state_ca, interface_batch_id, dim=0, dim_size=n_graph
-        )
-        source_centroid = scatter_mean(
-            source_ca, interface_batch_id, dim=0, dim_size=n_graph
-        )
-        endpoint_centroid = scatter_mean(
-            endpoint_ca, interface_batch_id, dim=0, dim_size=n_graph
-        )
-        t_graph, valid_graph = self._scorefm_time_per_graph(
-            flow_t, interface_batch_id, state_X
-        )
-        mean_hat = (
-            (1.0 - t_graph[:, None]) * source_centroid
-            + t_graph[:, None] * endpoint_centroid
-        )
-        global_score = mean_hat - state_centroid
-        global_flow = endpoint_centroid - source_centroid
-        if self.scoreflow_pair_stop_grad:
-            global_score = global_score.detach()
-            global_flow = global_flow.detach()
-        return {
-            "global_score": global_score.to(state_X.dtype),
-            "global_flow": global_flow.to(state_X.dtype),
-            "enabled": bool(valid_graph.any()),
-        }
-
     def _forward(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep,
                  surface, residue_pos, template, lengths, init_noise=None,
-                 interface_init=None, sequence_init=None, flow_t=None,
-                 flow_source_init=None):
+                 interface_init=None, sequence_init=None, flow_t=None):
         """Evaluate f_theta(X_t, S_t, t, proposal context).
 
         interface_init/sequence_init are the explicit generated state Xt/St.
@@ -4237,21 +4152,6 @@ class AbFlowModel(nn.Module):
                 interface_X, interface_S, X_pep, S_pep
             )
 
-        # Keep the queried transport state fixed across the three refinement
-        # rounds.  The previous round's Endpoint changes; X_t and X_0 do not.
-        scoreflow_state_X = interface_X.clone()
-        scoreflow_source_X = None
-        if flow_source_init is not None:
-            if flow_source_init.shape != interface_X.shape:
-                raise ValueError(
-                    "flow_source_init/interface shape mismatch: "
-                    f"{tuple(flow_source_init.shape)} vs "
-                    f"{tuple(interface_X.shape)}"
-                )
-            scoreflow_source_X = self._raw_interface_to_model_frame(
-                flow_source_init, paratope_mask, batch_id
-            )
-
         # Convert X_pep once to the internal frame. Its relation to the current
         # interface state is recomputed after every refinement round. Proposal
         # validity is tracked per residue so missing/invalid proposal coordinates
@@ -4335,18 +4235,6 @@ class AbFlowModel(nn.Module):
                 seq_pep_condition_this = None
                 seq_pep_condition_mask_this = None
 
-            scoreflow_pair_condition = None
-            if self.scoreflow_pair_enabled and round_idx > 0:
-                scoreflow_pair_condition = self._scoreflow_round_condition(
-                    state_X=scoreflow_state_X,
-                    source_X=scoreflow_source_X,
-                    endpoint_X=interface_X,
-                    flow_t=flow_t,
-                    interface_batch_id=self.batch_constants[
-                        "interface_batch_id"
-                    ],
-                )
-
             pred_S_logits, pred_X, interface_X, H, edge_dist = self.message_passing(
                 X, S, residue_pos, interface_X, surface, paratope_mask,
                 batch_id, round_idx, memory_H, pred_S_dist, smask,
@@ -4356,7 +4244,6 @@ class AbFlowModel(nn.Module):
                 seq_pep_condition=seq_pep_condition_this,
                 seq_pep_condition_mask=seq_pep_condition_mask_this,
                 sequence_state_full=sequence_state_full,
-                scoreflow_pair_condition=scoreflow_pair_condition,
             )
 
             if condition_diag_rounds is not None:
@@ -4855,6 +4742,36 @@ class AbFlowModel(nn.Module):
                         noise_scope="global", cfm_target=False,
                     )
                 )
+            elif self.scorefm_loss_mode in {
+                "f01_r3_canonical_carrier",
+                "f01_r3_endpoint_canonical_hybrid",
+            }:
+                # EXACT historical F01 stochastic state.  Only the training
+                # target changes to one unified Score--Flow carrier.
+                Xt, _, structured_path_details = (
+                    self._foldflow_r3_primary_path(
+                        source_X0=interface_X, target_X1=gt_interface_X,
+                        t_graph=t_graph, t_int=t_int,
+                        interface_batch_id=interface_batch_id,
+                        noise_scope="global", cfm_target=False,
+                    )
+                )
+                _t_min = (
+                    self.f01_canonical_t_min
+                    if self.scorefm_loss_mode == "f01_r3_canonical_carrier"
+                    else self.f01_hybrid_t_min
+                )
+                structured_endpoint_target, _canon_diag = (
+                    self._f01_unified_scoreflow_target(
+                        Xt=Xt, source_X0=interface_X,
+                        target_X1=gt_interface_X, t_int=t_int,
+                        t_min=_t_min,
+                    )
+                )
+                structured_path_details = dict(
+                    structured_path_details or {}
+                )
+                structured_path_details.update(_canon_diag)
             elif self.scorefm_loss_mode == "foldflow_r3_residue_endpoint":
                 Xt, structured_endpoint_target, structured_path_details = (
                     self._foldflow_r3_primary_path(
@@ -5035,8 +4952,7 @@ class AbFlowModel(nn.Module):
             surface, residue_pos, template, lengths,
             interface_init=Xt if state_path else None,
             sequence_init=sequence_state_for_model if state_path else None,
-            flow_t=t_graph if state_path else None,
-            flow_source_init=interface_X if state_path else None,
+            flow_t=t_graph if state_path else None
         )
 
         # v52 score-aware graph-translation teacher query.  It is skipped
@@ -5356,6 +5272,16 @@ class AbFlowModel(nn.Module):
                 "scorefm_loss_mode_graph_translation_satc": torch.as_tensor(
                     1.0 if self.scorefm_loss_mode
                     == "score_aware_graph_translation_consistency" else 0.0,
+                    device=X.device,
+                ),
+                "scorefm_loss_mode_f01_canonical_carrier": torch.as_tensor(
+                    1.0 if self.scorefm_loss_mode
+                    == "f01_r3_canonical_carrier" else 0.0,
+                    device=X.device,
+                ),
+                "scorefm_loss_mode_f01_endpoint_canonical_hybrid": torch.as_tensor(
+                    1.0 if self.scorefm_loss_mode
+                    == "f01_r3_endpoint_canonical_hybrid" else 0.0,
                     device=X.device,
                 ),
                 "si_gamma_scale": torch.as_tensor(
@@ -5685,7 +5611,6 @@ class AbFlowModel(nn.Module):
         time_grid = self._sampling_time_grid(
             n_steps, device=X.device, dtype=X.dtype
         )
-        flow_source_X0 = interface_X.clone()
         Xt = interface_X.clone()
         St = interface_S.clone()
 
@@ -5711,8 +5636,7 @@ class AbFlowModel(nn.Module):
                 surface, residue_pos, template, lengths,
                 interface_init=Xt,
                 sequence_init=sequence_state_for_model,
-                flow_t=flow_t_graph,
-                flow_source_init=flow_source_X0,
+                flow_t=flow_t_graph
             )
             pred_clean_X = r_interface_X[-1]
 
@@ -5723,6 +5647,25 @@ class AbFlowModel(nn.Module):
             elif self.scorefm_sampler_mode == "bridge":
                 Xt = self.flow_matcher.bridge_step(
                     Xt, pred_clean_X, t, dt
+                )
+            elif self.scorefm_sampler_mode == "f01_canonical_carrier":
+                # Matched sampler for the single-field carrier.  For the clean
+                # Endpoint boundary region this is exactly the historical
+                # bridge step.  In the canonical interior it analytically
+                # inverts the carrier to a clean-endpoint estimate and applies
+                # the exact g-free Gaussian residual-ratio step.
+                if self.scorefm_loss_mode == "f01_r3_canonical_carrier":
+                    _t_min = float(self.f01_canonical_t_min)
+                elif self.scorefm_loss_mode == "f01_r3_endpoint_canonical_hybrid":
+                    _t_min = float(self.f01_hybrid_t_min)
+                else:
+                    raise RuntimeError(
+                        "f01_canonical_carrier sampler requires a v85 F01 "
+                        "canonical-carrier loss mode."
+                    )
+                Xt, _ = self.r3_matcher.exact_carrier_scoreflow_step_gfree(
+                    x_t=Xt, x0=interface_X, carrier=pred_clean_X,
+                    t=t, t_next=t_next, canonical_t_min=_t_min,
                 )
             else:
                 raise ValueError(
@@ -5773,7 +5716,6 @@ class AbFlowModel(nn.Module):
                 interface_init=Xt,
                 sequence_init=sequence_state_for_model,
                 flow_t=final_flow_t_graph,
-                flow_source_init=flow_source_X0,
             )
             interface_X_final = r_interface_X_final[-1]
             final_logits_full = (

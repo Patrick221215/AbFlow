@@ -88,6 +88,7 @@ def ensure_model_runtime_compat(model):
         'last_scorefm_losses': {},
         'sf2m_t_eps': 0.01,
         'sf2m_score_weight': 1.0,
+        'pair_score_feedback': False,
     }
     for name, value in defaults.items():
         if not hasattr(model, name):
