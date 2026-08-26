@@ -464,6 +464,108 @@ class AbFlowR3Matcher:
             }
 
     # ============================================================
+    # v87: C1 smoothstep source-anchored canonical carrier
+    # ============================================================
+    @staticmethod
+    def c1_smoothstep_lambda(t):
+        """Unique cubic Hermite homotopy with zero endpoint slopes.
+
+        lambda(0)=0, lambda'(0)=0, lambda(1)=1, lambda'(1)=0,
+        hence lambda(t)=3t^2-2t^3.
+        """
+        return t.square() * (3.0 - 2.0 * t)
+
+    def c1_smoothstep_carrier_target_gfree(self, x_t, x0, x1, t):
+        """One-forward C1 chart of the same F01 canonical Score--Flow field.
+
+        Natural canonical carrier:
+            Y*=X1+r/(2t), r=x_t-mu_t.
+
+        Use the parameter-free cubic Hermite homotopy
+            lambda(t)=3t^2-2t^3
+        between Endpoint and the natural canonical chart:
+            P*=(1-lambda)X1+lambda Y*
+              =X1+c(t)r,
+            c(t)=lambda/(2t)=t(3-2t)/2.
+
+        Therefore dP*/dx_t=c(t)I -> 0 at the source, while c(t) is about
+        0.54--0.56 on t in [0.6,0.8], preserving the strong interior response
+        observed for U02/U03. No threshold, new head, auxiliary loss or second
+        network query is introduced.
+        """
+        if abs(float(self.path_min_sigma)) > self.eps:
+            raise ValueError(
+                "g-free F01 C1 smoothstep carrier requires path_min_sigma=0."
+            )
+        t_b = self._broadcast_time_like(t, x_t)
+        mu = (1.0 - t_b) * x0 + t_b * x1
+        residual = x_t - mu
+        gain = 0.5 * t_b * (3.0 - 2.0 * t_b)
+        return x1 + gain * residual
+
+    def endpoint_from_c1_smoothstep_carrier_gfree(
+            self, x_t, x0, carrier, t):
+        """Stable endpoint decode for the v87 C1 smoothstep chart.
+
+        P=X1+c(t)[x_t-(1-t)x0-tX1]
+         =[1-c(t)t]X1+c(t)[x_t-(1-t)x0].
+
+        Since c(t)t=lambda(t)/2 and lambda in [0,1], the denominator
+        1-lambda/2 lies in [0.5,1].
+        """
+        t_b = self._broadcast_time_like(t, x_t)
+        lam = self.c1_smoothstep_lambda(t_b)
+        gain = 0.5 * t_b * (3.0 - 2.0 * t_b)
+        denom = (1.0 - 0.5 * lam).clamp_min(0.5)
+        known = gain * (x_t - (1.0 - t_b) * x0)
+        return (carrier - known) / denom
+
+    def exact_c1_smoothstep_scoreflow_step_gfree(
+            self, x_t, x0, carrier, t, t_next):
+        """Matched F01 canonical interval step for the v87 C1 chart.
+
+        The chart changes only neural conditioning. Decode X1, then evolve the
+        exact same adaptive-g F01 Gaussian residual using the g-free ratio.
+        """
+        if abs(float(self.path_min_sigma)) > self.eps:
+            raise ValueError(
+                "g-free C1 smoothstep Score--Flow step requires path_min_sigma=0."
+            )
+        if x_t.numel() == 0:
+            return x_t, {}
+        t_b = self._broadcast_time_like(t, x_t)
+        tn_b = self._broadcast_time_like(t_next, x_t)
+        pred_x1 = self.endpoint_from_c1_smoothstep_carrier_gfree(
+            x_t, x0, carrier, t_b
+        )
+        mu0 = (1.0 - t_b) * x0 + t_b * pred_x1
+        mu1 = (1.0 - tn_b) * x0 + tn_b * pred_x1
+        residual = x_t - mu0
+        base0 = (t_b * (1.0 - t_b)).clamp_min(0.0)
+        base1 = (tn_b * (1.0 - tn_b)).clamp_min(0.0)
+        interior = base0 > self.eps
+        ratio = torch.zeros_like(base0)
+        ratio = torch.where(
+            interior,
+            torch.sqrt(base1 / base0.clamp_min(self.eps)),
+            ratio,
+        )
+        residual = torch.where(interior, residual, torch.zeros_like(residual))
+        x_next = mu1 + ratio * residual
+        with torch.no_grad():
+            gain = 0.5 * t_b * (3.0 - 2.0 * t_b)
+            lam = self.c1_smoothstep_lambda(t_b)
+            return x_next, {
+                "c1_smoothstep_gain_mean": gain.mean(),
+                "c1_smoothstep_lambda_mean": lam.mean(),
+                "c1_smoothstep_residual_rms": torch.sqrt(
+                    residual.pow(2).mean().clamp_min(0.0)
+                ),
+                "c1_smoothstep_ratio_mean": ratio.mean(),
+                "c1_smoothstep_decode_denom_min": (1.0 - 0.5 * lam).min(),
+            }
+
+    # ============================================================
     # v68: direct-Flow / dual-field Score-Flow coupling
     # ============================================================
     def exact_global_step_from_scaled_score(

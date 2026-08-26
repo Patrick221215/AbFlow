@@ -35,14 +35,18 @@
   "log_interval": 1,
   "tqdm_mininterval": 5.0,
   "_experiment": {
-    "exp_id": "F05_PCS_RC_LC_R1_FACTORIZED_MEAN_FLOW",
-    "parent": "F04_PCS_RC_LC_R1_CLEAN_MEAN_FLOW",
-    "loss_mode": "clean_r3_factorized_mean_flow",
-    "sampler_mode": "sf2m_ode",
-    "single_change": "factorize clean velocity error into global placement and local conformation subspaces",
-    "physical_object": "v_global plus v_local equals X1-X0",
+    "exp_id": "F06_PCS_RC_LC_R1_FLOW_CONDITIONED_SCORE_FLOW",
+    "parent": "F05_PCS_RC_LC_R1_FIXEDG_CANONICAL_SCORE_FLOW",
+    "loss_mode": "fixedg_r3_flow_conditioned_score_flow",
+    "sampler_mode": "fixedg_scaled_score_ode",
+    "single_change": "factorize the same fixed source-noise canonical probability velocity into clean mean Flow and a standardized q=sigma*score field conditioned on the Flow-implied residual",
+    "physical_object": "u_theta=m_theta-sigma_dot(t)*q_theta",
+    "fixed_g_angstrom": 0.5,
+    "score_parameterization": "q=sigma*score=-epsilon",
+    "flow_to_score_conditioning": "detached mean-path residual",
     "endpoint_coordinate_train_weight": 0.0,
     "terminal_projection": false,
-    "score_objective": "off"
+    "score_objective": "equal-budget standardized conditional score matching",
+    "pair_time_scope": "off"
   }
 }

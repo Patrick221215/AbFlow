@@ -429,6 +429,12 @@ class AbFlowModel(nn.Module):
         }:
             self.scorefm_loss_mode = "f01_r3_antithetic_boundary_regular"
         if self.scorefm_loss_mode in {
+            "f01_r3_c1_smoothstep_canonical_carrier",
+            "ff_r3_c1_smoothstep_canonical_carrier",
+            "f01_source_anchored_smoothstep_carrier",
+        }:
+            self.scorefm_loss_mode = "f01_r3_c1_smoothstep_canonical_carrier"
+        if self.scorefm_loss_mode in {
             "foldflow_r3_residue_endpoint", "r3_residue_endpoint",
             "ff_r3_residue_endpoint",
         }:
@@ -454,6 +460,7 @@ class AbFlowModel(nn.Module):
             "f01_r3_endpoint_canonical_hybrid",
             "f01_r3_boundary_regular_carrier",
             "f01_r3_antithetic_boundary_regular",
+            "f01_r3_c1_smoothstep_canonical_carrier",
             "foldflow_r3_residue_endpoint",
             "foldflow_r3_residue_cfm",
         }:
@@ -470,7 +477,7 @@ class AbFlowModel(nn.Module):
                 "structured_global_cfm, structured_multiscale_cfm, foldflow_r3_global_endpoint, "
                 "f01_r3_canonical_carrier, f01_r3_endpoint_canonical_hybrid, "
                 "f01_r3_boundary_regular_carrier, f01_r3_antithetic_boundary_regular, "
-                "foldflow_r3_residue_endpoint, foldflow_r3_residue_cfm."
+                "f01_r3_c1_smoothstep_canonical_carrier, foldflow_r3_residue_endpoint, foldflow_r3_residue_cfm."
             )
 
         # Stochastic-interpolant controls.  These regularizers keep the strong
@@ -3418,6 +3425,7 @@ class AbFlowModel(nn.Module):
                 "f01_r3_endpoint_canonical_hybrid",
                 "f01_r3_boundary_regular_carrier",
                 "f01_r3_antithetic_boundary_regular",
+                "f01_r3_c1_smoothstep_canonical_carrier",
             }
             and structured_endpoint_target is not None
         ):
@@ -3503,6 +3511,7 @@ class AbFlowModel(nn.Module):
             "f01_r3_endpoint_canonical_hybrid",
             "f01_r3_boundary_regular_carrier",
             "f01_r3_antithetic_boundary_regular",
+            "f01_r3_c1_smoothstep_canonical_carrier",
             "foldflow_r3_residue_endpoint",
             "foldflow_r3_residue_cfm",
         }:
@@ -3581,6 +3590,18 @@ class AbFlowModel(nn.Module):
                     _spd.get("r3_boundary_regular_hard_switch", 0.0),
                     device=pred_clean_X.device, dtype=pred_clean_X.dtype
                 ).detach(),
+                "scorefm_r3_c1_smoothstep_carrier": torch.as_tensor(
+                    _spd.get("r3_c1_smoothstep_carrier", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_r3_c1_smoothstep_gain_mean": torch.as_tensor(
+                    _spd.get("r3_c1_smoothstep_gain_mean", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_r3_c1_smoothstep_target_shift_rms": torch.as_tensor(
+                    _spd.get("r3_c1_smoothstep_target_shift_rms", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
                 "scorefm_r3_antithetic_pair": torch.as_tensor(
                     _spd.get("r3_antithetic_pair", 0.0),
                     device=pred_clean_X.device, dtype=pred_clean_X.dtype
@@ -3595,6 +3616,7 @@ class AbFlowModel(nn.Module):
                         "f01_r3_endpoint_canonical_hybrid",
                         "f01_r3_boundary_regular_carrier",
                         "f01_r3_antithetic_boundary_regular",
+                        "f01_r3_c1_smoothstep_canonical_carrier",
                     } else 0.0
                 ).detach(),
                 "scorefm_structured_cfm": pred_clean_X.new_tensor(
@@ -4949,6 +4971,7 @@ class AbFlowModel(nn.Module):
             elif self.scorefm_loss_mode in {
                 "f01_r3_boundary_regular_carrier",
                 "f01_r3_antithetic_boundary_regular",
+                "f01_r3_c1_smoothstep_canonical_carrier",
             }:
                 # EXACT historical F01 adaptive-g global-R3 stochastic state.
                 # v86 changes ONLY the output coordinate chart.  There is no
@@ -4961,12 +4984,30 @@ class AbFlowModel(nn.Module):
                         noise_scope="global", cfm_target=False,
                     )
                 )
-                structured_endpoint_target, _br_diag = (
-                    self._f01_boundary_regular_scoreflow_target(
-                        Xt=Xt, source_X0=interface_X,
-                        target_X1=gt_interface_X, t_int=t_int,
+                if self.scorefm_loss_mode == "f01_r3_c1_smoothstep_canonical_carrier":
+                    structured_endpoint_target = (
+                        self.r3_matcher.c1_smoothstep_carrier_target_gfree(
+                            Xt, interface_X, gt_interface_X, t_int
+                        )
                     )
-                )
+                    with torch.no_grad():
+                        _gain = 0.5 * t_int * (3.0 - 2.0 * t_int)
+                        _shift = structured_endpoint_target - gt_interface_X
+                        _br_diag = {
+                            "r3_c1_smoothstep_carrier": gt_interface_X.new_tensor(1.0),
+                            "r3_c1_smoothstep_gain_mean": _gain.mean(),
+                            "r3_c1_smoothstep_target_shift_rms": torch.sqrt(
+                                _shift.pow(2).mean().clamp_min(0.0)
+                            ),
+                            "r3_boundary_regular_hard_switch": gt_interface_X.new_tensor(0.0),
+                        }
+                else:
+                    structured_endpoint_target, _br_diag = (
+                        self._f01_boundary_regular_scoreflow_target(
+                            Xt=Xt, source_X0=interface_X,
+                            target_X1=gt_interface_X, t_int=t_int,
+                        )
+                    )
                 structured_path_details = dict(
                     structured_path_details or {}
                 )
@@ -5579,6 +5620,11 @@ class AbFlowModel(nn.Module):
                     == "f01_r3_antithetic_boundary_regular" else 0.0,
                     device=X.device,
                 ),
+                "scorefm_loss_mode_f01_c1_smoothstep_canonical_carrier": torch.as_tensor(
+                    1.0 if self.scorefm_loss_mode
+                    == "f01_r3_c1_smoothstep_canonical_carrier" else 0.0,
+                    device=X.device,
+                ),
                 "si_gamma_scale": torch.as_tensor(
                     float(getattr(self, "si_gamma_scale", 0.0)), device=X.device
                 ),
@@ -5973,6 +6019,18 @@ class AbFlowModel(nn.Module):
                     )
                 Xt, _ = (
                     self.r3_matcher.exact_boundary_regular_scoreflow_step_gfree(
+                        x_t=Xt, x0=interface_X, carrier=pred_clean_X,
+                        t=t, t_next=t_next,
+                    )
+                )
+            elif self.scorefm_sampler_mode == "f01_c1_smoothstep_canonical_carrier":
+                if self.scorefm_loss_mode != "f01_r3_c1_smoothstep_canonical_carrier":
+                    raise RuntimeError(
+                        "f01_c1_smoothstep_canonical_carrier sampler requires "
+                        "f01_r3_c1_smoothstep_canonical_carrier loss mode."
+                    )
+                Xt, _ = (
+                    self.r3_matcher.exact_c1_smoothstep_scoreflow_step_gfree(
                         x_t=Xt, x0=interface_X, carrier=pred_clean_X,
                         t=t, t_next=t_next,
                     )
