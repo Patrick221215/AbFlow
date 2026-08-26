@@ -355,6 +355,115 @@ class AbFlowR3Matcher:
             }
 
     # ============================================================
+    # v86: boundary-regular preconditioned canonical carrier
+    # ============================================================
+    def boundary_regular_carrier_target_gfree(
+            self, x_t, x0, x1, t):
+        """Boundary-regular chart of the same F01 canonical Score--Flow field.
+
+        The v85 natural carrier
+            Y*_t = X1 + (Xt-mu_t)/(2t)
+        is an exact bridge-coordinate representation of the conditional
+        probability-flow velocity but is badly conditioned near t=0.
+
+        v86 applies the parameter-free homotopy lambda(t)=t between the clean
+        Endpoint and the natural canonical carrier:
+            P*_t = (1-t) X1 + t Y*_t
+                 = X1 + 0.5 (Xt-mu_t).
+
+        IMPORTANT:
+        - this changes only the neural output coordinate chart;
+        - the physical F01 stochastic path is unchanged;
+        - the decoded endpoint is still used by the same canonical Gaussian
+          residual evolution;
+        - no score head, flow head, auxiliary loss, or t-threshold is added.
+        """
+        if abs(float(self.path_min_sigma)) > self.eps:
+            raise ValueError(
+                "g-free F01 boundary-regular carrier requires "
+                "path_min_sigma=0."
+            )
+        t_b = self._broadcast_time_like(t, x_t)
+        mu = (1.0 - t_b) * x0 + t_b * x1
+        residual = x_t - mu
+        return x1 + 0.5 * residual
+
+    def endpoint_from_boundary_regular_carrier_gfree(
+            self, x_t, x0, carrier, t):
+        """Decode the endpoint implied by the v86 boundary-regular carrier.
+
+        From
+            P = X1 + 0.5[Xt-(1-t)X0-tX1]
+              = (1-t/2)X1 + 0.5[Xt-(1-t)X0],
+        therefore
+            X1 = [P - 0.5(Xt-(1-t)X0)] / (1-t/2).
+
+        The denominator lies in [0.5, 1] for t in [0,1], hence there is no
+        source-side 1/t inversion singularity.
+        """
+        t_b = self._broadcast_time_like(t, x_t)
+        denom = (1.0 - 0.5 * t_b).clamp_min(0.5)
+        known = 0.5 * (x_t - (1.0 - t_b) * x0)
+        return (carrier - known) / denom
+
+    def exact_boundary_regular_scoreflow_step_gfree(
+            self, x_t, x0, carrier, t, t_next):
+        """Matched sampler for the v86 boundary-regular carrier.
+
+        1. Decode carrier -> endpoint estimate with a nonsingular transform.
+        2. Freeze the decoded endpoint over [t,t_next].
+        3. Evolve the F01 Gaussian residual with the exact g-free ratio
+              sqrt[t_next(1-t_next)/(t(1-t))].
+
+        At t=0 the formal residual is exactly zero, so the first interval starts
+        from the decoded mean. At t_next=1 the ratio is zero and the state lands
+        exactly on the decoded endpoint. No hard Endpoint/canonical switch is
+        used anywhere.
+        """
+        if abs(float(self.path_min_sigma)) > self.eps:
+            raise ValueError(
+                "g-free boundary-regular Score--Flow step requires "
+                "path_min_sigma=0."
+            )
+        if x_t.numel() == 0:
+            return x_t, {}
+
+        t_b = self._broadcast_time_like(t, x_t)
+        tn_b = self._broadcast_time_like(t_next, x_t)
+        pred_x1 = self.endpoint_from_boundary_regular_carrier_gfree(
+            x_t, x0, carrier, t_b
+        )
+
+        mu0 = (1.0 - t_b) * x0 + t_b * pred_x1
+        mu1 = (1.0 - tn_b) * x0 + tn_b * pred_x1
+        residual = x_t - mu0
+
+        base0 = (t_b * (1.0 - t_b)).clamp_min(0.0)
+        base1 = (tn_b * (1.0 - tn_b)).clamp_min(0.0)
+        interior = base0 > self.eps
+        ratio = torch.zeros_like(base0)
+        ratio = torch.where(
+            interior,
+            torch.sqrt(base1 / base0.clamp_min(self.eps)),
+            ratio,
+        )
+        residual = torch.where(
+            interior, residual, torch.zeros_like(residual)
+        )
+        x_next = mu1 + ratio * residual
+
+        with torch.no_grad():
+            return x_next, {
+                "boundary_regular_residual_rms": torch.sqrt(
+                    residual.pow(2).mean().clamp_min(0.0)
+                ),
+                "boundary_regular_ratio_mean": ratio.mean(),
+                "boundary_regular_endpoint_rms": torch.sqrt(
+                    pred_x1.pow(2).mean().clamp_min(0.0)
+                ),
+            }
+
+    # ============================================================
     # v68: direct-Flow / dual-field Score-Flow coupling
     # ============================================================
     def exact_global_step_from_scaled_score(

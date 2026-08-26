@@ -417,6 +417,18 @@ class AbFlowModel(nn.Module):
         }:
             self.scorefm_loss_mode = "f01_r3_endpoint_canonical_hybrid"
         if self.scorefm_loss_mode in {
+            "f01_r3_boundary_regular_carrier",
+            "ff_r3_boundary_regular_carrier",
+            "f01_preconditioned_scoreflow_carrier",
+        }:
+            self.scorefm_loss_mode = "f01_r3_boundary_regular_carrier"
+        if self.scorefm_loss_mode in {
+            "f01_r3_antithetic_boundary_regular",
+            "ff_r3_antithetic_boundary_regular",
+            "f01_antithetic_scoreflow_response",
+        }:
+            self.scorefm_loss_mode = "f01_r3_antithetic_boundary_regular"
+        if self.scorefm_loss_mode in {
             "foldflow_r3_residue_endpoint", "r3_residue_endpoint",
             "ff_r3_residue_endpoint",
         }:
@@ -440,6 +452,8 @@ class AbFlowModel(nn.Module):
             "foldflow_r3_global_endpoint",
             "f01_r3_canonical_carrier",
             "f01_r3_endpoint_canonical_hybrid",
+            "f01_r3_boundary_regular_carrier",
+            "f01_r3_antithetic_boundary_regular",
             "foldflow_r3_residue_endpoint",
             "foldflow_r3_residue_cfm",
         }:
@@ -455,6 +469,7 @@ class AbFlowModel(nn.Module):
                 "score_aware_graph_translation_consistency, structured_global_endpoint, "
                 "structured_global_cfm, structured_multiscale_cfm, foldflow_r3_global_endpoint, "
                 "f01_r3_canonical_carrier, f01_r3_endpoint_canonical_hybrid, "
+                "f01_r3_boundary_regular_carrier, f01_r3_antithetic_boundary_regular, "
                 "foldflow_r3_residue_endpoint, foldflow_r3_residue_cfm."
             )
 
@@ -797,12 +812,13 @@ class AbFlowModel(nn.Module):
             "ABFLOW_SCOREFM_SAMPLER_MODE", "bridge"
         ).lower()
         if self.scorefm_sampler_mode not in {
-            "residual", "bridge", "f01_canonical_carrier"
+            "residual", "bridge", "f01_canonical_carrier",
+            "f01_boundary_regular_carrier",
         }:
             raise ValueError(
                 "Unknown ABFLOW_SCOREFM_SAMPLER_MODE="
                 f"{self.scorefm_sampler_mode}. Choose from residual, bridge, "
-                "f01_canonical_carrier."
+                "f01_canonical_carrier, f01_boundary_regular_carrier."
             )
 
         # =========================================================
@@ -2415,6 +2431,85 @@ class AbFlowModel(nn.Module):
         )
         return per_graph, valid_graph
 
+    def _antithetic_even_odd_objective_per_graph(
+            self, *, pred_plus, pred_minus, target_plus, target_minus,
+            endpoint_target, atom_mask, interface_batch_id):
+        """One primary paired field objective in symmetric/antisymmetric coordinates.
+
+        For an antithetic F01 pair Xt+ = mu+r and Xt- = mu-r, the v86
+        boundary-regular targets satisfy
+            P*+ = X1 + 0.5 r,
+            P*- = X1 - 0.5 r.
+        Hence
+            even* = 0.5(P*+ + P*-) = X1,
+            odd*  = 0.5(P*+ - P*-) = 0.5 r.
+
+        The same coordinate network predicts both states.  We transform its two
+        outputs into even/odd channels and use their arithmetic mean as ONE
+        primary coordinate objective.  The factor 0.5 is only normalization of
+        two equal coordinate channels; it is not a tunable score/flow weight.
+        """
+        even_pred = 0.5 * (pred_plus + pred_minus)
+        odd_pred = 0.5 * (pred_plus - pred_minus)
+        even_target = endpoint_target
+        odd_target = 0.5 * (target_plus - target_minus)
+
+        even_pg, even_valid = self._masked_residue_smooth_l1_per_graph(
+            even_pred, even_target, atom_mask, interface_batch_id
+        )
+        odd_pg, odd_valid = self._masked_residue_smooth_l1_per_graph(
+            odd_pred, odd_target, atom_mask, interface_batch_id
+        )
+        valid = even_valid & odd_valid
+        paired_pg = 0.5 * (even_pg + odd_pg)
+
+        with torch.no_grad():
+            even_rms = torch.sqrt(
+                (even_pred - even_target).pow(2).mean().clamp_min(0.0)
+            )
+            odd_rms = torch.sqrt(
+                (odd_pred - odd_target).pow(2).mean().clamp_min(0.0)
+            )
+
+            # The stochastic subspace is graph-level R3 translation.  CA
+            # centroid odd response gives an interpretable functional-response
+            # diagnostic without changing the full-atom objective.
+            ca_idx = 1 if pred_plus.shape[1] > 1 else 0
+            n_graph = (
+                int(interface_batch_id.max().item()) + 1
+                if interface_batch_id.numel() > 0 else 1
+            )
+            odd_pred_z = scatter_mean(
+                odd_pred[:, ca_idx].float(), interface_batch_id,
+                dim=0, dim_size=n_graph,
+            )
+            odd_target_z = scatter_mean(
+                odd_target[:, ca_idx].float(), interface_batch_id,
+                dim=0, dim_size=n_graph,
+            )
+            dot = (odd_pred_z * odd_target_z).sum(dim=-1)
+            pn = torch.linalg.norm(odd_pred_z, dim=-1)
+            tn = torch.linalg.norm(odd_target_z, dim=-1)
+            cos = dot / (pn * tn + self.scorefm_eps)
+            ratio = dot / (tn.square() + self.scorefm_eps)
+            active = tn > self.scorefm_eps
+            odd_cos = (
+                cos[active].mean().to(pred_plus.dtype)
+                if bool(active.any()) else pred_plus.new_tensor(0.0)
+            )
+            odd_ratio = (
+                ratio[active].mean().to(pred_plus.dtype)
+                if bool(active.any()) else pred_plus.new_tensor(0.0)
+            )
+
+        return paired_pg, valid, {
+            "scorefm_antithetic_even_rms": even_rms.detach(),
+            "scorefm_antithetic_odd_rms": odd_rms.detach(),
+            "scorefm_antithetic_odd_cos": odd_cos.detach(),
+            "scorefm_antithetic_response_ratio": odd_ratio.detach(),
+            "scorefm_antithetic_pair_rate": pred_plus.new_tensor(1.0),
+        }
+
     def _scorefm_time_per_graph(
             self, t, interface_batch_id, ref_tensor):
         """Convert scalar/graph/interface time to one value per complex."""
@@ -2632,6 +2727,36 @@ class AbFlowModel(nn.Module):
                     target_shift.pow(2).mean().clamp_min(0.0)
                 ),
                 "r3_canonical_t_min": target_X1.new_tensor(float(t_min)),
+            }
+
+    @torch.no_grad()
+    def _f01_boundary_regular_scoreflow_target(
+            self, *, Xt, source_X0, target_X1, t_int):
+        """Boundary-regular coordinate target for the SAME F01 field.
+
+        Natural v85 canonical carrier:
+            Y* = X1 + (Xt-mu_t)/(2t)
+        is exact but ill-conditioned at the source boundary.
+
+        v86 uses the parameter-free homotopy lambda(t)=t:
+            P* = (1-t) X1 + t Y*
+               = X1 + 0.5 (Xt-mu_t).
+
+        There is no t-threshold and no auxiliary loss.  The target approaches
+        the clean Endpoint at both t=0 and t=1 while remaining state-dependent
+        throughout the stochastic interior.
+        """
+        target = self.r3_matcher.boundary_regular_carrier_target_gfree(
+            Xt, source_X0, target_X1, t_int
+        )
+        with torch.no_grad():
+            target_shift = target - target_X1
+            return target, {
+                "r3_boundary_regular_target_shift_rms": torch.sqrt(
+                    target_shift.pow(2).mean().clamp_min(0.0)
+                ),
+                "r3_boundary_regular_carrier": target_X1.new_tensor(1.0),
+                "r3_boundary_regular_hard_switch": target_X1.new_tensor(0.0),
             }
 
     @torch.no_grad()
@@ -3268,7 +3393,8 @@ class AbFlowModel(nn.Module):
             satc_residue_weight=None, satc_score_weight_eff=None,
             satc_velocity_weight_eff=None, satc_schedule_info=None,
             satc_transport_rms_graph=None, satc_gamma_graph=None,
-            structured_endpoint_target=None, structured_path_details=None):
+            structured_endpoint_target=None, structured_path_details=None,
+            antithetic_pred_X=None, antithetic_target_X=None):
         """Coordinate objective for the shadow paratope.
 
         endpoint mode:
@@ -3290,16 +3416,37 @@ class AbFlowModel(nn.Module):
                 "foldflow_r3_residue_cfm",
                 "f01_r3_canonical_carrier",
                 "f01_r3_endpoint_canonical_hybrid",
+                "f01_r3_boundary_regular_carrier",
+                "f01_r3_antithetic_boundary_regular",
             }
             and structured_endpoint_target is not None
         ):
             primary_target = structured_endpoint_target
 
-        endpoint_per_graph, endpoint_valid = (
-            self._masked_residue_smooth_l1_per_graph(
-                pred_clean_X, primary_target, atom_mask, interface_batch_id
+        antithetic_details = {}
+        if self.scorefm_loss_mode == "f01_r3_antithetic_boundary_regular":
+            if antithetic_pred_X is None or antithetic_target_X is None:
+                raise RuntimeError(
+                    "f01_r3_antithetic_boundary_regular requires the matched "
+                    "antithetic network query and target."
+                )
+            endpoint_per_graph, endpoint_valid, antithetic_details = (
+                self._antithetic_even_odd_objective_per_graph(
+                    pred_plus=pred_clean_X,
+                    pred_minus=antithetic_pred_X,
+                    target_plus=primary_target,
+                    target_minus=antithetic_target_X,
+                    endpoint_target=X1,
+                    atom_mask=atom_mask,
+                    interface_batch_id=interface_batch_id,
+                )
             )
-        )
+        else:
+            endpoint_per_graph, endpoint_valid = (
+                self._masked_residue_smooth_l1_per_graph(
+                    pred_clean_X, primary_target, atom_mask, interface_batch_id
+                )
+            )
         if endpoint_valid.any():
             endpoint_loss = endpoint_per_graph[endpoint_valid].mean()
         else:
@@ -3354,6 +3501,8 @@ class AbFlowModel(nn.Module):
             "foldflow_r3_global_endpoint",
             "f01_r3_canonical_carrier",
             "f01_r3_endpoint_canonical_hybrid",
+            "f01_r3_boundary_regular_carrier",
+            "f01_r3_antithetic_boundary_regular",
             "foldflow_r3_residue_endpoint",
             "foldflow_r3_residue_cfm",
         }:
@@ -3420,10 +3569,32 @@ class AbFlowModel(nn.Module):
                     _spd.get("r3_canonical_t_min", 0.0),
                     device=pred_clean_X.device, dtype=pred_clean_X.dtype
                 ).detach(),
+                "scorefm_r3_boundary_regular_target_shift_rms": torch.as_tensor(
+                    _spd.get("r3_boundary_regular_target_shift_rms", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_r3_boundary_regular_carrier": torch.as_tensor(
+                    _spd.get("r3_boundary_regular_carrier", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_r3_boundary_regular_hard_switch": torch.as_tensor(
+                    _spd.get("r3_boundary_regular_hard_switch", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_r3_antithetic_pair": torch.as_tensor(
+                    _spd.get("r3_antithetic_pair", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_r3_antithetic_separation_rms": torch.as_tensor(
+                    _spd.get("r3_antithetic_separation_rms", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
                 "scorefm_r3_unified_scoreflow": pred_clean_X.new_tensor(
                     1.0 if self.scorefm_loss_mode in {
                         "f01_r3_canonical_carrier",
                         "f01_r3_endpoint_canonical_hybrid",
+                        "f01_r3_boundary_regular_carrier",
+                        "f01_r3_antithetic_boundary_regular",
                     } else 0.0
                 ).detach(),
                 "scorefm_structured_cfm": pred_clean_X.new_tensor(
@@ -3437,6 +3608,7 @@ class AbFlowModel(nn.Module):
                 "scorefm_traj_velocity": zero,
                 "scorefm_traj_rate": zero,
             }
+            details.update(antithetic_details)
             details.update(tbin_details)
             return endpoint_loss, details
 
@@ -4733,6 +4905,8 @@ class AbFlowModel(nn.Module):
             gt_satc_transport_graph = None
             structured_endpoint_target = None
             structured_path_details = None
+            antithetic_Xt = None
+            antithetic_target_X = None
             if self.scorefm_loss_mode == "foldflow_r3_global_endpoint":
                 Xt, structured_endpoint_target, structured_path_details = (
                     self._foldflow_r3_primary_path(
@@ -4772,6 +4946,51 @@ class AbFlowModel(nn.Module):
                     structured_path_details or {}
                 )
                 structured_path_details.update(_canon_diag)
+            elif self.scorefm_loss_mode in {
+                "f01_r3_boundary_regular_carrier",
+                "f01_r3_antithetic_boundary_regular",
+            }:
+                # EXACT historical F01 adaptive-g global-R3 stochastic state.
+                # v86 changes ONLY the output coordinate chart.  There is no
+                # t-threshold and no auxiliary score/flow loss.
+                Xt, _, structured_path_details = (
+                    self._foldflow_r3_primary_path(
+                        source_X0=interface_X, target_X1=gt_interface_X,
+                        t_graph=t_graph, t_int=t_int,
+                        interface_batch_id=interface_batch_id,
+                        noise_scope="global", cfm_target=False,
+                    )
+                )
+                structured_endpoint_target, _br_diag = (
+                    self._f01_boundary_regular_scoreflow_target(
+                        Xt=Xt, source_X0=interface_X,
+                        target_X1=gt_interface_X, t_int=t_int,
+                    )
+                )
+                structured_path_details = dict(
+                    structured_path_details or {}
+                )
+                structured_path_details.update(_br_diag)
+
+                if self.scorefm_loss_mode == "f01_r3_antithetic_boundary_regular":
+                    # No new random draw: reflect the exact F01 residual around
+                    # the same conditional mean, preserving the parent RNG path.
+                    # If Xt=mu+r, the antithetic state is Xt-=mu-r.
+                    antithetic_Xt = 2.0 * mu_t - Xt
+                    antithetic_target_X = (
+                        self.r3_matcher.boundary_regular_carrier_target_gfree(
+                            antithetic_Xt, interface_X, gt_interface_X, t_int
+                        )
+                    )
+                    with torch.no_grad():
+                        structured_path_details["r3_antithetic_pair"] = (
+                            gt_interface_X.new_tensor(1.0)
+                        )
+                        structured_path_details["r3_antithetic_separation_rms"] = (
+                            torch.sqrt(
+                                (Xt - antithetic_Xt).pow(2).mean().clamp_min(0.0)
+                            )
+                        )
             elif self.scorefm_loss_mode == "foldflow_r3_residue_endpoint":
                 Xt, structured_endpoint_target, structured_path_details = (
                     self._foldflow_r3_primary_path(
@@ -4932,6 +5151,8 @@ class AbFlowModel(nn.Module):
             si_gamma_prime_int = None
             structured_endpoint_target = None
             structured_path_details = None
+            antithetic_Xt = None
+            antithetic_target_X = None
             sat_eps_int = None
             sat_gamma_int = None
             sat_active_int = None
@@ -4947,6 +5168,22 @@ class AbFlowModel(nn.Module):
             source_ca_mean = None
 
         # get results
+        # U04 needs a paired functional-response query. Save RNG before the
+        # primary forward so both antithetic states use the SAME dropout masks.
+        # After the second query, restore the RNG state to exactly what it was
+        # after one ordinary forward. Thus U04 does not shift subsequent random
+        # draws relative to its U03 parent.
+        antithetic_pred_X = None
+        _pair_rng_cpu_before = None
+        _pair_rng_cuda_before = None
+        if (
+            state_path
+            and self.scorefm_loss_mode == "f01_r3_antithetic_boundary_regular"
+        ):
+            _pair_rng_cpu_before = torch.get_rng_state()
+            if X.is_cuda:
+                _pair_rng_cuda_before = torch.cuda.get_rng_state(X.device)
+
         H, pred_S, r_pred_S_logits, pred_X, r_interface_X, r_edge_dist, prmsd = self._forward(
             X, S, cmask, smask, paratope_mask, X_pep, S_pep,
             surface, residue_pos, template, lengths,
@@ -4954,6 +5191,52 @@ class AbFlowModel(nn.Module):
             sequence_init=sequence_state_for_model if state_path else None,
             flow_t=t_graph if state_path else None
         )
+
+        if (
+            state_path
+            and self.scorefm_loss_mode == "f01_r3_antithetic_boundary_regular"
+        ):
+            if antithetic_Xt is None or antithetic_target_X is None:
+                raise RuntimeError(
+                    "Antithetic boundary-regular mode requires its paired state."
+                )
+            _pair_rng_cpu_after = torch.get_rng_state()
+            _pair_rng_cuda_after = (
+                torch.cuda.get_rng_state(X.device) if X.is_cuda else None
+            )
+
+            capture_saved = bool(getattr(self, "_diagnostic_capture", False))
+            probe_saved = self._diagnostic_probe_tensor
+            cond_diag_saved = dict(self._latest_condition_diagnostics)
+            self._diagnostic_capture = False
+            try:
+                torch.set_rng_state(_pair_rng_cpu_before)
+                if X.is_cuda:
+                    torch.cuda.set_rng_state(
+                        _pair_rng_cuda_before, device=X.device
+                    )
+                (
+                    _H_anti, _pred_S_anti, _logits_anti, _pred_X_anti,
+                    r_interface_X_anti, _edge_anti, _prmsd_anti,
+                ) = self._forward(
+                    X, S, cmask, smask, paratope_mask, X_pep, S_pep,
+                    surface, residue_pos, template, lengths,
+                    interface_init=antithetic_Xt,
+                    sequence_init=sequence_state_for_model,
+                    flow_t=t_graph,
+                )
+                antithetic_pred_X = r_interface_X_anti[-1]
+            finally:
+                # Keep primary-forward diagnostics and preserve the parent's
+                # random-call order after the paired query.
+                self._diagnostic_capture = capture_saved
+                self._diagnostic_probe_tensor = probe_saved
+                self._latest_condition_diagnostics = cond_diag_saved
+                torch.set_rng_state(_pair_rng_cpu_after)
+                if X.is_cuda:
+                    torch.cuda.set_rng_state(
+                        _pair_rng_cuda_after, device=X.device
+                    )
 
         # v52 score-aware graph-translation teacher query.  It is skipped
         # during validation and on non-scheduled training steps.  Diagnostic
@@ -5058,6 +5341,8 @@ class AbFlowModel(nn.Module):
                     satc_gamma_graph=satc_gamma_graph,
                     structured_endpoint_target=structured_endpoint_target,
                     structured_path_details=structured_path_details,
+                    antithetic_pred_X=antithetic_pred_X,
+                    antithetic_target_X=antithetic_target_X,
                 )
             )
         else:
@@ -5282,6 +5567,16 @@ class AbFlowModel(nn.Module):
                 "scorefm_loss_mode_f01_endpoint_canonical_hybrid": torch.as_tensor(
                     1.0 if self.scorefm_loss_mode
                     == "f01_r3_endpoint_canonical_hybrid" else 0.0,
+                    device=X.device,
+                ),
+                "scorefm_loss_mode_f01_boundary_regular_carrier": torch.as_tensor(
+                    1.0 if self.scorefm_loss_mode
+                    == "f01_r3_boundary_regular_carrier" else 0.0,
+                    device=X.device,
+                ),
+                "scorefm_loss_mode_f01_antithetic_boundary_regular": torch.as_tensor(
+                    1.0 if self.scorefm_loss_mode
+                    == "f01_r3_antithetic_boundary_regular" else 0.0,
                     device=X.device,
                 ),
                 "si_gamma_scale": torch.as_tensor(
@@ -5666,6 +5961,21 @@ class AbFlowModel(nn.Module):
                 Xt, _ = self.r3_matcher.exact_carrier_scoreflow_step_gfree(
                     x_t=Xt, x0=interface_X, carrier=pred_clean_X,
                     t=t, t_next=t_next, canonical_t_min=_t_min,
+                )
+            elif self.scorefm_sampler_mode == "f01_boundary_regular_carrier":
+                if self.scorefm_loss_mode not in {
+                    "f01_r3_boundary_regular_carrier",
+                    "f01_r3_antithetic_boundary_regular",
+                }:
+                    raise RuntimeError(
+                        "f01_boundary_regular_carrier sampler requires a v86 "
+                        "boundary-regular loss mode."
+                    )
+                Xt, _ = (
+                    self.r3_matcher.exact_boundary_regular_scoreflow_step_gfree(
+                        x_t=Xt, x0=interface_X, carrier=pred_clean_X,
+                        t=t, t_next=t_next,
+                    )
                 )
             else:
                 raise ValueError(
