@@ -821,11 +821,13 @@ class AbFlowModel(nn.Module):
         if self.scorefm_sampler_mode not in {
             "residual", "bridge", "f01_canonical_carrier",
             "f01_boundary_regular_carrier",
+            "f01_c1_smoothstep_canonical_carrier",
         }:
             raise ValueError(
                 "Unknown ABFLOW_SCOREFM_SAMPLER_MODE="
                 f"{self.scorefm_sampler_mode}. Choose from residual, bridge, "
-                "f01_canonical_carrier, f01_boundary_regular_carrier."
+                "f01_canonical_carrier, f01_boundary_regular_carrier, "
+                "f01_c1_smoothstep_canonical_carrier."
             )
 
         # =========================================================
