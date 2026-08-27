@@ -1094,6 +1094,69 @@ class AbFlowModel(nn.Module):
         self._last_condition_diagnostics = {}
         self._latest_condition_diagnostics = {}
 
+        # =========================================================
+        # v90 / U07: structure-conditioned inverse-folding readout
+        # =========================================================
+        # Scientific motivation:
+        #   - Keep the U02 structural path/target/sampler and the original
+        #     Kabsch-aligned static geometry supervision unchanged.
+        #   - Strengthen only the structure -> sequence direction.
+        #   - Sequence logits receive a residual feature computed from the
+        #     CURRENT PREDICTED H3--antigen interface geometry.
+        #
+        # The geometric feature is deliberately:
+        #   * prediction-derived (never GT-derived),
+        #   * translation/rotation invariant (CA distances only),
+        #   * detached from coordinates (one-way structure -> sequence),
+        #   * zero-start in function space (parent logits exactly preserved
+        #     at initialization),
+        #   * single-forward and CE-only (no CTMC/ELBO mismatch).
+        self.structure_seq_readout_mode = _env_str(
+            "ABFLOW_STRUCTURE_SEQ_READOUT", "off"
+        ).lower()
+        if self.structure_seq_readout_mode not in {
+            "off", "interface_geometry"
+        }:
+            raise ValueError(
+                "ABFLOW_STRUCTURE_SEQ_READOUT must be off or "
+                "interface_geometry."
+            )
+
+        self.structure_seq_feature_dim = 6  # d_min + 5 fixed RBF occupancies
+        self.structure_seq_adapter = None
+        if (
+            not self.struct_only
+            and self.structure_seq_readout_mode == "interface_geometry"
+        ):
+            self.structure_seq_adapter = nn.Sequential(
+                nn.Linear(
+                    hidden_size + self.structure_seq_feature_dim,
+                    hidden_size,
+                ),
+                nn.SiLU(),
+                nn.Linear(hidden_size, hidden_size),
+            )
+            # Exact parent function at step 0:
+            # geometry residual starts identically at zero.
+            nn.init.zeros_(self.structure_seq_adapter[-1].weight)
+            nn.init.zeros_(self.structure_seq_adapter[-1].bias)
+
+            # Fixed, non-tuned CA-distance basis.  The centers straddle the
+            # antibody-antigen contact regime and extend slightly beyond it.
+            self.register_buffer(
+                "_structure_seq_rbf_centers",
+                torch.tensor([4.0, 6.0, 8.0, 10.0, 12.0]),
+                persistent=True,
+            )
+        else:
+            self.register_buffer(
+                "_structure_seq_rbf_centers",
+                torch.empty(0),
+                persistent=False,
+            )
+
+        self._last_structure_seq_diagnostics = {}
+
 
     def init_mask(self, X, S, cmask, smask, template):
         if not self.struct_only:
@@ -1764,6 +1827,124 @@ class AbFlowModel(nn.Module):
             "tokens": safe_state,
         }
 
+    def _structure_conditioned_sequence_features(
+            self, interface_X, local_X, local_is_ab, local_batch_id):
+        """Build invariant predicted-interface features for H3 sequence readout.
+
+        Inputs are the CURRENT predicted H3 coordinates and the CURRENT local
+        antigen context.  Only CA distances are used, so the features do not
+        depend on side-chain atom topology / current amino-acid identity.
+
+        For each H3 residue i:
+          1) d_min(i): nearest antigen-CA distance;
+          2) five smooth RBF occupancies over H3-CA -- antigen-CA distances
+             with fixed centers 4,6,8,10,12 Angstrom and sigma=2 Angstrom.
+
+        The result is detached before entering the sequence adapter.  This makes
+        the coupling directional:
+              structure prediction -> sequence readout
+        and prevents sequence CE from directly pulling Cartesian coordinates.
+
+        Shape:
+            [N_H3, 6]
+        """
+        if (
+            self.structure_seq_adapter is None
+            or interface_X is None
+            or interface_X.numel() == 0
+        ):
+            return None
+
+        antigen_mask = ~local_is_ab
+        if antigen_mask.numel() == 0:
+            return None
+
+        # CA is channel 1 in AbFlow's full-atom representation.
+        h3_ca = interface_X[:, 1].float()
+        ag_ca = local_X[antigen_mask, 1].float()
+
+        if ag_ca.numel() == 0:
+            return h3_ca.new_zeros(
+                (h3_ca.shape[0], self.structure_seq_feature_dim)
+            ).to(dtype=interface_X.dtype)
+
+        h3_batch = self.batch_constants["interface_batch_id"]
+        ag_batch = local_batch_id[antigen_mask]
+        same_graph = h3_batch[:, None] == ag_batch[None, :]
+
+        # Pairwise CA distances.  Cross-complex pairs are masked out exactly.
+        d = torch.cdist(h3_ca, ag_ca, p=2)
+        d_masked = d.masked_fill(~same_graph, 1.0e4)
+
+        valid = same_graph.any(dim=1)
+        d_min = d_masked.min(dim=1).values
+        d_min = torch.where(valid, d_min, torch.zeros_like(d_min))
+
+        centers = self._structure_seq_rbf_centers.to(
+            device=d.device, dtype=d.dtype
+        )
+        sigma = 2.0
+        rbf = torch.exp(
+            -0.5 * ((d[..., None] - centers.view(1, 1, -1)) / sigma) ** 2
+        )
+        rbf = rbf * same_graph[..., None].to(rbf.dtype)
+        denom = same_graph.sum(dim=1).clamp_min(1).to(rbf.dtype)
+        rbf = rbf.sum(dim=1) / denom[:, None]
+
+        feat = torch.cat([d_min[:, None] / 10.0, rbf], dim=-1)
+        # One-way structure -> sequence coupling.
+        return feat.to(dtype=interface_X.dtype).detach()
+
+    def _apply_structure_conditioned_sequence_readout(
+            self, H, paratope_mask, interface_X,
+            local_X, local_is_ab, local_batch_id):
+        """Residual inverse-folding adapter; returns H used only for seq logits."""
+        self._last_structure_seq_diagnostics = {}
+        if self.structure_seq_adapter is None:
+            return H
+
+        feat = self._structure_conditioned_sequence_features(
+            interface_X, local_X, local_is_ab, local_batch_id
+        )
+        if feat is None:
+            # DDP safety: mark adapter parameters used without changing logits.
+            dummy = sum(p.sum() for p in self.structure_seq_adapter.parameters())
+            return H + 0.0 * dummy
+
+        h3_hidden = H[paratope_mask]
+        if h3_hidden.shape[0] != feat.shape[0]:
+            raise ValueError(
+                "U07 structure/sequence residue count mismatch: "
+                f"hidden={h3_hidden.shape[0]}, feature={feat.shape[0]}."
+            )
+
+        residual = self.structure_seq_adapter(
+            torch.cat([h3_hidden, feat.to(h3_hidden.dtype)], dim=-1)
+        )
+
+        H_seq = H.clone()
+        H_seq[paratope_mask] = h3_hidden + residual
+
+        with torch.no_grad():
+            base_rms = torch.sqrt(
+                h3_hidden.detach().float().pow(2).mean().clamp_min(1.0e-12)
+            )
+            residual_rms = torch.sqrt(
+                residual.detach().float().pow(2).mean().clamp_min(0.0)
+            )
+            self._last_structure_seq_diagnostics = {
+                "structure_seq_readout_enabled": H.new_tensor(1.0),
+                "structure_seq_residual_ratio": (
+                    residual_rms / base_rms.clamp_min(1.0e-12)
+                ).to(H.dtype),
+                "structure_seq_min_ag_ca_norm": (
+                    feat[:, 0].float().mean().to(H.dtype)
+                    if feat.numel() else H.new_tensor(0.0)
+                ),
+            }
+
+        return H_seq
+
     def message_passing(self, X, S, residue_pos, interface_X, surf, paratope_mask,
                         batch_id, round_idx, memory_H=None, smooth_prob=None,
                         smooth_mask=None, flow_t=None,
@@ -2230,7 +2411,22 @@ class AbFlowModel(nn.Module):
         # self.timing_stats['sme_encoding'] += time.time() - sme_start
 
         interface_X = pred_local_X[local_is_ab]
-        pred_logits = None if self.struct_only else self.ffn_residue(H)
+
+        if self.struct_only:
+            pred_logits = None
+        else:
+            # U07: the structural GNN remains untouched.  Only the sequence
+            # readout receives a zero-start residual built from the current
+            # predicted H3--antigen interface geometry.
+            H_seq = self._apply_structure_conditioned_sequence_readout(
+                H=H,
+                paratope_mask=paratope_mask,
+                interface_X=interface_X,
+                local_X=local_X,
+                local_is_ab=local_is_ab,
+                local_batch_id=local_batch_id,
+            )
+            pred_logits = self.ffn_residue(H_seq)
 
         return pred_logits, pred_X, interface_X, H, p_edge_dist  # [N, num_classes], [N, n_channel, 3], [Ncdr, n_channel, 3], [N, hidden_size]
     
@@ -5599,6 +5795,17 @@ class AbFlowModel(nn.Module):
                     1.0 if self.coordinate_authority == "carrier_single" else 0.0,
                     device=X.device,
                 ),
+                "structure_seq_readout_enabled": torch.as_tensor(
+                    1.0 if self.structure_seq_readout_mode == "interface_geometry"
+                    else 0.0,
+                    device=X.device,
+                ),
+                "structure_seq_residual_ratio": getattr(
+                    self, "_last_structure_seq_diagnostics", {}
+                ).get("structure_seq_residual_ratio", X.new_tensor(0.0)),
+                "structure_seq_min_ag_ca_norm": getattr(
+                    self, "_last_structure_seq_diagnostics", {}
+                ).get("structure_seq_min_ag_ca_norm", X.new_tensor(0.0)),
                 "scorefm_loss_mode_endpoint": torch.as_tensor(
                     1.0 if self.scorefm_loss_mode == "endpoint" else 0.0,
                     device=X.device,
