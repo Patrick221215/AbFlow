@@ -1041,6 +1041,31 @@ class AbFlowModel(nn.Module):
 
         self.seq_ce_weight = _env_float("ABFLOW_SEQ_CE_WEIGHT", 1.0)
 
+        # =========================================================
+        # v88: single coordinate authority for the designed paratope
+        # =========================================================
+        # legacy_dual:
+        #   Preserve historical AbFlow behavior: the static/global structure
+        #   branch contributes absolute-coordinate xloss on every xloss_mask atom,
+        #   while the shadow paratope is also supervised by the Score--Flow
+        #   carrier objective.
+        #
+        # carrier_single:
+        #   Remove ONLY the static absolute-coordinate xloss on the designed
+        #   paratope.  H3 absolute placement is then supervised by exactly one
+        #   coordinate authority: the Score--Flow carrier.  Backbone/sidechain
+        #   bond-length constraints remain active because ProteinFeature's
+        #   violation losses do not use xloss_mask.
+        #
+        # This is not a loss-weight schedule and adds no new head or forward.
+        self.coordinate_authority = _env_str(
+            "ABFLOW_COORDINATE_AUTHORITY", "legacy_dual"
+        ).lower()
+        if self.coordinate_authority not in {"legacy_dual", "carrier_single"}:
+            raise ValueError(
+                "ABFLOW_COORDINATE_AUTHORITY must be legacy_dual or carrier_single."
+            )
+
         # Local-correction schedule for proposal adapters.
         #
         # start_round=0 reproduces PCS_RC_COND: proposal-relative adapters are
@@ -5331,7 +5356,28 @@ class AbFlowModel(nn.Module):
             snll = snll / total.clamp_min(1.0)
 
         # structure loss
-        struct_loss, struct_loss_details, bb_rmsd, ops = self.protein_feature.structure_loss(pred_X, true_X, true_S, cmask, batch_id, xloss_mask, self.aa_feature)
+        #
+        # v88 single-coordinate-authority option:
+        # In carrier_single mode, remove the designed paratope ONLY from the
+        # static absolute-coordinate xloss mask.  The ProteinFeature implementation
+        # applies xloss_mask solely to coord_loss; backbone and sidechain
+        # bond-length penalties remain evaluated on the complete cmask structure.
+        #
+        # This prevents the same designed H3 absolute coordinates from being
+        # optimized by two different coordinate objectives:
+        #   (1) static/global structure xloss on pred_X, and
+        #   (2) dynamic Score--Flow carrier loss on r_interface_X[-1].
+        structure_xloss_mask = xloss_mask
+        if self.coordinate_authority == "carrier_single":
+            structure_xloss_mask = xloss_mask.clone()
+            structure_xloss_mask[paratope_mask] = False
+
+        struct_loss, struct_loss_details, bb_rmsd, ops = (
+            self.protein_feature.structure_loss(
+                pred_X, true_X, true_S, cmask, batch_id,
+                structure_xloss_mask, self.aa_feature
+            )
+        )
 
         # docking loss
 
@@ -5545,6 +5591,14 @@ class AbFlowModel(nn.Module):
 
             diag = {
                 "seq_ce_weight": torch.as_tensor(self.seq_ce_weight, device=X.device),
+                "coordinate_authority_carrier_single": torch.as_tensor(
+                    1.0 if self.coordinate_authority == "carrier_single" else 0.0,
+                    device=X.device,
+                ),
+                "static_paratope_xloss_removed_rate": torch.as_tensor(
+                    1.0 if self.coordinate_authority == "carrier_single" else 0.0,
+                    device=X.device,
+                ),
                 "scorefm_loss_mode_endpoint": torch.as_tensor(
                     1.0 if self.scorefm_loss_mode == "endpoint" else 0.0,
                     device=X.device,
