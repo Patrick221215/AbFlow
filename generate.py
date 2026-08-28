@@ -1,6 +1,7 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
 import argparse
+import copy
 import json
 import os
 from tqdm import tqdm
@@ -48,52 +49,278 @@ def load_model_compat(ckpt_path, map_location='cpu'):
         raise
 
 
+
+# ---------------------------------------------------------------------------
+# Full-object checkpoint runtime compatibility
+# ---------------------------------------------------------------------------
+#
+# Historical AbFlow checkpoints were serialized as full Python model objects.
+# When such an object is loaded under a newer AbFlowModel class, Python/PyTorch
+# restores the old instance state but DOES NOT re-run the new __init__().
+# Therefore a newer method may legally exist while the old instance lacks the
+# attributes that method expects.
+#
+# Compatibility policy:
+#   1) Never overwrite an attribute already stored in the checkpoint.
+#   2) Missing historical optional features mean the historical behavior
+#      ("feature off"), not the current environment setting.
+#   3) Never create new trainable modules for an old checkpoint at evaluation.
+#   4) If a partially migrated checkpoint claims a feature is enabled but lacks
+#      the trained module/state required to realize it, fail fast instead of
+#      silently changing the scientific model.
+#   5) Prefer a model-owned compatibility hook when future AbFlow versions add
+#      one.  This keeps future migrations next to the code that owns the new
+#      attributes rather than growing generate.py forever.
+#
+# This is deliberately a migration layer, not an experiment override layer.
+# ---------------------------------------------------------------------------
+
+RUNTIME_COMPAT_SCHEMA_VERSION = 3
+
+
+def _compat_log(message):
+    print_log(f"[RuntimeCompat] {message}")
+
+
+def _set_missing_attr(model, name, value, patched, reason=""):
+    """Set a checkpoint-missing plain attribute without overwriting stored state."""
+    if hasattr(model, name):
+        return False
+
+    # Avoid sharing mutable default objects between model instances.
+    setattr(model, name, copy.deepcopy(value))
+    patched.append(name)
+    if reason:
+        _compat_log(f"added {name}={value!r} ({reason})")
+    else:
+        _compat_log(f"added {name}={value!r}")
+    return True
+
+
+def _ensure_empty_buffer(model, name, patched):
+    """Register an empty non-persistent buffer only when the old object lacks it."""
+    if hasattr(model, name):
+        return False
+
+    # nn.Module.register_buffer is preferable to setattr because later .to(device)
+    # then handles the tensor exactly like buffers created by the current __init__.
+    if hasattr(model, "register_buffer"):
+        model.register_buffer(name, torch.empty(0), persistent=False)
+    else:
+        setattr(model, name, torch.empty(0))
+    patched.append(name)
+    _compat_log(f"added empty buffer {name} (historical feature-off state)")
+    return True
+
+
+def _call_model_compat_hooks(model):
+    """Run compatibility hooks implemented by the CURRENT model class.
+
+    A historical full-object checkpoint still resolves methods on the current
+    class, so this is the preferred future-proof extension point.  Going
+    forward, newly introduced inference-time attributes should be initialized
+    in AbFlowModel._ensure_runtime_compat(), using only hasattr/getattr-safe
+    logic and historical feature-off defaults.
+    """
+    # New general hook: future versions should put new migrations here.
+    hook = getattr(model, "_ensure_runtime_compat", None)
+    if callable(hook):
+        hook()
+
+    # Existing ScoreFM-specific compatibility hook retained for old revisions.
+    score_hook = getattr(model, "_ensure_scorefm_compat", None)
+    if callable(score_hook):
+        score_hook()
+
+
+def _migrate_structure_sequence_readout(model, patched):
+    """v90/U07 migration for checkpoints created before the readout existed.
+
+    Historical checkpoints (U02/U03/U05 and earlier) never contained this
+    module, so missing state must map to U07=OFF.  Existing U07+ checkpoints
+    keep their serialized adapter and mode untouched.
+    """
+    had_mode = hasattr(model, "structure_seq_readout_mode")
+    had_adapter = hasattr(model, "structure_seq_adapter")
+
+    # A transitional/new checkpoint may already carry a trained adapter but miss
+    # only the string mode.  In that narrow case the adapter itself is strong
+    # evidence that the feature was enabled, so preserve rather than disable it.
+    if not had_mode:
+        adapter = getattr(model, "structure_seq_adapter", None)
+        inferred_mode = "interface_geometry" if adapter is not None else "off"
+        _set_missing_attr(
+            model,
+            "structure_seq_readout_mode",
+            inferred_mode,
+            patched,
+            reason=(
+                "inferred from serialized adapter"
+                if inferred_mode == "interface_geometry"
+                else "pre-U07 checkpoint => feature off"
+            ),
+        )
+
+    _set_missing_attr(
+        model,
+        "structure_seq_feature_dim",
+        6,
+        patched,
+        reason="v90 interface-geometry feature width",
+    )
+
+    if not had_adapter:
+        _set_missing_attr(
+            model,
+            "structure_seq_adapter",
+            None,
+            patched,
+            reason="pre-U07 checkpoint => no untrained module is created",
+        )
+
+    _set_missing_attr(
+        model,
+        "_last_structure_seq_diagnostics",
+        {},
+        patched,
+        reason="diagnostics-only cache",
+    )
+
+    mode = getattr(model, "structure_seq_readout_mode", "off")
+    adapter = getattr(model, "structure_seq_adapter", None)
+
+    if mode not in {"off", "interface_geometry"}:
+        raise RuntimeError(
+            "Unsupported historical structure_seq_readout_mode="
+            f"{mode!r}. Refusing to guess checkpoint semantics."
+        )
+
+    if mode == "off":
+        # Historical U02/U03/U05 path: no geometry feature is evaluated.
+        _ensure_empty_buffer(model, "_structure_seq_rbf_centers", patched)
+    else:
+        # Never silently manufacture a fresh adapter for an evaluation checkpoint.
+        if adapter is None:
+            raise RuntimeError(
+                "Checkpoint says structure_seq_readout_mode='interface_geometry' "
+                "but contains no trained structure_seq_adapter. Refusing to "
+                "silently evaluate a different model."
+            )
+        if not hasattr(model, "_structure_seq_rbf_centers"):
+            raise RuntimeError(
+                "Checkpoint enables structure-conditioned sequence readout but "
+                "is missing _structure_seq_rbf_centers. This is not a safe "
+                "historical-feature-off migration; inspect the checkpoint/code "
+                "version instead of guessing the RBF basis."
+            )
+
+
+def _validate_runtime_compat(model):
+    """Fail early on combinations that would silently change experiment meaning."""
+    coordinate_authority = getattr(model, "coordinate_authority", "legacy_dual")
+    if coordinate_authority not in {"legacy_dual", "carrier_single"}:
+        raise RuntimeError(
+            "Invalid coordinate_authority in checkpoint: "
+            f"{coordinate_authority!r}"
+        )
+
+    mode = getattr(model, "structure_seq_readout_mode", "off")
+    adapter = getattr(model, "structure_seq_adapter", None)
+    if mode == "off" and adapter is not None:
+        # Current message-passing code may key directly on adapter is None.
+        # An off-mode + live adapter is therefore ambiguous and unsafe.
+        raise RuntimeError(
+            "Inconsistent checkpoint: structure_seq_readout_mode='off' but "
+            "structure_seq_adapter is not None. Refusing silent behavior change."
+        )
+
+    # Record the compatibility schema on the in-memory object only.  This does
+    # not alter the checkpoint file and is useful for diagnostic logs.
+    setattr(model, "_runtime_compat_schema_version", RUNTIME_COMPAT_SCHEMA_VERSION)
+
+
 def ensure_model_runtime_compat(model):
+    """Upgrade a historical full-object checkpoint to the CURRENT runtime API.
+
+    This function preserves checkpoint scientific semantics.  It never enables
+    a feature that did not exist in the serialized model and never overwrites a
+    stored attribute.  Future model versions should preferably implement
+    ``AbFlowModel._ensure_runtime_compat()``; this loader automatically calls it.
+
+    Important limitation
+    --------------------
+    No loader can safely guess the value/type/weights of an arbitrary future
+    attribute.  A newly added inference-time feature still needs ONE explicit
+    backward rule (normally "missing => feature off") in the model-owned hook.
+    What this framework prevents is scattering ad-hoc fixes throughout test
+    scripts or silently evaluating old checkpoints with new untrained modules.
     """
-    Runtime compatibility for old checkpoints loaded under newer AbFlow code.
+    patched = []
 
-    Old AbFlow checkpoints were saved as full Python model objects. Loading them
-    under a modified AbFlowModel class does not re-run __init__, so newly added
-    attributes may be absent. We add safe defaults here.
+    # Let the current class repair model-owned state first.
+    _call_model_compat_hooks(model)
 
-    For old non-ScoreFM checkpoints, use_scorefm defaults to False so inference
-    can keep the original AbFlow sampling behavior, provided AbFlowModel.sample
-    checks this flag.
-    """
-    if not hasattr(model, 'pep_seq'):
-        model.pep_seq = True
-    if not hasattr(model, 'pep_struct'):
-        model.pep_struct = True
+    # Very old AbFlow defaults.
+    _set_missing_attr(model, "pep_seq", True, patched, "historical AbFlow default")
+    _set_missing_attr(model, "pep_struct", True, patched, "historical AbFlow default")
 
-    if hasattr(model, '_ensure_scorefm_compat'):
-        model._ensure_scorefm_compat()
+    # Legacy ScoreFM fields read by newer runtime methods.  These are only
+    # injected when absent; checkpoints that already store their experiment
+    # values remain untouched.
+    historical_defaults = {
+        "use_scorefm": False,
+        "scorefm_min_sigma": 1e-2,
+        "scorefm_eps": 1e-8,
+        "scorefm_t_threshold": 0.50,
+        "scorefm_loss_weight": 5e-2,
+        "scorefm_velocity_weight": 1.0,
+        "scorefm_dsm_weight": 1.0,
+        "scorefm_x1_weight": 0.25,
+        "scorefm_local_dist_weight": 0.05,
+        "scorefm_interface_contact_weight": 0.05,
+        "scorefm_inter_clash_weight": 0.01,
+        "scorefm_intra_clash_weight": 0.005,
+        "scorefm_contact_cutoff": 8.0,
+        "scorefm_contact_temperature": 1.0,
+        "scorefm_inter_clash_cutoff": 2.0,
+        "scorefm_intra_clash_cutoff": 1.5,
+        "last_scorefm_losses": {},
+        "sf2m_t_eps": 0.01,
+        "sf2m_score_weight": 1.0,
 
-    defaults = {
-        'use_scorefm': False,
-        'scorefm_min_sigma': 1e-2,
-        'scorefm_eps': 1e-8,
-        'scorefm_t_threshold': 0.50,
-        'scorefm_loss_weight': 5e-2,
-        'scorefm_velocity_weight': 1.0,
-        'scorefm_dsm_weight': 1.0,
-        'scorefm_x1_weight': 0.25,
-        'scorefm_local_dist_weight': 0.05,
-        'scorefm_interface_contact_weight': 0.05,
-        'scorefm_inter_clash_weight': 0.01,
-        'scorefm_intra_clash_weight': 0.005,
-        'scorefm_contact_cutoff': 8.0,
-        'scorefm_contact_temperature': 1.0,
-        'scorefm_inter_clash_cutoff': 2.0,
-        'scorefm_intra_clash_cutoff': 1.5,
-        'last_scorefm_losses': {},
-        'sf2m_t_eps': 0.01,
-        'sf2m_score_weight': 1.0,
-        'pair_score_feedback': False,
+        # v81: old checkpoints predate pair-score feedback.
+        "pair_score_feedback": False,
+
+        # v88: U02/U03/U05 and earlier use the historical dual coordinate
+        # supervision/readout semantics.  Missing must NOT inherit a current
+        # ABFLOW_COORDINATE_AUTHORITY environment variable.
+        "coordinate_authority": "legacy_dual",
     }
-    for name, value in defaults.items():
-        if not hasattr(model, name):
-            setattr(model, name, value)
+    for name, value in historical_defaults.items():
+        _set_missing_attr(model, name, value, patched)
 
+    # v90/U07 migration.
+    _migrate_structure_sequence_readout(model, patched)
+
+    _validate_runtime_compat(model)
+
+    if patched:
+        _compat_log(
+            "patched historical checkpoint with "
+            f"{len(patched)} runtime field(s): {', '.join(patched)}"
+        )
+    else:
+        _compat_log("checkpoint already satisfies current runtime schema")
+
+    _compat_log(
+        "effective compatibility state: "
+        f"schema={RUNTIME_COMPAT_SCHEMA_VERSION}, "
+        f"coordinate_authority={getattr(model, 'coordinate_authority', '<missing>')}, "
+        f"structure_seq_readout_mode="
+        f"{getattr(model, 'structure_seq_readout_mode', '<missing>')}, "
+        f"structure_seq_adapter="
+        f"{'present' if getattr(model, 'structure_seq_adapter', None) is not None else 'none'}"
+    )
     return model
 
 def to_cplx(ori_cplx, ab_x, ab_s) -> AgAbComplex:
@@ -141,7 +368,6 @@ def to_cplx(ori_cplx, ab_x, ab_s) -> AgAbComplex:
 
 def generate(args):
 
-    # load model
     # load model
     model = load_model_compat(args.ckpt, map_location='cpu')
     model = ensure_model_runtime_compat(model)
