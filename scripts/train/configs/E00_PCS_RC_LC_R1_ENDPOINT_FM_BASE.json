@@ -22,7 +22,7 @@
   "pep_struct": true,
   "bind_dist_cutoff": 6.6,
   "save_interval": 1,
-  "resume_checkpoint": "/home/data3/cjm/project/AbFlow/results_module/E01_PCS_RC_LC_R1_STOCHASTIC_ENDPOINT/version_0/checkpoint/last_step10440.pt",
+  "resume_checkpoint": "",
   "use_ema": true,
   "ema_decay": 0.999,
   "num_workers": 8,
@@ -35,13 +35,13 @@
   "log_interval": 1,
   "tqdm_mininterval": 5.0,
   "_experiment": {
-    "exp_id": "E01_PCS_RC_LC_R1_STOCHASTIC_ENDPOINT",
-    "parent": "E00_PCS_RC_LC_R1_ENDPOINT_FM_BASE",
-    "loss_mode": "foldflow_r3_global_endpoint",
+    "exp_id": "E00_PCS_RC_LC_R1_ENDPOINT_FM_BASE",
+    "parent": "PCS_RC_LC_R1",
+    "loss_mode": "endpoint",
     "sampler_mode": "bridge",
-    "single_change": "replace deterministic training states by a standard Gaussian Brownian-bridge-style global-R3 path",
-    "physical_object": "same clean endpoint X1_hat under stochastic global-placement states",
-    "score_objective": "off; analytic score is not added as a loss",
-    "path": "mu_t=(1-t)X0+tX1, sigma_t=g*sqrt(t(1-t)) in graph-level R3 translation subspace"
+    "single_change": "restore clean-endpoint network parameterization and endpoint-consistent iterative refinement",
+    "physical_object": "X1_hat=f_theta(Xt,t,c); v_theta=(X1_hat-Xt)/(1-t)",
+    "score_objective": "off; score is not independently learned",
+    "path": "deterministic linear proposal-to-native conditional FM"
   }
 }

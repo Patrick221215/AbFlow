@@ -22,7 +22,7 @@
   "pep_struct": true,
   "bind_dist_cutoff": 6.6,
   "save_interval": 1,
-  "resume_checkpoint": "/home/data3/cjm/project/AbFlow/results_module/E01_PCS_RC_LC_R1_STOCHASTIC_ENDPOINT/version_0/checkpoint/last_step10440.pt",
+  "resume_checkpoint": "",
   "use_ema": true,
   "ema_decay": 0.999,
   "num_workers": 8,
@@ -35,13 +35,16 @@
   "log_interval": 1,
   "tqdm_mininterval": 5.0,
   "_experiment": {
-    "exp_id": "E01_PCS_RC_LC_R1_STOCHASTIC_ENDPOINT",
-    "parent": "E00_PCS_RC_LC_R1_ENDPOINT_FM_BASE",
-    "loss_mode": "foldflow_r3_global_endpoint",
-    "sampler_mode": "bridge",
-    "single_change": "replace deterministic training states by a standard Gaussian Brownian-bridge-style global-R3 path",
-    "physical_object": "same clean endpoint X1_hat under stochastic global-placement states",
-    "score_objective": "off; analytic score is not added as a loss",
-    "path": "mu_t=(1-t)X0+tX1, sigma_t=g*sqrt(t(1-t)) in graph-level R3 translation subspace"
+    "exp_id": "F05_PCS_RC_LC_R1_FIXEDG_CANONICAL_SCORE_FLOW",
+    "parent": "F04_PCS_RC_LC_R1_CLEAN_MEAN_FLOW",
+    "loss_mode": "fixedg_r3_canonical_score_flow",
+    "sampler_mode": "sf2m_ode",
+    "single_change": "replace the deterministic path by an exactly sampleable fixed source-noise Gaussian path and learn its complete canonical probability velocity in one carrier",
+    "physical_object": "u_theta approximates (X1-X0)-sigma_dot*q_star with sigma=g(1-t), sigma_dot=-g, q_star=sigma*score",
+    "fixed_g_angstrom": 0.5,
+    "endpoint_coordinate_train_weight": 0.0,
+    "terminal_projection": false,
+    "score_objective": "implicit_in_canonical_probability_velocity",
+    "pair_time_scope": "off"
   }
 }

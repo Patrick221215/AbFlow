@@ -15,68 +15,28 @@ PYSELF
 )
 
 # ============================================================
-# AbFlow v38: module-by-module causal ladder
+# AbFlow v87: U03 + single-forward C1 source-anchored Score--Flow
 # ============================================================
-# Scientific rule:
-#   1) AbFlow paper numbers are EXTERNAL absolute references only.
-#   2) Module effects are judged ONLY against the matched CURRENT-CODE BASE.
-#   3) In one stage, every active module changes one coherent mechanism family
-#      relative to the same base.  Do not combine modules before each has earned
-#      its place independently.
+# Both configs freeze the validated U02/F01 scientific parent:
+# PCS-RC source, recurrent proposal context, adaptive-g global-R3
+# sqrt(t(1-t)) stochastic state, full-atom backbone, 3 refinement rounds,
+# batch 56, EMA .999, SATC/auxiliary score/flow losses off.
 #
-# External AbFlow-paper locator (NOT the causal baseline):
-#   AAR=0.4234 | CAAR=0.2824 | H3 raw RMSD=8.250 A | DockQ=0.4230
+# U03: replace U02's hard t=0.20 Endpoint/canonical seam by the
+#      boundary-regular preconditioned carrier P*=X1+0.5*(Xt-mu_t).
+# U05: replace U03 lambda(t)=t by the C1 cubic Hermite homotopy
+#      lambda(t)=3t^2-2t^3; one forward only, no hard switch.
 #
-# Historical current-code BASE snapshot from the 160-epoch matched CTRL
-# (diagnostic only; v38 formal runs use max_epoch from the JSON):
-#   AAR=0.3929 | CAAR=0.2565 | H3 raw RMSD=8.726 A | DockQ=0.3897
-#
-# Stage-1 active experiments (three parallel slots):
-#
-#   PCS_RC_LC_R1_BASE
-#     M00 / matched current-code base.
-#     Endpoint FM only; no score-aware auxiliary.
-#
-#   PCS_RC_LC_R1_SATC_CORE
-#     M01 / score-aware off-path correction.
-#     Adds the one-forward SATC direction objective only.
-#     This tests the central idea: can a time-dependent score-like correction
-#     improve an endpoint-FM field without changing the backbone or adding heads?
-#
-#   PCS_RC_LC_R1_GT_SATC
-#     M02 / placement-specific graph-translation consistency.
-#     Adds a rigid H3 translation perturbation + clean-endpoint teacher query.
-#     This tests whether constraining the physically relevant placement subspace
-#     is better than generic full-atom off-path correction.
-#
-# Historical M02 snapshot relative to the historical current-code BASE:
-#   BASE: AAR=0.3929 | CAAR=0.2565 | H3raw=8.726 | DockQ=0.3897
-#   M02 : AAR=0.3932 | CAAR=0.2532 | H3raw=8.653 | DockQ=0.3878
-#   Delta: AAR=+0.0003 | CAAR=-0.0033 | H3raw improvement=+0.073 A |
-#          DockQ=-0.0019
-# Interpretation: geometry signal exists, but interface/sequence benefit is not
-# yet established.  This is exactly why v38 separates modules before combining.
-#
-# Archived / deliberately inactive in Stage-1:
-#   - SEQ_STATE_HIDDEN / hard_exact / JOINT_EXACT:
-#       rejected because sequence-state injection caused major AAR/CAAR collapse.
-#   - IF (interface weighting):
-#       deferred until M01 or M02 independently beats BASE.
-#   - NT (normal-tangent decomposition):
-#       deferred until a score-aware parent is validated.
-#   - explicit velocity/magnitude term:
-#       deferred because historical runs could lower training loss while hurting
-#       H3 placement / DockQ.
-#   - integrated_endpoint readout:
-#       excluded from causal module tests; keep integrated_endpoint fixed.
-#
-# Training-horizon rule:
-#   MAX_EPOCH is NOT set by profiles.  The JSON is the source of truth.
-#   ABFLOW_MAX_EPOCH may override only when intentionally supplied by the user.
-#
+# Both add NO score head, NO flow head, NO Pair-Time, NO SATC and NO
+# lambda_score/lambda_flow.  The F01 adaptive-g stochastic state and the
+# g-free canonical sampler physics are unchanged.
+# ============================================================
 STATE_PATH=on
 PER_SAMPLE_T=on
 TIME_EMBED=on
+PAIR_TIME_SCOPE=${ABFLOW_PAIR_TIME_SCOPE:-off}
+SCOREFLOW_PAIR_MODE=${ABFLOW_SCOREFLOW_PAIR_MODE:-off}
+SCOREFLOW_PAIR_STOP_GRAD=${ABFLOW_SCOREFLOW_PAIR_STOP_GRAD:-on}
 T_SAMPLING=uniform
 LOSS_MODE=endpoint
 SAMPLER_MODE=bridge
@@ -102,6 +62,22 @@ PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-0}
 SI_GAMMA_SCALE=${ABFLOW_SI_GAMMA_SCALE:-0.25}
 SI_SCORE_WEIGHT=${ABFLOW_SI_SCORE_WEIGHT:-0.002}
 SI_VELOCITY_WEIGHT=${ABFLOW_SI_VELOCITY_WEIGHT:-0.01}
+STRUCTURED_GAMMA_SCALE=${ABFLOW_STRUCTURED_GAMMA_SCALE:-0.05}
+STRUCTURED_TRANSPORT_MAX=${ABFLOW_STRUCTURED_TRANSPORT_MAX:-20.0}
+STRUCTURED_GAMMA_ABS_MAX=${ABFLOW_STRUCTURED_GAMMA_ABS_MAX:-1.0}
+STRUCTURED_LOCAL_GAMMA_SCALE=${ABFLOW_STRUCTURED_LOCAL_GAMMA_SCALE:-0.05}
+R3_TRANSPORT_FRACTION=${ABFLOW_R3_TRANSPORT_FRACTION:-0.05}
+R3_PATH_MIN_SIGMA=${ABFLOW_R3_PATH_MIN_SIGMA:-0.0}
+R3_TRANSPORT_MAX=${ABFLOW_R3_TRANSPORT_MAX:-20.0}
+R3_SCORE_MIN_SIGMA=${ABFLOW_R3_SCORE_MIN_SIGMA:-0.01}
+R3_SCORE_DSM_WEIGHT=${ABFLOW_R3_SCORE_DSM_WEIGHT:-0.0}
+R3_PATHFLOW_WEIGHT=${ABFLOW_R3_PATHFLOW_WEIGHT:-0.0}
+R3_FLOW_COORDINATE_SCALING=${ABFLOW_R3_FLOW_COORDINATE_SCALING:-0.1}
+SF2M_SCORE_WEIGHT=${ABFLOW_SF2M_SCORE_WEIGHT:-0.0}
+SF2M_T_EPS=${ABFLOW_SF2M_T_EPS:-0.01}
+SF2M_INFER_G=${ABFLOW_SF2M_INFER_G:-0.0}
+F01_CANONICAL_T_MIN=${ABFLOW_F01_CANONICAL_T_MIN:-0.05}
+F01_HYBRID_T_MIN=${ABFLOW_F01_HYBRID_T_MIN:-0.20}
 
 TRAJ_CONSISTENCY_WEIGHT=${ABFLOW_TRAJ_CONSISTENCY_WEIGHT:-0.05}
 TRAJ_VELOCITY_WEIGHT=${ABFLOW_TRAJ_VELOCITY_WEIGHT:-0.0}
@@ -159,6 +135,7 @@ GRAD_CONFLICT_DIAGNOSTICS=${ABFLOW_GRAD_CONFLICT_DIAGNOSTICS:-on}
 GRAD_DIAGNOSTIC_INTERVAL=${ABFLOW_GRAD_DIAGNOSTIC_INTERVAL:-0}
 MAX_EPOCH=${ABFLOW_MAX_EPOCH:-}
 FORCE_SCRATCH=${ABFLOW_FORCE_SCRATCH:-off}
+BOUNDARY_PCGRAD=${ABFLOW_BOUNDARY_PCGRAD:-off}
 
 ABLATION_PARENT=PCS_RC_LC_R1
 EXPERIMENT_FACTOR=unassigned
@@ -167,33 +144,20 @@ MODULE_ID=unassigned
 MODULE_PARENT=unassigned
 
 case "$EXP_ID" in
-  PCS_RC_LC_R1_BASE|R1_BASE|M00_BASE)
-    # ------------------------------------------------------------------
-    # M00 — INTERNAL CAUSAL BASE
-    # ------------------------------------------------------------------
-    # Role:
-    #   Defines "our base" for module attribution under the CURRENT code.
-    #   This is not the AbFlow-paper reference.
-    #
-    # Historical 160-epoch current-code snapshot:
-    #   AAR=0.3929 | CAAR=0.2565 | H3 raw RMSD=8.726 A | DockQ=0.3897
-    #
-    # External AbFlow-paper locator:
-    #   AAR=0.4234 | CAAR=0.2824 | H3 raw RMSD=8.250 A | DockQ=0.4230
-    #
-    # Formal v38 result:
-    #   TO BE FILLED from the matched v38 BASE run.  All module deltas must use
-    #   this result, not the paper values.
-    ABLATION_PARENT=NONE
-    EXPERIMENT_FACTOR=endpoint_fm_current_code_base
-    MODULE_ID=M00_BASE
-    MODULE_PARENT=NONE
+  U22_PCS_RC_LC_R1_FF_R3_U02_BRANCH_BALANCED)
+    ABLATION_PARENT=U02_PCS_RC_LC_R1_FF_R3_ENDPOINT_CANONICAL_HYBRID
+    EXPERIMENT_FACTOR=semantic_branch_balanced_training_time_sampling
+    MODULE_ID=U22_U02_BRANCH_BALANCED
+    MODULE_PARENT=U02_ENDPOINT_CANONICAL_HYBRID
+    SINGLE_FACTOR_ABLATION=true
 
     SOURCE_MODE=pcs_rc
     RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=endpoint
-    T_SAMPLING=uniform
-    SAMPLER_MODE=bridge
+    LOSS_MODE=f01_r3_endpoint_canonical_hybrid
+    T_SAMPLING=u02_branch_balanced
+    SAMPLER_MODE=f01_canonical_carrier
+    BOUNDARY_PCGRAD=off
+
     COORD_PEP_AS_CONDITION=on
     SEQ_INPUT_MODE=pep_condition
     SHADOW_SEQ_STATE=off
@@ -204,51 +168,34 @@ case "$EXP_ID" in
     SEQUENCE_DECODE_MODE=argmax
     DETERMINISTIC_VALIDATION=on
     PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-1}
-
+    PAIR_TIME_SCOPE=off
+    SCOREFLOW_PAIR_MODE=off
+    R3_TRANSPORT_FRACTION=${ABFLOW_R3_TRANSPORT_FRACTION:-0.05}
+    R3_PATH_MIN_SIGMA=0.0
+    R3_TRANSPORT_MAX=${ABFLOW_R3_TRANSPORT_MAX:-20.0}
+    R3_SCORE_DSM_WEIGHT=0.0
+    R3_PATHFLOW_WEIGHT=0.0
+    SF2M_SCORE_WEIGHT=0.0
     SATC_APPLY_PROB=0.0
     SATC_SCORE_WEIGHT=0.0
     SATC_VELOCITY_WEIGHT=0.0
     SATC_INTERFACE_WEIGHT_ALPHA=0.0
-    SATC_SCHEDULE=constant
     ;;
 
-  PCS_RC_LC_R1_SATC_CORE|SATC_CORE|M01_SATC_CORE)
-    # ------------------------------------------------------------------
-    # M01 — SCORE-AWARE OFF-PATH CORRECTION
-    # ------------------------------------------------------------------
-    # Parent:
-    #   M00 BASE.
-    #
-    # Only coherent module added:
-    #   One-forward score-aware trajectory correction.  The endpoint head
-    #   induces the correction velocity; no independent score/velocity head.
-    #
-    # Mechanistic hypothesis:
-    #   Intermediate off-path states should be pulled toward a plausible local
-    #   trajectory rather than relying on endpoint reconstruction alone.
-    #
-    # Expected signatures:
-    #   - scorefm_satc_rate > 0
-    #   - scorefm_satc_score > 0
-    #   - scorefm_satc_velocity == 0
-    #   - aux_to_endpoint preferably < 0.05, must remain < 0.10
-    #
-    # Success must be measured against M00, NOT against AbFlow paper:
-    #   maintain AAR/CAAR and improve H3raw and/or DockQ consistently.
-    #
-    # Historical matched v38 metrics:
-    #   NOT YET AVAILABLE.  Older SATC runs used different code/schedules and
-    #   are not promoted to causal evidence here.
-    ABLATION_PARENT=PCS_RC_LC_R1_BASE
-    EXPERIMENT_FACTOR=score_aware_off_path_direction_only
-    MODULE_ID=M01_SATC_CORE
-    MODULE_PARENT=M00_BASE
+  U23_PCS_RC_LC_R1_FF_R3_U02_BOUNDARY_PCGRAD)
+    ABLATION_PARENT=U02_PCS_RC_LC_R1_FF_R3_ENDPOINT_CANONICAL_HYBRID
+    EXPERIMENT_FACTOR=shared_gnn_boundary_pcgrad
+    MODULE_ID=U23_U02_BOUNDARY_PCGRAD
+    MODULE_PARENT=U02_ENDPOINT_CANONICAL_HYBRID
+    SINGLE_FACTOR_ABLATION=true
 
     SOURCE_MODE=pcs_rc
     RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=score_aware_traj_lite
+    LOSS_MODE=f01_r3_endpoint_canonical_hybrid
     T_SAMPLING=uniform
-    SAMPLER_MODE=bridge
+    SAMPLER_MODE=f01_canonical_carrier
+    BOUNDARY_PCGRAD=on
+
     COORD_PEP_AS_CONDITION=on
     SEQ_INPUT_MODE=pep_condition
     SHADOW_SEQ_STATE=off
@@ -259,103 +206,64 @@ case "$EXP_ID" in
     SEQUENCE_DECODE_MODE=argmax
     DETERMINISTIC_VALIDATION=on
     PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-1}
-
-    SATC_APPLY_PROB=${ABFLOW_SATC_APPLY_PROB:-0.50}
-    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.08}
-    SATC_TUBE_MODE=legacy_absolute
-    SATC_GAMMA_ABS_MAX=${ABFLOW_SATC_GAMMA_ABS_MAX:-0.50}
-    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.02}
-    SATC_VELOCITY_WEIGHT=0.0
-    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
-    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
-    SATC_INTERFACE_WEIGHT_ALPHA=0.0
-    SATC_SCHEDULE=constant
-    ;;
-
-  PCS_RC_LC_R1_GT_SATC|GT_SATC|M02_GT_SATC)
-    # ------------------------------------------------------------------
-    # M02 — GRAPH-TRANSLATION SATC / PLACEMENT CONSISTENCY
-    # ------------------------------------------------------------------
-    # Parent:
-    #   M00 BASE.
-    #
-    # Only coherent module added:
-    #   Rigid H3 graph-translation perturbation plus a scheduled second query.
-    #   All atoms in the H3 loop receive the same translation, preserving
-    #   intra-loop geometry and directly probing complex-frame placement.
-    #
-    # Mechanistic hypothesis:
-    #   The main residual failure is not local atom denoising but H3 placement.
-    #   Restricting the score-aware consistency signal to the 3D translation
-    #   subspace should improve H3 raw RMSD and DockQ without corrupting sequence.
-    #
-    # Historical 160-epoch matched evidence vs current-code BASE:
-    #   BASE: AAR=0.3929 | CAAR=0.2565 | H3raw=8.726 | DockQ=0.3897
-    #   M02 : AAR=0.3932 | CAAR=0.2532 | H3raw=8.653 | DockQ=0.3878
-    #   Delta vs BASE:
-    #     AAR +0.0003 | CAAR -0.0033 | H3raw +0.073 A improvement |
-    #     DockQ -0.0019
-    #
-    # Interpretation of that snapshot:
-    #   positive placement signal, but not yet a successful module because
-    #   CAAR/DockQ did not improve.  v38 repeats it under the same JSON-controlled
-    #   training horizon as M00/M01.
-    ABLATION_PARENT=PCS_RC_LC_R1_BASE
-    EXPERIMENT_FACTOR=graph_translation_placement_consistency
-    MODULE_ID=M02_GT_SATC
-    MODULE_PARENT=M00_BASE
-
-    SOURCE_MODE=pcs_rc
-    RECURRENT_PROPOSAL_CONTEXT=on
-    LOSS_MODE=score_aware_graph_translation_consistency
-    T_SAMPLING=uniform
-    SAMPLER_MODE=bridge
-    COORD_PEP_AS_CONDITION=on
-    SEQ_INPUT_MODE=pep_condition
-    SHADOW_SEQ_STATE=off
-    DUAL_SEQUENCE_STATE=off
-    DUAL_SEQUENCE_ATOM_MODE=hidden_only
-    SEQUENCE_CONTEXT_MODE=legacy
-    FINAL_READOUT_MODE=integrated_endpoint
-    SEQUENCE_DECODE_MODE=argmax
-    DETERMINISTIC_VALIDATION=on
-    PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-1}
-
+    PAIR_TIME_SCOPE=off
+    SCOREFLOW_PAIR_MODE=off
+    R3_TRANSPORT_FRACTION=${ABFLOW_R3_TRANSPORT_FRACTION:-0.05}
+    R3_PATH_MIN_SIGMA=0.0
+    R3_TRANSPORT_MAX=${ABFLOW_R3_TRANSPORT_MAX:-20.0}
+    R3_SCORE_DSM_WEIGHT=0.0
+    R3_PATHFLOW_WEIGHT=0.0
+    SF2M_SCORE_WEIGHT=0.0
     SATC_APPLY_PROB=0.0
-    SATC_GAMMA_SCALE=${ABFLOW_SATC_GAMMA_SCALE:-0.05}
-    SATC_TUBE_MODE=graph_translation_calibrated
-    SATC_TRANSPORT_RMS_MIN=${ABFLOW_SATC_TRANSPORT_RMS_MIN:-1.0}
-    SATC_TRANSPORT_RMS_MAX=${ABFLOW_SATC_TRANSPORT_RMS_MAX:-20.0}
-    SATC_GAMMA_ABS_MAX=${ABFLOW_SATC_GAMMA_ABS_MAX:-1.0}
-    SATC_SCORE_WEIGHT=${ABFLOW_SATC_SCORE_WEIGHT:-0.02}
+    SATC_SCORE_WEIGHT=0.0
     SATC_VELOCITY_WEIGHT=0.0
-    SATC_T_MIN=${ABFLOW_SATC_T_MIN:-0.10}
-    SATC_T_MAX=${ABFLOW_SATC_T_MAX:-0.80}
     SATC_INTERFACE_WEIGHT_ALPHA=0.0
-    SATC_SCHEDULE=constant
-    SATC_STEPS_PER_EPOCH=${ABFLOW_SATC_STEPS_PER_EPOCH:-52}
-    SATC_GT_INTERVAL=${ABFLOW_SATC_GT_INTERVAL:-4}
-    SATC_GT_START_EPOCH=${ABFLOW_SATC_GT_START_EPOCH:-10}
     ;;
 
-  # --------------------------------------------------------------------
-  # ARCHIVED / INACTIVE MODULES — intentionally not executable in Stage-1
-  # --------------------------------------------------------------------
-  # PCS_RC_LC_R1_SEQ_STATE_HIDDEN
-  # PCS_RC_LC_R1_JOINT_EXACT_CTRL
-  # PCS_RC_LC_R1_JOINT_EXACT_GT_SATC
-  # PCS_RC_LC_R1_SATC_IF_MAIN
-  # PCS_RC_LC_R1_SATC_NT_MAIN
-  # PCS_RC_LC_R1_SATC_IF_NT_TARGET
-  # PCS_RC_LC_R1_SATC_*_FM_*
-  #
-  # Why inactive:
-  #   They either failed prior causal checks or depend on an upstream SATC
-  #   mechanism that must first prove value in M01/M02.
-  #
+  U24_PCS_RC_LC_R1_FF_R3_U02_BRANCH_BALANCED_PCGRAD)
+    ABLATION_PARENT=U02_PCS_RC_LC_R1_FF_R3_ENDPOINT_CANONICAL_HYBRID
+    EXPERIMENT_FACTOR=branch_balanced_plus_shared_gnn_boundary_pcgrad
+    MODULE_ID=U24_U02_BRANCH_BALANCED_PCGRAD
+    MODULE_PARENT=U02_ENDPOINT_CANONICAL_HYBRID
+    SINGLE_FACTOR_ABLATION=false_factorial_combination
+
+    SOURCE_MODE=pcs_rc
+    RECURRENT_PROPOSAL_CONTEXT=on
+    LOSS_MODE=f01_r3_endpoint_canonical_hybrid
+    T_SAMPLING=u02_branch_balanced
+    SAMPLER_MODE=f01_canonical_carrier
+    BOUNDARY_PCGRAD=on
+
+    COORD_PEP_AS_CONDITION=on
+    SEQ_INPUT_MODE=pep_condition
+    SHADOW_SEQ_STATE=off
+    DUAL_SEQUENCE_STATE=off
+    DUAL_SEQUENCE_ATOM_MODE=hidden_only
+    SEQUENCE_CONTEXT_MODE=legacy
+    FINAL_READOUT_MODE=integrated_endpoint
+    SEQUENCE_DECODE_MODE=argmax
+    DETERMINISTIC_VALIDATION=on
+    PROPOSAL_ADAPTER_START_ROUND=${ABFLOW_PROPOSAL_ADAPTER_START_ROUND:-1}
+    PAIR_TIME_SCOPE=off
+    SCOREFLOW_PAIR_MODE=off
+    R3_TRANSPORT_FRACTION=${ABFLOW_R3_TRANSPORT_FRACTION:-0.05}
+    R3_PATH_MIN_SIGMA=0.0
+    R3_TRANSPORT_MAX=${ABFLOW_R3_TRANSPORT_MAX:-20.0}
+    R3_SCORE_DSM_WEIGHT=0.0
+    R3_PATHFLOW_WEIGHT=0.0
+    SF2M_SCORE_WEIGHT=0.0
+    SATC_APPLY_PROB=0.0
+    SATC_SCORE_WEIGHT=0.0
+    SATC_VELOCITY_WEIGHT=0.0
+    SATC_INTERFACE_WEIGHT_ALPHA=0.0
+    ;;
+
   *)
     echo "Unknown EXP_ID: $EXP_ID"
-    echo "Stage-1 supported: PCS_RC_LC_R1_BASE, PCS_RC_LC_R1_SATC_CORE, PCS_RC_LC_R1_GT_SATC"
+    echo "Supported v100:"
+    echo "  U22_PCS_RC_LC_R1_FF_R3_U02_BRANCH_BALANCED"
+    echo "  U23_PCS_RC_LC_R1_FF_R3_U02_BOUNDARY_PCGRAD"
+    echo "  U24_PCS_RC_LC_R1_FF_R3_U02_BRANCH_BALANCED_PCGRAD"
     exit 2
     ;;
 esac
@@ -373,6 +281,9 @@ run_with_env() {
   ABFLOW_SCOREFM_STATE_PATH="$STATE_PATH" \
   ABFLOW_SCOREFM_PER_SAMPLE_T="$PER_SAMPLE_T" \
   ABFLOW_SCOREFM_TIME_EMBED="$TIME_EMBED" \
+  ABFLOW_PAIR_TIME_SCOPE="$PAIR_TIME_SCOPE" \
+  ABFLOW_SCOREFLOW_PAIR_MODE="$SCOREFLOW_PAIR_MODE" \
+  ABFLOW_SCOREFLOW_PAIR_STOP_GRAD="$SCOREFLOW_PAIR_STOP_GRAD" \
   ABFLOW_SCOREFM_T_SAMPLING="$T_SAMPLING" \
   ABFLOW_SCOREFM_LOSS_MODE="$LOSS_MODE" \
   ABFLOW_SCOREFM_MIN_SIGMA="$MIN_SIGMA" \
@@ -393,6 +304,22 @@ run_with_env() {
   ABFLOW_SI_GAMMA_SCALE="$SI_GAMMA_SCALE" \
   ABFLOW_SI_SCORE_WEIGHT="$SI_SCORE_WEIGHT" \
   ABFLOW_SI_VELOCITY_WEIGHT="$SI_VELOCITY_WEIGHT" \
+  ABFLOW_STRUCTURED_GAMMA_SCALE="$STRUCTURED_GAMMA_SCALE" \
+  ABFLOW_STRUCTURED_TRANSPORT_MAX="$STRUCTURED_TRANSPORT_MAX" \
+  ABFLOW_STRUCTURED_GAMMA_ABS_MAX="$STRUCTURED_GAMMA_ABS_MAX" \
+  ABFLOW_STRUCTURED_LOCAL_GAMMA_SCALE="$STRUCTURED_LOCAL_GAMMA_SCALE" \
+  ABFLOW_R3_TRANSPORT_FRACTION="$R3_TRANSPORT_FRACTION" \
+  ABFLOW_R3_PATH_MIN_SIGMA="$R3_PATH_MIN_SIGMA" \
+  ABFLOW_R3_TRANSPORT_MAX="$R3_TRANSPORT_MAX" \
+  ABFLOW_R3_SCORE_MIN_SIGMA="$R3_SCORE_MIN_SIGMA" \
+  ABFLOW_R3_SCORE_DSM_WEIGHT="$R3_SCORE_DSM_WEIGHT" \
+  ABFLOW_R3_PATHFLOW_WEIGHT="$R3_PATHFLOW_WEIGHT" \
+  ABFLOW_R3_FLOW_COORDINATE_SCALING="$R3_FLOW_COORDINATE_SCALING" \
+  ABFLOW_SF2M_SCORE_WEIGHT="$SF2M_SCORE_WEIGHT" \
+  ABFLOW_SF2M_T_EPS="$SF2M_T_EPS" \
+  ABFLOW_SF2M_INFER_G="$SF2M_INFER_G" \
+  ABFLOW_F01_CANONICAL_T_MIN="$F01_CANONICAL_T_MIN" \
+  ABFLOW_F01_HYBRID_T_MIN="$F01_HYBRID_T_MIN" \
   ABFLOW_TRAJ_CONSISTENCY_WEIGHT="$TRAJ_CONSISTENCY_WEIGHT" \
   ABFLOW_TRAJ_VELOCITY_WEIGHT="$TRAJ_VELOCITY_WEIGHT" \
   ABFLOW_TRAJ_DELTA_T="$TRAJ_DELTA_T" \
@@ -434,6 +361,7 @@ run_with_env() {
   ABFLOW_GRAD_DIAGNOSTIC_INTERVAL="$GRAD_DIAGNOSTIC_INTERVAL" \
   ABFLOW_MAX_EPOCH="$MAX_EPOCH" \
   ABFLOW_FORCE_SCRATCH="$FORCE_SCRATCH" \
+  ABFLOW_BOUNDARY_PCGRAD="$BOUNDARY_PCGRAD" \
   ABFLOW_AMP="$AMP" \
   ABFLOW_AMP_DTYPE="$AMP_DTYPE" \
   ABFLOW_ALLOW_TF32="$ALLOW_TF32" \
@@ -464,7 +392,11 @@ print_settings() {
   echo "STATE_PATH=$STATE_PATH"
   echo "PER_SAMPLE_T=$PER_SAMPLE_T"
   echo "TIME_EMBED=$TIME_EMBED"
+  echo "PAIR_TIME_SCOPE=$PAIR_TIME_SCOPE"
+  echo "SCOREFLOW_PAIR_MODE=$SCOREFLOW_PAIR_MODE"
+  echo "SCOREFLOW_PAIR_STOP_GRAD=$SCOREFLOW_PAIR_STOP_GRAD"
   echo "T_SAMPLING=$T_SAMPLING"
+  echo "BOUNDARY_PCGRAD=$BOUNDARY_PCGRAD"
   echo "LOSS_MODE=$LOSS_MODE"
   echo "MIN_SIGMA=$MIN_SIGMA"
   echo "DSM_T_MIN=$DSM_T_MIN"
@@ -484,6 +416,22 @@ print_settings() {
   echo "SI_GAMMA_SCALE=$SI_GAMMA_SCALE"
   echo "SI_SCORE_WEIGHT=$SI_SCORE_WEIGHT"
   echo "SI_VELOCITY_WEIGHT=$SI_VELOCITY_WEIGHT"
+  echo "STRUCTURED_GAMMA_SCALE=$STRUCTURED_GAMMA_SCALE"
+  echo "STRUCTURED_TRANSPORT_MAX=$STRUCTURED_TRANSPORT_MAX"
+  echo "STRUCTURED_GAMMA_ABS_MAX=$STRUCTURED_GAMMA_ABS_MAX"
+  echo "STRUCTURED_LOCAL_GAMMA_SCALE=$STRUCTURED_LOCAL_GAMMA_SCALE"
+  echo "R3_TRANSPORT_FRACTION=$R3_TRANSPORT_FRACTION"
+  echo "R3_PATH_MIN_SIGMA=$R3_PATH_MIN_SIGMA"
+  echo "R3_TRANSPORT_MAX=$R3_TRANSPORT_MAX"
+  echo "R3_SCORE_MIN_SIGMA=$R3_SCORE_MIN_SIGMA"
+  echo "R3_SCORE_DSM_WEIGHT=$R3_SCORE_DSM_WEIGHT"
+  echo "R3_PATHFLOW_WEIGHT=$R3_PATHFLOW_WEIGHT"
+  echo "R3_FLOW_COORDINATE_SCALING=$R3_FLOW_COORDINATE_SCALING"
+  echo "SF2M_SCORE_WEIGHT=$SF2M_SCORE_WEIGHT"
+  echo "SF2M_T_EPS=$SF2M_T_EPS"
+  echo "SF2M_INFER_G=$SF2M_INFER_G"
+  echo "F01_CANONICAL_T_MIN=$F01_CANONICAL_T_MIN"
+  echo "F01_HYBRID_T_MIN=$F01_HYBRID_T_MIN"
   echo "TRAJ_CONSISTENCY_WEIGHT=$TRAJ_CONSISTENCY_WEIGHT"
   echo "TRAJ_VELOCITY_WEIGHT=$TRAJ_VELOCITY_WEIGHT"
   echo "TRAJ_DELTA_T=$TRAJ_DELTA_T"
@@ -544,7 +492,7 @@ print_settings() {
 # ============================================================
 # Principle:
 #   The original training command remains unchanged:
-#     bash scripts/train/run_gt_satc_matched_v55.sh train <EXP_ID> <GPU_ID> <BASE_CONFIG>
+#     bash scripts/train/run_G00_G01_G02_ff_r3_scoreflow_v83.sh train <EXP_ID> <GPU_ID> <BASE_CONFIG>
 #   When ABFLOW_AUTO_TOPK_EVAL=on (explicit opt-in), the launcher automatically starts
 #   a background watcher if spare GPUs are available.  It reads topk_map.txt,
 #   evaluates new checkpoints with the original test pipeline and writes CSV
@@ -730,7 +678,7 @@ if [[ "$MODE" == "test" ]]; then
   TEST_JSON=${6:-datasets/RAbD/test.json}
 
   if [[ -z "$CKPT" || -z "$RESULT_DIR" ]]; then
-    echo "Usage: bash $0 test <EXP_ID> <GPU_ID> <CKPT> <RESULT_DIR> [TEST_JSON]"
+    echo "Usage: bash $0 $MODE <EXP_ID> <GPU_ID> <CKPT> <RESULT_DIR> [TEST_JSON]"
     exit 2
   fi
 
@@ -750,9 +698,9 @@ fi
 
 if [[ "$MODE" != "train" ]]; then
   echo "Train: bash $0 train <EXP_ID> <GPU_ID> <BASE_CONFIG>"
-  echo "Test:  bash $0 test  <EXP_ID> <GPU_ID> <CKPT> <RESULT_DIR> [TEST_JSON]"
+  echo "Test bridge:    bash $0 test <EXP_ID> <GPU_ID> <CKPT> <RESULT_DIR> [TEST_JSON]"
   echo "Attach current training auto-eval: bash $0 attach_eval <EXP_ID> <GPU_ID|auto> [EVAL_GPU_ID|auto]"
-  echo "Stage-1 supported EXP_ID: PCS_RC_LC_R1_BASE, PCS_RC_LC_R1_SATC_CORE, PCS_RC_LC_R1_GT_SATC"
+  echo "v83 EXP_ID: G00_PCS_RC_LC_R1_FF_R3_PAIR_CAPACITY_CONTROL, G01_PCS_RC_LC_R1_FF_R3_FLOW_PAIR_CONTROL, G02_PCS_RC_LC_R1_FF_R3_STABLE_SCOREFLOW_PAIR_COUPLED"
   exit 2
 fi
 
@@ -1008,6 +956,11 @@ runtime = {
     "state_path": os.environ.get("ABFLOW_SCOREFM_STATE_PATH", ""),
     "per_sample_t": os.environ.get("ABFLOW_SCOREFM_PER_SAMPLE_T", ""),
     "time_embed": os.environ.get("ABFLOW_SCOREFM_TIME_EMBED", ""),
+    "pair_time_scope": os.environ.get("ABFLOW_PAIR_TIME_SCOPE", "off"),
+    "pair_time_conditioning": os.environ.get("ABFLOW_PAIR_TIME_SCOPE", "off") != "off",
+    "pair_time_adapter": "zero_init_pre_edge_sinusoidal_projection_when_enabled",
+    "scoreflow_pair_mode": "off",
+    "scoreflow_pair_stop_grad": os.environ.get("ABFLOW_SCOREFLOW_PAIR_STOP_GRAD", "on") == "on",
     "t_sampling": os.environ.get("ABFLOW_SCOREFM_T_SAMPLING", ""),
     "loss_mode": os.environ.get("ABFLOW_SCOREFM_LOSS_MODE", ""),
     "min_sigma": os.environ.get("ABFLOW_SCOREFM_MIN_SIGMA", ""),
@@ -1028,6 +981,30 @@ runtime = {
     "si_gamma_scale": os.environ.get("ABFLOW_SI_GAMMA_SCALE", ""),
     "si_score_weight": os.environ.get("ABFLOW_SI_SCORE_WEIGHT", ""),
     "si_velocity_weight": os.environ.get("ABFLOW_SI_VELOCITY_WEIGHT", ""),
+    "structured_gamma_scale": os.environ.get("ABFLOW_STRUCTURED_GAMMA_SCALE", ""),
+    "structured_transport_max": os.environ.get("ABFLOW_STRUCTURED_TRANSPORT_MAX", ""),
+    "structured_gamma_abs_max": os.environ.get("ABFLOW_STRUCTURED_GAMMA_ABS_MAX", ""),
+    "structured_local_gamma_scale": os.environ.get("ABFLOW_STRUCTURED_LOCAL_GAMMA_SCALE", ""),
+    "r3_transport_fraction": os.environ.get("ABFLOW_R3_TRANSPORT_FRACTION", ""),
+    "r3_width_rule": "adaptive_g_from_0.05_x_source_native_centroid_transport",
+    "r3_path_min_sigma": os.environ.get("ABFLOW_R3_PATH_MIN_SIGMA", ""),
+    "r3_transport_max": os.environ.get("ABFLOW_R3_TRANSPORT_MAX", ""),
+    "r3_score_min_sigma": os.environ.get("ABFLOW_R3_SCORE_MIN_SIGMA", ""),
+    "r3_score_dsm_weight": os.environ.get("ABFLOW_R3_SCORE_DSM_WEIGHT", ""),
+    "r3_pathflow_weight": os.environ.get("ABFLOW_R3_PATHFLOW_WEIGHT", ""),
+    "sf2m_score_weight": os.environ.get("ABFLOW_SF2M_SCORE_WEIGHT", ""),
+    "sf2m_t_eps": os.environ.get("ABFLOW_SF2M_T_EPS", ""),
+    "sf2m_infer_g": os.environ.get("ABFLOW_SF2M_INFER_G", ""),
+    "f01_canonical_t_min": os.environ.get("ABFLOW_F01_CANONICAL_T_MIN", ""),
+    "f01_hybrid_t_min": os.environ.get("ABFLOW_F01_HYBRID_T_MIN", ""),
+    "foldflow_r3_training": (
+        os.environ.get("ABFLOW_SCOREFM_LOSS_MODE", "").startswith("foldflow_r3_")
+        or os.environ.get("ABFLOW_SCOREFM_LOSS_MODE", "").startswith("f01_r3_")
+    ),
+    "f01_unified_scoreflow": os.environ.get("ABFLOW_SCOREFM_LOSS_MODE", "") in {
+        "f01_r3_canonical_carrier", "f01_r3_endpoint_canonical_hybrid"
+    },
+    "structured_multiscale_cfm": os.environ.get("ABFLOW_SCOREFM_LOSS_MODE", "") == "structured_multiscale_cfm",
     "traj_consistency_weight": os.environ.get("ABFLOW_TRAJ_CONSISTENCY_WEIGHT", ""),
     "traj_velocity_weight": os.environ.get("ABFLOW_TRAJ_VELOCITY_WEIGHT", ""),
     "traj_delta_t": os.environ.get("ABFLOW_TRAJ_DELTA_T", ""),
@@ -1086,13 +1063,17 @@ runtime = {
     "proposal_recurrent_context": os.environ.get("ABFLOW_RECURRENT_PROPOSAL_CONTEXT", "") == "on",
     "peptide_state_injection": "false",
     "peptide_prior_weighting": "false",
-    "independent_score_head": "false",
-    "independent_velocity_head": "false",
+    "independent_score_head": os.environ.get(
+        "ABFLOW_SCOREFM_LOSS_MODE", ""
+    ) == "fixedg_r3_flow_conditioned_score_flow",
+    "flow_conditioned_scaled_score": os.environ.get(
+        "ABFLOW_SCOREFM_LOSS_MODE", ""
+    ) == "fixedg_r3_flow_conditioned_score_flow",
+    "independent_velocity_head": False,
     "stochastic_interpolant_training": os.environ.get("ABFLOW_SCOREFM_LOSS_MODE", "") in {"si_score", "si_score_fm"},
     "trajectory_consistency_training": os.environ.get("ABFLOW_SCOREFM_LOSS_MODE", "") in {"traj_consistency", "traj_consistency_fm"},
     "score_aware_trajectory_lite_training": os.environ.get("ABFLOW_SCOREFM_LOSS_MODE", "").startswith("score_aware_traj_"),
     "interface_weighted_satc": "_if_" in os.environ.get("ABFLOW_SCOREFM_LOSS_MODE", ""),
-    "pair_time_conditioning": "false",
     "coordinate_objective_stacking": "false",
     "true_path_endpoint": "1.0",
 }

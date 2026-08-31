@@ -22,7 +22,7 @@
   "pep_struct": true,
   "bind_dist_cutoff": 6.6,
   "save_interval": 1,
-  "resume_checkpoint": "/home/data3/cjm/project/AbFlow/results_module/E01_PCS_RC_LC_R1_STOCHASTIC_ENDPOINT/version_0/checkpoint/last_step10440.pt",
+  "resume_checkpoint": "",
   "use_ema": true,
   "ema_decay": 0.999,
   "num_workers": 8,
@@ -35,13 +35,15 @@
   "log_interval": 1,
   "tqdm_mininterval": 5.0,
   "_experiment": {
-    "exp_id": "E01_PCS_RC_LC_R1_STOCHASTIC_ENDPOINT",
-    "parent": "E00_PCS_RC_LC_R1_ENDPOINT_FM_BASE",
+    "exp_id": "E02_PCS_RC_LC_R1_STOCHASTIC_ENDPOINT_INTERFACE_TIME",
+    "parent": "E01_PCS_RC_LC_R1_STOCHASTIC_ENDPOINT",
     "loss_mode": "foldflow_r3_global_endpoint",
     "sampler_mode": "bridge",
-    "single_change": "replace deterministic training states by a standard Gaussian Brownian-bridge-style global-R3 path",
-    "physical_object": "same clean endpoint X1_hat under stochastic global-placement states",
-    "score_objective": "off; analytic score is not added as a loss",
-    "path": "mu_t=(1-t)X0+tX1, sigma_t=g*sqrt(t(1-t)) in graph-level R3 translation subspace"
+    "single_change": "enable zero-start explicit time conditioning only on antibody-antigen interface/surface messages",
+    "physical_object": "same clean endpoint X1_hat under the same stochastic global-placement states, with time-aware interface evidence",
+    "score_objective": "off; analytic score remains a derived sampling quantity, never an independent training head/loss",
+    "path": "same as E01: mu_t=(1-t)X0+tX1, sigma_t=g*sqrt(t(1-t)) in graph-level R3 translation subspace",
+    "pair_time_scope": "interface",
+    "scoreflow_evaluation": "evaluate the same checkpoint with MODE=test_scoreflow; do not retrain a sampler-only clone"
   }
 }
