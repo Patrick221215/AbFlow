@@ -825,6 +825,19 @@ class ProteinFeature:
 
 
 class SeperatedCoordNormalizer(nn.Module):
+    """AbX-style common complex coordinate normalizer.
+
+    v103 rule:
+      1) compute ONE antibody-backbone C-alpha center per complex;
+      2) subtract that SAME center from antibody, antigen and all auxiliary
+         coordinate objects belonging to the complex;
+      3) divide coordinates by 10 Angstrom, matching FoldFlow's
+         coordinate_scaling=0.1.
+
+    This replaces the historical AbFlow behavior that centered antigen and
+    antibody separately.  The common translation preserves every physical
+    antibody-antigen relative vector exactly.
+    """
     def __init__(self) -> None:
         super().__init__()
         self.mean = torch.tensor(0)
@@ -832,58 +845,143 @@ class SeperatedCoordNormalizer(nn.Module):
         self.mean = nn.parameter.Parameter(self.mean, requires_grad=False)
         self.std = nn.parameter.Parameter(self.std, requires_grad=False)
         self.boa_idx = VOCAB.symbol_to_idx(VOCAB.BOA)
+        self.common_centers = None
+        # Historical AbFlow surface pickles are consumed without coordinate
+        # centering, while antigen residue coordinates are antigen-centered in
+        # the legacy pipeline.  Cache that exact legacy antigen center so the
+        # pre-centered surface can be mapped into the new AbX common frame.
+        self.legacy_ag_centers = None
+        # Compatibility aliases used by historical runtime helpers.  In v103
+        # they intentionally point to the SAME common center.
+        self.ag_centers = None
+        self.ab_centers = None
+        self.is_ag = None
+        self.is_ab = None
 
     def normalize(self, X):
-        X = (X - self.mean) / self.std
-        return X
+        return (X - self.mean) / self.std
 
     def unnormalize(self, X):
-        X = X * self.std + self.mean
-        return X
+        return X * self.std + self.mean
 
-    def centering(self, X, S, batch_id, aa_feature: AminoAcidFeature):
-        # centering antigen and antibody separatedly
+    def prepare_common_center(self, X, S, batch_id, aa_feature: AminoAcidFeature):
+        """Cache the AbX antibody-backbone CA center for each graph.
+
+        The center is computed from the raw, uncorrupted antibody coordinates
+        passed into ``_forward`` before masking/proposal replacement.  This
+        mirrors AbX's dataset normalization: antibody and antigen use the same
+        antibody backbone center.  Global BOA/BOH/BOL pseudo-nodes are excluded.
+        """
         segment_ids = aa_feature._construct_segment_ids(S)
-        not_bol = S != aa_feature.bol_idx
-        tmp_S = S[not_bol]
-        tmp_X = aa_feature.update_global_coordinates(X[not_bol], tmp_S)
-        self.ag_centers = tmp_X[tmp_S == aa_feature.boa_idx][:, 0]
-        self.ab_centers = tmp_X[tmp_S == aa_feature.boh_idx][:, 0]
-
         is_ag = segment_ids == aa_feature.ag_seg_id
         is_ab = torch.logical_not(is_ag)
 
-        # compose centers
-        centers = torch.zeros(X.shape[0], X.shape[-1], dtype=X.dtype, device=X.device)
-        centers[is_ag] = self.ag_centers[batch_id[is_ag]]
-        centers[is_ab] = self.ab_centers[batch_id[is_ab]]
-        X = X - centers.unsqueeze(1)
+        ca_idx = 1 if X.shape[1] > 1 else 0
+        ca = X[:, ca_idx]
+        is_global = sequential_or(
+            S == aa_feature.boa_idx,
+            S == aa_feature.boh_idx,
+            S == aa_feature.bol_idx,
+        )
+        valid = is_ab & (~is_global) & torch.isfinite(ca).all(dim=-1)
+
+        n_graph = int(batch_id.max().item()) + 1 if batch_id.numel() else 1
+        weights = valid.to(X.dtype)
+        sums = scatter_sum(
+            ca * weights[:, None], batch_id, dim=0, dim_size=n_graph
+        )
+        counts_raw = scatter_sum(
+            weights, batch_id, dim=0, dim_size=n_graph
+        )
+        if bool((counts_raw <= 0).any()):
+            raise RuntimeError('AbX common centering found a graph with no valid antibody CA coordinate.')
+        counts = counts_raw.clamp_min(1.0)
+        centers = sums / counts[:, None]
+
+        # Recover the exact antigen center used by historical AbFlow before
+        # v103.  This is needed only to re-express the existing surface pickle,
+        # which historically lived in that antigen-centered frame.
+        not_bol = S != aa_feature.bol_idx
+        tmp_S = S[not_bol]
+        tmp_X = aa_feature.update_global_coordinates(X[not_bol], tmp_S)
+        legacy_ag = tmp_X[tmp_S == aa_feature.boa_idx][:, 0]
+        if legacy_ag.shape[0] != n_graph:
+            raise RuntimeError(
+                f'Expected {n_graph} antigen global centers, got {legacy_ag.shape[0]}.'
+            )
+
+        self.common_centers = centers
+        self.legacy_ag_centers = legacy_ag
+        self.ag_centers = centers
+        self.ab_centers = centers
         self.is_ag, self.is_ab = is_ag, is_ab
-        return X
+        return centers
+
+    def centering(self, X, S, batch_id, aa_feature: AminoAcidFeature, reuse_cached=True):
+        """Apply one shared antibody-derived translation to the full complex."""
+        if (not reuse_cached) or self.common_centers is None:
+            self.prepare_common_center(X, S, batch_id, aa_feature)
+        centers = self.common_centers[batch_id]
+        return X - centers.unsqueeze(1)
+
+    def center_auxiliary(self, X, aux_batch_id):
+        """Raw absolute auxiliary coordinates -> AbX common-centered frame."""
+        if self.common_centers is None:
+            raise RuntimeError('prepare_common_center must be called before center_auxiliary.')
+        centers = self.common_centers[aux_batch_id]
+        while centers.dim() < X.dim():
+            centers = centers.unsqueeze(-2)
+        return X - centers
+
+    def surface_legacy_to_common(self, surface, surface_batch_id):
+        """Map historical antigen-centered surface vertices to AbX common frame.
+
+        Existing AbFlow surface pickles were already compatible with the legacy
+        antigen-centered residue coordinates, which is why the old model only
+        divided ``surface`` by 10 and did not call ``centering`` on it.  If
+        ``S_old = S_raw - c_ag`` then the new common-centered representation is
+
+            S_common = S_old + c_ag - c_ab.
+
+        Applying ``surface - c_ab`` directly would subtract a center twice.
+        """
+        if self.common_centers is None or self.legacy_ag_centers is None:
+            raise RuntimeError('prepare_common_center must be called before surface conversion.')
+        ag = self.legacy_ag_centers[surface_batch_id]
+        ab = self.common_centers[surface_batch_id]
+        shift = ag - ab
+        while shift.dim() < surface.dim():
+            shift = shift.unsqueeze(-2)
+        return surface + shift
+
+    def raw_to_model_frame(self, X, batch_id):
+        """Raw Angstrom -> AbX common-centered, FoldFlow-scaled model frame."""
+        if self.common_centers is None:
+            raise RuntimeError('prepare_common_center must be called before raw_to_model_frame.')
+        centers = self.common_centers[batch_id]
+        while centers.dim() < X.dim():
+            centers = centers.unsqueeze(-2)
+        return self.normalize(X - centers)
 
     def uncentering(self, X, batch_id, _type=1):
+        """Undo the single common translation.  ``_type`` is retained for compatibility."""
+        if self.common_centers is None:
+            raise RuntimeError('No cached common center available for uncentering.')
         if _type == 0:
-            # type 0: [N, 3]
-            X = X.unsqueeze(1) # then it is type 1
-        
-        if _type == 0 or _type == 1:
-            # type 1: [N, n_channel, 3]
-            centers = torch.zeros(X.shape[0], X.shape[-1], dtype=X.dtype, device=X.device)
-            centers[self.is_ag] = self.ag_centers[batch_id[self.is_ag]]
-            centers[self.is_ab] = self.ab_centers[batch_id[self.is_ab]]
+            X = X.unsqueeze(1)
+
+        if _type in {0, 1, 4}:
+            centers = self.common_centers[batch_id]
             X = X + centers.unsqueeze(1)
         elif _type == 2:
-            # type 2: [2, bs, K, 3], X[0] for antigen, X[1] for antibody
-            centers = torch.stack([self.ag_centers, self.ab_centers], dim=0)  # [2, bs, 3]
+            centers = torch.stack([self.common_centers, self.common_centers], dim=0)
             X = X + centers.unsqueeze(-2)
         elif _type == 3:
-            # type 3: [2, Ef, 3], X[0] for antigen, X[1] for antibody
-            centers = torch.stack([self.ag_centers[batch_id], self.ab_centers[batch_id]], dim=0)
+            centers = torch.stack([
+                self.common_centers[batch_id],
+                self.common_centers[batch_id],
+            ], dim=0)
             X = X + centers
-        elif _type == 4:
-            # type 4: [N, n_channel, 3], but all uncentering to the center of antigen
-            centers = self.ag_centers[batch_id]
-            X = X + centers.unsqueeze(1)
         else:
             raise NotImplementedError(f'uncentering for type {_type} not implemented')
 
@@ -892,4 +990,10 @@ class SeperatedCoordNormalizer(nn.Module):
         return X
 
     def clear_cache(self):
-        self.ag_centers, self.ab_centers, self.is_ag, self.is_ab = None, None, None, None
+        self.common_centers = None
+        self.legacy_ag_centers = None
+        self.ag_centers = None
+        self.ab_centers = None
+        self.is_ag = None
+        self.is_ab = None
+

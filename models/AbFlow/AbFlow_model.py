@@ -22,7 +22,7 @@ from .abflow_conditional_matcher import AbFlowConditionalMatcher
 from .abflow_r3_matcher import AbFlowR3Matcher
 
 
-# v59 FoldFlow-R3 adaptation: structured full-atom stochastic R3 paths with endpoint-parameterized CFM.
+# v101 support-geometry optimization on the validated U02/F01 physical parent.
 
 
 def _env_str(name, default):
@@ -55,7 +55,7 @@ def _env_flag(name, default=False):
 
 
 def get_timestep_embedding(timesteps, embedding_dim, max_positions=10000):
-    """AbFlow v96.1 training-first U14/U15/U16 factorial family (init-order fix).\n\nSinusoidal embedding for continuous flow time t in [0, 1].
+    """Sinusoidal embedding for continuous flow time t in [0, 1].
 
     This is the same style of time embedding used in diffusion models and in
     the uploaded AbX Seqformer.  It lets AbFlow learn f_theta(X_t, t, c)
@@ -417,14 +417,6 @@ class AbFlowModel(nn.Module):
         }:
             self.scorefm_loss_mode = "f01_r3_endpoint_canonical_hybrid"
         if self.scorefm_loss_mode in {
-            "f01_r3_progressive_endpoint_canonical_refinement",
-            "ff_r3_progressive_endpoint_canonical_refinement",
-            "f01_progressive_endpoint_canonical_refinement",
-        }:
-            self.scorefm_loss_mode = (
-                "f01_r3_progressive_endpoint_canonical_refinement"
-            )
-        if self.scorefm_loss_mode in {
             "f01_r3_boundary_regular_carrier",
             "ff_r3_boundary_regular_carrier",
             "f01_preconditioned_scoreflow_carrier",
@@ -443,14 +435,6 @@ class AbFlowModel(nn.Module):
         }:
             self.scorefm_loss_mode = "f01_r3_c1_smoothstep_canonical_carrier"
         if self.scorefm_loss_mode in {
-            "f01_r3_source_flat_hermite_canonical_carrier",
-            "ff_r3_source_flat_hermite_canonical_carrier",
-            "f01_source_flat_phase_matched_carrier",
-        }:
-            self.scorefm_loss_mode = (
-                "f01_r3_source_flat_hermite_canonical_carrier"
-            )
-        if self.scorefm_loss_mode in {
             "foldflow_r3_residue_endpoint", "r3_residue_endpoint",
             "ff_r3_residue_endpoint",
         }:
@@ -460,6 +444,16 @@ class AbFlowModel(nn.Module):
             "ff_r3_residue_cfm",
         }:
             self.scorefm_loss_mode = "foldflow_r3_residue_cfm"
+        if self.scorefm_loss_mode in {
+            "abx_cartesian_cfm", "r02_cartesian_cfm",
+            "foldflow_cartesian_cfm",
+        }:
+            self.scorefm_loss_mode = "abx_cartesian_cfm"
+        if self.scorefm_loss_mode in {
+            "abx_cartesian_scoreflow", "r03_cartesian_scoreflow",
+            "foldflow_sf2m_cartesian",
+        }:
+            self.scorefm_loss_mode = "abx_cartesian_scoreflow"
         if self.scorefm_loss_mode not in {
             "endpoint", "analytic_core", "velocity_core",
             "si_score", "si_score_fm",
@@ -474,13 +468,13 @@ class AbFlowModel(nn.Module):
             "foldflow_r3_global_endpoint",
             "f01_r3_canonical_carrier",
             "f01_r3_endpoint_canonical_hybrid",
-            "f01_r3_progressive_endpoint_canonical_refinement",
             "f01_r3_boundary_regular_carrier",
             "f01_r3_antithetic_boundary_regular",
             "f01_r3_c1_smoothstep_canonical_carrier",
-            "f01_r3_source_flat_hermite_canonical_carrier",
             "foldflow_r3_residue_endpoint",
             "foldflow_r3_residue_cfm",
+            "abx_cartesian_cfm",
+            "abx_cartesian_scoreflow",
         }:
             raise ValueError(
                 "Unknown ABFLOW_SCOREFM_LOSS_MODE="
@@ -495,9 +489,8 @@ class AbFlowModel(nn.Module):
                 "structured_global_cfm, structured_multiscale_cfm, foldflow_r3_global_endpoint, "
                 "f01_r3_canonical_carrier, f01_r3_endpoint_canonical_hybrid, "
                 "f01_r3_boundary_regular_carrier, f01_r3_antithetic_boundary_regular, "
-                "f01_r3_c1_smoothstep_canonical_carrier, "
-                "f01_r3_source_flat_hermite_canonical_carrier, "
-                "foldflow_r3_residue_endpoint, foldflow_r3_residue_cfm."
+                "f01_r3_c1_smoothstep_canonical_carrier, foldflow_r3_residue_endpoint, "
+                "foldflow_r3_residue_cfm, abx_cartesian_cfm, abx_cartesian_scoreflow."
             )
 
         # Stochastic-interpolant controls.  These regularizers keep the strong
@@ -577,6 +570,39 @@ class AbFlowModel(nn.Module):
         )
 
         # =========================================================
+        # v103: AbX common frame + FoldFlow-style direct Cartesian Flow.
+        # =========================================================
+        self.abx_common_center = _env_flag("ABFLOW_ABX_COMMON_CENTER", False)
+        self.flow_coordinate_scaling = _env_float(
+            "ABFLOW_R3_FLOW_COORDINATE_SCALING", 0.1
+        )
+        self.flow_t_min = _env_float("ABFLOW_FLOW_T_MIN", 0.0)
+        self.flow_t_max = _env_float("ABFLOW_FLOW_T_MAX", 1.0)
+        self.r03_g_scaled = _env_float("ABFLOW_R03_G_SCALED", 0.1)
+        self.r03_path_min_sigma_scaled = _env_float(
+            "ABFLOW_R03_PATH_MIN_SIGMA_SCALED", 0.0
+        )
+        self.r03_center_residual = _env_flag(
+            "ABFLOW_R03_CENTER_RESIDUAL", True
+        )
+        if not (0.0 < self.flow_coordinate_scaling <= 1.0):
+            raise ValueError("ABFLOW_R3_FLOW_COORDINATE_SCALING must be in (0,1].")
+        if not (0.0 <= self.flow_t_min < self.flow_t_max <= 1.0):
+            raise ValueError("Require 0 <= ABFLOW_FLOW_T_MIN < ABFLOW_FLOW_T_MAX <= 1.")
+        if self.r03_g_scaled <= 0.0:
+            raise ValueError("ABFLOW_R03_G_SCALED must be positive.")
+        if self.r03_path_min_sigma_scaled < 0.0:
+            raise ValueError("ABFLOW_R03_PATH_MIN_SIGMA_SCALED must be non-negative.")
+        if (
+            self.scorefm_loss_mode == "abx_cartesian_scoreflow"
+            and self.r03_path_min_sigma_scaled != 0.0
+        ):
+            raise ValueError(
+                "R03 uses clean PCS-RC/native endpoints; physical path min sigma "
+                "must be 0. Use ABFLOW_R3_SCORE_MIN_SIGMA only as a numerical score floor."
+            )
+
+        # =========================================================
         # v85 F01-anchored single-field Score--Flow carrier
         # =========================================================
         # The physical F01 adaptive-g stochastic path is unchanged.  The new
@@ -605,11 +631,6 @@ class AbFlowModel(nn.Module):
             raise ValueError(
                 "ABFLOW_F01_HYBRID_T_MIN must be in (0,1)."
             )
-
-        # v93/U11: intrinsic Gaussian expansion/contraction boundary.
-        # Fixed by k(t)=(1-2t)/(2t(1-t)) changing sign at t=1/2.
-        # This is intentionally NOT an environment-tuned hyperparameter.
-        self.f01_source_flat_hermite_transition_t = 0.5
 
         # Trajectory-consistency controls.
         # These terms do not introduce a new score head or velocity head.
@@ -847,14 +868,13 @@ class AbFlowModel(nn.Module):
             "residual", "bridge", "f01_canonical_carrier",
             "f01_boundary_regular_carrier",
             "f01_c1_smoothstep_canonical_carrier",
-            "f01_source_flat_hermite_canonical_carrier",
+            "cartesian_direct_ode",
         }:
             raise ValueError(
                 "Unknown ABFLOW_SCOREFM_SAMPLER_MODE="
                 f"{self.scorefm_sampler_mode}. Choose from residual, bridge, "
                 "f01_canonical_carrier, f01_boundary_regular_carrier, "
-                "f01_c1_smoothstep_canonical_carrier, "
-                "f01_source_flat_hermite_canonical_carrier."
+                "f01_c1_smoothstep_canonical_carrier, cartesian_direct_ode."
             )
 
         # =========================================================
@@ -978,12 +998,11 @@ class AbFlowModel(nn.Module):
             "ABFLOW_DUAL_SEQUENCE_ATOM_MODE", "hard_exact"
         ).lower()
         if self.dual_sequence_atom_mode not in {
-            "hard", "hard_exact", "latent_exact", "hidden_only",
-            "time_gated_union"
+            "hard", "hard_exact", "hidden_only", "time_gated_union"
         }:
             raise ValueError(
                 "ABFLOW_DUAL_SEQUENCE_ATOM_MODE must be hard, hard_exact, "
-                "latent_exact, hidden_only or time_gated_union."
+                "hidden_only or time_gated_union."
             )
 
         # Legacy learned adapters are retained only for historical modes.  The
@@ -992,8 +1011,7 @@ class AbFlowModel(nn.Module):
         if (
             self.dual_sequence_state
             and not self.struct_only
-            and self.dual_sequence_atom_mode
-            not in {"hard_exact", "latent_exact"}
+            and self.dual_sequence_atom_mode != "hard_exact"
         ):
             self.seq_state_adapter = nn.Sequential(
                 nn.Linear(2 * embed_size, embed_size),
@@ -1021,72 +1039,6 @@ class AbFlowModel(nn.Module):
         if self.sequence_context_mode not in {"legacy", "loss_only", "off"}:
             raise ValueError(
                 "ABFLOW_SEQUENCE_CONTEXT_MODE must be legacy, loss_only or off."
-            )
-
-        # =========================================================
-        # v91 synchronized joint-state / AbX-style fixed-time recycle
-        # =========================================================
-        # Outer S_t remains the categorical process state at physical flow time t.
-        # ``hard_detached`` changes only the INTERNAL refinement authority:
-        # round-r sequence prediction is detached, becomes the categorical state
-        # seen by round r+1, and the historical soft pred_S_dist path is disabled.
-        # Therefore we never confuse solver depth with t -> t+dt evolution.
-        self.sequence_recycle_mode = _env_str(
-            "ABFLOW_SEQUENCE_RECYCLE_MODE", "off"
-        ).lower()
-        if self.sequence_recycle_mode not in {
-            "off", "hard_detached", "latent_detached"
-        }:
-            raise ValueError(
-                "ABFLOW_SEQUENCE_RECYCLE_MODE must be off, hard_detached "
-                "or latent_detached."
-            )
-        if self.sequence_recycle_mode in {
-            "hard_detached", "latent_detached"
-        }:
-            if self.struct_only:
-                raise ValueError(
-                    "sequence recycle is invalid in struct_only mode."
-                )
-            if not self.dual_sequence_state:
-                raise ValueError(
-                    "sequence recycle requires ABFLOW_DUAL_SEQUENCE_STATE=on."
-                )
-            required_mode = (
-                "hard_exact"
-                if self.sequence_recycle_mode == "hard_detached"
-                else "latent_exact"
-            )
-            if self.dual_sequence_atom_mode != required_mode:
-                raise ValueError(
-                    f"{self.sequence_recycle_mode} requires "
-                    f"ABFLOW_DUAL_SEQUENCE_ATOM_MODE={required_mode}."
-                )
-            if self.sequence_context_mode != "off":
-                raise ValueError(
-                    "sequence recycle requires ABFLOW_SEQUENCE_CONTEXT_MODE=off."
-                )
-        self._last_sequence_recycle_diagnostics = {}
-
-        # =========================================================
-        # v96.1 / U14,U16: round-consistent coordinate supervision
-        # =========================================================
-        # IMPORTANT INITIALIZATION ORDER:
-        # this attribute must exist before any compatibility guard reads it.
-        # U14/U16 still use the exact same v96 scientific semantics:
-        # every recurrent coordinate round estimates the SAME U02 carrier.
-        self.round_consistent_coord_supervision = _env_flag(
-            "ABFLOW_ROUND_CONSISTENT_COORD_SUPERVISION", False
-        )
-
-        if (
-            self.round_consistent_coord_supervision
-            and self.scorefm_loss_mode
-            == "f01_r3_progressive_endpoint_canonical_refinement"
-        ):
-            raise ValueError(
-                "Round-consistent supervision cannot be combined with U08 "
-                "progressive round-dependent target semantics."
             )
 
         # The bridge Euler/CTMC step already reaches the terminal state.  The
@@ -1118,21 +1070,6 @@ class AbFlowModel(nn.Module):
             "ABFLOW_DETERMINISTIC_VALIDATION", True
         )
 
-        # =========================================================
-        # v96 / U15,U16: DFM-style sequence source/state semantics
-        # =========================================================
-        # proposal: historical PCS-RC, where S_pep overwrites the random S0.
-        # reference_uniform: keep init_interface()'s random categorical S0 as
-        # the dynamic source and retain S_pep only as proposal condition.
-        # The endpoint-posterior CE itself is preserved.
-        self.sequence_source_mode = _env_str(
-            "ABFLOW_SEQUENCE_SOURCE_MODE", "proposal"
-        ).lower()
-        if self.sequence_source_mode not in {"proposal", "reference_uniform"}:
-            raise ValueError(
-                "ABFLOW_SEQUENCE_SOURCE_MODE must be proposal or reference_uniform."
-            )
-
         # Diagnostics are observational only. Gradient-conflict probing is
         # explicitly periodic because autograd.grad adds cost.
         self.grad_conflict_diagnostics = _env_flag(
@@ -1145,6 +1082,12 @@ class AbFlowModel(nn.Module):
         self._diagnostic_probe_tensor = None
         self._last_gradient_diagnostic_error = ""
         self._diagnostic_validation_mode = False
+        # v100 U02 boundary-task decomposition.
+        # These are differentiable scalar contributions whose sum is exactly
+        # the hybrid carrier endpoint loss for the current local batch.
+        # The trainer uses them only when ABFLOW_BOUNDARY_PCGRAD=on.
+        self._boundary_task_tensors = {}
+        self.last_boundary_task_diagnostics = {}
         # Set by the trainer only on recorded/probed steps so diagnostics do not
         # turn every expensive training batch into a synchronization point.
         self._diagnostic_capture = False
@@ -1189,6 +1132,30 @@ class AbFlowModel(nn.Module):
         self.proposal_adapter_start_round = max(
             0, _env_int("ABFLOW_PROPOSAL_ADAPTER_START_ROUND", 0)
         )
+
+        # =========================================================
+        # v101 / U25-U27: support-aware coordinate training geometry.
+        #
+        # F01/U02 corrupts H3 with ONE graph-level R3 translation.
+        # Therefore the stochastic support is rank-3, whereas centered
+        # full-atom H3 shape is deterministic along the conditional path.
+        #
+        # These switches alter TRAINING CREDIT/LOSS GEOMETRY ONLY.
+        # =========================================================
+        self.support_factorized_coord = _env_flag(
+            "ABFLOW_SUPPORT_FACTORIZED_COORD", False
+        )
+        self.translation_round_credit = _env_flag(
+            "ABFLOW_TRANSLATION_ROUND_CREDIT", False
+        )
+        if (
+            self.support_factorized_coord
+            or self.translation_round_credit
+        ) and self.scorefm_loss_mode != "f01_r3_endpoint_canonical_hybrid":
+            raise ValueError(
+                "v101 support-geometry objectives are defined only for "
+                "U02 loss_mode=f01_r3_endpoint_canonical_hybrid."
+            )
 
         self.last_scorefm_losses = {}
         self.last_abflow_diagnostics = {}
@@ -1343,24 +1310,16 @@ class AbFlowModel(nn.Module):
             if valid.any():
                 interface_X = torch.where(valid.view(-1, 1, 1), pep_X, interface_X)
 
-        if not self.struct_only:
-            if getattr(
-                self, "sequence_source_mode", "proposal"
-            ) == "reference_uniform":
-                # Preserve init_interface()'s independent dynamic S0.
-                # S_pep remains available later via pep_condition.
-                pass
-            elif (
-                getattr(self, 'pep_seq', True)
-                and S_pep is not None
-                and S_pep.shape == interface_S.shape
-            ):
-                pep_S = S_pep.to(
-                    device=interface_S.device, dtype=torch.long
-                )
-                valid = (pep_S >= 0) & (pep_S < self.num_classes)
-                if valid.any():
-                    interface_S = torch.where(valid, pep_S, interface_S)
+        if (
+            not self.struct_only
+            and getattr(self, 'pep_seq', True)
+            and S_pep is not None
+            and S_pep.shape == interface_S.shape
+        ):
+            pep_S = S_pep.to(device=interface_S.device, dtype=torch.long)
+            valid = (pep_S >= 0) & (pep_S < self.num_classes)
+            if valid.any():
+                interface_S = torch.where(valid, pep_S, interface_S)
 
         return interface_X, interface_S
 
@@ -1493,6 +1452,11 @@ class AbFlowModel(nn.Module):
         mode = getattr(self, 'scorefm_t_sampling', 'uniform')
 
         if self.deterministic_validation and not self.training:
+            # IMPORTANT v100 protocol:
+            # even when training uses U02 branch-balanced sampling, validation
+            # keeps the exact historical U02 deterministic *uniform* time grid.
+            # This preserves checkpoint-selection semantics and prevents a
+            # training-distribution intervention from silently changing val loss.
             if n <= 1:
                 t = torch.full((n,), 0.5, device=device, dtype=dtype)
             else:
@@ -1505,12 +1469,20 @@ class AbFlowModel(nn.Module):
                 t = 0.2 + 0.6 * t
             elif mode in {'late_t', 'late'}:
                 t = 0.55 + 0.35 * t
-            elif mode not in {'uniform', 'stratified', 'strat'}:
+            elif mode in {
+                'uniform', 'stratified', 'strat',
+                'u02_branch_balanced', 'branch_balanced'
+            }:
+                # branch-balanced is TRAINING ONLY; validation remains uniform.
+                pass
+            else:
                 raise ValueError(
                     f"Unknown ABFLOW_SCOREFM_T_SAMPLING={mode}. "
-                    "Choose from uniform, low_t, stratified, mid_t, late_t."
+                    "Choose from uniform, low_t, stratified, mid_t, late_t, "
+                    "u02_branch_balanced."
                 )
-            return t.clamp(min=0.0, max=1.0)
+            t = t.clamp(min=0.0, max=1.0)
+            return self.flow_t_min + (self.flow_t_max - self.flow_t_min) * t
 
         if mode == 'uniform':
             t = torch.rand(n, device=device, dtype=dtype)
@@ -1534,13 +1506,60 @@ class AbFlowModel(nn.Module):
         elif mode in {'late_t', 'late'}:
             t = 0.55 + 0.35 * torch.rand(n, device=device, dtype=dtype)
 
+        elif mode in {'u02_branch_balanced', 'branch_balanced'}:
+            # =============================================================
+            # v100 / U22,U24: semantic-task-balanced U02 time sampling.
+            #
+            # U02 contains two explicit target regimes:
+            #   Endpoint  : t < f01_hybrid_t_min
+            #   Canonical : t >= f01_hybrid_t_min
+            #
+            # Historical uniform t gives approximately 20/80 task frequency
+            # when t_min=0.20.  The balanced sampler changes ONLY task
+            # frequency, not the path, target formula, network, or sampler.
+            #
+            # For the formal 2-GPU batch56 setup each rank receives 28 graphs,
+            # so n_endpoint=n_canonical=14 exactly on every rank.
+            # =============================================================
+            split = float(self.f01_hybrid_t_min)
+            if not (0.0 < split < 1.0):
+                raise RuntimeError(
+                    "u02_branch_balanced requires 0 < F01_HYBRID_T_MIN < 1."
+                )
+            if n <= 1:
+                choose_endpoint = bool(
+                    (torch.rand((), device=device) < 0.5).item()
+                )
+                if choose_endpoint:
+                    t = split * torch.rand(
+                        n, device=device, dtype=dtype
+                    )
+                else:
+                    t = split + (1.0 - split) * torch.rand(
+                        n, device=device, dtype=dtype
+                    )
+            else:
+                n_endpoint = n // 2
+                n_canonical = n - n_endpoint
+                t_endpoint = split * torch.rand(
+                    n_endpoint, device=device, dtype=dtype
+                )
+                t_canonical = split + (1.0 - split) * torch.rand(
+                    n_canonical, device=device, dtype=dtype
+                )
+                t = torch.cat([t_endpoint, t_canonical], dim=0)
+                # Do not let graph order reveal branch identity.
+                t = t[torch.randperm(n, device=device)]
+
         else:
             raise ValueError(
                 f"Unknown ABFLOW_SCOREFM_T_SAMPLING={mode}. "
-                "Choose from uniform, low_t, stratified, mid_t, late_t."
+                "Choose from uniform, low_t, stratified, mid_t, late_t, "
+                "u02_branch_balanced."
             )
 
-        return t.clamp(min=0.0, max=1.0)
+        t = t.clamp(min=0.0, max=1.0)
+        return self.flow_t_min + (self.flow_t_max - self.flow_t_min) * t
 
     def _time_for_interface(self, t_graph, interface_batch_id, ref_tensor):
         """Broadcast graph-level time to [N_interface, 1, 1]."""
@@ -2190,10 +2209,7 @@ class AbFlowModel(nn.Module):
                 context_atom_embeddings = atom_embeddings
                 context_atom_weights = atom_weights
 
-                if self.dual_sequence_atom_mode in {
-                    "hard_exact", "latent_exact"
-                }:
-                    # exact semantic replacement in residue-latent space
+                if self.dual_sequence_atom_mode == "hard_exact":
                     context_features = self._build_dual_sequence_state_features(
                         S, residue_pos, H_0
                     )
@@ -2279,12 +2295,7 @@ class AbFlowModel(nn.Module):
                         ),
                     )
 
-                elif self.dual_sequence_atom_mode in {
-                    "latent_exact", "hidden_only"
-                }:
-                    # Formal U12/U13: S_t is authoritative in residue semantics
-                    # only.  The continuous X_t state keeps the U02/PCS-RC atom
-                    # identities, masks, weights and edge topology.
+                elif self.dual_sequence_atom_mode == "hidden_only":
                     state_atom_pos_full = None
 
                 if state_atom_pos_full is not None:
@@ -2379,12 +2390,6 @@ class AbFlowModel(nn.Module):
                                 else 0.0
                             )
                             self._last_condition_diagnostics[
-                                "seq_state_atom_mode_latent_exact"
-                            ] = H_0.detach().new_tensor(
-                                1.0 if self.dual_sequence_atom_mode == "latent_exact"
-                                else 0.0
-                            )
-                            self._last_condition_diagnostics[
                                 "seq_state_atom_mode_time_gated_union"
                             ] = H_0.detach().new_tensor(
                                 1.0 if self.dual_sequence_atom_mode
@@ -2459,14 +2464,8 @@ class AbFlowModel(nn.Module):
                                        channel_weights=atom_weights)
                 X = X + dumb_X * 0  # to cheat the autograd check
 
-        # Update global-chain coordinates with the SAME atom topology that the
-        # current joint state uses for message passing.  In hard_exact mode,
-        # state_atom_pos_full replaces proposal/context atom masks on designed
-        # residues, so the global-node centroid must not silently fall back to
-        # S_pep/native-context topology.
-        X = self.aa_feature.update_global_coordinates(
-            X, S, atom_pos=state_atom_pos_full
-        )
+        # update coordination of the global node
+        X = self.aa_feature.update_global_coordinates(X, S)
 
         # prepare local complex
         local_mask = self.batch_constants['local_mask']
@@ -2579,29 +2578,10 @@ class AbFlowModel(nn.Module):
         noise[:, 1] = ca_noise
         init_local_X = init_local_X + noise
 
-        if (
-            getattr(self, "sequence_source_mode", "proposal")
-            == "reference_uniform"
-            and self.deterministic_validation
-            and not self.training
-        ):
-            # Deterministic validation reference without a second RNG draw.
-            n_seq = int(paratope_mask.sum().item())
-            idx = torch.arange(n_seq, device=X.device, dtype=torch.float32)
-            u = torch.frac(
-                torch.sin((idx + 1.0) * 91.345 + 17.123) * 47453.5453
-            ).abs()
-            init_local_S = torch.floor(
-                u * float(self.num_classes)
-            ).long().clamp_(0, self.num_classes - 1)
-        else:
-            # Exact historical training RNG draw.
-            init_local_S = torch.randint(
-                0, self.num_classes,
-                (paratope_mask.sum(),),
-                device=X.device,
-                dtype=torch.long,
-            )
+        init_local_S = torch.randint(0, self.num_classes, 
+                                   (paratope_mask.sum(),), 
+                                   device=X.device,
+                                   dtype=torch.long)
         return init_local_X, init_local_S
 
     @torch.no_grad()
@@ -2672,18 +2652,15 @@ class AbFlowModel(nn.Module):
         return dist
     
     def _raw_interface_to_model_frame(self, interface_X, paratope_mask, batch_id):
-        """Convert raw paratope coordinates into internal shadow frame.
+        """Convert raw paratope coordinates into the AbX common complex frame.
 
-        `_forward` centers the antigen/antibody and normalizes coordinates before
-        message passing. Shadow paratope coordinates are later uncentered with
-        `_type=4`, i.e. by adding the antigen center. Therefore an externally
-        supplied raw X_t must be represented internally as:
-
-            X_t_model = (X_t_raw - antigen_center) / std.
+        v103 uses one antibody-backbone center for antibody, antigen, proposal,
+        target and generated state.  No antigen-specific shadow frame remains.
         """
         interface_batch_id = batch_id[paratope_mask]
-        ag_centers = self.normalizer.ag_centers[interface_batch_id]
-        return self.normalizer.normalize(interface_X - ag_centers.unsqueeze(1))
+        return self.normalizer.raw_to_model_frame(
+            interface_X, interface_batch_id
+        )
 
     def _reference_ca_mean(self, X, S, paratope_mask, batch_id):
         """Reference mean for CA translation under init_interface().
@@ -3071,6 +3048,113 @@ class AbFlowModel(nn.Module):
                 "r3_noise_scope": target_X1.new_tensor(scope_code),
                 "r3_cfm_target": target_X1.new_tensor(1.0 if cfm_target else 0.0),
             }
+
+    @torch.no_grad()
+    def _v103_cartesian_scoreflow_path(
+            self, *, source_X0, target_X1, t_graph, t_int,
+            interface_batch_id):
+        """R03 stochastic path on the R02 full-atom Cartesian mean flow.
+
+        Mean transport (all valid atoms):
+            mu_t = (1-t) X0 + t X1.
+
+        Protein-aware stochastic support (FoldFlow-inspired):
+            one R3 translation sample per H3 residue, broadcast to all atoms
+            of that residue.  We subtract the per-complex mean translation from
+            the stochastic residual only; this mirrors FoldFlow translation
+            gauge fixing without deleting H3-antigen placement from the mean.
+
+        Physical width uses FoldFlow's scaled g=0.1 convention converted back
+        to Angstroms, but keeps sigma(0)=sigma(1)=0 so PCS-RC and native remain
+        the exact paired endpoints.
+
+        Canonical probability-flow target:
+            u* = (X1-X0) + dlog(sigma)/dt * (Xt-mu_t).
+
+        No separate score head is introduced.
+        """
+        mu_t = self.r3_matcher.linear_mean(source_X0, target_X1, t_int)
+        if interface_batch_id.numel() == 0:
+            zero = target_X1.new_tensor(0.0)
+            return mu_t, target_X1 - source_X0, {
+                'v103_sigma_mean': zero,
+                'v103_noise_rms': zero,
+                'v103_noise_centroid_rms': zero,
+                'v103_score_correction_rms': zero,
+                'v103_mean_flow_rms': zero,
+            }
+
+        n_graph = int(interface_batch_id.max().item()) + 1
+        t_graph_f = torch.as_tensor(
+            t_graph, device=target_X1.device, dtype=torch.float32
+        ).reshape(-1)
+        if t_graph_f.numel() == 1 and n_graph > 1:
+            t_graph_f = t_graph_f.expand(n_graph)
+        if t_graph_f.numel() != n_graph:
+            raise ValueError(
+                f'R03 expects {n_graph} graph times, got {t_graph_f.numel()}.'
+            )
+
+        sigma_raw = self.r3_matcher.foldflow_scaled_sigma_to_raw(
+            t_graph_f,
+            g_scaled=float(self.r03_g_scaled),
+            coordinate_scaling=float(self.flow_coordinate_scaling),
+            min_sigma_scaled=float(self.r03_path_min_sigma_scaled),
+        ).to(target_X1.dtype)
+
+        n_res = int(interface_batch_id.numel())
+        if self.deterministic_validation and not self.training:
+            eps_res = self._deterministic_standard_normal(
+                (n_res, 3), target_X1.device, torch.float32
+            )
+        else:
+            eps_res = torch.randn(
+                (n_res, 3), device=target_X1.device, dtype=torch.float32
+            )
+
+        if self.r03_center_residual:
+            eps_center = scatter_mean(
+                eps_res, interface_batch_id, dim=0, dim_size=n_graph
+            )
+            eps_res = eps_res - eps_center[interface_batch_id]
+
+        shift_res = sigma_raw[interface_batch_id, None] * eps_res.to(sigma_raw.dtype)
+        shift_res = shift_res.to(mu_t.dtype)
+        Xt = mu_t + shift_res[:, None, :]
+
+        true_v = self.r3_matcher.canonical_cartesian_scoreflow_velocity(
+            Xt, source_X0, target_X1, t_int
+        )
+        mean_v = target_X1 - source_X0
+        correction = true_v - mean_v
+
+        with torch.no_grad():
+            shift_centroid = scatter_mean(
+                shift_res.float(), interface_batch_id, dim=0, dim_size=n_graph
+            )
+            details = {
+                'v103_sigma_mean': sigma_raw.mean().to(target_X1.dtype),
+                'v103_noise_rms': torch.sqrt(
+                    shift_res.pow(2).mean().clamp_min(0.0)
+                ).to(target_X1.dtype),
+                'v103_noise_centroid_rms': torch.sqrt(
+                    shift_centroid.pow(2).mean().clamp_min(0.0)
+                ).to(target_X1.dtype),
+                'v103_score_correction_rms': torch.sqrt(
+                    correction.pow(2).mean().clamp_min(0.0)
+                ).to(target_X1.dtype),
+                'v103_mean_flow_rms': torch.sqrt(
+                    mean_v.pow(2).mean().clamp_min(0.0)
+                ).to(target_X1.dtype),
+                'v103_centered_residual': target_X1.new_tensor(
+                    1.0 if self.r03_center_residual else 0.0
+                ),
+                'v103_g_scaled': target_X1.new_tensor(float(self.r03_g_scaled)),
+                'v103_coordinate_scaling': target_X1.new_tensor(
+                    float(self.flow_coordinate_scaling)
+                ),
+            }
+        return Xt, true_v, details
 
     @torch.no_grad()
     def _f01_unified_scoreflow_target(
@@ -3772,6 +3856,260 @@ class AbFlowModel(nn.Module):
             "scorefm_gt_satc_aux_to_endpoint": aux_ratio.detach(),
         }
 
+    # =============================================================
+    # v101 / U25-U27: support-aware U02 objective geometry
+    # =============================================================
+    def _v101_ca_centroid(self, x, interface_batch_id):
+        """Graph H3 CA centroid matching the F01 transport calibration."""
+        if interface_batch_id.numel() == 0:
+            return x.new_zeros((1, 3))
+        n_graph = int(interface_batch_id.max().item()) + 1
+        ca_idx = 1 if x.shape[1] > 1 else 0
+        return scatter_mean(
+            x[:, ca_idx].float(),
+            interface_batch_id,
+            dim=0,
+            dim_size=n_graph,
+        ).to(dtype=x.dtype)
+
+    def _v101_center_by_ca(self, x, interface_batch_id):
+        centroid = self._v101_ca_centroid(x, interface_batch_id)
+        return x - centroid[interface_batch_id, None, :], centroid
+
+    def _v101_support_factorized_per_graph(
+            self, *, pred, primary_target, clean_endpoint_target,
+            atom_mask, interface_batch_id):
+        """U25: factor-normalized loss on the actual F01 support.
+
+        P = graph-level H3 translation (3 DOF).
+        Q = CA-centered full-atom H3 shape.
+
+        Exact U02/F01 carrier targets differ from X1 only through P.
+        """
+        pred_centered, pred_c = self._v101_center_by_ca(
+            pred, interface_batch_id
+        )
+        clean_centered, clean_c = self._v101_center_by_ca(
+            clean_endpoint_target, interface_batch_id
+        )
+        primary_centered, primary_c = self._v101_center_by_ca(
+            primary_target, interface_batch_id
+        )
+
+        shape_pg, shape_valid = self._masked_residue_smooth_l1_per_graph(
+            pred_centered,
+            clean_centered,
+            atom_mask,
+            interface_batch_id,
+        )
+        trans_pg = F.smooth_l1_loss(
+            pred_c, primary_c, reduction="none"
+        ).mean(dim=-1)
+        trans_valid = self._interface_valid_graph_mask(
+            interface_batch_id,
+            int(trans_pg.shape[0]),
+            pred.device,
+        )
+        valid = shape_valid & trans_valid
+
+        # Arithmetic mean of two normalized physical factors.
+        # This is fixed normalization, not a tuned loss weight.
+        total_pg = 0.5 * (shape_pg + trans_pg)
+
+        with torch.no_grad():
+            mismatch = primary_centered - clean_centered
+            mask = atom_mask.to(dtype=mismatch.dtype)[..., None]
+            mismatch_rms = torch.sqrt(
+                (mismatch.square() * mask).sum()
+                / (3.0 * mask.sum().clamp_min(1.0))
+            )
+            translation_shift_rms = torch.sqrt(
+                (primary_c - clean_c).square().mean().clamp_min(0.0)
+            )
+            pred_translation_rms = torch.sqrt(
+                (pred_c - primary_c).square().mean().clamp_min(0.0)
+            )
+
+        details = {
+            "scorefm_support_shape_loss": (
+                shape_pg[shape_valid].mean().detach()
+                if bool(shape_valid.any()) else pred.new_tensor(0.0)
+            ),
+            "scorefm_support_translation_loss": (
+                trans_pg[trans_valid].mean().detach()
+                if bool(trans_valid.any()) else pred.new_tensor(0.0)
+            ),
+            "scorefm_support_target_centered_mismatch_rms": mismatch_rms.detach(),
+            "scorefm_support_target_translation_shift_rms": (
+                translation_shift_rms.detach()
+            ),
+            "scorefm_support_pred_translation_rms": pred_translation_rms.detach(),
+            "scorefm_support_factorized": pred.new_tensor(1.0),
+        }
+        return total_pg, valid, details
+
+    def _v101_translation_round_credit_per_graph(
+            self, *, round_pred_X, final_pred, primary_target,
+            atom_mask, interface_batch_id):
+        """U26: route recurrent credit only through placement.
+
+        For every actual refinement round r:
+            composite_r = Q(final_prediction) + P(round_prediction_r)
+
+        All rounds estimate the SAME U02 carrier centroid. Centered shape comes
+        only from the final round. The original U02 SmoothL1 geometry is kept.
+        """
+        if round_pred_X is None or len(round_pred_X) == 0:
+            raise RuntimeError(
+                "ABFLOW_TRANSLATION_ROUND_CREDIT requires recurrent "
+                "coordinate predictions."
+            )
+
+        final_centered, _ = self._v101_center_by_ca(
+            final_pred, interface_batch_id
+        )
+        target_c = self._v101_ca_centroid(
+            primary_target, interface_batch_id
+        )
+
+        per_round_pg = []
+        round_centroids = []
+        valid_ref = None
+        details = {}
+
+        for ridx, pred_r in enumerate(round_pred_X):
+            c_r = self._v101_ca_centroid(pred_r, interface_batch_id)
+            composite = final_centered + c_r[interface_batch_id, None, :]
+            pg, valid = self._masked_residue_smooth_l1_per_graph(
+                composite,
+                primary_target,
+                atom_mask,
+                interface_batch_id,
+            )
+            per_round_pg.append(pg)
+            round_centroids.append(c_r)
+            valid_ref = valid if valid_ref is None else (valid_ref & valid)
+
+            with torch.no_grad():
+                details[
+                    f"scorefm_round_translation_r{ridx}_rms"
+                ] = torch.sqrt(
+                    (c_r - target_c).square().mean().clamp_min(0.0)
+                ).detach()
+
+        total_pg = torch.stack(per_round_pg, dim=0).mean(dim=0)
+
+        with torch.no_grad():
+            centroid_stack = torch.stack(round_centroids, dim=0)
+            centroid_mean = centroid_stack.mean(dim=0, keepdim=True)
+            round_span = torch.sqrt(
+                (centroid_stack - centroid_mean)
+                .square().mean().clamp_min(0.0)
+            )
+            details["scorefm_round_translation_span_rms"] = round_span.detach()
+            details["scorefm_round_translation_credit"] = final_pred.new_tensor(
+                1.0
+            )
+            details["scorefm_round_translation_loss"] = (
+                total_pg[valid_ref].mean().detach()
+                if bool(valid_ref.any()) else final_pred.new_tensor(0.0)
+            )
+
+        return total_pg, valid_ref, details
+
+    def _v101_support_round_factorized_per_graph(
+            self, *, round_pred_X, final_pred, primary_target,
+            clean_endpoint_target, atom_mask, interface_batch_id):
+        """U27: support factorization plus placement-only recurrent credit.
+
+        L = 0.5 * [
+            L_shape(Q(final), Q(X1))
+            + mean_r L_trans(P(round_r), P(U02_target))
+        ]
+        """
+        if round_pred_X is None or len(round_pred_X) == 0:
+            raise RuntimeError(
+                "U27 support+round objective requires recurrent predictions."
+            )
+
+        final_centered, _ = self._v101_center_by_ca(
+            final_pred, interface_batch_id
+        )
+        clean_centered, clean_c = self._v101_center_by_ca(
+            clean_endpoint_target, interface_batch_id
+        )
+        primary_centered, target_c = self._v101_center_by_ca(
+            primary_target, interface_batch_id
+        )
+
+        shape_pg, shape_valid = self._masked_residue_smooth_l1_per_graph(
+            final_centered,
+            clean_centered,
+            atom_mask,
+            interface_batch_id,
+        )
+
+        trans_valid = self._interface_valid_graph_mask(
+            interface_batch_id,
+            int(target_c.shape[0]),
+            final_pred.device,
+        )
+        trans_round = []
+        centroids = []
+        details = {}
+
+        for ridx, pred_r in enumerate(round_pred_X):
+            c_r = self._v101_ca_centroid(pred_r, interface_batch_id)
+            centroids.append(c_r)
+            tpg = F.smooth_l1_loss(
+                c_r, target_c, reduction="none"
+            ).mean(dim=-1)
+            trans_round.append(tpg)
+            with torch.no_grad():
+                details[
+                    f"scorefm_round_translation_r{ridx}_rms"
+                ] = torch.sqrt(
+                    (c_r - target_c).square().mean().clamp_min(0.0)
+                ).detach()
+
+        trans_pg = torch.stack(trans_round, dim=0).mean(dim=0)
+        valid = shape_valid & trans_valid
+        total_pg = 0.5 * (shape_pg + trans_pg)
+
+        with torch.no_grad():
+            mask = atom_mask.to(dtype=primary_centered.dtype)[..., None]
+            mismatch = primary_centered - clean_centered
+            mismatch_rms = torch.sqrt(
+                (mismatch.square() * mask).sum()
+                / (3.0 * mask.sum().clamp_min(1.0))
+            )
+            cstack = torch.stack(centroids, dim=0)
+            cmean = cstack.mean(dim=0, keepdim=True)
+            span = torch.sqrt(
+                (cstack - cmean).square().mean().clamp_min(0.0)
+            )
+            details.update({
+                "scorefm_support_shape_loss": (
+                    shape_pg[shape_valid].mean().detach()
+                    if bool(shape_valid.any()) else final_pred.new_tensor(0.0)
+                ),
+                "scorefm_support_translation_loss": (
+                    trans_pg[trans_valid].mean().detach()
+                    if bool(trans_valid.any()) else final_pred.new_tensor(0.0)
+                ),
+                "scorefm_support_target_centered_mismatch_rms": (
+                    mismatch_rms.detach()
+                ),
+                "scorefm_support_target_translation_shift_rms": torch.sqrt(
+                    (target_c - clean_c).square().mean().clamp_min(0.0)
+                ).detach(),
+                "scorefm_round_translation_span_rms": span.detach(),
+                "scorefm_round_translation_credit": final_pred.new_tensor(1.0),
+                "scorefm_support_factorized": final_pred.new_tensor(1.0),
+            })
+
+        return total_pg, valid, details
+
     def _coordinate_training_objective(
             self, *, Xt, X1, pred_clean_X, atom_mask,
             interface_batch_id, t, sigma_t, source_ca_mean,
@@ -3780,7 +4118,8 @@ class AbFlowModel(nn.Module):
             satc_residue_weight=None, satc_score_weight_eff=None,
             satc_velocity_weight_eff=None, satc_schedule_info=None,
             satc_transport_rms_graph=None, satc_gamma_graph=None,
-            structured_endpoint_target=None, structured_path_details=None,
+            structured_endpoint_target=None, structured_velocity_target=None,
+            structured_path_details=None,
             antithetic_pred_X=None, antithetic_target_X=None,
             round_pred_X=None):
         """Coordinate objective for the shadow paratope.
@@ -3797,6 +4136,130 @@ class AbFlowModel(nn.Module):
         analytic_core mode:
             Historical reference-source score diagnostic.
         """
+        # =============================================================
+        # v103 R02/R03: DIRECT Cartesian vector-field objective.
+        #
+        # The existing coordinate-like head is decoded as
+        #     v_theta = Y_theta - X_t,
+        # exactly matching the original AbFlow Euler displacement semantics and
+        # FoldFlow's direct translation-vector-field regression.  Crucially we
+        # do NOT encode u* as Y*=Xt+(1-t)u*, which would hide a (1-t)^2 time
+        # weighting inside an endpoint-space loss.
+        # =============================================================
+        if self.scorefm_loss_mode in {
+            "abx_cartesian_cfm", "abx_cartesian_scoreflow"
+        }:
+            if structured_velocity_target is None:
+                raise RuntimeError(
+                    f"{self.scorefm_loss_mode} requires a direct velocity target."
+                )
+            pred_v = pred_clean_X - Xt
+            true_v = structured_velocity_target.to(pred_v.dtype)
+            scale = float(self.flow_coordinate_scaling)
+            flow_diff = scale * (pred_v - true_v)
+            flow_pg, flow_valid = self._masked_residue_mse_per_graph(
+                flow_diff, atom_mask, interface_batch_id
+            )
+            flow_loss = (
+                flow_pg[flow_valid].mean()
+                if bool(flow_valid.any())
+                else pred_clean_X.new_tensor(0.0)
+            )
+
+            # Diagnostic only: if the local velocity were held constant for the
+            # remaining interval, where would it point?  This is NOT optimized.
+            t_b = torch.as_tensor(
+                t, device=pred_v.device, dtype=pred_v.dtype
+            )
+            endpoint_proxy = Xt + (1.0 - t_b) * pred_v
+            proxy_pg, proxy_valid = self._masked_residue_smooth_l1_per_graph(
+                endpoint_proxy, X1, atom_mask, interface_batch_id
+            )
+            endpoint_proxy_loss = (
+                proxy_pg[proxy_valid].mean()
+                if bool(proxy_valid.any())
+                else flow_loss.detach() * 0.0
+            )
+
+            tbin_details = {}
+            try:
+                n_graph_diag = int(flow_pg.shape[0])
+                t_res_diag = torch.as_tensor(
+                    t, device=pred_clean_X.device, dtype=torch.float32
+                ).reshape(interface_batch_id.numel(), -1).mean(dim=-1)
+                t_graph_diag = scatter_mean(
+                    t_res_diag, interface_batch_id, dim=0, dim_size=n_graph_diag
+                )
+                for _bi, (_lo, _hi) in enumerate(
+                    [(0.0,0.2),(0.2,0.4),(0.4,0.6),(0.6,0.8),(0.8,1.0001)]
+                ):
+                    _m = flow_valid & (t_graph_diag >= _lo) & (t_graph_diag < _hi)
+                    tbin_details[f"scorefm_tbin_{_bi}_loss"] = (
+                        flow_pg[_m].mean().detach()
+                        if bool(_m.any()) else flow_loss.detach() * 0.0
+                    )
+            except Exception:
+                tbin_details = {}
+
+            _spd = structured_path_details or {}
+            zero = flow_loss.detach() * 0.0
+            with torch.no_grad():
+                pred_v_rms = torch.sqrt(pred_v.pow(2).mean().clamp_min(0.0))
+                true_v_rms = torch.sqrt(true_v.pow(2).mean().clamp_min(0.0))
+                flow_error_rms = torch.sqrt(
+                    (pred_v - true_v).pow(2).mean().clamp_min(0.0)
+                )
+            self._last_endpoint_objective_tensor = flow_loss
+            self._last_satc_objective_tensor = flow_loss * 0.0
+            details = {
+                "scorefm_total": flow_loss.detach(),
+                "scorefm_direct_flow": flow_loss.detach(),
+                "scorefm_endpoint": zero,
+                "scorefm_endpoint_proxy": endpoint_proxy_loss.detach(),
+                "scorefm_pred_velocity_rms": pred_v_rms.detach(),
+                "scorefm_target_velocity_rms": true_v_rms.detach(),
+                "scorefm_velocity_error_rms": flow_error_rms.detach(),
+                "scorefm_coordinate_scaling": pred_clean_X.new_tensor(scale),
+                "scorefm_v103_direct_cfm": torch.as_tensor(
+                    _spd.get("v103_direct_cfm", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_v103_stochastic_scoreflow": torch.as_tensor(
+                    _spd.get("v103_stochastic_scoreflow", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_v103_sigma_mean": torch.as_tensor(
+                    _spd.get("v103_sigma_mean", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_v103_noise_rms": torch.as_tensor(
+                    _spd.get("v103_noise_rms", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_v103_noise_centroid_rms": torch.as_tensor(
+                    _spd.get("v103_noise_centroid_rms", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_v103_score_correction_rms": torch.as_tensor(
+                    _spd.get("v103_score_correction_rms", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_v103_mean_flow_rms": torch.as_tensor(
+                    _spd.get("v103_mean_flow_rms", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_v103_centered_residual": torch.as_tensor(
+                    _spd.get("v103_centered_residual", 0.0),
+                    device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                ).detach(),
+                "scorefm_dsm": zero,
+                "scorefm_dsm_rate": zero,
+                "scorefm_velocity": flow_loss.detach(),
+                "scorefm_velocity_rate": pred_clean_X.new_tensor(1.0),
+            }
+            details.update(tbin_details)
+            return flow_loss, details
+
         primary_target = X1
         if (
             self.scorefm_loss_mode in {
@@ -3804,142 +4267,67 @@ class AbFlowModel(nn.Module):
                 "foldflow_r3_residue_cfm",
                 "f01_r3_canonical_carrier",
                 "f01_r3_endpoint_canonical_hybrid",
-                "f01_r3_progressive_endpoint_canonical_refinement",
                 "f01_r3_boundary_regular_carrier",
                 "f01_r3_antithetic_boundary_regular",
                 "f01_r3_c1_smoothstep_canonical_carrier",
-                "f01_r3_source_flat_hermite_canonical_carrier",
             }
             and structured_endpoint_target is not None
         ):
             primary_target = structured_endpoint_target
 
         antithetic_details = {}
-        progressive_details = {}
-        round_consistent_details = {}
+        support_geometry_details = {}
 
-        if self.round_consistent_coord_supervision:
-            # v96: all ACTUAL network rounds estimate one identical quantity:
-            # the primary U02 carrier for this sampled (X_t,t).
-            if round_pred_X is None or len(round_pred_X) < 1:
-                raise RuntimeError(
-                    "Round-consistent supervision requires per-round coordinate predictions."
-                )
-            _round_losses = []
-            _round_valid = None
-            for _ri, _pred_r in enumerate(round_pred_X):
-                _loss_r, _valid_r = self._masked_residue_smooth_l1_per_graph(
-                    _pred_r, primary_target, atom_mask, interface_batch_id
-                )
-                _round_losses.append(_loss_r)
-                _round_valid = (
-                    _valid_r if _round_valid is None
-                    else (_round_valid & _valid_r)
-                )
-                round_consistent_details[
-                    f"scorefm_round_consistent_round{_ri}_loss"
-                ] = (
-                    _loss_r[_valid_r].mean().detach()
-                    if bool(_valid_r.any())
-                    else pred_clean_X.detach().new_tensor(0.0)
-                )
-                with torch.no_grad():
-                    _am = atom_mask.to(_pred_r.dtype).unsqueeze(-1)
-                    _den = (
-                        _am.sum() * float(_pred_r.shape[-1])
-                    ).clamp_min(1.0)
-                    _rms = torch.sqrt(
-                        (((_pred_r - primary_target) ** 2) * _am).sum() / _den
-                    )
-                    round_consistent_details[
-                        f"scorefm_round_consistent_round{_ri}_target_rms"
-                    ] = _rms.detach()
-
-            # Mean, not sum: scale-preserving deep supervision.
-            endpoint_per_graph = torch.stack(
-                _round_losses, dim=0
-            ).mean(dim=0)
-            endpoint_valid = _round_valid
-            round_consistent_details[
-                "scorefm_round_consistent_supervision"
-            ] = pred_clean_X.detach().new_tensor(1.0)
-            round_consistent_details[
-                "scorefm_round_consistent_num_rounds"
-            ] = pred_clean_X.detach().new_tensor(float(len(round_pred_X)))
-            if endpoint_valid is not None and bool(endpoint_valid.any()):
-                _first = _round_losses[0][endpoint_valid].mean().detach()
-                _last = _round_losses[-1][endpoint_valid].mean().detach()
-                round_consistent_details[
-                    "scorefm_round_consistent_first_to_final"
-                ] = _first / (_last.abs() + self.scorefm_eps)
+        if (
+            self.scorefm_loss_mode == "f01_r3_endpoint_canonical_hybrid"
+            and self.support_factorized_coord
+            and self.translation_round_credit
+        ):
+            (
+                endpoint_per_graph,
+                endpoint_valid,
+                support_geometry_details,
+            ) = self._v101_support_round_factorized_per_graph(
+                round_pred_X=round_pred_X,
+                final_pred=pred_clean_X,
+                primary_target=primary_target,
+                clean_endpoint_target=X1,
+                atom_mask=atom_mask,
+                interface_batch_id=interface_batch_id,
+            )
 
         elif (
-            self.scorefm_loss_mode
-            == "f01_r3_progressive_endpoint_canonical_refinement"
+            self.scorefm_loss_mode == "f01_r3_endpoint_canonical_hybrid"
+            and self.support_factorized_coord
         ):
-            # v91/U08: refinement-depth homotopy over ACTUAL network rounds.
-            # IMPORTANT: caller passes r_interface_X[1:], excluding the initial
-            # X_t entry.  For R=3 this gives alpha=[0, 0.5, 1]:
-            #   round0 -> clean endpoint X1 (absolute-placement anchor)
-            #   round1 -> halfway endpoint/canonical carrier
-            #   round2 -> exact U02 endpoint-canonical carrier.
-            # The final round therefore remains exactly matched to the U02 sampler.
-            if round_pred_X is None or len(round_pred_X) < 2:
-                raise RuntimeError(
-                    "progressive endpoint-canonical refinement requires the "
-                    "actual per-round coordinate predictions (initial X_t excluded)."
-                )
-            _nr = len(round_pred_X)
-            _round_losses = []
-            _round_valid = None
-            for _ri, _pred_r in enumerate(round_pred_X):
-                _alpha = float(_ri) / float(_nr - 1)
-                _target_r = X1 + _alpha * (primary_target - X1)
-                _loss_r, _valid_r = self._masked_residue_smooth_l1_per_graph(
-                    _pred_r, _target_r, atom_mask, interface_batch_id
-                )
-                _round_losses.append(_loss_r)
-                _round_valid = (
-                    _valid_r if _round_valid is None
-                    else (_round_valid & _valid_r)
-                )
-                progressive_details[
-                    f"scorefm_progressive_round{_ri}_alpha"
-                ] = pred_clean_X.detach().new_tensor(_alpha)
-                if _valid_r.any():
-                    progressive_details[
-                        f"scorefm_progressive_round{_ri}_loss"
-                    ] = _loss_r[_valid_r].mean().detach()
-                else:
-                    progressive_details[
-                        f"scorefm_progressive_round{_ri}_loss"
-                    ] = pred_clean_X.detach().new_tensor(0.0)
-
-                # Same-unit observational RMS to the stage target.
-                with torch.no_grad():
-                    _am = atom_mask.to(_pred_r.dtype).unsqueeze(-1)
-                    _den = (_am.sum() * float(_pred_r.shape[-1])).clamp_min(1.0)
-                    _rms = torch.sqrt(
-                        (((_pred_r - _target_r) ** 2) * _am).sum() / _den
-                    )
-                    progressive_details[
-                        f"scorefm_progressive_round{_ri}_target_rms"
-                    ] = _rms.detach()
-
-            endpoint_per_graph = torch.stack(_round_losses, dim=0).mean(dim=0)
-            endpoint_valid = _round_valid
-            progressive_details["scorefm_progressive_refinement"] = (
-                pred_clean_X.detach().new_tensor(1.0)
+            (
+                endpoint_per_graph,
+                endpoint_valid,
+                support_geometry_details,
+            ) = self._v101_support_factorized_per_graph(
+                pred=pred_clean_X,
+                primary_target=primary_target,
+                clean_endpoint_target=X1,
+                atom_mask=atom_mask,
+                interface_batch_id=interface_batch_id,
             )
-            progressive_details["scorefm_progressive_num_rounds"] = (
-                pred_clean_X.detach().new_tensor(float(_nr))
+
+        elif (
+            self.scorefm_loss_mode == "f01_r3_endpoint_canonical_hybrid"
+            and self.translation_round_credit
+        ):
+            (
+                endpoint_per_graph,
+                endpoint_valid,
+                support_geometry_details,
+            ) = self._v101_translation_round_credit_per_graph(
+                round_pred_X=round_pred_X,
+                final_pred=pred_clean_X,
+                primary_target=primary_target,
+                atom_mask=atom_mask,
+                interface_batch_id=interface_batch_id,
             )
-            if endpoint_valid is not None and endpoint_valid.any():
-                _anchor = _round_losses[0][endpoint_valid].mean().detach()
-                _final = _round_losses[-1][endpoint_valid].mean().detach()
-                progressive_details["scorefm_progressive_anchor_to_final"] = (
-                    _anchor / (_final.abs() + self.scorefm_eps)
-                )
+
         elif self.scorefm_loss_mode == "f01_r3_antithetic_boundary_regular":
             if antithetic_pred_X is None or antithetic_target_X is None:
                 raise RuntimeError(
@@ -3977,6 +4365,94 @@ class AbFlowModel(nn.Module):
             clean_endpoint_loss = clean_endpoint_per_graph[clean_endpoint_valid].mean()
         else:
             clean_endpoint_loss = pred_clean_X.new_tensor(0.0)
+
+        # =============================================================
+        # v100: exact U02 Endpoint-vs-Canonical task decomposition.
+        #
+        # We decompose the *same* hybrid carrier objective:
+        #   L_coord = L_E_weighted + L_C_weighted
+        #
+        # where each branch is normalized by the total valid graph count.
+        # Therefore their sum is algebraically identical to endpoint_loss;
+        # PCGrad can alter gradient interaction without introducing a new
+        # scalar loss weight or changing the forward objective value.
+        # =============================================================
+        boundary_details = {}
+        if self.scorefm_loss_mode == "f01_r3_endpoint_canonical_hybrid":
+            n_graph_boundary = int(endpoint_per_graph.shape[0])
+            t_res_boundary = torch.as_tensor(
+                t, device=pred_clean_X.device, dtype=torch.float32
+            ).reshape(interface_batch_id.numel(), -1).mean(dim=-1)
+            t_graph_boundary = scatter_mean(
+                t_res_boundary, interface_batch_id,
+                dim=0, dim_size=n_graph_boundary
+            )
+            valid_count = endpoint_valid.to(torch.float32).sum().clamp_min(1.0)
+            endpoint_branch = (
+                endpoint_valid
+                & (t_graph_boundary < float(self.f01_hybrid_t_min))
+            )
+            canonical_branch = (
+                endpoint_valid
+                & (t_graph_boundary >= float(self.f01_hybrid_t_min))
+            )
+
+            # Weighted contributions: exact decomposition of the original mean.
+            if bool(endpoint_branch.any()):
+                loss_endpoint_weighted = (
+                    endpoint_per_graph[endpoint_branch].sum()
+                    / valid_count.to(endpoint_per_graph.dtype)
+                )
+                loss_endpoint_mean = endpoint_per_graph[
+                    endpoint_branch
+                ].mean()
+            else:
+                loss_endpoint_weighted = endpoint_loss * 0.0
+                loss_endpoint_mean = endpoint_loss * 0.0
+
+            if bool(canonical_branch.any()):
+                loss_canonical_weighted = (
+                    endpoint_per_graph[canonical_branch].sum()
+                    / valid_count.to(endpoint_per_graph.dtype)
+                )
+                loss_canonical_mean = endpoint_per_graph[
+                    canonical_branch
+                ].mean()
+            else:
+                loss_canonical_weighted = endpoint_loss * 0.0
+                loss_canonical_mean = endpoint_loss * 0.0
+
+            self._boundary_task_tensors = {
+                "endpoint": loss_endpoint_weighted,
+                "canonical": loss_canonical_weighted,
+            }
+            decomp = loss_endpoint_weighted + loss_canonical_weighted
+            boundary_details = {
+                "scorefm_boundary_endpoint_rate": (
+                    endpoint_branch.float().sum()
+                    / valid_count
+                ).detach(),
+                "scorefm_boundary_canonical_rate": (
+                    canonical_branch.float().sum()
+                    / valid_count
+                ).detach(),
+                "scorefm_boundary_endpoint_loss": (
+                    loss_endpoint_mean.detach()
+                ),
+                "scorefm_boundary_canonical_loss": (
+                    loss_canonical_mean.detach()
+                ),
+                "scorefm_boundary_decomposition_error": (
+                    decomp - endpoint_loss
+                ).abs().detach(),
+                "scorefm_boundary_hybrid_t_min": endpoint_loss.detach().new_tensor(
+                    float(self.f01_hybrid_t_min)
+                ),
+            }
+            self.last_boundary_task_diagnostics = boundary_details
+        else:
+            self._boundary_task_tensors = {}
+            self.last_boundary_task_diagnostics = {}
 
         # FoldFlow-style t-stratified diagnostics: observational only.
         # This mirrors the useful diagnostic principle in experiments_utils.py
@@ -4017,11 +4493,9 @@ class AbFlowModel(nn.Module):
             "foldflow_r3_global_endpoint",
             "f01_r3_canonical_carrier",
             "f01_r3_endpoint_canonical_hybrid",
-            "f01_r3_progressive_endpoint_canonical_refinement",
             "f01_r3_boundary_regular_carrier",
             "f01_r3_antithetic_boundary_regular",
             "f01_r3_c1_smoothstep_canonical_carrier",
-            "f01_r3_source_flat_hermite_canonical_carrier",
             "foldflow_r3_residue_endpoint",
             "foldflow_r3_residue_cfm",
         }:
@@ -4124,7 +4598,6 @@ class AbFlowModel(nn.Module):
                     1.0 if self.scorefm_loss_mode in {
                         "f01_r3_canonical_carrier",
                         "f01_r3_endpoint_canonical_hybrid",
-                        "f01_r3_progressive_endpoint_canonical_refinement",
                         "f01_r3_boundary_regular_carrier",
                         "f01_r3_antithetic_boundary_regular",
                         "f01_r3_c1_smoothstep_canonical_carrier",
@@ -4142,9 +4615,9 @@ class AbFlowModel(nn.Module):
                 "scorefm_traj_rate": zero,
             }
             details.update(antithetic_details)
-            details.update(progressive_details)
-            details.update(round_consistent_details)
             details.update(tbin_details)
+            details.update(boundary_details)
+            details.update(support_geometry_details)
             return endpoint_loss, details
 
         if self.scorefm_loss_mode in {
@@ -4788,6 +5261,14 @@ class AbFlowModel(nn.Module):
         has_interface_state = interface_init is not None
         has_sequence_state = sequence_init is not None
 
+        # v103 / AbX standard: define ONE complex translation frame from the
+        # raw antibody backbone BEFORE masking/proposal replacement.  The same
+        # center is then applied to antibody, antigen, surface and shadow state.
+        if self.abx_common_center:
+            self.normalizer.prepare_common_center(
+                X, S, batch_id, self.aa_feature
+            )
+
         X, S = self.init_mask(X, S, cmask, smask, template)
 
         if has_interface_state:
@@ -4836,8 +5317,28 @@ class AbFlowModel(nn.Module):
                 )
 
 
-        X = self.normalizer.centering(X, S, batch_id, self.aa_feature)
+        X = self.normalizer.centering(
+            X, S, batch_id, self.aa_feature,
+            reuse_cached=bool(self.abx_common_center),
+        )
         X = self.normalizer.normalize(X)
+
+        # Surface vertices are indexed in antigen-residue order.  They must use
+        # the SAME AbX complex center as the antigen coordinates they describe.
+        if self.abx_common_center and surface.numel() > 0:
+            local_batch_id = self.batch_constants['local_batch_id']
+            local_is_ab = self.batch_constants['local_is_ab']
+            surface_batch_id = local_batch_id[~local_is_ab]
+            if surface.shape[0] != surface_batch_id.shape[0]:
+                raise RuntimeError(
+                    'Surface/common-center mismatch: expected one surface row '
+                    'per local antigen residue.'
+                )
+            # Surface PKLs follow the historical antigen-centered AbFlow frame.
+            # Re-express them as S_common = S_old + c_ag - c_ab before /10.
+            surface = self.normalizer.surface_legacy_to_common(
+                surface, surface_batch_id
+            )
         surface = self.normalizer.normalize(surface)
         X = self.aa_feature.update_global_coordinates(X, S)
 
@@ -4909,8 +5410,6 @@ class AbFlowModel(nn.Module):
         r_interface_X = [interface_X.clone()]
         r_edge_dist = []
         memory_H = None
-        self._last_sequence_recycle_diagnostics = {}
-        _recycle_change_masks_interface = []
         diagnostics_active = bool(
             self.condition_diagnostics_enabled
             and getattr(self, "_diagnostic_capture", False)
@@ -4976,60 +5475,6 @@ class AbFlowModel(nn.Module):
                     S[smask] = torch.argmax(
                         pred_S_logits[smask], dim=-1
                     )
-                elif self.sequence_recycle_mode in {
-                    "hard_detached", "latent_detached"
-                }:
-                    if sequence_state_full is None:
-                        raise RuntimeError(
-                            "hard_detached recycle requires an explicit S_t state."
-                        )
-                    _logits_design = pred_S_logits[smask]
-                    _recycled_tokens = torch.argmax(
-                        _logits_design, dim=-1
-                    ).detach()
-                    _previous_tokens = sequence_state_full[smask].detach()
-                    _changed = _recycled_tokens != _previous_tokens
-
-                    # Map the designed-token change mask to paratope/interface
-                    # order for later coordinate-response diagnostics.
-                    _local_design = smask[paratope_mask]
-                    _changed_interface = torch.zeros(
-                        _local_design.shape, device=_local_design.device,
-                        dtype=torch.bool
-                    )
-                    if bool(_local_design.any()):
-                        _changed_interface[_local_design] = _changed
-                    _recycle_change_masks_interface.append(
-                        (_local_design.detach().clone(), _changed_interface)
-                    )
-
-                    with torch.no_grad():
-                        if _logits_design.shape[0] > 0:
-                            _p = torch.softmax(_logits_design.float(), dim=-1)
-                            _conf = _p.max(dim=-1).values.mean()
-                            _ent = -(
-                                _p * torch.log(_p.clamp_min(1.0e-8))
-                            ).sum(-1).mean()
-                            _change_rate = _changed.float().mean()
-                        else:
-                            _conf = X.new_tensor(0.0)
-                            _ent = X.new_tensor(0.0)
-                            _change_rate = X.new_tensor(0.0)
-                        self._last_sequence_recycle_diagnostics[
-                            f"seq_recycle_round{round_idx}_change_rate"
-                        ] = _change_rate.to(X.dtype)
-                        self._last_sequence_recycle_diagnostics[
-                            f"seq_recycle_round{round_idx}_confidence"
-                        ] = _conf.to(X.dtype)
-                        self._last_sequence_recycle_diagnostics[
-                            f"seq_recycle_round{round_idx}_entropy"
-                        ] = _ent.to(X.dtype)
-
-                    sequence_state_full = sequence_state_full.clone()
-                    sequence_state_full[smask] = _recycled_tokens
-                    # One categorical authority per refinement round: do NOT
-                    # simultaneously feed the historical soft pred_S_dist.
-                    pred_S_dist = None
                 else:
                     pred_S_dist = torch.softmax(
                         pred_S_logits[smask], dim=-1
@@ -5061,35 +5506,6 @@ class AbFlowModel(nn.Module):
             )
             r_interface_X[i] = interface_X_i
 
-        if (
-            self.sequence_recycle_mode in {
-                "hard_detached", "latent_detached"
-            }
-            and _recycle_change_masks_interface
-        ):
-            with torch.no_grad():
-                for _ri, (_design_interface, _changed_interface) in enumerate(
-                    _recycle_change_masks_interface
-                ):
-                    # r_interface_X = [X_t, round0, round1, ...].
-                    # A sequence prediction from round r becomes authority for
-                    # round r+1, so inspect that next structural update only.
-                    if _ri + 2 >= len(r_interface_X):
-                        break
-                    _dx = r_interface_X[_ri + 2] - r_interface_X[_ri + 1]
-                    _per_res_update = torch.sqrt(
-                        _dx.float().pow(2).mean(dim=(-2, -1)).clamp_min(0.0)
-                    )
-                    if bool(_changed_interface.any()):
-                        self._last_sequence_recycle_diagnostics[
-                            f"seq_recycle_round{_ri}_next_coord_rms_changed"
-                        ] = _per_res_update[_changed_interface].mean().to(X.dtype)
-                    _unchanged = _design_interface & (~_changed_interface)
-                    if bool(_unchanged.any()):
-                        self._last_sequence_recycle_diagnostics[
-                            f"seq_recycle_round{_ri}_next_coord_rms_unchanged"
-                        ] = _per_res_update[_unchanged].mean().to(X.dtype)
-
         self.normalizer.clear_cache()
         return H, S, r_pred_S_logits, pred_X, r_interface_X, r_edge_dist, prmsd
 
@@ -5097,9 +5513,7 @@ class AbFlowModel(nn.Module):
     @torch.no_grad()
     def _validation_proxy_diagnostics(
             self, *, true_X, true_S, pred_S, r_pred_S_logits, r_interface_X,
-            paratope_mask, smask, batch_id, interface_batch_id,
-            state_Xt=None, source_X0=None, t_int=None,
-            structured_endpoint_target=None):
+            paratope_mask, smask, batch_id, interface_batch_id):
         """Cheap validation proxies aligned with the final evaluation axes.
 
         These are not substitutes for TM-score/lDDT/DockQ and are never used as
@@ -5114,203 +5528,6 @@ class AbFlowModel(nn.Module):
         ca_idx = 1 if true_int.shape[1] > 1 else 0
         true_ca = true_int[:, ca_idx].float()
         n_graph = int(interface_batch_id.max().item()) + 1
-
-        # ---------------------------------------------------------
-        # v93 chart-aware proxy: compare physical endpoint estimates in X1 space.
-        # The historical proxy below intentionally remains available as an
-        # internal-solver diagnostic, but carrier coordinates must not be
-        # interpreted as clean physical endpoints without decoding.
-        # ---------------------------------------------------------
-        decoded_final = None
-        sampler_one_step_pred = None
-        sampler_one_step_true = None
-        if (
-            state_Xt is not None
-            and source_X0 is not None
-            and t_int is not None
-            and len(r_interface_X) > 1
-        ):
-            try:
-                _carrier = r_interface_X[-1]
-                _mode = self.scorefm_loss_mode
-                if _mode in {
-                    "f01_r3_canonical_carrier",
-                    "f01_r3_endpoint_canonical_hybrid",
-                    "f01_r3_progressive_endpoint_canonical_refinement",
-                }:
-                    _tmin = (
-                        self.f01_canonical_t_min
-                        if _mode == "f01_r3_canonical_carrier"
-                        else self.f01_hybrid_t_min
-                    )
-                    _canon = self.r3_matcher.endpoint_from_canonical_carrier_gfree(
-                        state_Xt, source_X0, _carrier, t_int,
-                        boundary_eps=float(_tmin),
-                    )
-                    _tb = self.r3_matcher._broadcast_time_like(t_int, state_Xt)
-                    _active = _tb >= float(_tmin)
-                    decoded_final = torch.where(_active, _canon, _carrier)
-                elif _mode in {
-                    "f01_r3_boundary_regular_carrier",
-                    "f01_r3_antithetic_boundary_regular",
-                }:
-                    decoded_final = (
-                        self.r3_matcher
-                        .endpoint_from_boundary_regular_carrier_gfree(
-                            state_Xt, source_X0, _carrier, t_int
-                        )
-                    )
-                elif _mode == "f01_r3_c1_smoothstep_canonical_carrier":
-                    decoded_final = (
-                        self.r3_matcher
-                        .endpoint_from_c1_smoothstep_carrier_gfree(
-                            state_Xt, source_X0, _carrier, t_int
-                        )
-                    )
-                elif _mode == "f01_r3_source_flat_hermite_canonical_carrier":
-                    decoded_final = (
-                        self.r3_matcher
-                        .endpoint_from_source_flat_hermite_carrier_gfree(
-                            state_Xt, source_X0, _carrier, t_int,
-                            transition_t=self.f01_source_flat_hermite_transition_t,
-                        )
-                    )
-
-                # Zero-extra-forward one-step sampler proxy.  It compares the
-                # state reached by the predicted carrier with the state reached
-                # by the exact training carrier under the SAME sampler map.
-                if (
-                    structured_endpoint_target is not None
-                    and decoded_final is not None
-                ):
-                    _tn = torch.clamp(
-                        torch.as_tensor(
-                            t_int, device=state_Xt.device, dtype=state_Xt.dtype
-                        ) + 0.10,
-                        max=1.0,
-                    )
-                    if _mode in {
-                        "f01_r3_canonical_carrier",
-                        "f01_r3_endpoint_canonical_hybrid",
-                        "f01_r3_progressive_endpoint_canonical_refinement",
-                    }:
-                        _tmin = (
-                            self.f01_canonical_t_min
-                            if _mode == "f01_r3_canonical_carrier"
-                            else self.f01_hybrid_t_min
-                        )
-                        sampler_one_step_pred, _ = (
-                            self.r3_matcher.exact_carrier_scoreflow_step_gfree(
-                                state_Xt, source_X0, _carrier, t_int, _tn,
-                                canonical_t_min=float(_tmin),
-                            )
-                        )
-                        sampler_one_step_true, _ = (
-                            self.r3_matcher.exact_carrier_scoreflow_step_gfree(
-                                state_Xt, source_X0,
-                                structured_endpoint_target, t_int, _tn,
-                                canonical_t_min=float(_tmin),
-                            )
-                        )
-                    elif _mode in {
-                        "f01_r3_boundary_regular_carrier",
-                        "f01_r3_antithetic_boundary_regular",
-                    }:
-                        sampler_one_step_pred, _ = (
-                            self.r3_matcher
-                            .exact_boundary_regular_scoreflow_step_gfree(
-                                state_Xt, source_X0, _carrier, t_int, _tn
-                            )
-                        )
-                        sampler_one_step_true, _ = (
-                            self.r3_matcher
-                            .exact_boundary_regular_scoreflow_step_gfree(
-                                state_Xt, source_X0,
-                                structured_endpoint_target, t_int, _tn
-                            )
-                        )
-                    elif _mode == "f01_r3_c1_smoothstep_canonical_carrier":
-                        sampler_one_step_pred, _ = (
-                            self.r3_matcher
-                            .exact_c1_smoothstep_scoreflow_step_gfree(
-                                state_Xt, source_X0, _carrier, t_int, _tn
-                            )
-                        )
-                        sampler_one_step_true, _ = (
-                            self.r3_matcher
-                            .exact_c1_smoothstep_scoreflow_step_gfree(
-                                state_Xt, source_X0,
-                                structured_endpoint_target, t_int, _tn
-                            )
-                        )
-                    elif _mode == "f01_r3_source_flat_hermite_canonical_carrier":
-                        sampler_one_step_pred, _ = (
-                            self.r3_matcher
-                            .exact_source_flat_hermite_scoreflow_step_gfree(
-                                state_Xt, source_X0, _carrier, t_int, _tn,
-                                transition_t=self.f01_source_flat_hermite_transition_t,
-                            )
-                        )
-                        sampler_one_step_true, _ = (
-                            self.r3_matcher
-                            .exact_source_flat_hermite_scoreflow_step_gfree(
-                                state_Xt, source_X0,
-                                structured_endpoint_target, t_int, _tn,
-                                transition_t=self.f01_source_flat_hermite_transition_t,
-                            )
-                        )
-            except Exception:
-                # Diagnostics are observational and must never stop training.
-                decoded_final = None
-                sampler_one_step_pred = None
-                sampler_one_step_true = None
-
-        if decoded_final is not None:
-            _pred_ca = decoded_final[:, ca_idx].float()
-            _raw_values, _aligned_values = [], []
-            for _g in range(n_graph):
-                _m = interface_batch_id == _g
-                if not bool(_m.any()):
-                    continue
-                _p, _q = _pred_ca[_m], true_ca[_m]
-                _raw_values.append(
-                    torch.sqrt(((_p - _q) ** 2).sum(-1).mean())
-                )
-                if _p.shape[0] >= 3:
-                    try:
-                        _, _rot, _trans = kabsch_torch(_p, _q)
-                        _pa = torch.matmul(_p, _rot.T) + _trans
-                        _aligned_values.append(
-                            torch.sqrt(((_pa - _q) ** 2).sum(-1).mean())
-                        )
-                    except Exception:
-                        pass
-            if _raw_values:
-                out["val_proxy_decoded_x1_h3_ca_rmsd"] = (
-                    torch.stack(_raw_values).mean()
-                )
-            if _aligned_values:
-                out["val_proxy_decoded_x1_h3_ca_aligned_rmsd"] = (
-                    torch.stack(_aligned_values).mean()
-                )
-
-        if (
-            sampler_one_step_pred is not None
-            and sampler_one_step_true is not None
-        ):
-            _pp = sampler_one_step_pred[:, ca_idx].float()
-            _qq = sampler_one_step_true[:, ca_idx].float()
-            _vals = []
-            for _g in range(n_graph):
-                _m = interface_batch_id == _g
-                if bool(_m.any()):
-                    _vals.append(
-                        torch.sqrt(((_pp[_m] - _qq[_m]) ** 2).sum(-1).mean())
-                    )
-            if _vals:
-                out["val_proxy_sampler_one_step_h3_ca_rmsd"] = (
-                    torch.stack(_vals).mean()
-                )
 
         round_raw = []
         round_aligned = []
@@ -5361,12 +5578,7 @@ class AbFlowModel(nn.Module):
         if is_ag is None:
             return out
         pred_final_ca = r_interface_X[-1][:, ca_idx].float()
-        decoded_final_ca = (
-            decoded_final[:, ca_idx].float()
-            if decoded_final is not None else None
-        )
         contact_f1, contact_precision, contact_recall, caar_values = [], [], [], []
-        decoded_contact_f1 = []
         for g in range(n_graph):
             pm = interface_batch_id == g
             agm = (batch_id == g) & is_ag & (true_S != self.aa_feature.boa_idx)
@@ -5375,18 +5587,6 @@ class AbFlowModel(nn.Module):
             ag_ca = true_X[agm, ca_idx].float()
             native_contact = torch.cdist(true_ca[pm], ag_ca) < 8.0
             pred_contact = torch.cdist(pred_final_ca[pm], ag_ca) < 8.0
-            if decoded_final_ca is not None:
-                _dec_contact = torch.cdist(
-                    decoded_final_ca[pm], ag_ca
-                ) < 8.0
-                _dtp = (native_contact & _dec_contact).float().sum()
-                _dfp = ((~native_contact) & _dec_contact).float().sum()
-                _dfn = (native_contact & (~_dec_contact)).float().sum()
-                _dp = _dtp / (_dtp + _dfp + self.scorefm_eps)
-                _dr = _dtp / (_dtp + _dfn + self.scorefm_eps)
-                decoded_contact_f1.append(
-                    2.0 * _dp * _dr / (_dp + _dr + self.scorefm_eps)
-                )
             tp = (native_contact & pred_contact).float().sum()
             fp = ((~native_contact) & pred_contact).float().sum()
             fn = (native_contact & (~pred_contact)).float().sum()
@@ -5409,10 +5609,6 @@ class AbFlowModel(nn.Module):
             out["val_proxy_native_contact_recall"] = torch.stack(contact_recall).mean()
         if caar_values:
             out["val_proxy_caar"] = torch.stack(caar_values).mean()
-        if decoded_contact_f1:
-            out["val_proxy_decoded_x1_native_contact_f1"] = (
-                torch.stack(decoded_contact_f1).mean()
-            )
         return out
 
     def compute_gradient_conflict_diagnostics(self):
@@ -5638,6 +5834,8 @@ class AbFlowModel(nn.Module):
         # Do not retain a shared activation from a previous batch.
         self._diagnostic_probe_tensor = None
         self._last_gradient_diagnostic_error = ""
+        self._boundary_task_tensors = {}
+        self.last_boundary_task_diagnostics = {}
         if self.backbone_only:
             X, template = X[:, :4], template[:, :4]  # backbone
             if X_pep is not None:
@@ -5744,10 +5942,46 @@ class AbFlowModel(nn.Module):
             gt_satc_active_graph = None
             gt_satc_transport_graph = None
             structured_endpoint_target = None
+            structured_velocity_target = None
             structured_path_details = None
             antithetic_Xt = None
             antithetic_target_X = None
-            if self.scorefm_loss_mode == "foldflow_r3_global_endpoint":
+            if self.scorefm_loss_mode == "abx_cartesian_cfm":
+                # R02: FoldFlow-style deterministic Euclidean CFM on the
+                # complete AbFlow Cartesian H3 state.  No intermediate noise.
+                Xt = mu_t
+                structured_velocity_target = (
+                    self.r3_matcher.direct_cartesian_cfm_velocity(
+                        interface_X, gt_interface_X
+                    )
+                )
+                with torch.no_grad():
+                    structured_path_details = {
+                        "v103_direct_cfm": gt_interface_X.new_tensor(1.0),
+                        "v103_stochastic_scoreflow": gt_interface_X.new_tensor(0.0),
+                        "v103_sigma_mean": gt_interface_X.new_tensor(0.0),
+                        "v103_noise_rms": gt_interface_X.new_tensor(0.0),
+                        "v103_noise_centroid_rms": gt_interface_X.new_tensor(0.0),
+                        "v103_score_correction_rms": gt_interface_X.new_tensor(0.0),
+                        "v103_mean_flow_rms": torch.sqrt(
+                            structured_velocity_target.pow(2).mean().clamp_min(0.0)
+                        ),
+                    }
+            elif self.scorefm_loss_mode == "abx_cartesian_scoreflow":
+                # R03: same PCS-RC/native mean transport and same direct
+                # velocity decoder as R02, plus the canonical score-induced
+                # correction from a FoldFlow-inspired residue-R3 bridge.
+                Xt, structured_velocity_target, structured_path_details = (
+                    self._v103_cartesian_scoreflow_path(
+                        source_X0=interface_X, target_X1=gt_interface_X,
+                        t_graph=t_graph, t_int=t_int,
+                        interface_batch_id=interface_batch_id,
+                    )
+                )
+                structured_path_details = dict(structured_path_details or {})
+                structured_path_details["v103_direct_cfm"] = gt_interface_X.new_tensor(0.0)
+                structured_path_details["v103_stochastic_scoreflow"] = gt_interface_X.new_tensor(1.0)
+            elif self.scorefm_loss_mode == "foldflow_r3_global_endpoint":
                 Xt, structured_endpoint_target, structured_path_details = (
                     self._foldflow_r3_primary_path(
                         source_X0=interface_X, target_X1=gt_interface_X,
@@ -5759,7 +5993,6 @@ class AbFlowModel(nn.Module):
             elif self.scorefm_loss_mode in {
                 "f01_r3_canonical_carrier",
                 "f01_r3_endpoint_canonical_hybrid",
-                "f01_r3_progressive_endpoint_canonical_refinement",
             }:
                 # EXACT historical F01 stochastic state.  Only the training
                 # target changes to one unified Score--Flow carrier.
@@ -5791,7 +6024,6 @@ class AbFlowModel(nn.Module):
                 "f01_r3_boundary_regular_carrier",
                 "f01_r3_antithetic_boundary_regular",
                 "f01_r3_c1_smoothstep_canonical_carrier",
-                "f01_r3_source_flat_hermite_canonical_carrier",
             }:
                 # EXACT historical F01 adaptive-g global-R3 stochastic state.
                 # v86 changes ONLY the output coordinate chart.  There is no
@@ -5804,46 +6036,7 @@ class AbFlowModel(nn.Module):
                         noise_scope="global", cfm_target=False,
                     )
                 )
-                if (
-                    self.scorefm_loss_mode
-                    == "f01_r3_source_flat_hermite_canonical_carrier"
-                ):
-                    structured_endpoint_target = (
-                        self.r3_matcher.source_flat_hermite_carrier_target_gfree(
-                            Xt, interface_X, gt_interface_X, t_int,
-                            transition_t=self.f01_source_flat_hermite_transition_t,
-                        )
-                    )
-                    with torch.no_grad():
-                        _gain, _lam = (
-                            self.r3_matcher.source_flat_hermite_gain(
-                                t_int,
-                                transition_t=self.f01_source_flat_hermite_transition_t,
-                            )
-                        )
-                        _shift = structured_endpoint_target - gt_interface_X
-                        _br_diag = {
-                            "r3_source_flat_hermite_carrier":
-                                gt_interface_X.new_tensor(1.0),
-                            "r3_source_flat_hermite_transition_t":
-                                gt_interface_X.new_tensor(
-                                    float(self.f01_source_flat_hermite_transition_t)
-                                ),
-                            "r3_source_flat_hermite_gain_mean": _gain.mean(),
-                            "r3_source_flat_hermite_lambda_mean": _lam.mean(),
-                            "r3_source_flat_hermite_exact_u02_rate": (
-                                t_int >= float(
-                                    self.f01_source_flat_hermite_transition_t
-                                )
-                            ).to(gt_interface_X.dtype).mean(),
-                            "r3_source_flat_hermite_target_shift_rms":
-                                torch.sqrt(
-                                    _shift.pow(2).mean().clamp_min(0.0)
-                                ),
-                            "r3_boundary_regular_hard_switch":
-                                gt_interface_X.new_tensor(0.0),
-                        }
-                elif self.scorefm_loss_mode == "f01_r3_c1_smoothstep_canonical_carrier":
+                if self.scorefm_loss_mode == "f01_r3_c1_smoothstep_canonical_carrier":
                     structured_endpoint_target = (
                         self.r3_matcher.c1_smoothstep_carrier_target_gfree(
                             Xt, interface_X, gt_interface_X, t_int
@@ -6261,12 +6454,12 @@ class AbFlowModel(nn.Module):
                     satc_transport_rms_graph=satc_transport_rms_graph,
                     satc_gamma_graph=satc_gamma_graph,
                     structured_endpoint_target=structured_endpoint_target,
+                    structured_velocity_target=structured_velocity_target,
                     structured_path_details=structured_path_details,
                     antithetic_pred_X=antithetic_pred_X,
                     antithetic_target_X=antithetic_target_X,
-                    # r_interface_X[0] is the initial X_t, NOT a network round.
-                    # Exclude it so iter_round=3 means exactly 3 targets with
-                    # alpha=[0, 0.5, 1].
+                    # r_interface_X[0] is the input state; [1:] are the
+                    # actual recurrent coordinate predictions.
                     round_pred_X=r_interface_X[1:],
                 )
             )
@@ -6511,11 +6704,6 @@ class AbFlowModel(nn.Module):
                 "scorefm_loss_mode_f01_endpoint_canonical_hybrid": torch.as_tensor(
                     1.0 if self.scorefm_loss_mode
                     == "f01_r3_endpoint_canonical_hybrid" else 0.0,
-                    device=X.device,
-                ),
-                "scorefm_loss_mode_f01_progressive_endpoint_canonical_refinement": torch.as_tensor(
-                    1.0 if self.scorefm_loss_mode
-                    == "f01_r3_progressive_endpoint_canonical_refinement" else 0.0,
                     device=X.device,
                 ),
                 "scorefm_loss_mode_f01_boundary_regular_carrier": torch.as_tensor(
@@ -6782,149 +6970,6 @@ class AbFlowModel(nn.Module):
                         St[valid_pair] != pep_state[valid_pair]
                     ).float().mean()
 
-            # v96 source-role diagnostics; zero extra network forward.
-            if (
-                state_path and St is not None and not self.struct_only
-                and interface_S is not None
-            ):
-                _true_int_v96 = true_S[paratope_mask].to(
-                    device=St.device, dtype=torch.long
-                )
-                _src_v96 = interface_S.to(device=St.device, dtype=torch.long)
-                _valid_v96 = (
-                    (_true_int_v96 >= 0)
-                    & (_true_int_v96 < self.num_classes)
-                    & (_src_v96 >= 0)
-                    & (_src_v96 < self.num_classes)
-                )
-                if bool(_valid_v96.any()):
-                    diag["seq_reference_source_native_rate"] = (
-                        (_src_v96[_valid_v96] == _true_int_v96[_valid_v96])
-                        .float().mean()
-                    )
-                    if S_pep is not None and S_pep.numel() == _src_v96.numel():
-                        _pep_v96 = S_pep.to(
-                            device=St.device, dtype=torch.long
-                        ).reshape_as(_src_v96)
-                        _pep_valid_v96 = (
-                            (_pep_v96 >= 0)
-                            & (_pep_v96 < self.num_classes)
-                            & _valid_v96
-                        )
-                        if bool(_pep_valid_v96.any()):
-                            diag["seq_source_vs_pep_agreement_rate"] = (
-                                (_src_v96[_pep_valid_v96] == _pep_v96[_pep_valid_v96])
-                                .float().mean()
-                            )
-                diag["sequence_source_reference_uniform"] = torch.as_tensor(
-                    1.0 if getattr(
-                        self, "sequence_source_mode", "proposal"
-                    ) == "reference_uniform" else 0.0,
-                    device=X.device,
-                )
-
-            # v94: teacher-state-aware sequence diagnostics.
-            # High ordinary validation AAR can be inflated because q_t may
-            # already place the native token in S_t.  Measure the actually
-            # corrupted subset separately without any extra network forward.
-            if (
-                state_path and St is not None and not self.struct_only
-                and r_pred_S_logits
-            ):
-                _true_int_seq = true_S[paratope_mask].to(
-                    device=St.device, dtype=torch.long
-                )
-                _valid = (
-                    (St >= 0) & (St < self.num_classes)
-                    & (_true_int_seq >= 0) & (_true_int_seq < self.num_classes)
-                )
-                if bool(_valid.any()):
-                    _native = (St == _true_int_seq) & _valid
-                    _corrupt = (St != _true_int_seq) & _valid
-                    diag["seq_state_native_rate"] = (
-                        _native.float().sum()
-                        / _valid.float().sum().clamp_min(1.0)
-                    )
-                    _final_tok = torch.argmax(
-                        r_pred_S_logits[-1][0][paratope_mask], dim=-1
-                    )
-                    if bool(_corrupt.any()):
-                        diag["seq_recovery_aar_on_corrupted_state"] = (
-                            _final_tok[_corrupt] == _true_int_seq[_corrupt]
-                        ).float().mean()
-                    if bool(_native.any()):
-                        _keep = (
-                            _final_tok[_native] == _true_int_seq[_native]
-                        ).float()
-                        diag["seq_native_preservation_rate"] = _keep.mean()
-                        diag["seq_harmful_flip_rate"] = 1.0 - _keep.mean()
-
-            # v91 joint-state/recycle diagnostics: no extra forward and no
-            # training weight.  These expose whether sequence actually changes
-            # across refinement and whether predictions stabilize.
-            diag["joint_xt_st_state_enabled"] = torch.as_tensor(
-                1.0 if (self.dual_sequence_state
-                        and self.dual_sequence_atom_mode in {
-                            "hard_exact", "latent_exact"
-                        }
-                        and self.sequence_context_mode == "off") else 0.0,
-                device=X.device,
-            )
-            diag["joint_xt_st_latent_authority"] = torch.as_tensor(
-                1.0 if (self.dual_sequence_state
-                        and self.dual_sequence_atom_mode == "latent_exact"
-                        and self.sequence_context_mode == "off") else 0.0,
-                device=X.device,
-            )
-            diag["joint_xt_st_topology_authority"] = torch.as_tensor(
-                1.0 if (self.dual_sequence_state
-                        and self.dual_sequence_atom_mode == "hard_exact"
-                        and self.sequence_context_mode == "off") else 0.0,
-                device=X.device,
-            )
-            diag["sequence_recycle_mode_hard_detached"] = torch.as_tensor(
-                1.0 if self.sequence_recycle_mode == "hard_detached" else 0.0,
-                device=X.device,
-            )
-            diag["sequence_recycle_mode_latent_detached"] = torch.as_tensor(
-                1.0 if self.sequence_recycle_mode == "latent_detached" else 0.0,
-                device=X.device,
-            )
-            diag["sequence_recycle_soft_authority_disabled"] = torch.as_tensor(
-                1.0 if self.sequence_recycle_mode in {
-                    "hard_detached", "latent_detached"
-                } else 0.0,
-                device=X.device,
-            )
-            for _k, _v in self._last_sequence_recycle_diagnostics.items():
-                diag[_k] = _v.detach() if torch.is_tensor(_v) else _v
-
-            if not self.struct_only and r_pred_S_logits:
-                _round_preds = []
-                for _ri, (_logits_r, _mask_r) in enumerate(r_pred_S_logits):
-                    _m = sequence_loss_mask
-                    if bool(_m.any()):
-                        _lr = _logits_r[_m].float()
-                        _pr = torch.softmax(_lr, dim=-1)
-                        _tok = torch.argmax(_lr, dim=-1)
-                        _round_preds.append(_tok)
-                        diag[f"seq_round{_ri}_aar"] = (
-                            _tok == true_S[_m]
-                        ).float().mean()
-                        diag[f"seq_round{_ri}_confidence"] = (
-                            _pr.max(dim=-1).values.mean()
-                        )
-                        diag[f"seq_round{_ri}_entropy"] = (
-                            -(_pr * torch.log(_pr.clamp_min(1.0e-8)))
-                            .sum(dim=-1).mean()
-                        )
-                if len(_round_preds) >= 2:
-                    _final_tok = _round_preds[-1]
-                    for _ri, _tok in enumerate(_round_preds[:-1]):
-                        diag[f"seq_round{_ri}_to_final_agreement"] = (
-                            _tok == _final_tok
-                        ).float().mean()
-
             if bool(getattr(self, "_diagnostic_validation_mode", False)):
                 diag.update(self._validation_proxy_diagnostics(
                     true_X=true_X, true_S=true_S, pred_S=pred_S,
@@ -6932,12 +6977,6 @@ class AbFlowModel(nn.Module):
                     r_interface_X=r_interface_X,
                     paratope_mask=paratope_mask, smask=smask,
                     batch_id=batch_id, interface_batch_id=interface_batch_id,
-                    state_Xt=Xt if state_path else None,
-                    source_X0=interface_X if state_path else None,
-                    t_int=t_int if state_path else None,
-                    structured_endpoint_target=(
-                        structured_endpoint_target if state_path else None
-                    ),
                 ))
             self.last_abflow_diagnostics = {
                 k: v.detach() if torch.is_tensor(v) else v for k, v in diag.items()
@@ -7024,9 +7063,20 @@ class AbFlowModel(nn.Module):
             t = time_grid[i]
             t_next = time_grid[i + 1]
             dt = t_next - t
-            flow_t_graph = t.reshape(1).expand(batch_size)
+            # R02/R03 are trained on FoldFlow-style interior times [t_min,t_max].
+            # Integrate the full physical interval [0,1], but evaluate the learned
+            # field at the nearest trained boundary on the two terminal slivers.
+            # R01 keeps the exact historical U02 time semantics.
+            model_t = t
+            if self.scorefm_loss_mode in {
+                "abx_cartesian_cfm", "abx_cartesian_scoreflow"
+            }:
+                model_t = t.clamp(
+                    min=float(self.flow_t_min), max=float(self.flow_t_max)
+                )
+            flow_t_graph = model_t.reshape(1).expand(batch_size)
             if show_progress and hasattr(step_iter, 'set_postfix'):
-                step_iter.set_postfix(t=f'{float(t):.2f}')
+                step_iter.set_postfix(t=f'{float(t):.2f}', model_t=f'{float(model_t):.2f}')
 
             sequence_state_for_model = St if not self.struct_only else None
             H, pred_S, r_pred_S_logits, pred_X, r_interface_X, _, prmsd = self._forward(
@@ -7046,6 +7096,19 @@ class AbFlowModel(nn.Module):
                 Xt = self.flow_matcher.bridge_step(
                     Xt, pred_clean_X, t, dt
                 )
+            elif self.scorefm_sampler_mode == "cartesian_direct_ode":
+                if self.scorefm_loss_mode not in {
+                    "abx_cartesian_cfm", "abx_cartesian_scoreflow"
+                }:
+                    raise RuntimeError(
+                        "cartesian_direct_ode requires abx_cartesian_cfm or "
+                        "abx_cartesian_scoreflow loss mode."
+                    )
+                # Direct probability-flow Euler step.  The coordinate-like
+                # network output Y is decoded as v=Y-Xt; there is no endpoint
+                # bridge denominator and no carrier inversion.
+                dX = pred_clean_X - Xt
+                Xt = Xt + dX * dt
             elif self.scorefm_sampler_mode == "f01_canonical_carrier":
                 # Matched sampler for the single-field carrier.  For the clean
                 # Endpoint boundary region this is exactly the historical
@@ -7054,10 +7117,7 @@ class AbFlowModel(nn.Module):
                 # the exact g-free Gaussian residual-ratio step.
                 if self.scorefm_loss_mode == "f01_r3_canonical_carrier":
                     _t_min = float(self.f01_canonical_t_min)
-                elif self.scorefm_loss_mode in {
-                    "f01_r3_endpoint_canonical_hybrid",
-                    "f01_r3_progressive_endpoint_canonical_refinement",
-                }:
+                elif self.scorefm_loss_mode == "f01_r3_endpoint_canonical_hybrid":
                     _t_min = float(self.f01_hybrid_t_min)
                 else:
                     raise RuntimeError(
@@ -7093,25 +7153,6 @@ class AbFlowModel(nn.Module):
                     self.r3_matcher.exact_c1_smoothstep_scoreflow_step_gfree(
                         x_t=Xt, x0=interface_X, carrier=pred_clean_X,
                         t=t, t_next=t_next,
-                    )
-                )
-            elif (
-                self.scorefm_sampler_mode
-                == "f01_source_flat_hermite_canonical_carrier"
-            ):
-                if (
-                    self.scorefm_loss_mode
-                    != "f01_r3_source_flat_hermite_canonical_carrier"
-                ):
-                    raise RuntimeError(
-                        "f01_source_flat_hermite_canonical_carrier sampler "
-                        "requires the matched U11 loss mode."
-                    )
-                Xt, _ = (
-                    self.r3_matcher.exact_source_flat_hermite_scoreflow_step_gfree(
-                        x_t=Xt, x0=interface_X, carrier=pred_clean_X,
-                        t=t, t_next=t_next,
-                        transition_t=self.f01_source_flat_hermite_transition_t,
                     )
                 )
             else:

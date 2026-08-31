@@ -464,168 +464,6 @@ class AbFlowR3Matcher:
             }
 
     # ============================================================
-    # v93 / U11: source-flat Hermite phase-matched canonical carrier
-    # ============================================================
-    @staticmethod
-    def source_flat_hermite_gain(t, transition_t=0.5):
-        """Return the carrier residual gain c(t) and lambda(t)=2 t c(t).
-
-        Scientific constraints
-        ----------------------
-        The carrier family is
-            P_t = X1 + c(t) [Xt - mu_t],
-            mu_t = (1-t) X0 + t X1.
-
-        Empirical evidence motivating U11:
-          * U03 (c=1/2) improved absolute H3 placement.
-          * U02's natural canonical carrier c=1/(2t) retained the strongest
-            sequence/interface performance in the contraction phase.
-          * U05 suppressed source sensitivity toward zero and did not preserve
-            U02's interior carrier response.
-
-        We therefore match U03 at the source in both value and first derivative,
-        and match U02 at the intrinsic Gaussian phase boundary T=1/2 in both
-        value and first derivative:
-            c(0)=1/2,      c'(0)=0,
-            c(T)=1/(2T),   c'(T)=-1/(2T^2).
-
-        The unique cubic on [0,T] is
-            c(t) = 1/2
-                 + (4-3T)/(2T^3) t^2
-                 + (T-3/2)/T^4 t^3.
-
-        Formal U11 fixes T=1/2 (not a tuned hyperparameter), giving
-            c(t)=1/2 + 10 t^2 - 16 t^3,    t <= 1/2
-            c(t)=1/(2t),                    t >= 1/2.
-
-        lambda(t)=2tc(t) is in [0,1] for T=1/2, so endpoint decoding uses
-        denominator 1-lambda/2 in [1/2,1].  The chart is C1-matched to the
-        exact U02 natural canonical chart at t=1/2 and has no U02 t=0.20 seam.
-        """
-        T = float(transition_t)
-        if abs(T - 0.5) > 1e-12:
-            raise ValueError(
-                "Formal source-flat Hermite carrier fixes transition_t=0.5; "
-                "do not tune this value."
-            )
-        tt = torch.as_tensor(t)
-        early = tt <= T
-
-        # Source-flat cubic in c-space.  For T=1/2:
-        # c=0.5 + 10 t^2 - 16 t^3.
-        c_early = 0.5 + 10.0 * tt.square() - 16.0 * tt.pow(3)
-        t_safe = tt.clamp_min(torch.finfo(tt.dtype).eps)
-        c_late = 0.5 / t_safe
-        gain = torch.where(early, c_early, c_late)
-        lam = 2.0 * tt * gain
-
-        # Numerical guard only; the analytic formal schedule already satisfies
-        # lambda in [0,1].
-        lam = lam.clamp(0.0, 1.0)
-        return gain, lam
-
-    def source_flat_hermite_carrier_target_gfree(
-            self, x_t, x0, x1, t, transition_t=0.5):
-        """U11 carrier target with one semantic quantity at every refinement round.
-
-        P*=X1+c(t)(Xt-mu_t), where c(t) is source-flat U03-matched for the
-        source phase and is EXACTLY U02's natural canonical gain for t>=1/2.
-
-        This changes only the neural output chart.  The F01 stochastic state,
-        PCS-RC source, full-atom backbone and canonical Gaussian sampler physics
-        are unchanged.  No independent score/flow head, auxiliary loss, hard
-        t=0.20 switch or round-index-dependent target is introduced.
-        """
-        if abs(float(self.path_min_sigma)) > self.eps:
-            raise ValueError(
-                "g-free U11 carrier requires path_min_sigma=0."
-            )
-        t_b = self._broadcast_time_like(t, x_t)
-        mu = (1.0 - t_b) * x0 + t_b * x1
-        residual = x_t - mu
-        gain, _ = self.source_flat_hermite_gain(
-            t_b, transition_t=transition_t
-        )
-        return x1 + gain * residual
-
-    def endpoint_from_source_flat_hermite_carrier_gfree(
-            self, x_t, x0, carrier, t, transition_t=0.5):
-        """Decode the clean endpoint implied by the U11 carrier.
-
-        From
-            P = X1 + c[Xt-(1-t)X0-tX1]
-              = (1-ct)X1 + c[Xt-(1-t)X0],
-        therefore
-            X1 = [P-c(Xt-(1-t)X0)] / (1-ct).
-
-        Since lambda=2tc is in [0,1], 1-ct=1-lambda/2 is in [1/2,1].
-        """
-        t_b = self._broadcast_time_like(t, x_t)
-        gain, lam = self.source_flat_hermite_gain(
-            t_b, transition_t=transition_t
-        )
-        denom = (1.0 - 0.5 * lam).clamp_min(0.5)
-        known = gain * (x_t - (1.0 - t_b) * x0)
-        return (carrier - known) / denom
-
-    def exact_source_flat_hermite_scoreflow_step_gfree(
-            self, x_t, x0, carrier, t, t_next, transition_t=0.5):
-        """Matched canonical Gaussian interval step for U11.
-
-        1) Decode the endpoint from the U11 carrier.
-        2) Freeze that endpoint on [t,t_next].
-        3) Evolve the exact F01 Gaussian residual with
-             sqrt[t_next(1-t_next)/(t(1-t))].
-
-        This is the same g-free canonical residual-ratio physics used by U03/U05
-        after decoding.  At t_next=1 it returns the decoded endpoint exactly.
-        """
-        if abs(float(self.path_min_sigma)) > self.eps:
-            raise ValueError(
-                "g-free U11 Score--Flow step requires path_min_sigma=0."
-            )
-        if x_t.numel() == 0:
-            return x_t, {}
-
-        t_b = self._broadcast_time_like(t, x_t)
-        tn_b = self._broadcast_time_like(t_next, x_t)
-        pred_x1 = self.endpoint_from_source_flat_hermite_carrier_gfree(
-            x_t, x0, carrier, t_b, transition_t=transition_t
-        )
-
-        mu0 = (1.0 - t_b) * x0 + t_b * pred_x1
-        mu1 = (1.0 - tn_b) * x0 + tn_b * pred_x1
-        residual = x_t - mu0
-
-        base0 = (t_b * (1.0 - t_b)).clamp_min(0.0)
-        base1 = (tn_b * (1.0 - tn_b)).clamp_min(0.0)
-        interior = base0 > self.eps
-        ratio = torch.zeros_like(base0)
-        ratio = torch.where(
-            interior,
-            torch.sqrt(base1 / base0.clamp_min(self.eps)),
-            ratio,
-        )
-        residual = torch.where(interior, residual, torch.zeros_like(residual))
-        x_next = mu1 + ratio * residual
-
-        with torch.no_grad():
-            gain, lam = self.source_flat_hermite_gain(
-                t_b, transition_t=transition_t
-            )
-            return x_next, {
-                "source_flat_hermite_gain_mean": gain.mean(),
-                "source_flat_hermite_lambda_mean": lam.mean(),
-                "source_flat_hermite_residual_rms": torch.sqrt(
-                    residual.pow(2).mean().clamp_min(0.0)
-                ),
-                "source_flat_hermite_ratio_mean": ratio.mean(),
-                "source_flat_hermite_decode_denom_min": (
-                    1.0 - 0.5 * lam
-                ).min(),
-            }
-
-    # ============================================================
     # v87: C1 smoothstep source-anchored canonical carrier
     # ============================================================
     @staticmethod
@@ -970,3 +808,56 @@ class AbFlowR3Matcher:
         return probability_flow + 0.5*g[:,None].square()*raw_score
 
 
+
+    # ============================================================
+    # v103: AbX-centered Cartesian Flow / Score--Flow algebra
+    # ============================================================
+    @staticmethod
+    def direct_cartesian_cfm_velocity(x0, x1):
+        """FoldFlow/CFM Euclidean target on AbFlow's full Cartesian state.
+
+        For X_t=(1-t)X0+tX1, the exact conditional velocity is X1-X0.
+        No endpoint carrier and no (1-t) reweighting are introduced.
+        """
+        return x1 - x0
+
+    @staticmethod
+    def canonical_brownian_k(t, eps=1e-8):
+        """d log sigma / dt for sigma(t)=g*sqrt(t(1-t))."""
+        tt = torch.as_tensor(t)
+        tt = tt.clamp(min=float(eps), max=1.0-float(eps))
+        return (1.0 - 2.0 * tt) / (2.0 * tt * (1.0 - tt))
+
+    @staticmethod
+    def foldflow_scaled_sigma_to_raw(
+            t, *, g_scaled=0.1, coordinate_scaling=0.1,
+            min_sigma_scaled=0.0):
+        """FoldFlow-style R3 width converted from model units to Angstroms.
+
+        FoldFlow uses coordinate_scaling=0.1 and g=0.1 in scaled translation
+        coordinates.  For the paired PCS-RC->native Score--Flow path we keep
+        clean endpoints, hence the *physical* path floor defaults to zero.
+        Numerical score floors remain a separate concern.
+        """
+        tt = torch.as_tensor(t)
+        sigma_scaled = torch.sqrt(
+            (float(g_scaled) ** 2 * tt * (1.0 - tt)).clamp_min(0.0)
+            + float(min_sigma_scaled) ** 2
+        )
+        return sigma_scaled / float(coordinate_scaling)
+
+    def canonical_cartesian_scoreflow_velocity(
+            self, x_t, x0, x1, t):
+        """Canonical probability-flow target for a clean-endpoint bridge.
+
+        x_t = mu_t + sigma_t * eps,  mu_t=(1-t)x0+t x1
+        u*  = (x1-x0) + (d log sigma/dt) * (x_t-mu_t)
+
+        The stochastic residual may live in a lower-dimensional protein-aware
+        translation support; the formula is valid on that support and the
+        deterministic mean transport still acts on every full-atom coordinate.
+        """
+        tb = self._broadcast_time_like(t, x_t)
+        mu = (1.0 - tb) * x0 + tb * x1
+        k = self.canonical_brownian_k(tb, eps=self.eps).to(x_t.dtype)
+        return (x1 - x0) + k * (x_t - mu)
