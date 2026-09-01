@@ -5252,6 +5252,8 @@ class AbFlowModel(nn.Module):
         In PCS-RC mode X_pep/S_pep are also used to build a recurrent global
         proposal context, but they never overwrite the explicit shadow state.
         """
+        
+        # import ipdb; ipdb.set_trace()
         batch_id = self.batch_constants['batch_id']
 
         X = X.clone()

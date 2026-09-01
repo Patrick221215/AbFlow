@@ -168,6 +168,7 @@ class Trainer:
         torch.save(module_to_save, save_path)
 
     def _train_epoch(self, device):
+        # import ipdb; ipdb.set_trace()
         if self.train_loader.sampler is not None and self.local_rank != -1:
             self.train_loader.sampler.set_epoch(self.epoch)
 
@@ -324,6 +325,7 @@ class Trainer:
                 fout.write(f'{metric}: {path}\n')
 
     def train(self, device_ids, local_rank):
+        # import ipdb; ipdb.set_trace()
         self.local_rank = local_rank
 
         if self._is_main_proc():
@@ -409,8 +411,10 @@ class Trainer:
         return {'scheduler': scheduler, 'frequency': 'epoch'}
 
     def train_step(self, batch, batch_idx):
+        # import ipdb; ipdb.set_trace()
         loss = self.model(batch)
         self.log('Loss/train', loss, batch_idx)
+        # import ipdb; ipdb.set_trace()
         return loss
 
     def valid_step(self, batch, batch_idx):

@@ -148,6 +148,22 @@ case "$EXP_ID" in
     export ABFLOW_R03_CENTER_RESIDUAL="on"
     ;;
 
+  R03_test)
+    export ABFLOW_ABLATION_PARENT="R02_PCS_RC_LC_R1_ABX_CARTESIAN_CFM"
+    export ABFLOW_EXPERIMENT_FACTOR="canonical_score_correction_on_matched_cartesian_flow"
+    export ABFLOW_SINGLE_FACTOR_ABLATION="true"
+    export ABFLOW_MODULE_ID="R03_ABX_CARTESIAN_SCOREFLOW"
+    export ABFLOW_MODULE_PARENT="R02_ABX_CARTESIAN_CFM"
+
+    export ABFLOW_SCOREFM_LOSS_MODE="abx_cartesian_scoreflow"
+    export ABFLOW_SCOREFM_SAMPLER_MODE="cartesian_direct_ode"
+    export ABFLOW_FLOW_T_MIN="0.01"
+    export ABFLOW_FLOW_T_MAX="0.99"
+    export ABFLOW_R03_G_SCALED="0.1"
+    export ABFLOW_R03_PATH_MIN_SIGMA_SCALED="0.0"
+    export ABFLOW_R03_CENTER_RESIDUAL="on"
+    ;;
+
   *)
     echo "Unknown EXP_ID: $EXP_ID"
     echo "Supported v103:"
@@ -173,9 +189,35 @@ export ABFLOW_PREFETCH_FACTOR="${ABFLOW_PREFETCH_FACTOR:-4}"
 export ABFLOW_VALID_NUM_WORKERS="${ABFLOW_VALID_NUM_WORKERS:-2}"
 export ABFLOW_VALID_PREFETCH_FACTOR="${ABFLOW_VALID_PREFETCH_FACTOR:-2}"
 export ABFLOW_VALID_PERSISTENT_WORKERS="${ABFLOW_VALID_PERSISTENT_WORKERS:-off}"
+# v3: validation uses the SAME DDP world as training.  The Trainer shards the
+# historical logical validation batches exactly once across ranks and reduces
+# them back to the original global mean, with no padding or duplicate samples.
+export ABFLOW_DDP_VALIDATION="${ABFLOW_DDP_VALIDATION:-on}"
 export ABFLOW_LOG_INTERVAL="${ABFLOW_LOG_INTERVAL:-1}"
 export ABFLOW_TQDM_MININTERVAL="${ABFLOW_TQDM_MININTERVAL:-5.0}"
 export ABFLOW_SAVE_INTERVAL="${ABFLOW_SAVE_INTERVAL:-1}"
+
+# ------------------------------------------------------------------
+# Formal epoch-wise Test phase (evaluation infrastructure only)
+# ------------------------------------------------------------------
+# Scientific R01/R02/R03 variables above are untouched.  Test reuses the same
+# DDP world as training, applies EMA inside Trainer, runs model.sample + the
+# original cal_metrics.py, and restores RNG afterwards.
+export ABFLOW_PROJECT_ROOT="${ABFLOW_PROJECT_ROOT:-$PROJECT_ROOT}"
+export ABFLOW_EPOCH_TEST="${ABFLOW_EPOCH_TEST:-on}"
+export ABFLOW_EPOCH_TEST_INTERVAL="${ABFLOW_EPOCH_TEST_INTERVAL:-1}"
+export ABFLOW_EPOCH_TEST_JSON="${ABFLOW_EPOCH_TEST_JSON:-${PROJECT_ROOT}/datasets/RAbD/test.json}"
+export ABFLOW_EPOCH_TEST_BATCH_SIZE="${ABFLOW_EPOCH_TEST_BATCH_SIZE:-20}"
+export ABFLOW_EPOCH_TEST_N_STEPS="${ABFLOW_EPOCH_TEST_N_STEPS:-10}"
+export ABFLOW_EPOCH_TEST_BASE_SEED="${ABFLOW_EPOCH_TEST_BASE_SEED:-2023}"
+export ABFLOW_EPOCH_TEST_METRIC_WORKERS="${ABFLOW_EPOCH_TEST_METRIC_WORKERS:-8}"
+export ABFLOW_EPOCH_TEST_SHOW_SAMPLE_PROGRESS="${ABFLOW_EPOCH_TEST_SHOW_SAMPLE_PROGRESS:-off}"
+export ABFLOW_EPOCH_TEST_KEEP_STRUCTURES="${ABFLOW_EPOCH_TEST_KEEP_STRUCTURES:-off}"
+export ABFLOW_EPOCH_TEST_FAIL_FAST="${ABFLOW_EPOCH_TEST_FAIL_FAST:-off}"
+
+# The formal train path no longer uses the historical TopK watcher.  TopK
+# checkpoint *retention* inside validation remains unchanged.
+export ABFLOW_AUTO_TOPK_EVAL="off"
 
 FORCE_SCRATCH=${ABFLOW_FORCE_SCRATCH:-off}
 MAX_EPOCH=${ABFLOW_MAX_EPOCH:-}
@@ -207,6 +249,14 @@ _csv_contains() {
 }
 
 _infer_spare_eval_gpus() {
+  # v103 same-GPU policy:
+  # AutoTopK uses the SAME physical GPU list as training by default.
+  # Explicit ABFLOW_EVAL_GPUS / ABFLOW_EVAL_GPU still overrides this.
+  #
+  # Examples:
+  #   train GPU_ID=2,3 -> eval pool=2,3
+  #   train GPU_ID=4,5 -> eval pool=4,5
+  #   train GPU_ID=6,7 -> eval pool=6,7
   if [[ -n "${ABFLOW_EVAL_GPUS:-}" ]]; then
     echo "$ABFLOW_EVAL_GPUS"
     return 0
@@ -215,31 +265,8 @@ _infer_spare_eval_gpus() {
     echo "$ABFLOW_EVAL_GPU"
     return 0
   fi
-  if ! command -v nvidia-smi >/dev/null 2>&1; then
-    echo ""
-    return 0
-  fi
 
-  local all_ids train_ids selected id count
-  all_ids=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | tr '\n' ',' | sed 's/,$//') || all_ids=""
-  train_ids="$GPU_ID"
-  selected=""
-  count=0
-
-  IFS=',' read -ra ids <<< "$all_ids"
-  for id in "${ids[@]}"; do
-    id=$(echo "$id" | xargs)
-    [[ -z "$id" ]] && continue
-    if _csv_contains "$train_ids" "$id"; then
-      continue
-    fi
-    selected="${selected:+${selected},}${id}"
-    count=$((count + 1))
-    if [[ "$count" -ge "$AUTO_TOPK_MAX_EVAL_GPUS" ]]; then
-      break
-    fi
-  done
-  echo "$selected"
+  echo "$GPU_ID"
 }
 
 _start_auto_topk_watcher() {
@@ -349,6 +376,13 @@ print_settings() {
   echo "FLOW_COORDINATE_SCALING=$ABFLOW_R3_FLOW_COORDINATE_SCALING"
   echo "R03_G_SCALED=$ABFLOW_R03_G_SCALED"
   echo "R03_CENTER_RESIDUAL=$ABFLOW_R03_CENTER_RESIDUAL"
+  echo "DDP_VALIDATION=$ABFLOW_DDP_VALIDATION"
+  echo "EPOCH_TEST=$ABFLOW_EPOCH_TEST"
+  echo "EPOCH_TEST_INTERVAL=$ABFLOW_EPOCH_TEST_INTERVAL"
+  echo "EPOCH_TEST_JSON=$ABFLOW_EPOCH_TEST_JSON"
+  echo "EPOCH_TEST_BATCH_SIZE=$ABFLOW_EPOCH_TEST_BATCH_SIZE"
+  echo "EPOCH_TEST_N_STEPS=$ABFLOW_EPOCH_TEST_N_STEPS"
+  echo "EPOCH_TEST_BASE_SEED=$ABFLOW_EPOCH_TEST_BASE_SEED"
   echo "COORDINATE_AUTHORITY=$ABFLOW_COORDINATE_AUTHORITY"
   echo "STRUCTURE_SEQ_READOUT=$ABFLOW_STRUCTURE_SEQ_READOUT"
   echo "DUAL_SEQUENCE_STATE=$ABFLOW_DUAL_SEQUENCE_STATE"
@@ -382,19 +416,19 @@ if [[ "$MODE" == "test" ]]; then
   echo "Result dir: $RESULT_DIR"
   echo "Test JSON: $TEST_JSON"
 
-  # Multiple training runs may intentionally share one evaluation GPU (R01/R02
-  # both use GPU0 in the formal protocol).  Serialize only the actual test job,
-  # not the long-lived watchers, so AutoTopK cannot collide/OOM on that GPU.
+  # Serialize actual test jobs that target the same GPU id/list.
+  # The watcher itself is lightweight; only the generation/evaluation subprocess
+  # is protected by this lock.
   if command -v flock >/dev/null 2>&1; then
     EVAL_LOCK="/tmp/abflow_v103_eval_gpu_${GPU_ID//,/__}.lock"
     (
       flock -x 9
-      GPU="$GPU_ID" bash "$PROJECT_ROOT/scripts/test/test.sh" \
+      GPU="$GPU_ID" bash "$PROJECT_ROOT/scripts/test/test_epoch_ddp.sh" \
         "$CKPT" "$TEST_JSON" "$RESULT_DIR" rabd
     ) 9>"$EVAL_LOCK"
   else
     echo "[AutoTopK] WARNING: flock unavailable; shared eval GPUs are not serialized." >&2
-    GPU="$GPU_ID" bash "$PROJECT_ROOT/scripts/test/test.sh" \
+    GPU="$GPU_ID" bash "$PROJECT_ROOT/scripts/test/test_epoch_ddp.sh" \
       "$CKPT" "$TEST_JSON" "$RESULT_DIR" rabd
   fi
   exit 0
@@ -429,8 +463,8 @@ fi
 
 if [[ "$MODE" != "train" ]]; then
   echo "Train:       bash $0 train <R01|R02|R03 EXP_ID> 2,3 <config.json>"
-  echo "Test bridge: bash $0 test  <R01|R02|R03 EXP_ID> 0 <ckpt> <result_dir> [test.json]"
-  echo "Attach eval: bash $0 attach_eval <R01|R02|R03 EXP_ID> 0 [eval_gpu|auto]"
+  echo "Test bridge: bash $0 test  <R01|R02|R03 EXP_ID> 2,3 <ckpt> <result_dir> [test.json]"
+  echo "Attach eval: bash $0 attach_eval <R01|R02|R03 EXP_ID> 2,3 [eval_gpus|auto]"
   exit 2
 fi
 
@@ -456,13 +490,29 @@ with open(sys.argv[1], "r", encoding="utf-8") as f:
 print(str(cfg.get("resume_checkpoint", "") or "").strip())
 PYRESUME
 )
+ENV_RESUME_CHECKPOINT=$(echo "${ABFLOW_RESUME_CHECKPOINT:-}" | xargs)
 
-if _is_on "$FORCE_SCRATCH"; then
-  RUN_MODE="scratch"
-  EFFECTIVE_RESUME_CHECKPOINT=""
+# Resume priority:
+#   1) explicit ABFLOW_RESUME_CHECKPOINT from the launch command;
+#   2) resume_checkpoint stored in the scientific JSON;
+#   3) scratch only when neither exists.
+# The environment override changes only runtime state restoration; the generated
+# config records the resolved absolute checkpoint path for reproducibility.
+if [[ -n "$ENV_RESUME_CHECKPOINT" ]]; then
+  RUN_MODE="resume"
+  EFFECTIVE_RESUME_CHECKPOINT="$ENV_RESUME_CHECKPOINT"
+  if _is_on "$FORCE_SCRATCH"; then
+    echo "[Resume] WARNING: ABFLOW_FORCE_SCRATCH=$FORCE_SCRATCH ignored because ABFLOW_RESUME_CHECKPOINT is set." >&2
+  fi
 elif [[ -n "$BASE_RESUME_CHECKPOINT" ]]; then
   RUN_MODE="resume"
   EFFECTIVE_RESUME_CHECKPOINT="$BASE_RESUME_CHECKPOINT"
+  if _is_on "$FORCE_SCRATCH"; then
+    echo "[Resume] WARNING: ABFLOW_FORCE_SCRATCH=$FORCE_SCRATCH ignored because base config contains resume_checkpoint." >&2
+  fi
+elif _is_on "$FORCE_SCRATCH"; then
+  RUN_MODE="scratch"
+  EFFECTIVE_RESUME_CHECKPOINT=""
 else
   RUN_MODE="scratch"
   EFFECTIVE_RESUME_CHECKPOINT=""
@@ -592,6 +642,14 @@ runtime = {
     "sequence_context_mode": os.environ.get("ABFLOW_SEQUENCE_CONTEXT_MODE", ""),
     "sequence_recycle_mode": os.environ.get("ABFLOW_SEQUENCE_RECYCLE_MODE", ""),
     "auto_topk_eval": os.environ.get("ABFLOW_AUTO_TOPK_EVAL", "off"),
+    "epoch_test": os.environ.get("ABFLOW_EPOCH_TEST", "off"),
+    "epoch_test_interval": os.environ.get("ABFLOW_EPOCH_TEST_INTERVAL", "1"),
+    "epoch_test_json": os.environ.get("ABFLOW_EPOCH_TEST_JSON", ""),
+    "epoch_test_batch_size": os.environ.get("ABFLOW_EPOCH_TEST_BATCH_SIZE", "20"),
+    "epoch_test_n_steps": os.environ.get("ABFLOW_EPOCH_TEST_N_STEPS", "10"),
+    "ddp_validation": os.environ.get("ABFLOW_DDP_VALIDATION", "on"),
+    "epoch_test_base_seed": os.environ.get("ABFLOW_EPOCH_TEST_BASE_SEED", "2023"),
+    "epoch_test_protocol": "logical_batch_seeded_v1",
     "eval_gpus": os.environ.get("ABFLOW_EVAL_GPUS", ""),
 }
 os.makedirs(os.path.dirname(runtime_meta), exist_ok=True)
@@ -630,19 +688,17 @@ if [[ "${ABFLOW_DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
-EVAL_GPUS=$(_infer_spare_eval_gpus)
-_start_auto_topk_watcher "$EVAL_GPUS" "$RUN_DIR"
+# Formal v103 path no longer uses the historical TopK watcher.  A watcher from
+# a previous invocation may still be alive when resuming the same run, so stop
+# that stale process before the DDP Trainer starts.  This changes only
+# evaluation infrastructure; validation TopK checkpoint retention is untouched.
+_stop_auto_topk_watcher "$RUN_DIR"
 
+# Formal v103 path: Test is the Trainer's third epoch phase.  No watcher is
+# spawned and no second model process competes with the training DDP job.
 set +e
 GPU="$GPU_ID" bash "$PROJECT_ROOT/scripts/train/train.sh" "$RUN_CONFIG"
 TRAIN_STATUS=$?
 set -e
 
-if [[ "$TRAIN_STATUS" -eq 0 ]]; then
-  _run_auto_topk_once "${EVAL_GPUS:-$GPU_ID}" "$RUN_DIR"
-else
-  echo "[AutoTopK] training failed with status=$TRAIN_STATUS; skipping final evaluation."
-fi
-
-_stop_auto_topk_watcher "$RUN_DIR"
 exit "$TRAIN_STATUS"

@@ -574,6 +574,7 @@ def parse():
 # ============================================================
 
 def main(args):
+    # import ipdb; ipdb.set_trace()
     ########### DDP and run directory setup ###########
     os.environ.setdefault('NCCL_TIMEOUT', '30')
 
@@ -761,6 +762,7 @@ def main(args):
         **valid_loader_kwargs,
     )
     
+    # import ipdb; ipdb.set_trace()
     trainer = Trainer(model, train_loader, valid_loader, config)
 
     # Now the original Trainer should have created or exposed its concrete

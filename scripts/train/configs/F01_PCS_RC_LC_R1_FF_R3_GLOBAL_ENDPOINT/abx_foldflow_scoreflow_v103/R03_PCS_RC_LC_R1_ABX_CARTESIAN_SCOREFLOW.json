@@ -23,7 +23,7 @@
   "pep_struct": true,
   "bind_dist_cutoff": 6.6,
   "save_interval": 1,
-  "resume_checkpoint": "",
+  "resume_checkpoint": "/home/data3/cjm/project/AbFlow/results_module/R03_PCS_RC_LC_R1_ABX_CARTESIAN_SCOREFLOW/version_0/checkpoint/last_step8236.pt",
   "use_ema": true,
   "ema_decay": 0.999,
   "num_workers": 8,
