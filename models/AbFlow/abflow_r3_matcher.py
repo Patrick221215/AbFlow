@@ -829,6 +829,27 @@ class AbFlowR3Matcher:
         return (1.0 - 2.0 * tt) / (2.0 * tt * (1.0 - tt))
 
     @staticmethod
+    def foldflow_scaled_g_to_raw(*, g_scaled=0.1, coordinate_scaling=0.1):
+        """Convert FoldFlow's scaled R3 diffusion amplitude to Angstroms.
+
+        FoldFlow first applies ``x_scaled = coordinate_scaling * x_raw`` and
+        defines ``g`` in that scaled space.  Therefore a path implemented on
+        raw Angstrom coordinates must use
+
+            g_raw = g_scaled / coordinate_scaling.
+
+        With the published/default FoldFlow convention g_scaled=0.1 and
+        coordinate_scaling=0.1, this is exactly 1.0 Angstrom.
+        """
+        scale = float(coordinate_scaling)
+        if scale <= 0.0:
+            raise ValueError("coordinate_scaling must be positive.")
+        g = float(g_scaled)
+        if g <= 0.0:
+            raise ValueError("g_scaled must be positive.")
+        return g / scale
+
+    @staticmethod
     def foldflow_scaled_sigma_to_raw(
             t, *, g_scaled=0.1, coordinate_scaling=0.1,
             min_sigma_scaled=0.0):

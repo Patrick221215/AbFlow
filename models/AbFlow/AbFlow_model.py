@@ -557,12 +557,47 @@ class AbFlowModel(nn.Module):
         self.r3_transport_max = _env_float(
             "ABFLOW_R3_TRANSPORT_MAX", 20.0
         )
+
+        # v104: make the stochastic-width policy explicit.
+        #
+        # adaptive_transport (historical R01):
+        #     g is calibrated per complex from the PCS-RC -> native H3
+        #     centroid displacement.
+        #
+        # foldflow_fixed_scaled (R04/R05/R06):
+        #     use FoldFlow's validated R3 numerical amplitude g=0.1 in the
+        #     0.1-scaled coordinate system.  The actual F01 path is built in
+        #     raw Angstroms, so g_raw = g_scaled / coordinate_scaling.
+        #
+        # The physical endpoint floor remains controlled independently by
+        # ABFLOW_R3_PATH_MIN_SIGMA.  Formal canonical Score--Flow runs keep it
+        # at zero so t=0 is exactly PCS-RC and t=1 is exactly native.
+        self.r3_g_mode = _env_str(
+            "ABFLOW_R3_G_MODE", "adaptive_transport"
+        ).strip().lower()
+        self.r3_fixed_g_scaled = _env_float(
+            "ABFLOW_R3_FIXED_G_SCALED", 0.1
+        )
+        self.r3_noise_scope = _env_str(
+            "ABFLOW_R3_NOISE_SCOPE", "global"
+        ).strip().lower()
+
         if not (0.0 < self.r3_transport_fraction <= 1.0):
             raise ValueError("ABFLOW_R3_TRANSPORT_FRACTION must be in (0,1].")
         if self.r3_path_min_sigma < 0.0:
             raise ValueError("ABFLOW_R3_PATH_MIN_SIGMA must be non-negative.")
         if self.r3_transport_max <= 0.0:
             raise ValueError("ABFLOW_R3_TRANSPORT_MAX must be positive.")
+        if self.r3_g_mode not in {"adaptive_transport", "foldflow_fixed_scaled"}:
+            raise ValueError(
+                "ABFLOW_R3_G_MODE must be adaptive_transport or "
+                "foldflow_fixed_scaled."
+            )
+        if self.r3_fixed_g_scaled <= 0.0:
+            raise ValueError("ABFLOW_R3_FIXED_G_SCALED must be positive.")
+        if self.r3_noise_scope not in {"global", "residue"}:
+            raise ValueError("ABFLOW_R3_NOISE_SCOPE must be global or residue.")
+
         self.r3_matcher = AbFlowR3Matcher(
             transport_fraction=self.r3_transport_fraction,
             path_min_sigma=self.r3_path_min_sigma,
@@ -2959,6 +2994,9 @@ class AbFlowModel(nn.Module):
             return mu_t, target_X1, {
                 "r3_transport_mean": zero,
                 "r3_sigma_mean": zero,
+                "r3_g_raw_mean": zero,
+                "r3_g_scaled_equiv_mean": zero,
+                "r3_g_mode_fixed": zero,
                 "r3_noise_rms": zero,
                 "r3_target_shift_rms": zero,
                 "r3_noise_scope": zero,
@@ -2979,7 +3017,22 @@ class AbFlowModel(nn.Module):
             tgt_centroid - src_centroid, dim=-1
         ).clamp(min=0.0, max=float(self.r3_transport_max))
 
-        g_graph = self.r3_matcher.graph_g_from_transport(transport)
+        if self.r3_g_mode == "adaptive_transport":
+            g_graph = self.r3_matcher.graph_g_from_transport(transport)
+            g_mode_code = 0.0
+        elif self.r3_g_mode == "foldflow_fixed_scaled":
+            # FoldFlow defines g in scaled translation coordinates.  This
+            # routine receives raw-Angstrom H3 coordinates, therefore convert
+            # once and only once before constructing sigma_t.
+            g_raw = self.r3_matcher.foldflow_scaled_g_to_raw(
+                g_scaled=float(self.r3_fixed_g_scaled),
+                coordinate_scaling=float(self.flow_coordinate_scaling),
+            )
+            g_graph = torch.full_like(transport, float(g_raw))
+            g_mode_code = 1.0
+        else:  # guarded in __init__; defensive for checkpoint/config drift.
+            raise RuntimeError(f"Unsupported R3 g mode: {self.r3_g_mode}")
+
         t_graph_f = torch.as_tensor(
             t_graph, device=target_X1.device, dtype=torch.float32
         ).reshape(-1)
@@ -3039,6 +3092,11 @@ class AbFlowModel(nn.Module):
             return Xt, target, {
                 "r3_transport_mean": transport.mean().to(target_X1.dtype),
                 "r3_sigma_mean": sigma_graph.mean().to(target_X1.dtype),
+                "r3_g_raw_mean": g_graph.mean().to(target_X1.dtype),
+                "r3_g_scaled_equiv_mean": (
+                    g_graph.mean() * float(self.flow_coordinate_scaling)
+                ).to(target_X1.dtype),
+                "r3_g_mode_fixed": target_X1.new_tensor(g_mode_code),
                 "r3_noise_rms": torch.sqrt(
                     shift_res.pow(2).sum(dim=-1).mean().clamp_min(0.0)
                 ).to(target_X1.dtype),
@@ -5252,8 +5310,6 @@ class AbFlowModel(nn.Module):
         In PCS-RC mode X_pep/S_pep are also used to build a recurrent global
         proposal context, but they never overwrite the explicit shadow state.
         """
-        
-        # import ipdb; ipdb.set_trace()
         batch_id = self.batch_constants['batch_id']
 
         X = X.clone()
@@ -5996,14 +6052,15 @@ class AbFlowModel(nn.Module):
                 "f01_r3_canonical_carrier",
                 "f01_r3_endpoint_canonical_hybrid",
             }:
-                # EXACT historical F01 stochastic state.  Only the training
-                # target changes to one unified Score--Flow carrier.
+                # F01 stochastic state family.  R01 uses historical adaptive-g;
+                # v104 can standardize only g and/or noise support while keeping
+                # the same carrier algebra and matched sampler.
                 Xt, _, structured_path_details = (
                     self._foldflow_r3_primary_path(
                         source_X0=interface_X, target_X1=gt_interface_X,
                         t_graph=t_graph, t_int=t_int,
                         interface_batch_id=interface_batch_id,
-                        noise_scope="global", cfm_target=False,
+                        noise_scope=self.r3_noise_scope, cfm_target=False,
                     )
                 )
                 _t_min = (
@@ -6027,15 +6084,16 @@ class AbFlowModel(nn.Module):
                 "f01_r3_antithetic_boundary_regular",
                 "f01_r3_c1_smoothstep_canonical_carrier",
             }:
-                # EXACT historical F01 adaptive-g global-R3 stochastic state.
-                # v86 changes ONLY the output coordinate chart.  There is no
+                # Same F01 stochastic-path family as the U02 branch above.
+                # v104 may use fixed FoldFlow g, but this branch still changes
+                # ONLY the output coordinate chart.  There is no
                 # t-threshold and no auxiliary score/flow loss.
                 Xt, _, structured_path_details = (
                     self._foldflow_r3_primary_path(
                         source_X0=interface_X, target_X1=gt_interface_X,
                         t_graph=t_graph, t_int=t_int,
                         interface_batch_id=interface_batch_id,
-                        noise_scope="global", cfm_target=False,
+                        noise_scope=self.r3_noise_scope, cfm_target=False,
                     )
                 )
                 if self.scorefm_loss_mode == "f01_r3_c1_smoothstep_canonical_carrier":
