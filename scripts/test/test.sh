@@ -86,10 +86,12 @@ if [[ "$TASK" == "rabd" ]]; then
   esac
 
   echo "[FormalTest] task=rabd"
+  echo "[FormalTest] parallel_mode=cooperative_same_checkpoint"
   echo "[FormalTest] checkpoint=$CKPT"
   echo "[FormalTest] GPUs=$GPU world_size=$NPROC"
   echo "[FormalTest] test_set=$TEST_SET"
   echo "[FormalTest] logical_batch_size=$BATCH_SIZE n_steps=$N_STEPS base_seed=$BASE_SEED"
+  echo "[FormalTest] logical batches are assigned whole to DDP ranks; they are not split within a batch"
   echo "[FormalTest] save_dir=$SAVE_DIR"
 
   cd "$CODE_DIR"

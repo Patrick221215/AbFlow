@@ -32,6 +32,16 @@ def _env_flag(name, default=False):
     return value in {"1", "true", "yes", "y", "on"}
 
 
+def _env_float(name, default):
+    value = os.environ.get(name, "").strip()
+    return float(value) if value else float(default)
+
+
+def _env_str(name, default):
+    value = os.environ.get(name, "").strip()
+    return value if value else str(default)
+
+
 class _ExactDistributedValidationBatchSampler(Sampler):
     """Shard *logical validation batches* across ranks without padding.
 
@@ -93,6 +103,30 @@ class AbFlowTrainer(Trainer):
         self.max_step = config.max_epoch * config.step_per_epoch
         self.log_alpha = log(config.final_lr / config.lr) / self.max_step
         super().__init__(model, train_loader, valid_loader, config)
+
+        # ================================================================
+        # Module 9 — optimizer/schedule for the modern Pairformer backbone
+        # ================================================================
+        self._optimizer_name = _env_str("ABFLOW_OPTIMIZER", "adamw").lower()
+        if self._optimizer_name not in {"adamw", "adam"}:
+            raise ValueError("ABFLOW_OPTIMIZER must be adamw or adam")
+        self._weight_decay = _env_float("ABFLOW_WEIGHT_DECAY", 0.01)
+        if self._weight_decay < 0.0:
+            raise ValueError("ABFLOW_WEIGHT_DECAY must be non-negative")
+        self._warmup_epochs = max(
+            0, _env_int("ABFLOW_WARMUP_EPOCHS", getattr(config, "warmup", 0))
+        )
+        self._warmup_steps = min(
+            int(self.max_step),
+            int(self._warmup_epochs) * int(config.step_per_epoch),
+        )
+
+        # ================================================================
+        # Module 11 — formal three-phase Train -> Validation -> Test protocol
+        # ================================================================
+        self._three_phase_protocol = _env_flag(
+            "ABFLOW_THREE_PHASE_PROTOCOL", True
+        )
 
         self._diag_main_rank = int(getattr(self.config, "local_rank", -1)) in {-1, 0}
         requested_file_interval = _env_int("ABFLOW_DIAGNOSTIC_FILE_INTERVAL", 0)
@@ -182,17 +216,38 @@ class AbFlowTrainer(Trainer):
         ) or os.getcwd()).strip()
         self._epoch_test_dataset = None
         self._epoch_test_root = os.path.join(self.config.save_dir, "epoch_test")
+        self._phase_protocol_path = os.path.join(
+            self.config.save_dir, "phase_protocol.jsonl"
+        )
+        if self._three_phase_protocol:
+            if not self._epoch_test_enabled:
+                raise ValueError(
+                    "ABFLOW_THREE_PHASE_PROTOCOL=on requires ABFLOW_EPOCH_TEST=on"
+                )
+            if int(self._epoch_test_interval) != 1:
+                raise ValueError(
+                    "Formal Train->Validation->Test requires "
+                    "ABFLOW_EPOCH_TEST_INTERVAL=1"
+                )
+            if not self._epoch_test_json:
+                raise ValueError(
+                    "Formal Train->Validation->Test requires ABFLOW_EPOCH_TEST_JSON"
+                )
+            # Missing Test means the epoch protocol is incomplete; fail rather
+            # than silently producing an epoch without Test observations.
+            self._epoch_test_fail_fast = True
 
         self._diag_dir = os.path.join(self.config.save_dir, "diagnostics")
         if self._diag_main_rank and self._diag_enabled:
             os.makedirs(self._diag_dir, exist_ok=True)
             schema = {
-                "purpose": "Diagnose joint state, proposal influence, SATC scale, refinement rounds and objective conflicts.",
+                "purpose": "Diagnose modern generator objectives, joint structure-sequence state, refinement, optimizer stability and objective conflicts.",
                 "files": {
                     "metrics.jsonl": "append-only batch/validation diagnostic records",
                     "latest_train.json": "latest train record",
                     "latest_validation.json": "latest validation record",
                     "alerts.log": "heuristic warnings; warnings are not stopping rules",
+                    "../phase_protocol.jsonl": "one record per completed Train->Validation->Test epoch",
                 },
                 "intervals": {
                     "train_steps": self._diag_file_interval,
@@ -361,7 +416,9 @@ class AbFlowTrainer(Trainer):
         from utils.epoch_test import (
             TB_METRICS,
             append_epoch_metrics,
+            assigned_logical_batches,
             cleanup_structures,
+            dist_info,
             generate_distributed,
             run_cal_metrics_rank0,
         )
@@ -377,6 +434,38 @@ class AbFlowTrainer(Trainer):
         rng_state_before_test = get_rng_state()
         was_training = bool(self.model.training)
         metrics = {}
+
+        # Explicit observability for the SAME-WORLD DDP Test authority.
+        #
+        # Test intentionally assigns complete logical batches to ranks rather
+        # than dividing one logical batch by world_size.  This preserves the
+        # batch-keyed sampling RNG protocol across world sizes while still
+        # allowing all GPUs to generate different test batches concurrently.
+        test_rank, test_world_size = dist_info()
+        test_assignments = assigned_logical_batches(
+            len(dataset),
+            self._epoch_test_batch_size,
+            rank=test_rank,
+            world_size=test_world_size,
+        )
+        test_local_samples = sum(len(indices) for _, indices in test_assignments)
+        print(
+            "[EpochTestDDP] "
+            f"rank={test_rank}/{test_world_size} "
+            f"device={device} "
+            f"logical_batch_size={self._epoch_test_batch_size} "
+            f"assigned_batches={len(test_assignments)} "
+            f"assigned_samples={test_local_samples}",
+            flush=True,
+        )
+        if self._is_main_proc():
+            print(
+                "[EpochTestDDP] cooperative_same_checkpoint=on "
+                f"world_size={test_world_size} "
+                "protocol=logical_batch_seeded_v1",
+                flush=True,
+            )
+
         try:
             self.model.eval()
             # v103 validation_ema applies EMA whenever EMA exists.  This is the
@@ -529,28 +618,144 @@ class AbFlowTrainer(Trainer):
                 self.writer.flush()
         self.writer_buffer = {}
 
-        # Third epoch phase: real EMA rollout Test.  This is observation-only
-        # and leaves the scientific R01/R02/R03 configurations untouched.
-        if not self._epoch_test_should_run():
+    def _write_phase_protocol_record(self, test_metrics):
+        if not self._is_main_proc():
             return
+        record = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "epoch": int(self.epoch),
+            "global_step": int(self.global_step),
+            "order": ["train", "validation", "test"],
+            "train_loss": getattr(self, "last_train_metric", None),
+            "validation_loss": getattr(self, "last_valid_metric", None),
+            "test": dict(test_metrics or {}),
+            "checkpoint_authority": "validation_loss_only",
+            "auto_topk_eval": False,
+        }
+        os.makedirs(os.path.dirname(self._phase_protocol_path), exist_ok=True)
+        with open(self._phase_protocol_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+        if self.writer is not None:
+            if self.last_train_metric is not None:
+                self.writer.add_scalar(
+                    "Phase/TrainLoss", float(self.last_train_metric), int(self.epoch)
+                )
+            if self.last_valid_metric is not None:
+                self.writer.add_scalar(
+                    "Phase/ValidationLoss", float(self.last_valid_metric), int(self.epoch)
+                )
+            self.writer.flush()
+
+    def _test_epoch(self, device):
+        """Formal third phase, separated from Validation.
+
+        Test uses the same EMA/sample/cal_metrics core as standalone RAbD test,
+        restores RNG afterwards, and is never allowed to change checkpoint
+        membership or optimizer/scheduler state.
+        """
+        if not self._epoch_test_should_run():
+            if self._three_phase_protocol:
+                raise RuntimeError(
+                    "Three-phase protocol requires Test on every epoch."
+                )
+            self.last_test_metrics = {}
+            return self.last_test_metrics
         try:
-            self._run_epoch_test(device)
+            metrics = self._run_epoch_test(device)
+            self.last_test_metrics = dict(metrics or {})
+            self._write_phase_protocol_record(self.last_test_metrics)
+            return self.last_test_metrics
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
             self._write_epoch_test_error(message)
             if self._is_main_proc():
                 print(f"[EpochTest][ERROR] {message}")
-            if self._epoch_test_fail_fast:
+            if self._epoch_test_fail_fast or self._three_phase_protocol:
                 raise
+            self.last_test_metrics = {}
+            return self.last_test_metrics
+
+    def _optimizer_param_groups(self):
+        """Decoupled weight decay without penalizing scalar/vector parameters.
+
+        Matrix/tensor weights (ndim>=2) receive AdamW decay; biases, LayerNorm
+        scales and other 1-D parameters do not.  The partition is exhaustive and
+        deterministic, and introduces no model-specific hand tuning.
+        """
+        decay, no_decay = [], []
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if param.ndim >= 2:
+                decay.append(param)
+            else:
+                no_decay.append(param)
+        return [
+            {"params": decay, "weight_decay": float(self._weight_decay)},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
 
     def get_optimizer(self):
-        return torch.optim.Adam(self.model.parameters(), lr=self.config.lr)
+        optimizer_name = _env_str("ABFLOW_OPTIMIZER", "adamw").lower()
+        weight_decay = _env_float("ABFLOW_WEIGHT_DECAY", 0.01)
+
+        decay, no_decay = [], []
+        for _, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            (decay if param.ndim >= 2 else no_decay).append(param)
+
+        groups = [
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+        if optimizer_name == "adamw":
+            return torch.optim.AdamW(groups, lr=self.config.lr)
+        if optimizer_name == "adam":
+            return torch.optim.Adam(
+                self.model.parameters(), lr=self.config.lr
+            )
+        raise ValueError("ABFLOW_OPTIMIZER must be adamw or adam")
 
     def get_scheduler(self, optimizer):
-        log_alpha = self.log_alpha
-        lr_lambda = lambda step: exp(log_alpha * (step + 1))
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-        return {'scheduler': scheduler, 'frequency': 'batch'}
+        # Warmup is expressed in epochs to remain stable when world size changes;
+        # config.step_per_epoch converts it to optimizer steps.  After warmup, a
+        # log-linear/exponential schedule reaches final_lr at the formal horizon.
+        warmup_epochs = max(
+            0, _env_int(
+                "ABFLOW_WARMUP_EPOCHS", getattr(self.config, "warmup", 0)
+            )
+        )
+        warmup_steps = min(
+            int(self.max_step),
+            warmup_epochs * int(self.config.step_per_epoch),
+        )
+        total_steps = max(1, int(self.max_step))
+        base_lr = float(self.config.lr)
+        final_lr = float(self.config.final_lr)
+        if base_lr <= 0.0 or final_lr <= 0.0:
+            raise ValueError("lr and final_lr must be positive")
+        if final_lr > base_lr:
+            raise ValueError("formal warmup-exponential schedule requires final_lr <= lr")
+
+        decay_steps = max(1, total_steps - warmup_steps)
+        log_ratio = log(final_lr / base_lr)
+
+        def lr_lambda(step):
+            step = int(step)
+            if warmup_steps > 0 and step < warmup_steps:
+                return max(1.0 / warmup_steps, float(step + 1) / warmup_steps)
+            progress = min(
+                1.0,
+                max(0.0, float(step - warmup_steps + 1) / decay_steps),
+            )
+            return exp(log_ratio * progress)
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=lr_lambda
+        )
+        return {"scheduler": scheduler, "frequency": "batch"}
 
     def train_step(self, batch, batch_idx):
         batch['context_ratio'] = self.get_context_ratio()
@@ -690,13 +895,15 @@ class AbFlowTrainer(Trainer):
         # Capture validation diagnostics on every rank so epoch-level TensorBoard
         # aggregation reflects the entire validation set.  File writing remains
         # rank0-only to avoid concurrent JSONL writes.
+        should_probe_grad = bool(self._should_probe_grad(val))
         capture_diagnostics = (
             (bool(val) and bool(getattr(self, "_ddp_validation_active", False)))
             or self._should_write(val, batch_idx)
-            or self._should_probe_grad(val)
+            or should_probe_grad
         )
         raw_model._diagnostic_capture = bool(capture_diagnostics)
         raw_model._diagnostic_validation_mode = bool(val and capture_diagnostics)
+        raw_model._gradient_diagnostic_capture = should_probe_grad
 
         loss, seq_detail, structure_detail, dock_detail, pdev_detail = self.model(**batch)
         snll, aar = seq_detail
@@ -704,7 +911,7 @@ class AbFlowTrainer(Trainer):
         dock_loss, interface_loss, ed_loss, r_ed_losses = dock_detail
         pdev_loss, prmsd_loss = pdev_detail
 
-        if self._should_probe_grad(val) and hasattr(raw_model, "compute_gradient_conflict_diagnostics"):
+        if should_probe_grad and hasattr(raw_model, "compute_gradient_conflict_diagnostics"):
             raw_model.compute_gradient_conflict_diagnostics()
             grad_error = str(getattr(raw_model, "_last_gradient_diagnostic_error", "") or "")
             if grad_error and self._diag_main_rank and self._diag_enabled:
@@ -719,6 +926,9 @@ class AbFlowTrainer(Trainer):
                     )
         else:
             raw_model.last_gradient_diagnostics = {}
+
+        if hasattr(raw_model, "release_gradient_diagnostic_graph_refs"):
+            raw_model.release_gradient_diagnostic_graph_refs()
 
         log_type = 'Validation' if val else 'Train'
         self.log(f'Overall/Loss/{log_type}', loss, batch_idx, val)
@@ -740,6 +950,20 @@ class AbFlowTrainer(Trainer):
         scorefm_losses = getattr(raw_model, "last_scorefm_losses", None) or {}
         for name, value in scorefm_losses.items():
             self.log(f"DTM/{name}/{log_type}", value, batch_idx, val)
+
+        # Modules 6--8 + Confidence diagnostics.  The model already returns the
+        # correct optimization loss: training includes detached confidence
+        # calibration, validation excludes it from checkpoint authority.
+        modern_aux = getattr(
+            raw_model, "last_modern_auxiliary_losses", None
+        ) or {}
+        for name, value in modern_aux.items():
+            self.log(
+                f"Modern/{name}/{log_type}",
+                value,
+                batch_idx,
+                val,
+            )
 
         abflow_diagnostics = getattr(raw_model, "last_abflow_diagnostics", None) or {}
         for name, value in abflow_diagnostics.items():
@@ -777,6 +1001,7 @@ class AbFlowTrainer(Trainer):
             }
             for prefix, values in (
                 ("dtm", scorefm_losses),
+                ("modern", modern_aux),
                 ("diag", abflow_diagnostics),
                 ("grad", grad_diagnostics),
             ):

@@ -727,7 +727,7 @@ def evaluate_one(
 
 
 def worker(
-    gpu: str,
+    gpu_group: str,
     q: "queue.Queue[TopKEntry]",
     args,
     lock: threading.Lock,
@@ -739,19 +739,19 @@ def worker(
             return
         try:
             print(
-                f"[TopK evaluator] GPU {gpu}: {entry.short_name}",
+                f"[TopK evaluator] GPU group {gpu_group}: {entry.short_name}",
                 flush=True,
             )
-            row = evaluate_one(entry, gpu, args, lock)
+            row = evaluate_one(entry, gpu_group, args, lock)
             print(
-                f"[TopK evaluator] GPU {gpu}: {entry.short_name} "
+                f"[TopK evaluator] GPU group {gpu_group}: {entry.short_name} "
                 f"status={row.get('status')} "
                 f"{row.get('core_metrics','')}",
                 flush=True,
             )
         except Exception as exc:
             print(
-                f"[TopK evaluator] ERROR GPU {gpu} "
+                f"[TopK evaluator] ERROR GPU group {gpu_group} "
                 f"{entry.ckpt}: {exc}",
                 flush=True,
             )
@@ -825,14 +825,31 @@ def run_once(args) -> int:
         for g in str(args.gpu_ids).split(",")
         if g.strip()
     ] or ["0"]
+
+    if args.gpu_mode == "cooperative":
+        # One checkpoint uses the whole physical GPU list through the launcher's
+        # DDP Test bridge. Checkpoints are evaluated sequentially so the same
+        # GPU group is never oversubscribed.
+        gpu_groups = [",".join(gpus)]
+    else:
+        # Historical behavior: GPU2 evaluates checkpoint A while GPU3 can
+        # independently evaluate checkpoint B.
+        gpu_groups = list(gpus)
+
+    print(
+        f"[TopK evaluator] gpu_mode={args.gpu_mode} "
+        f"gpu_groups={gpu_groups}",
+        flush=True,
+    )
+
     lock = threading.Lock()
     threads = [
         threading.Thread(
             target=worker,
-            args=(gpu, q, args, lock),
+            args=(gpu_group, q, args, lock),
             daemon=True,
         )
-        for gpu in gpus
+        for gpu_group in gpu_groups
     ]
     for t in threads:
         t.start()
@@ -870,7 +887,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--launcher",
         default="scripts/train/run_state_consistent_ablation.sh",
     )
-    p.add_argument("--gpu-ids", default="0")
+    p.add_argument(
+        "--gpu-ids",
+        default="0",
+        help=(
+            "Physical GPU list. With --gpu-mode cooperative (default), "
+            "'2,3' is one DDP group for the SAME checkpoint. With "
+            "--gpu-mode independent, each GPU evaluates a different checkpoint."
+        ),
+    )
+    p.add_argument(
+        "--gpu-mode",
+        choices=["cooperative", "independent"],
+        default=os.environ.get("ABFLOW_TOPK_GPU_MODE", "cooperative").strip().lower(),
+        help=(
+            "cooperative: all --gpu-ids form one DDP group for one checkpoint "
+            "(formal default); independent: legacy one-checkpoint-per-GPU workers."
+        ),
+    )
     p.add_argument(
         "--limit",
         type=int,
