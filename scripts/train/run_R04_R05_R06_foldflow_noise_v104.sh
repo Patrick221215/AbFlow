@@ -27,6 +27,8 @@ PYSELF
 #      the Euclidean translation granularity used by FoldFlow.
 # R06: R04, but change only U02's hard endpoint/canonical seam to the already
 #      implemented U03 boundary-regular carrier and its matched sampler.
+# R07: R05 + R06 factor combination: residue-level R3 support + U03 carrier.
+#      Relative to R05, only the carrier changes; no model code is changed.
 #
 # Physical path min_sigma is intentionally 0 for all three formal runs.  This
 # keeps PCS-RC/native as exact endpoints and preserves the exact canonical
@@ -148,12 +150,31 @@ case "$EXP_ID" in
     export ABFLOW_FLOW_T_MAX="1.0"
     ;;
 
+
+  R07_PCS_RC_LC_R1_ABX_FF_FIXEDG_RESIDUE_U03_SCOREFLOW)
+    # R07 = R05 + the single carrier change already validated in R06.
+    # Relative to R05 this remains a one-factor ablation:
+    #   residue support stays fixed; U02 -> U03 only.
+    export ABFLOW_ABLATION_PARENT="R05_PCS_RC_LC_R1_ABX_FF_FIXEDG_RESIDUE_U02_SCOREFLOW"
+    export ABFLOW_EXPERIMENT_FACTOR="u02_hard_seam_to_u03_boundary_regular_carrier_only_on_residue_support"
+    export ABFLOW_SINGLE_FACTOR_ABLATION="true"
+    export ABFLOW_MODULE_ID="R07_FF_FIXEDG_RESIDUE_U03"
+    export ABFLOW_MODULE_PARENT="R05_FF_FIXEDG_RESIDUE_U02"
+
+    export ABFLOW_R3_NOISE_SCOPE="residue"
+    export ABFLOW_SCOREFM_LOSS_MODE="f01_r3_boundary_regular_carrier"
+    export ABFLOW_SCOREFM_SAMPLER_MODE="f01_boundary_regular_carrier"
+    export ABFLOW_FLOW_T_MIN="0.0"
+    export ABFLOW_FLOW_T_MAX="1.0"
+    ;;
+
   *)
     echo "Unknown EXP_ID: $EXP_ID"
     echo "Supported v104:"
     echo "  R04_PCS_RC_LC_R1_ABX_FF_FIXEDG_GLOBAL_U02_SCOREFLOW"
     echo "  R05_PCS_RC_LC_R1_ABX_FF_FIXEDG_RESIDUE_U02_SCOREFLOW"
     echo "  R06_PCS_RC_LC_R1_ABX_FF_FIXEDG_GLOBAL_U03_SCOREFLOW"
+    echo "  R07_PCS_RC_LC_R1_ABX_FF_FIXEDG_RESIDUE_U03_SCOREFLOW"
     exit 2
     ;;
 esac
@@ -450,9 +471,9 @@ if [[ "$MODE" == "attach_eval" ]]; then
 fi
 
 if [[ "$MODE" != "train" ]]; then
-  echo "Train:       bash $0 train <R04|R05|R06 EXP_ID> 2,3 <config.json>"
-  echo "Test bridge: bash $0 test  <R04|R05|R06 EXP_ID> 2,3 <ckpt> <result_dir> [test.json]"
-  echo "Attach eval: bash $0 attach_eval <R04|R05|R06 EXP_ID> 2,3 [eval_gpus|auto]"
+  echo "Train:       bash $0 train <R04|R05|R06|R07 EXP_ID> 2,3 <config.json>"
+  echo "Test bridge: bash $0 test  <R04|R05|R06|R07 EXP_ID> 2,3 <ckpt> <result_dir> [test.json]"
+  echo "Attach eval: bash $0 attach_eval <R04|R05|R06|R07 EXP_ID> 2,3 [eval_gpus|auto]"
   exit 2
 fi
 
