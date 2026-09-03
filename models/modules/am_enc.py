@@ -656,6 +656,13 @@ _ATTN_RUNTIME_STATS = {
     "lma_calls": 0,
     "checkpoint_cleanup_calls": 0,
     "checkpoint_storage_tensors": 0,
+    # v126 batched-runtime counters (plain Python integers only).
+    "batched_pairformer_calls": 0,
+    "graphwise_equiv_pairformer_calls": 0,
+    "batched_atom_calls": 0,
+    "batched_shadow_atom_calls": 0,
+    "real_tokens": 0,
+    "padded_tokens": 0,
 }
 
 
@@ -1640,6 +1647,215 @@ class FixedSlotAtomStructureNetwork(nn.Module):
         pred = coords + update
         return a[0], pred
 
+    def forward_batched(
+        self,
+        s,
+        z,
+        coords,
+        atom_attr,
+        atom_weights,
+        residue_update_mask=None,
+        token_valid_mask=None,
+    ):
+        """MFDesign-style batch-first fixed-slot AtomStructure.
+
+        Parameters
+        ----------
+        s : [B,L,Ds]
+        z : [B,L,L,Dz]
+        coords : [B,L,C,3]
+        atom_attr : [B,L,C,Da]
+        atom_weights : [B,L,C]
+        residue_update_mask : [B,L] or None
+        token_valid_mask : [B,L] or None
+
+        The equations are exactly the same as ``forward``.  The only change is
+        that the existing MFDesign batch dimension is used directly instead of
+        invoking the module B separate times from Python.
+        """
+        if s.ndim != 3 or z.ndim != 4 or coords.ndim != 4:
+            raise ValueError(
+                "forward_batched expects s[B,L,D], z[B,L,L,Dz], "
+                "coords[B,L,C,3]"
+            )
+        B, L, C, _ = coords.shape
+        if C != self.n_channel:
+            raise ValueError(
+                f"expected n_channel={self.n_channel}, got C={C}"
+            )
+        if z.shape[:3] != (B, L, L):
+            raise ValueError(
+                f"z shape mismatch: got {tuple(z.shape)}, "
+                f"expected [{B},{L},{L},Dz]"
+            )
+
+        if _env_flag("ABFLOW_PERF_DIAGNOSTICS", False):
+            _ATTN_RUNTIME_STATS["batched_atom_calls"] += 1
+
+        atom_mask = (atom_weights != 0).to(coords.dtype)
+        if token_valid_mask is None:
+            token_valid_mask = torch.ones(
+                (B, L), dtype=coords.dtype, device=coords.device
+            )
+        else:
+            token_valid_mask = token_valid_mask.to(
+                device=coords.device, dtype=coords.dtype
+            ).reshape(B, L)
+        atom_mask = atom_mask * token_valid_mask[:, :, None]
+        atom_feat = torch.cat(
+            [atom_attr, atom_mask.unsqueeze(-1)], dim=-1
+        )
+
+        A = L * C
+        pad_A = (self.W - (A % self.W)) % self.W
+        A_pad = A + pad_A
+
+        coords_f = coords.reshape(B, A, 3)
+        mask_f = atom_mask.reshape(B, A)
+        feat_f = atom_feat.reshape(B, A, atom_feat.shape[-1])
+        token_ids = (
+            torch.arange(L, device=coords.device)
+            .repeat_interleave(C)
+            .view(1, A)
+            .expand(B, A)
+        )
+
+        coords_f = self._pad_atoms(coords_f, pad_A, fill=0.0)
+        mask_f = self._pad_atoms(
+            mask_f.unsqueeze(-1), pad_A, fill=0.0
+        ).squeeze(-1)
+        feat_f = self._pad_atoms(feat_f, pad_A, fill=0.0)
+        token_ids = self._pad_atoms(
+            token_ids.unsqueeze(-1).to(coords.dtype),
+            pad_A,
+            fill=-1.0,
+        ).squeeze(-1).long()
+
+        c = self.embed_atom_features(feat_f)
+        valid_tid = token_ids.clamp(min=0)
+        token_cond = torch.gather(
+            s,
+            1,
+            valid_tid.unsqueeze(-1).expand(
+                B, A_pad, s.shape[-1]
+            ),
+        )
+        token_cond = token_cond * (token_ids >= 0).unsqueeze(-1)
+        c = c + self.s_to_c(token_cond)
+
+        q = c + self.r_to_q(coords_f)
+
+        K = A_pad // self.W
+        indexing = get_indexing_matrix(
+            K, self.W, self.H, coords.device
+        )
+        to_keys = partial(
+            single_to_keys,
+            indexing_matrix=indexing,
+            W=self.W,
+            H=self.H,
+        )
+
+        q_coords = coords_f.view(B, K, self.W, 1, 3)
+        k_coords = to_keys(coords_f).view(B, K, 1, self.H, 3)
+        d = k_coords - q_coords
+        inv_dist = 1.0 / (
+            1.0 + torch.sum(d * d, dim=-1, keepdim=True)
+        )
+
+        q_mask = mask_f.view(B, K, self.W, 1).bool()
+        k_mask = to_keys(
+            mask_f.unsqueeze(-1)
+        ).view(B, K, 1, self.H).bool()
+        valid = (q_mask & k_mask).float().unsqueeze(-1)
+
+        p = self.embed_atompair_pos(d) * valid
+        p = p + self.embed_atompair_dist(inv_dist) * valid
+        p = p + self.embed_atompair_mask(valid) * valid
+
+        # Same token-pair -> atom-window lookup as the validated single path.
+        q_tid = token_ids.view(B, K, self.W, 1)
+        k_tid = to_keys(
+            token_ids.unsqueeze(-1).float()
+        ).view(B, K, 1, self.H).long()
+        q_valid = q_tid >= 0
+        k_valid = k_tid >= 0
+        q_safe = q_tid.clamp(min=0, max=max(0, L - 1))
+        k_safe = k_tid.clamp(min=0, max=max(0, L - 1))
+
+        b_idx = torch.arange(
+            B, device=coords.device
+        ).view(B, 1, 1, 1)
+        z_atom = z[b_idx, q_safe, k_safe]
+        z_atom = z_atom * (
+            q_valid & k_valid
+        ).unsqueeze(-1)
+        p = p + self.z_to_p(z_atom)
+
+        p = p + self.c_to_p_q(
+            c.view(B, K, self.W, 1, -1)
+        )
+        p = p + self.c_to_p_k(
+            to_keys(c).view(B, K, 1, self.H, -1)
+        )
+        p = p + self.p_mlp(p)
+
+        q_skip, c_skip, p_skip = q, c, p
+        q = self.atom_encoder(
+            q=q, c=c, p=p, mask=mask_f, to_keys=to_keys
+        )
+
+        # Atom -> token mean, now batched.
+        q_real = q[:, :A].reshape(B, L, C, -1)
+        mask_real = atom_mask.unsqueeze(-1)
+        denom = mask_real.sum(dim=2).clamp_min(1.0)
+        a = (
+            self.atom_to_token(q_real) * mask_real
+        ).sum(dim=2) / denom
+
+        a = a + self.s_to_a(s)
+        a = self.token_transformer(
+            a=a,
+            s=s,
+            z=z,
+            mask=token_valid_mask,
+        )
+        a = self.a_norm(a)
+
+        # Token -> atom gather and decoder.
+        a_atom = torch.gather(
+            a,
+            1,
+            valid_tid.unsqueeze(-1).expand(
+                B, A_pad, a.shape[-1]
+            ),
+        )
+        a_atom = a_atom * (token_ids >= 0).unsqueeze(-1)
+        q = q_skip + self.a_to_q(a_atom)
+        q = self.atom_decoder(
+            q=q,
+            c=c_skip,
+            p=p_skip,
+            mask=mask_f,
+            to_keys=to_keys,
+        )
+
+        update = self.to_xyz(q[:, :A]).reshape(B, L, C, 3)
+        update = update * atom_mask.unsqueeze(-1)
+
+        if residue_update_mask is not None:
+            if residue_update_mask.shape != (B, L):
+                raise ValueError(
+                    "batched residue_update_mask must be [B,L]; "
+                    f"got {tuple(residue_update_mask.shape)}"
+                )
+            update = update * residue_update_mask.to(
+                update
+            ).view(B, L, 1, 1)
+
+        pred = coords + update
+        return a, pred
+
 
 
 # ============================================================================
@@ -2518,6 +2734,35 @@ class AMEncoder(nn.Module):
         self.recycling_steps = max(0, _env_int('ABFLOW_MFDESIGN_RECYCLING_STEPS', 3))
         self.random_recycling = _env_flag('ABFLOW_MFDESIGN_RANDOM_RECYCLING', True)
 
+        # v126 MFDesign-style runtime authority.
+        self.batched_runtime = _env_flag(
+            "ABFLOW_MFDESIGN_BATCHED_RUNTIME", False
+        )
+        self.batched_parity_check = _env_flag(
+            "ABFLOW_BATCHED_PARITY_CHECK", False
+        )
+        self.batched_parity_fail_fast = _env_flag(
+            "ABFLOW_BATCHED_PARITY_FAIL_FAST", True
+        )
+        # v127 parity policy:
+        # batched GEMM/reduction is mathematically identical to per-sample
+        # execution but is not expected to be bitwise-identical in FP32.
+        # Use both pointwise and aggregate criteria so we do not "pass" a
+        # systematic padding/mask error by merely relaxing one max threshold.
+        self.batched_parity_hidden_max_tol = _env_float(
+            "ABFLOW_BATCHED_PARITY_HIDDEN_MAX_TOL", 2e-4
+        )
+        self.batched_parity_hidden_rms_tol = _env_float(
+            "ABFLOW_BATCHED_PARITY_HIDDEN_RMS_TOL", 2e-5
+        )
+        self.batched_parity_hidden_rel_l2_tol = _env_float(
+            "ABFLOW_BATCHED_PARITY_HIDDEN_REL_L2_TOL", 2e-5
+        )
+        self.batched_parity_coord_max_tol = _env_float(
+            "ABFLOW_BATCHED_PARITY_COORD_MAX_TOL", 1e-5
+        )
+        self._batched_parity_done = False
+
         # -------------------- Module 3: Pairformer
         token_heads = 8
         if hidden_nf % token_heads != 0:
@@ -2604,6 +2849,847 @@ class AMEncoder(nn.Module):
 
         self.linear_out = nn.Linear(hidden_nf, out_node_nf)
 
+
+    @staticmethod
+    def _max_valid_diff(a, b, mask):
+        if mask is None:
+            return float((a.float() - b.float()).abs().max().item())
+        while mask.ndim < a.ndim:
+            mask = mask.unsqueeze(-1)
+        selected = (a.float() - b.float()).abs() * mask.to(a)
+        return float(selected.max().item())
+
+    def _batched_runtime_log(self, message):
+        if not _env_flag("ABFLOW_BATCHED_RUNTIME_DIAGNOSTICS", False):
+            return
+        rank = _runtime_trace_rank()
+        line = f"[BatchedRuntime] rank={rank} {message}"
+        if rank == 0:
+            print(line, flush=True)
+        _runtime_trace_file_line(line)
+
+    def _run_batched_complexes(
+        self,
+        s_raw,
+        x,
+        atom_attr,
+        atom_weights,
+        feats,
+        residue_update_mask,
+        recycling_steps,
+    ):
+        """Batch-first MFDesign trunk + full-complex AtomStructure."""
+        B, L, _ = s_raw.shape
+
+        s_init = self.s_init(s_raw)
+        z_init = (
+            self.z_init_1(s_raw)[:, :, None, :]
+            + self.z_init_2(s_raw)[:, None, :, :]
+        )
+        z_init = z_init + self.rel_pos(feats)
+        z_init = z_init + self.token_bonds(
+            feats["token_bonds"].float()
+        )
+
+        if self.current_state_pair_geometry:
+            ca_idx = 1 if x.shape[2] > 1 else 0
+            d_ang = torch.cdist(
+                x[:, :, ca_idx].float(),
+                x[:, :, ca_idx].float(),
+            ) * float(self.coord_scale_angstrom)
+            geom_bin = self.distogram_binner(d_ang)
+            z_init = z_init + self.current_state_dist_embedding(
+                geom_bin
+            )
+
+        mask = feats["token_pad_mask"].to(s_raw.dtype)
+        pair_mask = mask[:, :, None] * mask[:, None, :]
+
+        s = torch.zeros_like(s_init)
+        z = torch.zeros_like(z_init)
+        steps = int(recycling_steps)
+
+        for recycle_idx in range(steps + 1):
+            final_pass = recycle_idx == steps
+            grad_on = bool(
+                self.training
+                and final_pass
+                and torch.is_grad_enabled()
+            )
+
+            # The same AMP correctness barrier as the validated graphwise path,
+            # but now it is executed ONCE for the whole local batch rather than
+            # once per complex.
+            if (
+                grad_on
+                and recycle_idx > 0
+                and torch.is_autocast_enabled()
+            ):
+                torch.clear_autocast_cache()
+
+            with torch.set_grad_enabled(grad_on):
+                s = s_init + self.s_recycle(
+                    self.s_recycle_norm(s)
+                )
+                z = z_init + self.z_recycle(
+                    self.z_recycle_norm(z)
+                )
+                s, z = self.pairformer(
+                    s,
+                    z,
+                    mask=mask,
+                    pair_mask=pair_mask,
+                )
+
+            if _env_flag("ABFLOW_PERF_DIAGNOSTICS", False):
+                _ATTN_RUNTIME_STATS[
+                    "batched_pairformer_calls"
+                ] += 1
+                _ATTN_RUNTIME_STATS[
+                    "graphwise_equiv_pairformer_calls"
+                ] += B
+
+        s_struct, pred_x = self.atom_structure.forward_batched(
+            s=s,
+            z=z,
+            coords=x,
+            atom_attr=atom_attr,
+            atom_weights=atom_weights,
+            residue_update_mask=residue_update_mask,
+            token_valid_mask=mask,
+        )
+        return s, z, s_struct, pred_x
+
+    def _clean_self_condition_z_batched(
+        self,
+        s_local,
+        z_local,
+        current_coords,
+        atom_attr,
+        atom_weights,
+        residue_update_mask,
+        token_valid_mask,
+        active_graph_ids,
+    ):
+        """Batch-first equivalent of per-graph clean self-conditioning."""
+        B = s_local.shape[0]
+
+        if not self.clean_self_condition:
+            s_out, pred = self.atom_structure.forward_batched(
+                s=s_local,
+                z=z_local,
+                coords=current_coords,
+                atom_attr=atom_attr,
+                atom_weights=atom_weights,
+                residue_update_mask=residue_update_mask,
+                token_valid_mask=token_valid_mask,
+            )
+            if _env_flag("ABFLOW_PERF_DIAGNOSTICS", False):
+                _ATTN_RUNTIME_STATS[
+                    "batched_shadow_atom_calls"
+                ] += 1
+            gates = current_coords.new_zeros((B,))
+            return s_out, pred, z_local, gates
+
+        with torch.no_grad():
+            _, clean0 = self.atom_structure.forward_batched(
+                s=s_local,
+                z=z_local,
+                coords=current_coords,
+                atom_attr=atom_attr,
+                atom_weights=atom_weights,
+                residue_update_mask=residue_update_mask,
+                token_valid_mask=token_valid_mask,
+            )
+            if _env_flag("ABFLOW_PERF_DIAGNOSTICS", False):
+                _ATTN_RUNTIME_STATS[
+                    "batched_shadow_atom_calls"
+                ] += 1
+
+            ca_idx = 1 if clean0.shape[2] > 1 else 0
+            d_ang = torch.cdist(
+                clean0[:, :, ca_idx].float(),
+                clean0[:, :, ca_idx].float(),
+            ) * float(self.coord_scale_angstrom)
+            sc_bins = self.distogram_binner(d_ang)
+
+        # Preserve graphwise gate semantics: one scalar Bernoulli draw per
+        # active graph, in ascending graph order.  A vectorized torch.rand(B)
+        # call is intentionally avoided because exact RNG counter assignment
+        # is implementation-dependent on CUDA.
+        if self.training:
+            gate_list = []
+            for _graph_id in active_graph_ids:
+                del _graph_id
+                gate_list.append(
+                    (
+                        torch.rand(
+                            (),
+                            device=current_coords.device,
+                        )
+                        < float(self.clean_self_condition_prob)
+                    ).to(current_coords.dtype)
+                )
+            gates = torch.stack(gate_list, dim=0)
+        else:
+            gates = current_coords.new_ones((B,))
+
+        z_sc = z_local + (
+            gates[:, None, None, None]
+            * self.clean_sc_embedding(sc_bins)
+        )
+
+        s_out, pred = self.atom_structure.forward_batched(
+            s=s_local,
+            z=z_sc,
+            coords=current_coords,
+            atom_attr=atom_attr,
+            atom_weights=atom_weights,
+            residue_update_mask=residue_update_mask,
+            token_valid_mask=token_valid_mask,
+        )
+        if _env_flag("ABFLOW_PERF_DIAGNOSTICS", False):
+            _ATTN_RUNTIME_STATS[
+                "batched_shadow_atom_calls"
+            ] += 1
+        return s_out, pred, z_sc, gates
+
+    def _maybe_check_batched_parity(
+        self,
+        s_raw_b,
+        x_b,
+        atom_attr_b,
+        atom_weights_b,
+        feats_b,
+        update_b,
+        lengths,
+    ):
+        """First-batch deterministic eval parity: batched vs graphwise.
+
+        The check is intentionally:
+        - no-grad;
+        - FP32 (autocast disabled);
+        - eval-mode (dropout disabled);
+        - limited to at most two complexes.
+
+        Therefore it validates padding/masking/batch algebra without consuming
+        training RNG or changing the actual training graph.
+        """
+        if (
+            not self.batched_parity_check
+            or self._batched_parity_done
+            or len(lengths) == 0
+        ):
+            return
+        self._batched_parity_done = True
+
+        Bv = min(2, len(lengths))
+        Lv = max(int(v) for v in lengths[:Bv])
+
+        pair_training = self.pairformer.training
+        atom_training = self.atom_structure.training
+        self.pairformer.eval()
+        self.atom_structure.eval()
+
+        pair_s_err = 0.0
+        pair_z_err = 0.0
+        atom_s_err = 0.0
+        atom_x_err = 0.0
+
+        pair_s_sse = 0.0
+        pair_s_ref_sse = 0.0
+        pair_s_count = 0
+        pair_z_sse = 0.0
+        pair_z_ref_sse = 0.0
+        pair_z_count = 0
+        atom_s_sse = 0.0
+        atom_s_ref_sse = 0.0
+        atom_s_count = 0
+        atom_x_sse = 0.0
+        atom_x_ref_sse = 0.0
+        atom_x_count = 0
+
+        try:
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(enabled=False):
+                    sraw = s_raw_b[:Bv, :Lv].float()
+                    xb = x_b[:Bv, :Lv].float()
+                    aa = atom_attr_b[:Bv, :Lv].float()
+                    aw = atom_weights_b[:Bv, :Lv].float()
+                    up = update_b[:Bv, :Lv]
+                    f = {}
+                    for key, value in feats_b.items():
+                        if key == "token_bonds":
+                            f[key] = value[
+                                :Bv, :Lv, :Lv
+                            ].float()
+                        else:
+                            f[key] = value[:Bv, :Lv]
+
+                    s_init = self.s_init(sraw)
+                    z_init = (
+                        self.z_init_1(sraw)[:, :, None, :]
+                        + self.z_init_2(sraw)[:, None, :, :]
+                    )
+                    z_init = z_init + self.rel_pos(f)
+                    z_init = z_init + self.token_bonds(
+                        f["token_bonds"].float()
+                    )
+                    if self.current_state_pair_geometry:
+                        ca_idx = 1 if xb.shape[2] > 1 else 0
+                        d_ang = torch.cdist(
+                            xb[:, :, ca_idx],
+                            xb[:, :, ca_idx],
+                        ) * float(self.coord_scale_angstrom)
+                        z_init = z_init + (
+                            self.current_state_dist_embedding(
+                                self.distogram_binner(d_ang)
+                            ).float()
+                        )
+
+                    mask = f["token_pad_mask"].float()
+                    pair_mask = (
+                        mask[:, :, None] * mask[:, None, :]
+                    )
+
+                    sb, zb = self.pairformer(
+                        s_init,
+                        z_init,
+                        mask,
+                        pair_mask,
+                    )
+
+                    for bi in range(Bv):
+                        Li = int(lengths[bi])
+                        si, zi = self.pairformer(
+                            s_init[bi:bi + 1, :Li],
+                            z_init[
+                                bi:bi + 1, :Li, :Li
+                            ],
+                            mask[bi:bi + 1, :Li],
+                            pair_mask[
+                                bi:bi + 1, :Li, :Li
+                            ],
+                        )
+                        _ds = (
+                            sb[bi, :Li].float() - si[0].float()
+                        )
+                        _dz = (
+                            zb[bi, :Li, :Li].float()
+                            - zi[0].float()
+                        )
+                        pair_s_err = max(
+                            pair_s_err,
+                            float(_ds.abs().max().item()),
+                        )
+                        pair_z_err = max(
+                            pair_z_err,
+                            float(_dz.abs().max().item()),
+                        )
+                        pair_s_sse += float(
+                            (_ds * _ds).sum().item()
+                        )
+                        pair_s_ref_sse += float(
+                            (si[0].float() ** 2).sum().item()
+                        )
+                        pair_s_count += int(_ds.numel())
+
+                        pair_z_sse += float(
+                            (_dz * _dz).sum().item()
+                        )
+                        pair_z_ref_sse += float(
+                            (zi[0].float() ** 2).sum().item()
+                        )
+                        pair_z_count += int(_dz.numel())
+
+                    as_b, ax_b = (
+                        self.atom_structure.forward_batched(
+                            s=sb,
+                            z=zb,
+                            coords=xb,
+                            atom_attr=aa,
+                            atom_weights=aw,
+                            residue_update_mask=up,
+                            token_valid_mask=mask,
+                        )
+                    )
+
+                    for bi in range(Bv):
+                        Li = int(lengths[bi])
+                        as_i, ax_i = self.atom_structure(
+                            s=sb[bi, :Li],
+                            z=zb[
+                                bi:bi + 1, :Li, :Li
+                            ],
+                            coords=xb[bi, :Li],
+                            atom_attr=aa[bi, :Li],
+                            atom_weights=aw[bi, :Li],
+                            residue_update_mask=up[bi, :Li],
+                            token_valid_mask=mask[bi, :Li],
+                        )
+                        _das = (
+                            as_b[bi, :Li].float() - as_i.float()
+                        )
+                        _dax = (
+                            ax_b[bi, :Li].float() - ax_i.float()
+                        )
+                        atom_s_err = max(
+                            atom_s_err,
+                            float(_das.abs().max().item()),
+                        )
+                        atom_x_err = max(
+                            atom_x_err,
+                            float(_dax.abs().max().item()),
+                        )
+
+                        atom_s_sse += float(
+                            (_das * _das).sum().item()
+                        )
+                        atom_s_ref_sse += float(
+                            (as_i.float() ** 2).sum().item()
+                        )
+                        atom_s_count += int(_das.numel())
+
+                        atom_x_sse += float(
+                            (_dax * _dax).sum().item()
+                        )
+                        atom_x_ref_sse += float(
+                            (ax_i.float() ** 2).sum().item()
+                        )
+                        atom_x_count += int(_dax.numel())
+        finally:
+            self.pairformer.train(pair_training)
+            self.atom_structure.train(atom_training)
+            # The diagnostic performed no-grad linear calls.  Never allow any
+            # low-precision no-grad weight casts to leak into the real
+            # grad-enabled training pass.
+            if torch.is_autocast_enabled():
+                torch.clear_autocast_cache()
+
+        def _rms(sse, count):
+            return (float(sse) / float(max(1, count))) ** 0.5
+
+        def _rel_l2(sse, ref_sse):
+            return (
+                float(sse) / max(float(ref_sse), 1e-30)
+            ) ** 0.5
+
+        pair_s_rms = _rms(pair_s_sse, pair_s_count)
+        pair_z_rms = _rms(pair_z_sse, pair_z_count)
+        atom_s_rms = _rms(atom_s_sse, atom_s_count)
+        atom_x_rms = _rms(atom_x_sse, atom_x_count)
+
+        pair_s_rel = _rel_l2(pair_s_sse, pair_s_ref_sse)
+        pair_z_rel = _rel_l2(pair_z_sse, pair_z_ref_sse)
+        atom_s_rel = _rel_l2(atom_s_sse, atom_s_ref_sse)
+        atom_x_rel = _rel_l2(atom_x_sse, atom_x_ref_sse)
+
+        hidden_max = max(
+            pair_s_err, pair_z_err, atom_s_err
+        )
+        hidden_rms = max(
+            pair_s_rms, pair_z_rms, atom_s_rms
+        )
+        hidden_rel_l2 = max(
+            pair_s_rel, pair_z_rel, atom_s_rel
+        )
+
+        line = (
+            "[BatchedParity] "
+            f"rank={_runtime_trace_rank()} B={Bv} Lmax={Lv} "
+            f"pair_s_max={pair_s_err:.3e} "
+            f"pair_s_rms={pair_s_rms:.3e} "
+            f"pair_s_rel_l2={pair_s_rel:.3e} "
+            f"pair_z_max={pair_z_err:.3e} "
+            f"pair_z_rms={pair_z_rms:.3e} "
+            f"pair_z_rel_l2={pair_z_rel:.3e} "
+            f"atom_s_max={atom_s_err:.3e} "
+            f"atom_s_rms={atom_s_rms:.3e} "
+            f"atom_s_rel_l2={atom_s_rel:.3e} "
+            f"atom_x_max={atom_x_err:.3e} "
+            f"atom_x_rms={atom_x_rms:.3e} "
+            f"atom_x_rel_l2={atom_x_rel:.3e} "
+            f"hidden_max_tol={self.batched_parity_hidden_max_tol:.1e} "
+            f"hidden_rms_tol={self.batched_parity_hidden_rms_tol:.1e} "
+            f"hidden_rel_l2_tol={self.batched_parity_hidden_rel_l2_tol:.1e} "
+            f"coord_max_tol={self.batched_parity_coord_max_tol:.1e}"
+        )
+        if _runtime_trace_rank() == 0:
+            print(line, flush=True)
+        _runtime_trace_file_line(line)
+
+        parity_ok = (
+            hidden_max
+                <= float(self.batched_parity_hidden_max_tol)
+            and hidden_rms
+                <= float(self.batched_parity_hidden_rms_tol)
+            and hidden_rel_l2
+                <= float(self.batched_parity_hidden_rel_l2_tol)
+            and atom_x_err
+                <= float(self.batched_parity_coord_max_tol)
+        )
+
+        verdict = (
+            "[BatchedParityVerdict] "
+            f"rank={_runtime_trace_rank()} "
+            f"status={'PASS' if parity_ok else 'FAIL'} "
+            f"hidden_max={hidden_max:.3e} "
+            f"hidden_rms={hidden_rms:.3e} "
+            f"hidden_rel_l2={hidden_rel_l2:.3e} "
+            f"coord_max={atom_x_err:.3e}"
+        )
+        if _runtime_trace_rank() == 0:
+            print(verdict, flush=True)
+        _runtime_trace_file_line(verdict)
+
+        if self.batched_parity_fail_fast and not parity_ok:
+            raise RuntimeError(
+                "v127 batched runtime numerical parity failed: "
+                f"hidden_max={hidden_max:.6e}, "
+                f"hidden_rms={hidden_rms:.6e}, "
+                f"hidden_rel_l2={hidden_rel_l2:.6e}, "
+                f"coord_max={atom_x_err:.6e}"
+            )
+
+    def _forward_batched_runtime(
+        self,
+        *,
+        h0,
+        x,
+        inter_mask,
+        inter_x,
+        surf_verts,
+        update_mask,
+        inter_update_mask,
+        aligned_edges,
+        epi_index,
+        channel_attr,
+        channel_weights,
+        labels,
+        num_graphs,
+        required_meta,
+        token_bonds,
+        token_pad_mask,
+        effective_recycling_steps,
+    ):
+        """Complete batch-first MFDesign runtime for the local DDP batch."""
+        N = int(h0.shape[0])
+        lengths = [
+            int((labels == g).sum().item())
+            for g in range(num_graphs)
+        ]
+        Lmax = max(lengths) if lengths else 0
+        B = int(num_graphs)
+
+        if B <= 0 or Lmax <= 0:
+            raise RuntimeError(
+                "batched runtime received an empty local batch"
+            )
+
+        device = x.device
+        C = x.shape[1]
+
+        flat_idx = torch.full(
+            (B, Lmax), -1, dtype=torch.long, device=device
+        )
+        for g in range(B):
+            gidx = torch.nonzero(
+                labels == g, as_tuple=False
+            ).reshape(-1)
+            flat_idx[g, :gidx.numel()] = gidx
+
+        valid = flat_idx >= 0
+        safe_idx = flat_idx.clamp(min=0)
+
+        s_raw_b = h0[safe_idx]
+        s_raw_b = s_raw_b * valid.unsqueeze(-1).to(s_raw_b)
+
+        x_b = x[safe_idx]
+        x_b = x_b * valid[:, :, None, None].to(x_b)
+
+        attr_b = channel_attr[safe_idx]
+        attr_b = attr_b * valid[
+            :, :, None, None
+        ].to(attr_b)
+        weights_b = channel_weights[safe_idx]
+        weights_b = weights_b * valid[
+            :, :, None
+        ].to(weights_b)
+        update_b = update_mask[safe_idx].bool() & valid
+
+        feats_b = {}
+        for key, value in required_meta.items():
+            packed = value[safe_idx]
+            packed = torch.where(
+                valid,
+                packed,
+                torch.zeros_like(packed),
+            )
+            feats_b[key] = packed
+
+        # Preserve the dataset-provided BOA/BOH/BOL masking semantics.
+        token_mask_b = torch.zeros(
+            (B, Lmax),
+            dtype=token_pad_mask.dtype,
+            device=device,
+        )
+        for g, Lg in enumerate(lengths):
+            token_mask_b[g, :Lg] = token_pad_mask[g, :Lg]
+        feats_b["token_pad_mask"] = token_mask_b
+
+        if token_bonds.ndim != 4:
+            raise ValueError(
+                "token_bonds must be [B,L,L,Cbond]"
+            )
+        feats_b["token_bonds"] = token_bonds[
+            :B, :Lmax, :Lmax
+        ]
+
+        # Replace generated local-shadow coordinates before current-Xt pair
+        # geometry and full-complex atom input, exactly as graphwise code.
+        local_global = torch.nonzero(
+            inter_mask, as_tuple=False
+        ).reshape(-1)
+        g2shadow = torch.full(
+            (N,), -1, dtype=torch.long, device=device
+        )
+        g2shadow[local_global] = torch.arange(
+            local_global.numel(), device=device
+        )
+
+        x_state_b = x_b.clone()
+        for g, Lg in enumerate(lengths):
+            gidx = flat_idx[g, :Lg]
+            local_pos = torch.nonzero(
+                inter_mask[gidx], as_tuple=False
+            ).reshape(-1)
+            if local_pos.numel() > 0:
+                shadow_idx = g2shadow[gidx[local_pos]]
+                x_state_b[g, local_pos] = inter_x[shadow_idx]
+
+        real_tokens = int(sum(lengths))
+        padded_total = int(B * Lmax)
+        if _env_flag("ABFLOW_PERF_DIAGNOSTICS", False):
+            _ATTN_RUNTIME_STATS["real_tokens"] += real_tokens
+            _ATTN_RUNTIME_STATS["padded_tokens"] += padded_total
+
+        pad_eff = (
+            float(real_tokens) / float(max(1, padded_total))
+        )
+        self._batched_runtime_log(
+            f"B={B} lengths={lengths} Lmax={Lmax} "
+            f"pad_eff={pad_eff:.4f} "
+            f"recycle={effective_recycling_steps}"
+        )
+
+        self._maybe_check_batched_parity(
+            s_raw_b=s_raw_b,
+            x_b=x_state_b,
+            atom_attr_b=attr_b,
+            atom_weights_b=weights_b,
+            feats_b=feats_b,
+            update_b=update_b,
+            lengths=lengths,
+        )
+
+        s_b, z_b, s_struct_b, pred_b = (
+            self._run_batched_complexes(
+                s_raw=s_raw_b,
+                x=x_state_b,
+                atom_attr=attr_b,
+                atom_weights=weights_b,
+                feats=feats_b,
+                residue_update_mask=update_b,
+                recycling_steps=effective_recycling_steps,
+            )
+        )
+
+        # Stitch full-complex outputs back to the exact historical flat API.
+        h_out = h0.float().clone()
+        pred_x = x.clone()
+        for g, Lg in enumerate(lengths):
+            gidx = flat_idx[g, :Lg]
+            s_g = s_struct_b[g, :Lg]
+            if s_g.dtype != h_out.dtype:
+                s_g = s_g.to(h_out.dtype)
+            h_out[gidx] = s_g
+            pred_x[gidx] = pred_b[g, :Lg]
+
+        inter_h_out = h0[inter_mask].float().clone()
+        pred_inter_x = inter_x.clone()
+
+        # Pack all dynamic H3/local shadows and run clean-SC AtomStructure
+        # batch-first as well.
+        infos = []
+        for g, Lg in enumerate(lengths):
+            gidx = flat_idx[g, :Lg]
+            local_pos = torch.nonzero(
+                inter_mask[gidx], as_tuple=False
+            ).reshape(-1)
+            if local_pos.numel() == 0:
+                continue
+            shadow_idx = g2shadow[gidx[local_pos]]
+            infos.append(
+                (g, gidx, local_pos, shadow_idx)
+            )
+
+        if infos:
+            Bh = len(infos)
+            Hmax = max(
+                int(info[2].numel()) for info in infos
+            )
+            Ds = s_b.shape[-1]
+            Dz = z_b.shape[-1]
+            Da = channel_attr.shape[-1]
+
+            s_local_b = h0.new_zeros(
+                (Bh, Hmax, Ds)
+            )
+            z_local_b = z_b.new_zeros(
+                (Bh, Hmax, Hmax, Dz)
+            )
+            coords_local_b = inter_x.new_zeros(
+                (Bh, Hmax, C, 3)
+            )
+            attr_local_b = channel_attr.new_zeros(
+                (Bh, Hmax, C, Da)
+            )
+            weights_local_b = channel_weights.new_zeros(
+                (Bh, Hmax, C)
+            )
+            update_local_b = torch.zeros(
+                (Bh, Hmax),
+                dtype=torch.bool,
+                device=device,
+            )
+            valid_local_b = torch.zeros(
+                (Bh, Hmax),
+                dtype=token_mask_b.dtype,
+                device=device,
+            )
+
+            for j, (g, gidx, local_pos, shadow_idx) in enumerate(infos):
+                Lj = int(local_pos.numel())
+                s_local_b[j, :Lj] = s_b[g, local_pos]
+                z_local_b[j, :Lj, :Lj] = (
+                    z_b[g, local_pos][:, local_pos]
+                )
+                coords_local_b[j, :Lj] = inter_x[shadow_idx]
+                attr_local_b[j, :Lj] = channel_attr[
+                    gidx[local_pos]
+                ]
+                weights_local_b[j, :Lj] = channel_weights[
+                    gidx[local_pos]
+                ]
+                update_local_b[j, :Lj] = (
+                    inter_update_mask[shadow_idx].bool()
+                )
+                valid_local_b[j, :Lj] = 1
+
+            active_graph_ids = [int(v[0]) for v in infos]
+            (
+                s_local_out_b,
+                pred_local_b,
+                z_local_used_b,
+                gates,
+            ) = self._clean_self_condition_z_batched(
+                s_local=s_local_b,
+                z_local=z_local_b,
+                current_coords=coords_local_b,
+                atom_attr=attr_local_b,
+                atom_weights=weights_local_b,
+                residue_update_mask=update_local_b,
+                token_valid_mask=valid_local_b,
+                active_graph_ids=active_graph_ids,
+            )
+
+            for j, (g, gidx, local_pos, shadow_idx) in enumerate(infos):
+                Lj = int(local_pos.numel())
+                s_local = s_local_out_b[j, :Lj]
+                if s_local.dtype != inter_h_out.dtype:
+                    s_local = s_local.to(inter_h_out.dtype)
+                inter_h_out[shadow_idx] = s_local
+                pred_inter_x[shadow_idx] = pred_local_b[j, :Lj]
+
+                local_feats = {}
+                for key, value in feats_b.items():
+                    if key == "token_bonds":
+                        local_feats[key] = value[
+                            g:g + 1, local_pos
+                        ][:, :, local_pos]
+                    else:
+                        local_feats[key] = value[
+                            g:g + 1, local_pos
+                        ]
+
+                self._modern_aux_cache.append({
+                    "global_idx": gidx[local_pos],
+                    "shadow_idx": shadow_idx,
+                    "design_mask": update_local_b[j, :Lj],
+                    "z_base": z_local_b[
+                        j:j + 1, :Lj, :Lj
+                    ],
+                    "z_used": z_local_used_b[
+                        j:j + 1, :Lj, :Lj
+                    ],
+                    "sc_gate": gates[j],
+                    "s_inputs": h0[gidx][local_pos],
+                    "confidence_feats": local_feats,
+                    "recycling_steps": x.new_tensor(
+                        float(effective_recycling_steps)
+                    ),
+                })
+
+        # Preserve the already-validated AbFlow surface refiner exactly.
+        if (
+            aligned_edges is not None
+            and aligned_edges.numel() > 0
+            and surf_verts is not None
+            and surf_verts.numel() > 0
+        ):
+            inter_attr = channel_attr[inter_mask]
+            inter_weights = channel_weights[inter_mask]
+            inter_h_out, pred_inter_x = self.surface_refiner(
+                inter_h_out,
+                aligned_edges,
+                epi_index,
+                pred_inter_x,
+                surf_verts,
+                inter_attr,
+                inter_weights,
+            )
+
+        # Same auxiliary/confidence finalization as the graphwise parent.
+        pending = self._modern_aux_cache
+        self._modern_aux_cache = []
+        for meta in pending:
+            shadow_idx = meta["shadow_idx"]
+            global_idx = meta["global_idx"]
+            local_xloss_hint = channel_weights[global_idx]
+            final_pred = pred_inter_x[shadow_idx]
+            final_s = inter_h_out[shadow_idx]
+            self._append_aux_cache(
+                global_idx=global_idx,
+                design_mask=meta["design_mask"],
+                z_base=meta["z_base"],
+                pred_coords=final_pred,
+                s_inputs=meta["s_inputs"],
+                s_for_confidence=final_s,
+                xloss_hint=(
+                    local_xloss_hint[:, 1]
+                    if local_xloss_hint.shape[1] > 1
+                    else local_xloss_hint[:, 0]
+                ),
+                sc_gate=meta["sc_gate"],
+                confidence_feats=meta["confidence_feats"],
+            )
+
+        h_out = h_out.clone()
+        h_out[inter_mask] = inter_h_out
+        h_out = self.dropout(h_out)
+        h_out = self.linear_out(h_out)
+        return h_out, pred_x, pred_inter_x
+
     def _run_one_complex(
         self,
         s_raw,
@@ -2645,16 +3731,27 @@ class AMEncoder(nn.Module):
             final_pass = recycle_idx == steps
             # 1:1 MFDesign training semantics: intermediate recycles are
             # state computation only; the final recycle is gradient-bearing.
-            grad_on = bool(self.training and final_pass and torch.is_grad_enabled())
+            grad_on = bool(
+                self.training and final_pass and torch.is_grad_enabled()
+            )
+
+            # PyTorch AMP correctness barrier:
+            # no-grad recycles may populate the autocast weight cache with
+            # low-precision copies that have requires_grad=False.  The final
+            # grad-enabled recycle must not reuse those detached copies.
+            if (
+                grad_on
+                and recycle_idx > 0
+                and torch.is_autocast_enabled()
+            ):
+                torch.clear_autocast_cache()
+
             with torch.set_grad_enabled(grad_on):
-                if grad_on and torch.is_autocast_enabled():
-                    try:
-                        torch.clear_autocast_cache()
-                    except Exception:
-                        pass
                 s = s_init + self.s_recycle(self.s_recycle_norm(s))
                 z = z_init + self.z_recycle(self.z_recycle_norm(z))
-                s, z = self.pairformer(s, z, mask=mask, pair_mask=pair_mask)
+                s, z = self.pairformer(
+                    s, z, mask=mask, pair_mask=pair_mask
+                )
 
         # Evaluation/no-grad callers naturally keep all recycle passes detached.
         s_struct, pred_x = self.atom_structure(
@@ -3146,6 +4243,27 @@ class AMEncoder(nn.Module):
             effective_recycling_steps = self.recycling_steps
 
         self._last_effective_recycling_steps = int(effective_recycling_steps)
+
+        if self.batched_runtime:
+            return self._forward_batched_runtime(
+                h0=h0,
+                x=x,
+                inter_mask=inter_mask,
+                inter_x=inter_x,
+                surf_verts=surf_verts,
+                update_mask=update_mask,
+                inter_update_mask=inter_update_mask,
+                aligned_edges=aligned_edges,
+                epi_index=epi_index,
+                channel_attr=channel_attr,
+                channel_weights=channel_weights,
+                labels=labels,
+                num_graphs=num_graphs,
+                required_meta=required_meta,
+                token_bonds=token_bonds,
+                token_pad_mask=token_pad_mask,
+                effective_recycling_steps=effective_recycling_steps,
+            )
 
         _trace_id = int(self._runtime_trace_forward_count)
         _trace_forward = (

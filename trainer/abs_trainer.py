@@ -430,6 +430,18 @@ class Trainer:
             name, default
         ).strip().lower() in {"1", "true", "yes", "y", "on"}
 
+    def _disable_perf_instrumentation_after_gate(self):
+        """Disable all v123/v126 speed counters after startup validation.
+
+        This is called once after the configured profiling window.  It changes
+        diagnostics only; model/training math is untouched.
+        """
+        os.environ["ABFLOW_PERF_DIAGNOSTICS"] = "off"
+        raw = getattr(self.model, "module", self.model)
+        for module in raw.modules():
+            if hasattr(module, "perf_stats_enabled"):
+                module.perf_stats_enabled = False
+
     def _perf_step_enabled(self, step):
         if not self._env_on("ABFLOW_PERF_DIAGNOSTICS"):
             return False
@@ -449,6 +461,12 @@ class Trainer:
                 "lma_calls": -1,
                 "checkpoint_cleanup_calls": -1,
                 "checkpoint_storage_tensors": -1,
+                "batched_pairformer_calls": -1,
+                "graphwise_equiv_pairformer_calls": -1,
+                "batched_atom_calls": -1,
+                "batched_shadow_atom_calls": -1,
+                "real_tokens": -1,
+                "padded_tokens": -1,
             }
 
     def _effective_recycling_for_perf(self):
@@ -486,12 +504,62 @@ class Trainer:
             f"attn_full={stats.get('full_calls', -1)} "
             f"attn_lma={stats.get('lma_calls', -1)} "
             f"ckpt_cleanup={stats.get('checkpoint_cleanup_calls', -1)} "
-            f"ckpt_saved={stats.get('checkpoint_storage_tensors', -1)}"
+            f"ckpt_saved={stats.get('checkpoint_storage_tensors', -1)} "
+            f"pf_batch_calls={stats.get('batched_pairformer_calls', -1)} "
+            f"pf_graphwise_equiv={stats.get('graphwise_equiv_pairformer_calls', -1)} "
+            f"atom_batch_calls={stats.get('batched_atom_calls', -1)} "
+            f"shadow_atom_batch_calls={stats.get('batched_shadow_atom_calls', -1)} "
+            f"real_tokens={stats.get('real_tokens', -1)} "
+            f"padded_tokens={stats.get('padded_tokens', -1)}"
         )
         # All ranks persist their own line. Only global rank0 prints to stdout.
         self._runtime_log_line(line)
         if rank == 0:
             print(line, flush=True)
+
+    def _log_gradient_contract(self, step):
+        if not self._env_on("ABFLOW_BATCHED_GRAD_DIAGNOSTICS"):
+            return
+        limit = max(
+            0,
+            int(os.environ.get(
+                "ABFLOW_BATCHED_GRAD_DIAGNOSTIC_STEPS", "3"
+            ) or 3),
+        )
+        if int(step) >= limit:
+            return
+
+        raw = getattr(self.model, "module", self.model)
+        missing = [
+            name
+            for name, p in raw.named_parameters()
+            if p.requires_grad and p.grad is None
+        ]
+        rank = (
+            dist.get_rank()
+            if dist.is_available() and dist.is_initialized()
+            else 0
+        )
+        line = (
+            "[BatchedGrad] "
+            f"rank={rank} step={int(step)} "
+            f"missing={len(missing)} "
+            f"first={missing[:12]}"
+        )
+        self._runtime_log_line(line)
+        if rank == 0:
+            print(line, flush=True)
+
+        if (
+            missing
+            and self._env_on(
+                "ABFLOW_BATCHED_GRAD_FAIL_FAST", "on"
+            )
+        ):
+            raise RuntimeError(
+                "v126 batched runtime has parameters without gradient: "
+                + ", ".join(missing[:20])
+            )
 
     def _train_epoch(self, device):
         # Module 11: the Train phase exposes one epoch-level diagnostic scalar.
@@ -571,6 +639,7 @@ class Trainer:
                         "train_backward", self.global_step
                     )
                     raise
+                self._log_gradient_contract(self.global_step)
                 if self.config.grad_clip is not None:
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), self.config.grad_clip
@@ -658,6 +727,24 @@ class Trainer:
                     self._consume_model_runtime_perf_stats()
 
             self.global_step += 1
+
+            _perf_limit = max(
+                0,
+                int(os.environ.get(
+                    "ABFLOW_PERF_DIAGNOSTIC_STEPS", "8"
+                ) or 8),
+            )
+            if (
+                self.global_step == _perf_limit
+                and self._env_on("ABFLOW_PERF_DIAGNOSTICS")
+            ):
+                self._runtime_log_line(
+                    "[RuntimePerf] startup profiling complete; "
+                    "disabling performance instrumentation for the "
+                    "remaining formal 200-epoch run"
+                )
+                self._disable_perf_instrumentation_after_gate()
+
             _previous_step_end = time.perf_counter()
 
             if self.sched_freq == 'batch':
