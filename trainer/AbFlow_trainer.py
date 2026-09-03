@@ -11,6 +11,7 @@ from datetime import datetime
 import json
 import os
 import tempfile
+import time
 
 import torch
 import torch.distributed as dist
@@ -19,6 +20,36 @@ from tqdm import tqdm
 from .abs_trainer import Trainer
 from .resume_ema import validation_ema, get_rng_state, set_rng_state
 
+
+
+_ABFLOW_CONFIG_CACHE = None
+
+def _abflow_config():
+    """Load the formal JSON config once from ABFLOW_CONFIG_PATH."""
+    global _ABFLOW_CONFIG_CACHE
+    if _ABFLOW_CONFIG_CACHE is not None:
+        return _ABFLOW_CONFIG_CACHE
+    path = os.environ.get("ABFLOW_CONFIG_PATH", "").strip()
+    if not path:
+        _ABFLOW_CONFIG_CACHE = {}
+        return _ABFLOW_CONFIG_CACHE
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        _ABFLOW_CONFIG_CACHE = cfg if isinstance(cfg, dict) else {}
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load ABFLOW_CONFIG_PATH={path}: {exc}"
+        ) from exc
+    return _ABFLOW_CONFIG_CACHE
+
+
+def _cfg_value(section, key, default):
+    cfg = _abflow_config()
+    block = cfg.get(section, {}) if isinstance(cfg, dict) else {}
+    if isinstance(block, dict) and key in block:
+        return block[key]
+    return default
 
 def _env_int(name, default):
     value = os.environ.get(name, "").strip()
@@ -41,6 +72,52 @@ def _env_str(name, default):
     value = os.environ.get(name, "").strip()
     return value if value else str(default)
 
+
+
+class AlphaFoldLRScheduler(torch.optim.lr_scheduler._LRScheduler):
+    """Exact AF3/MFDesign scheduler equation from the supplied source."""
+    def __init__(
+        self,
+        optimizer,
+        last_epoch=-1,
+        verbose=False,
+        base_lr=0.0,
+        max_lr=1.8e-3,
+        warmup_no_steps=1000,
+        start_decay_after_n_steps=50000,
+        decay_every_n_steps=50000,
+        decay_factor=0.95,
+    ):
+        if warmup_no_steps < 0 or start_decay_after_n_steps < 0:
+            raise ValueError("scheduler step counts must be nonnegative")
+        if warmup_no_steps > start_decay_after_n_steps:
+            raise ValueError("warmup_no_steps must not exceed decay start")
+        if warmup_no_steps == 0:
+            raise ValueError("v132 requires at least one warmup step")
+        self.optimizer = optimizer
+        self.last_epoch = last_epoch
+        self.verbose = verbose
+        self.base_lr = float(base_lr)
+        self.max_lr = float(max_lr)
+        self.warmup_no_steps = int(warmup_no_steps)
+        self.start_decay_after_n_steps = int(start_decay_after_n_steps)
+        self.decay_every_n_steps = int(decay_every_n_steps)
+        self.decay_factor = float(decay_factor)
+        super().__init__(optimizer, last_epoch=last_epoch, verbose=verbose)
+
+    def get_lr(self):
+        step_no = self.last_epoch
+        if step_no <= self.warmup_no_steps:
+            lr = self.base_lr + (
+                step_no / self.warmup_no_steps
+            ) * self.max_lr
+        elif step_no > self.start_decay_after_n_steps:
+            steps_since_decay = step_no - self.start_decay_after_n_steps
+            expn = (steps_since_decay // self.decay_every_n_steps) + 1
+            lr = self.max_lr * (self.decay_factor ** expn)
+        else:
+            lr = self.max_lr
+        return [lr for _ in self.optimizer.param_groups]
 
 class _ExactDistributedValidationBatchSampler(Sampler):
     """Shard *logical validation batches* across ranks without padding.
@@ -503,11 +580,23 @@ class AbFlowTrainer(Trainer):
                         )
                 if self.writer is not None:
                     self.writer.flush()
+                def _metric_any(*keys):
+                    for key in keys:
+                        if key in metrics:
+                            try:
+                                return float(metrics[key])
+                            except Exception:
+                                pass
+                    return float("nan")
+
                 core = (
-                    f"AAR={metrics.get('AAR_mean', float('nan')):.4f} "
-                    f"CAAR={metrics.get('CAAR_mean', float('nan')):.4f} "
-                    f"H3raw={metrics.get('RMSDCA_CDRH3_mean', float('nan')):.4f} "
-                    f"DockQ={metrics.get('DockQ_mean', float('nan')):.4f}"
+                    f"AAR={_metric_any('AAR_mean'):.4f} "
+                    f"CAAR={_metric_any('CAAR_mean'):.4f} "
+                    f"H3raw={_metric_any('RMSDCA_CDRH3_mean'):.4f} "
+                    f"H3aligned={_metric_any('RMSDCA_CDRH3_aligned_mean', 'RMSDCA_CDRH3_ALIGN_mean', 'H3_aligned_RMSD_mean'):.4f} "
+                    f"TM={_metric_any('TMscore_mean', 'TM_score_mean', 'TM_mean'):.4f} "
+                    f"lDDT={_metric_any('lDDT_mean', 'LDDT_mean', 'lddt_mean'):.4f} "
+                    f"DockQ={_metric_any('DockQ_mean'):.4f}"
                 )
                 print(f"[EpochTest] epoch={self.epoch} {core}")
 
@@ -614,6 +703,31 @@ class AbFlowTrainer(Trainer):
                     continue
                 value = float(np.mean(values))
                 self.writer.add_scalar(name, value, self.epoch)
+
+            def _vmean(key):
+                values = merged_buffer.get(key, [])
+                return float(np.mean(values)) if values else float("nan")
+
+            print(
+                "[ValidationPhysical] "
+                f"epoch={int(self.epoch)} "
+                f"X1decode={_vmean('AbFlowDiag/val_proxy_physical_endpoint_decode/Validation'):.3f} "
+                f"H3raw={_vmean('AbFlowDiag/val_proxy_round0_h3_ca_rmsd/Validation'):.4f}A "
+                f"H3aligned={_vmean('AbFlowDiag/val_proxy_round0_h3_ca_aligned_rmsd/Validation'):.4f}A "
+                f"contactF1={_vmean('AbFlowDiag/val_proxy_native_contact_f1/Validation'):.4f} "
+                f"CAAR={_vmean('AbFlowDiag/val_proxy_caar/Validation'):.4f}",
+                flush=True,
+            )
+            print(
+                "[ValidationPhysicalBins] "
+                f"epoch={int(self.epoch)} "
+                f"raw0={_vmean('AbFlowDiag/val_physical_x1_tbin0_raw_rmsd/Validation'):.3f} "
+                f"raw1={_vmean('AbFlowDiag/val_physical_x1_tbin1_raw_rmsd/Validation'):.3f} "
+                f"raw2={_vmean('AbFlowDiag/val_physical_x1_tbin2_raw_rmsd/Validation'):.3f} "
+                f"raw3={_vmean('AbFlowDiag/val_physical_x1_tbin3_raw_rmsd/Validation'):.3f} "
+                f"raw4={_vmean('AbFlowDiag/val_physical_x1_tbin4_raw_rmsd/Validation'):.3f}",
+                flush=True,
+            )
             if self.writer is not None:
                 self.writer.flush()
         self.writer_buffer = {}
@@ -697,64 +811,70 @@ class AbFlowTrainer(Trainer):
         ]
 
     def get_optimizer(self):
-        optimizer_name = _env_str("ABFLOW_OPTIMIZER", "adamw").lower()
-        weight_decay = _env_float("ABFLOW_WEIGHT_DECAY", 0.01)
+        """MFDesign optimizer family, task-scaled for scratch antibody design.
 
-        decay, no_decay = [], []
-        for _, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
-            (decay if param.ndim >= 2 else no_decay).append(param)
-
-        groups = [
-            {"params": decay, "weight_decay": weight_decay},
-            {"params": no_decay, "weight_decay": 0.0},
-        ]
-        if optimizer_name == "adamw":
-            return torch.optim.AdamW(groups, lr=self.config.lr)
-        if optimizer_name == "adam":
-            return torch.optim.Adam(
-                self.model.parameters(), lr=self.config.lr
-            )
-        raise ValueError("ABFLOW_OPTIMIZER must be adamw or adam")
+        MFDesign source uses Adam (not AdamW).  We copy that equation exactly:
+        beta=(0.9,0.95), eps=1e-8 by default.  The max LR is supplied by the
+        v132 JSON and is 3e-4 following the ABX scratch training scale.
+        """
+        optimizer_name = str(_cfg_value("optimizer_profile", "optimizer", _env_str("ABFLOW_OPTIMIZER", "adam"))).lower()
+        if optimizer_name != "adam":
+            raise ValueError("v132 formal profile requires ABFLOW_OPTIMIZER=adam")
+        beta1 = float(_cfg_value("optimizer_profile", "beta1", _env_float("ABFLOW_ADAM_BETA1", 0.9)))
+        beta2 = float(_cfg_value("optimizer_profile", "beta2", _env_float("ABFLOW_ADAM_BETA2", 0.95)))
+        eps = float(_cfg_value("optimizer_profile", "eps", _env_float("ABFLOW_ADAM_EPS", 1.0e-8)))
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        return torch.optim.Adam(
+            params,
+            betas=(beta1, beta2),
+            eps=eps,
+            lr=float(self.config.lr),
+        )
 
     def get_scheduler(self, optimizer):
-        # Warmup is expressed in epochs to remain stable when world size changes;
-        # config.step_per_epoch converts it to optimizer steps.  After warmup, a
-        # log-linear/exponential schedule reaches final_lr at the formal horizon.
-        warmup_epochs = max(
-            0, _env_int(
-                "ABFLOW_WARMUP_EPOCHS", getattr(self.config, "warmup", 0)
-            )
-        )
-        warmup_steps = min(
-            int(self.max_step),
-            warmup_epochs * int(self.config.step_per_epoch),
-        )
+        """Exact AF3 scheduler equation with ABX scratch horizon ratios."""
+        mode = str(_cfg_value("optimizer_profile", "scheduler", _env_str("ABFLOW_LR_SCHEDULER", "abx_taskscale_af3"))).lower()
+        if mode != "abx_taskscale_af3":
+            raise ValueError("v132 requires ABFLOW_LR_SCHEDULER=abx_taskscale_af3")
+
         total_steps = max(1, int(self.max_step))
-        base_lr = float(self.config.lr)
-        final_lr = float(self.config.final_lr)
-        if base_lr <= 0.0 or final_lr <= 0.0:
-            raise ValueError("lr and final_lr must be positive")
-        if final_lr > base_lr:
-            raise ValueError("formal warmup-exponential schedule requires final_lr <= lr")
+        warmup_ratio = float(_cfg_value("optimizer_profile", "warmup_ratio", _env_float("ABFLOW_LR_WARMUP_RATIO", 0.05)))
+        decay_start_ratio = float(_cfg_value("optimizer_profile", "decay_start_ratio", _env_float("ABFLOW_LR_DECAY_START_RATIO", 0.50)))
+        decay_every_ratio = float(_cfg_value("optimizer_profile", "decay_every_ratio", _env_float("ABFLOW_LR_DECAY_EVERY_RATIO", 0.10)))
+        decay_factor = float(_cfg_value("optimizer_profile", "decay_factor", _env_float("ABFLOW_LR_DECAY_FACTOR", 0.95)))
+        base_lr = float(_cfg_value("optimizer_profile", "base_lr", _env_float("ABFLOW_LR_BASE", 0.0)))
+        max_lr = float(self.config.lr)
 
-        decay_steps = max(1, total_steps - warmup_steps)
-        log_ratio = log(final_lr / base_lr)
-
-        def lr_lambda(step):
-            step = int(step)
-            if warmup_steps > 0 and step < warmup_steps:
-                return max(1.0 / warmup_steps, float(step + 1) / warmup_steps)
-            progress = min(
-                1.0,
-                max(0.0, float(step - warmup_steps + 1) / decay_steps),
-            )
-            return exp(log_ratio * progress)
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer, lr_lambda=lr_lambda
+        warmup_steps = max(1, int(round(total_steps * warmup_ratio)))
+        decay_start = max(
+            warmup_steps,
+            int(round(total_steps * decay_start_ratio)),
         )
+        decay_every = max(1, int(round(total_steps * decay_every_ratio)))
+        decay_start = min(decay_start, total_steps)
+
+        scheduler = AlphaFoldLRScheduler(
+            optimizer,
+            base_lr=base_lr,
+            max_lr=max_lr,
+            warmup_no_steps=warmup_steps,
+            start_decay_after_n_steps=decay_start,
+            decay_every_n_steps=decay_every,
+            decay_factor=decay_factor,
+        )
+        # TrainerBase constructs the scheduler before assigning self.local_rank.
+        # Use the torchrun environment here; later training logs may safely use
+        # self._is_main_proc().
+        if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+            print(
+                "[V137Config][Optimizer] "
+                f"Adam lr_max={max_lr:.3e} beta=("
+                f"{optimizer.param_groups[0].get('betas', (None,None))[0]},"
+                f"{optimizer.param_groups[0].get('betas', (None,None))[1]}) "
+                f"warmup_steps={warmup_steps} decay_start={decay_start} "
+                f"decay_every={decay_every} decay_factor={decay_factor}",
+                flush=True,
+            )
         return {"scheduler": scheduler, "frequency": "batch"}
 
     def train_step(self, batch, batch_idx):
@@ -905,7 +1025,28 @@ class AbFlowTrainer(Trainer):
         raw_model._diagnostic_validation_mode = bool(val and capture_diagnostics)
         raw_model._gradient_diagnostic_capture = should_probe_grad
 
+        _perf_probe = (not val) and int(getattr(self, "global_step", 0)) < 8
+        if _perf_probe and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+        _forward_t0 = time.perf_counter() if _perf_probe else None
         loss, seq_detail, structure_detail, dock_detail, pdev_detail = self.model(**batch)
+        if _perf_probe:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _forward_ms = (time.perf_counter() - _forward_t0) * 1000.0
+            _peak_alloc_gib = (
+                torch.cuda.max_memory_allocated() / (1024.0 ** 3)
+                if torch.cuda.is_available() else 0.0
+            )
+            _peak_reserved_gib = (
+                torch.cuda.max_memory_reserved() / (1024.0 ** 3)
+                if torch.cuda.is_available() else 0.0
+            )
+        else:
+            _forward_ms = None
+            _peak_alloc_gib = None
+            _peak_reserved_gib = None
         snll, aar = seq_detail
         struct_loss, xloss, bond_loss, sc_bond_loss = structure_detail
         dock_loss, interface_loss, ed_loss, r_ed_losses = dock_detail
@@ -969,9 +1110,77 @@ class AbFlowTrainer(Trainer):
         for name, value in abflow_diagnostics.items():
             self.log(f"AbFlowDiag/{name}/{log_type}", value, batch_idx, val)
 
+        if _perf_probe:
+            runtime_stats = {}
+            if hasattr(raw_model, "gnn") and hasattr(
+                raw_model.gnn, "consume_runtime_perf_stats"
+            ):
+                runtime_stats = raw_model.gnn.consume_runtime_perf_stats()
+
+            def _dget(name, default=float("nan")):
+                value = abflow_diagnostics.get(name, default)
+                try:
+                    if torch.is_tensor(value):
+                        return float(value.detach().float().cpu().item())
+                    return float(value)
+                except Exception:
+                    return float("nan")
+
+            if self._is_main_proc():
+                real_tok = float(runtime_stats.get("real_tokens", 0) or 0)
+                padded_tok = float(runtime_stats.get("padded_tokens", 0) or 0)
+                pad_eff = real_tok / padded_tok if padded_tok > 0 else float("nan")
+                print(
+                    "[V137Step] "
+                    f"step={int(self.global_step)} forward_ms={_forward_ms:.1f} "
+                    f"peak_alloc={_peak_alloc_gib:.2f}GiB "
+                    f"peak_reserved={_peak_reserved_gib:.2f}GiB "
+                    f"recycle={getattr(raw_model.gnn, '_last_effective_recycling_steps', -1)} "
+                    f"pad_eff={pad_eff:.3f} "
+                    f"PFcalls={runtime_stats.get('batched_pairformer_calls', 0)} "
+                    f"AtomCalls={runtime_stats.get('batched_atom_calls', 0)} "
+                    f"SCteacher={runtime_stats.get('sc_teacher_calls', 0)}/"
+                    f"graphs={runtime_stats.get('sc_teacher_graphs', 0)} "
+                    f"SCformal={runtime_stats.get('sc_formal_calls', 0)} "
+                    f"ConfCalls={runtime_stats.get('confidence_calls', 0)} "
+                    f"wT={_dget('v132_weighted_transport'):.4f} "
+                    f"wS={_dget('v132_weighted_sequence'):.4f} "
+                    f"wA={_dget('v132_weighted_aligned'):.4f} "
+                    f"wL={_dget('v132_weighted_smooth_lddt'):.4f} "
+                    f"wD={_dget('v132_weighted_distogram'):.4f} "
+                    f"wC={_dget('v132_weighted_confidence'):.4f} "
+                    f"disto_gate={_dget('v137_distogram_gate_mean'):.3f} "
+                    f"SCrate={self._scalar(modern_aux.get('self_condition_rate'))}",
+                    flush=True,
+                )
+
         grad_diagnostics = getattr(raw_model, "last_gradient_diagnostics", None) or {}
         for name, value in grad_diagnostics.items():
             self.log(f"GradientDiag/{name}/{log_type}", value, batch_idx, val)
+
+        if should_probe_grad and self._is_main_proc() and grad_diagnostics:
+            def _g(name):
+                value = grad_diagnostics.get(name, float("nan"))
+                try:
+                    if torch.is_tensor(value):
+                        return float(value.detach().float().cpu().item())
+                    return float(value)
+                except Exception:
+                    return float("nan")
+            print(
+                "[LossAuthority] "
+                f"epoch={int(self.epoch)} step={int(self.global_step)} "
+                f"|gT|={_g('grad_probe_norm_endpoint'):.3e} "
+                f"|gS|={_g('grad_probe_norm_seq'):.3e} "
+                f"|gA|={_g('grad_probe_norm_aligned'):.3e} "
+                f"|gL|={_g('grad_probe_norm_smooth_lddt'):.3e} "
+                f"|gD|={_g('grad_probe_norm_distogram'):.3e} "
+                f"cos(T,A)={_g('grad_probe_cos_endpoint_aligned'):.3f} "
+                f"cos(T,L)={_g('grad_probe_cos_endpoint_smooth_lddt'):.3f} "
+                f"cos(A,L)={_g('grad_probe_cos_aligned_smooth_lddt'):.3f} "
+                f"cos(T,S)={_g('grad_probe_cos_endpoint_seq'):.3f}",
+                flush=True,
+            )
 
         lr = None
         if not val:

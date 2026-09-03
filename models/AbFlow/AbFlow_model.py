@@ -1,6 +1,6 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
-import math, time, os
+import math, time, os, json
 from contextlib import nullcontext
 from tqdm import tqdm
 
@@ -23,6 +23,36 @@ from ..modules.am_enc_pair_time import AMEncoderPairTime
 from .abflow_conditional_matcher import AbFlowConditionalMatcher
 from .abflow_r3_matcher import AbFlowR3Matcher
 
+
+
+_ABFLOW_CONFIG_CACHE = None
+
+def _abflow_config():
+    """Load the formal JSON config once from ABFLOW_CONFIG_PATH."""
+    global _ABFLOW_CONFIG_CACHE
+    if _ABFLOW_CONFIG_CACHE is not None:
+        return _ABFLOW_CONFIG_CACHE
+    path = os.environ.get("ABFLOW_CONFIG_PATH", "").strip()
+    if not path:
+        _ABFLOW_CONFIG_CACHE = {}
+        return _ABFLOW_CONFIG_CACHE
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        _ABFLOW_CONFIG_CACHE = cfg if isinstance(cfg, dict) else {}
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load ABFLOW_CONFIG_PATH={path}: {exc}"
+        ) from exc
+    return _ABFLOW_CONFIG_CACHE
+
+
+def _cfg_value(section, key, default):
+    cfg = _abflow_config()
+    block = cfg.get(section, {}) if isinstance(cfg, dict) else {}
+    if isinstance(block, dict) and key in block:
+        return block[key]
+    return default
 
 # v101 support-geometry optimization on the validated U02/F01 physical parent.
 
@@ -1161,7 +1191,52 @@ class AbFlowModel(nn.Module):
         # turn every expensive training batch into a synchronization point.
         self._diagnostic_capture = False
 
-        self.seq_ce_weight = _env_float("ABFLOW_SEQ_CE_WEIGHT", 1.0)
+        # v132 task-specific loss hierarchy.  The JSON launcher exports these
+        # values, so the experiment configuration is the single source of truth.
+        # ABX supplies the task-scale hierarchy; MFDesign supplies the loss
+        # definitions.  U02 transport remains the unique path authority.
+        self.loss_transport_weight = float(_cfg_value("loss_weights", "transport", _env_float("ABFLOW_LOSS_TRANSPORT_WEIGHT", 1.0)))
+        self.loss_sequence_weight = float(_cfg_value("loss_weights", "sequence", _env_float("ABFLOW_LOSS_SEQUENCE_WEIGHT", 0.4)))
+        self.loss_aligned_weight = float(_cfg_value("loss_weights", "aligned_mse", _env_float("ABFLOW_LOSS_ALIGNED_WEIGHT", 0.5)))
+        self.loss_smooth_lddt_weight = float(_cfg_value("loss_weights", "smooth_lddt", _env_float("ABFLOW_LOSS_SMOOTH_LDDT_WEIGHT", 0.1)))
+        self.loss_distogram_weight = float(_cfg_value("loss_weights", "distogram", _env_float("ABFLOW_LOSS_DISTOGRAM_WEIGHT", 0.5)))
+        self.loss_confidence_weight = float(_cfg_value("loss_weights", "confidence", _env_float("ABFLOW_LOSS_CONFIDENCE_WEIGHT", 0.025)))
+        # V137: only the persistent pair/distogram auxiliary remains
+        # near-native gated.  Physical clean-endpoint geometry losses are
+        # defined for the full U02 time domain after analytic carrier decoding.
+        self.distogram_gate_start = float(_cfg_value(
+            "loss_weights", "distogram_gate_start",
+            _cfg_value(
+                "loss_weights", "native_geometry_gate_start",
+                _env_float("ABFLOW_DISTOGRAM_GATE_START", 0.75),
+            ),
+        ))
+        if not (0.0 <= self.distogram_gate_start < 1.0):
+            raise ValueError("distogram_gate_start must be in [0,1)")
+
+        # Raw AbFlow / Score--Flow coordinates are Å.  The aligned Cartesian
+        # auxiliary is evaluated in the same 0.1-scaled coordinate convention
+        # used by the R3 flow objective; this removes an otherwise arbitrary
+        # Å^2 magnitude mismatch without inventing a time gate.
+        self.geometry_coordinate_scaling = float(_cfg_value(
+            "loss_weights", "geometry_coordinate_scaling",
+            self.flow_coordinate_scaling,
+        ))
+        if self.geometry_coordinate_scaling <= 0.0:
+            raise ValueError("geometry_coordinate_scaling must be positive")
+        for _name, _value in {
+            "transport": self.loss_transport_weight,
+            "sequence": self.loss_sequence_weight,
+            "aligned": self.loss_aligned_weight,
+            "smooth_lddt": self.loss_smooth_lddt_weight,
+            "distogram": self.loss_distogram_weight,
+            "confidence": self.loss_confidence_weight,
+        }.items():
+            if float(_value) < 0.0:
+                raise ValueError(f"loss weight {_name} must be non-negative")
+
+        # Backward-compatible alias used by historical logging paths.
+        self.seq_ce_weight = self.loss_sequence_weight
 
         # =========================================================
         # Modern Generative Learning & Calibration (Modules 6--8)
@@ -1170,25 +1245,37 @@ class AbFlowModel(nn.Module):
         #   L_gen = L_transport + L_sequence + L_distogram.
         # Historical static structure and learned sparse edge-distance losses
         # remain diagnostics only in this modern mode.
-        self.modern_objective_mode = _env_str(
-            "ABFLOW_MODERN_OBJECTIVE_MODE",
-            "transport_sequence_distogram",
-        ).lower()
+        self.modern_objective_mode = str(_cfg_value(
+            "objective", "mode",
+            _env_str(
+                "ABFLOW_MODERN_OBJECTIVE_MODE",
+                "transport_sequence_distogram",
+            ),
+        )).strip().lower()
         if self.modern_objective_mode not in {
             "legacy",
             "transport_sequence_distogram",
+            "mfdesign_u02_hierarchy",
+            "mfdesign_abx_taskscale",
+            "mfdesign_abx_physical_endpoint",
         }:
             raise ValueError(
-                "ABFLOW_MODERN_OBJECTIVE_MODE must be legacy or "
-                "transport_sequence_distogram."
+                "ABFLOW_MODERN_OBJECTIVE_MODE must be legacy, "
+                "transport_sequence_distogram, mfdesign_u02_hierarchy, "
+                "mfdesign_abx_taskscale, or "
+                "mfdesign_abx_physical_endpoint."
             )
 
         # Confidence is optimized in the same run but is gradient-isolated in
         # AMEncoder: s/z/x_pred are detached before confidence refinement.
         # Therefore adding L_conf changes only confidence parameters.
-        self.modern_confidence_training = _env_flag(
-            "ABFLOW_CONFIDENCE", True
-        )
+        self.modern_confidence_training = bool(_cfg_value(
+            "confidence", "enabled", _env_flag("ABFLOW_CONFIDENCE", True)
+        ))
+        # Deprecated v131 aliases retained only for checkpoint/log compatibility.
+        self.mfdesign_main_loss_weight = 1.0
+        self.mfdesign_distogram_loss_weight = self.loss_distogram_weight
+        self.mfdesign_confidence_loss_weight = self.loss_confidence_weight
         self.last_modern_auxiliary_losses = {}
 
         # Final-round sequence supervision is the formal modern setting.  The
@@ -1392,6 +1479,25 @@ class AbFlowModel(nn.Module):
             )
 
         self._last_structure_seq_diagnostics = {}
+
+        if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+            print(
+                "[V137Config][Science] "
+                f"source={self.abflow_source_mode} common_center={self.abx_common_center} "
+                f"scorefm_loss={self.scorefm_loss_mode} "
+                f"sampler={self.scorefm_sampler_mode} "
+                f"objective={self.modern_objective_mode} "
+                f"readout={self.final_readout_mode} "
+                f"seq_mode={self.sequence_generative_mode} "
+                f"weights(T/S/A/L/D/C)="
+                f"{self.loss_transport_weight:.3g}/{self.loss_sequence_weight:.3g}/"
+                f"{self.loss_aligned_weight:.3g}/{self.loss_smooth_lddt_weight:.3g}/"
+                f"{self.loss_distogram_weight:.3g}/{self.loss_confidence_weight:.3g} "
+                f"geom_scale={self.geometry_coordinate_scaling:.3g} "
+                f"disto_gate_start={self.distogram_gate_start:.2f} "
+                f"physical_X1_losses=full_time literal_integrated_readout=on",
+                flush=True,
+            )
 
 
     def init_mask(self, X, S, cmask, smask, template):
@@ -5819,13 +5925,17 @@ class AbFlowModel(nn.Module):
     @torch.no_grad()
     def _validation_proxy_diagnostics(
             self, *, true_X, true_S, pred_S, r_pred_S_logits, r_interface_X,
-            paratope_mask, smask, batch_id, interface_batch_id):
-        """Cheap validation proxies aligned with the final evaluation axes.
+            paratope_mask, smask, batch_id, interface_batch_id,
+            state_Xt=None, source_X0=None, t_int=None):
+        """Validation diagnostics in the PHYSICAL clean-endpoint X1 chart.
 
-        These are not substitutes for TM-score/lDDT/DockQ and are never used as
-        test-set checkpoint selection.  They answer where the refinement process
-        changes: raw placement, aligned local geometry, native contacts and
-        contact-residue sequence recovery.
+        U02's canonical branch predicts a carrier Y_t rather than X1 directly.
+        Therefore every recurrent coordinate prediction is decoded through the
+        exact U02 inverse before RMSD/contact diagnostics are computed.
+
+        This restores the invariant:
+            validation geometry == physical endpoint geometry,
+        instead of comparing the carrier chart directly against native X1.
         """
         out = {}
         if interface_batch_id.numel() == 0:
@@ -5835,10 +5945,25 @@ class AbFlowModel(nn.Module):
         true_ca = true_int[:, ca_idx].float()
         n_graph = int(interface_batch_id.max().item()) + 1
 
+        can_decode = (
+            state_Xt is not None and source_X0 is not None and t_int is not None
+        )
+        physical_rounds = []
         round_raw = []
         round_aligned = []
+
         for ridx, pred_int in enumerate(r_interface_X[1:]):
-            pred_ca = pred_int[:, ca_idx].float()
+            physical_pred = (
+                self._decode_u02_clean_endpoint_for_aux(
+                    x_t=state_Xt,
+                    x0=source_X0,
+                    carrier=pred_int,
+                    t=t_int,
+                )
+                if can_decode else pred_int
+            )
+            physical_rounds.append(physical_pred)
+            pred_ca = physical_pred[:, ca_idx].float()
             raw_values, aligned_values = [], []
             for g in range(n_graph):
                 m = interface_batch_id == g
@@ -5879,11 +6004,60 @@ class AbFlowModel(nn.Module):
             out["val_proxy_refinement_aligned_rmsd_delta"] = (
                 round_aligned[-1] - round_aligned[0]
             )
+        out["val_proxy_physical_endpoint_decode"] = true_X.new_tensor(
+            1.0 if can_decode else 0.0
+        )
+
+        # Final-round physical X1 error by t-bin.  This directly shows whether
+        # the decoded endpoint is learned uniformly or only near one boundary.
+        if physical_rounds and can_decode:
+            final_ca = physical_rounds[-1][:, ca_idx].float()
+            try:
+                t_res = torch.as_tensor(
+                    t_int, device=final_ca.device, dtype=torch.float32
+                ).reshape(interface_batch_id.numel(), -1).mean(dim=-1)
+                t_graph = scatter_mean(
+                    t_res, interface_batch_id, dim=0, dim_size=n_graph
+                )
+                raw_pg = final_ca.new_full((n_graph,), float("nan"))
+                aligned_pg = final_ca.new_full((n_graph,), float("nan"))
+                for g in range(n_graph):
+                    m = interface_batch_id == g
+                    if not bool(m.any()):
+                        continue
+                    p, q = final_ca[m], true_ca[m]
+                    raw_pg[g] = torch.sqrt(
+                        ((p - q) ** 2).sum(-1).mean().clamp_min(0.0)
+                    )
+                    if p.shape[0] >= 3:
+                        try:
+                            _, rot, trans = kabsch_torch(p, q)
+                            pa = torch.matmul(p, rot.T) + trans
+                            aligned_pg[g] = torch.sqrt(
+                                ((pa - q) ** 2).sum(-1).mean().clamp_min(0.0)
+                            )
+                        except Exception:
+                            pass
+
+                for bi, (lo, hi) in enumerate(
+                    [(0.0,0.2),(0.2,0.4),(0.4,0.6),(0.6,0.8),(0.8,1.0001)]
+                ):
+                    gm = (t_graph >= lo) & (t_graph < hi)
+                    raw_ok = gm & torch.isfinite(raw_pg)
+                    ali_ok = gm & torch.isfinite(aligned_pg)
+                    if bool(raw_ok.any()):
+                        out[f"val_physical_x1_tbin{bi}_raw_rmsd"] = raw_pg[raw_ok].mean()
+                        out[f"val_physical_x1_tbin{bi}_count"] = raw_ok.float().sum()
+                    if bool(ali_ok.any()):
+                        out[f"val_physical_x1_tbin{bi}_aligned_rmsd"] = aligned_pg[ali_ok].mean()
+            except Exception:
+                pass
 
         is_ag = self.batch_constants.get("is_ag")
-        if is_ag is None:
+        if is_ag is None or not physical_rounds:
             return out
-        pred_final_ca = r_interface_X[-1][:, ca_idx].float()
+
+        pred_final_ca = physical_rounds[-1][:, ca_idx].float()
         contact_f1, contact_precision, contact_recall, caar_values = [], [], [], []
         for g in range(n_graph):
             pm = interface_batch_id == g
@@ -5987,6 +6161,9 @@ class AbFlowModel(nn.Module):
             ("endpoint", "seq"),
             ("endpoint", "distogram"),
             ("seq", "distogram"),
+            ("endpoint", "aligned"),
+            ("endpoint", "smooth_lddt"),
+            ("aligned", "smooth_lddt"),
         ]
         for a, b in pairs:
             if a in grads and b in grads:
@@ -6143,6 +6320,163 @@ class AbFlowModel(nn.Module):
             "scorefm_traj_velocity": velocity_consistency.detach(),
             "scorefm_traj_rate": traj_rate.detach(),
         }
+
+    def _decode_u02_clean_endpoint_for_aux(self, x_t, x0, carrier, t):
+        """Map the U02 network coordinate chart back to physical clean X1.
+
+        U02 trains Endpoint for t<t_min and the canonical carrier for the
+        interior.  Local geometry/confidence losses must act on X1, never on the
+        carrier chart itself.
+        """
+        if self.scorefm_loss_mode != "f01_r3_endpoint_canonical_hybrid":
+            return carrier
+        decoded = self.r3_matcher.endpoint_from_canonical_carrier_gfree(
+            x_t=x_t,
+            x0=x0,
+            carrier=carrier,
+            t=t,
+            boundary_eps=float(self.f01_hybrid_t_min),
+        )
+        t_b = self.r3_matcher._broadcast_time_like(t, carrier)
+        active = t_b >= float(self.f01_hybrid_t_min)
+        return torch.where(active, decoded, carrier)
+
+    def _distogram_gate_graph(self, t_graph):
+        """C1 near-native gate used ONLY by the persistent pair distogram.
+
+        The pair representation z is built from the current noisy/interpolated
+        state X_t, so asking it to predict the native distance map at very early
+        times is a substantially harder conditional task.  This gate is
+        therefore retained for L_D only.
+
+        In contrast, aligned-MSE and smooth-lDDT act on the analytically decoded
+        clean endpoint X1_hat and are valid over the full U02 time domain.
+        """
+        t = torch.as_tensor(t_graph, dtype=torch.float32).reshape(-1)
+        start = float(self.distogram_gate_start)
+        u = ((t - start) / max(1.0 - start, 1e-8)).clamp(0.0, 1.0)
+        return u * u * (3.0 - 2.0 * u)
+
+    @staticmethod
+    def _aligned_target_to_prediction(pred_points, true_points):
+        """MFDesign-style detached rigid alignment target for Cartesian MSE.
+
+        Kabsch/SVD is a numerically sensitive linear-algebra kernel and PyTorch
+        1.11 CUDA does not implement ``torch.linalg.svd`` for BF16.  Training
+        runs under global BF16 autocast, so merely calling ``.float()`` on the
+        inputs is insufficient: autocast may cast the covariance matmul back to
+        BF16.  Keep this detached alignment island explicitly in FP32, then cast
+        only the aligned target back to the prediction dtype for the outer loss.
+        """
+        with torch.no_grad():
+            # Explicit FP32 island.  This is not a change to the model state or
+            # transport objective; it only makes the detached Kabsch target
+            # numerically valid under BF16 AMP.
+            with torch.cuda.amp.autocast(enabled=False):
+                p = pred_points.detach().to(dtype=torch.float32)
+                q = true_points.detach().to(dtype=torch.float32)
+                p_center = p.mean(dim=0, keepdim=True)
+                q_center = q.mean(dim=0, keepdim=True)
+                pc = p - p_center
+                qc = q - q_center
+                cov = qc.transpose(0, 1) @ pc
+                U, _, Vh = torch.linalg.svd(cov)
+                det = torch.det(U @ Vh)
+                D = torch.eye(3, device=cov.device, dtype=torch.float32)
+                D[-1, -1] = torch.where(
+                    det < 0,
+                    det.new_tensor(-1.0),
+                    det.new_tensor(1.0),
+                )
+                R = U @ D @ Vh
+                aligned = qc @ R + p_center
+        return aligned.to(device=pred_points.device, dtype=pred_points.dtype)
+
+    def _endpoint_geometry_losses(
+        self, pred_x1, true_x1, atom_mask, interface_batch_id
+    ):
+        """Physical-endpoint geometry losses for U02.
+
+        ``pred_x1`` and ``true_x1`` are raw Cartesian Å coordinates.
+
+        L_A:
+            Detached Kabsch target followed by Cartesian MSE in the same scaled
+            coordinate convention used by the R3 flow:
+                delta_scaled = geometry_coordinate_scaling * delta_Angstrom.
+            This keeps the loss dimensionally compatible with the flow scale
+            without using a time gate as an implicit loss weight.
+
+        L_sLDDT:
+            MFDesign smooth-lDDT on RAW Å distances using soft thresholds
+            0.5/1/2/4 Å and the 15 Å native-neighbor cutoff.
+
+        Both are defined on the analytically decoded physical clean endpoint
+        over the complete U02 training-time support.
+        """
+        zero = pred_x1.sum() * 0.0
+        if pred_x1.numel() == 0:
+            return zero, zero, zero
+
+        n_graph = int(interface_batch_id.max().item()) + 1
+        aligned_ang2 = []
+        aligned_scaled = []
+        lddt_losses = []
+        coord_scale = float(self.geometry_coordinate_scaling)
+
+        for g in range(n_graph):
+            res = interface_batch_id == g
+            if not bool(res.any()):
+                continue
+            p = pred_x1[res]
+            q = true_x1[res]
+            m = atom_mask[res].bool()
+            p_pts = p[m]
+            q_pts = q[m]
+            if p_pts.shape[0] < 2:
+                continue
+
+            # Alignment itself is detached and forced to FP32 by
+            # _aligned_target_to_prediction; gradients flow only through p_pts.
+            aligned_q = self._aligned_target_to_prediction(p_pts, q_pts)
+            diff_ang = p_pts - aligned_q
+            mse_ang2_g = diff_ang.pow(2).mean()
+            mse_scaled_g = (coord_scale * diff_ang).pow(2).mean()
+
+            # pred_x1/true_x1 are already raw Å.  Do NOT multiply by the
+            # AtomStructure internal 10 Å/model-unit factor here.
+            p_ang = p_pts.float()
+            q_ang = q_pts.float()
+            true_d = torch.cdist(q_ang, q_ang)
+            pred_d = torch.cdist(p_ang, p_ang)
+            pair_mask = true_d < 15.0
+            eye = torch.eye(
+                true_d.shape[0], dtype=torch.bool, device=true_d.device
+            )
+            pair_mask = pair_mask & (~eye)
+            if bool(pair_mask.any()):
+                diff = (true_d - pred_d).abs()
+                score = (
+                    torch.sigmoid(0.5 - diff)
+                    + torch.sigmoid(1.0 - diff)
+                    + torch.sigmoid(2.0 - diff)
+                    + torch.sigmoid(4.0 - diff)
+                ) / 4.0
+                lddt_g = 1.0 - score[pair_mask].mean()
+            else:
+                lddt_g = zero
+
+            aligned_ang2.append(mse_ang2_g)
+            aligned_scaled.append(mse_scaled_g)
+            lddt_losses.append(lddt_g)
+
+        def _avg(xs):
+            return torch.stack(xs).mean() if xs else zero
+
+        return (
+            _avg(aligned_ang2),
+            _avg(aligned_scaled),
+            _avg(lddt_losses),
+        )
 
     def forward(
         self, X, S, cmask, smask, paratope_mask, X_pep, S_pep, surface,
@@ -6621,32 +6955,10 @@ class AbFlowModel(nn.Module):
             flow_t=t_graph if state_path else None
         )
 
-        # Consume Module 6/7/Confidence caches immediately after the PRIMARY
-        # generator query.  Some historical diagnostics issue extra _forward
-        # calls later; those must never replace the supervision target/cache of
-        # the actual training prediction.
-        if hasattr(self.gnn, "compute_auxiliary_losses"):
-            modern_aux = self.gnn.compute_auxiliary_losses(
-                true_X=true_X,
-                xloss_mask=xloss_mask,
-            )
-        else:
-            _zero_aux = X.sum() * 0.0
-            modern_aux = {
-                "distogram_loss": _zero_aux,
-                "confidence_loss": _zero_aux,
-                "plddt_loss": _zero_aux,
-                "pde_loss": _zero_aux,
-                "pae_loss": _zero_aux,
-                "self_condition_rate": _zero_aux.detach(),
-                "confidence_mean_plddt": _zero_aux.detach(),
-                "confidence_mean_pde": _zero_aux.detach(),
-                "confidence_mean_pae": _zero_aux.detach(),
-            }
-        self.last_modern_auxiliary_losses = {
-            k: (v.detach() if torch.is_tensor(v) else v)
-            for k, v in modern_aux.items()
-        }
+        # v132 defers pair/confidence loss assembly until the U02 carrier has
+        # been analytically decoded to the physical clean endpoint.  This is
+        # essential for smooth-lDDT/confidence semantic correctness.
+        modern_aux = None
 
         if (
             state_path
@@ -6730,6 +7042,65 @@ class AbFlowModel(nn.Module):
                 self._diagnostic_probe_tensor = probe_saved
                 self._latest_condition_diagnostics = cond_diag_saved
 
+        # -------------------------------------------------------------
+        # v132 physical clean-endpoint view for MFDesign losses/confidence.
+        # -------------------------------------------------------------
+        if state_path:
+            decoded_clean_interface_X1 = self._decode_u02_clean_endpoint_for_aux(
+                x_t=Xt,
+                x0=interface_X,
+                carrier=r_interface_X[-1],
+                t=t_int,
+            )
+            distogram_gate_graph = self._distogram_gate_graph(t_graph).to(X.device)
+            distogram_gate_residue = distogram_gate_graph[batch_id]
+
+            # AMEncoder caches AtomStructure coordinates in internal model units
+            # (1 model unit = 10 Å by default).  decoded_clean_interface_X1 is
+            # raw Å, so convert exactly once before overriding confidence input.
+            clean_override = torch.zeros_like(pred_X)
+            clean_override[paratope_mask] = (
+                decoded_clean_interface_X1 * float(self.flow_coordinate_scaling)
+            )
+            clean_override_mask = torch.zeros(
+                pred_X.shape[0], dtype=torch.bool, device=pred_X.device
+            )
+            clean_override_mask[paratope_mask] = True
+        else:
+            decoded_clean_interface_X1 = None
+            distogram_gate_graph = X.new_zeros((batch_size,), dtype=torch.float32)
+            distogram_gate_residue = X.new_zeros((X.shape[0],), dtype=torch.float32)
+            clean_override = None
+            clean_override_mask = None
+
+        if hasattr(self.gnn, "compute_auxiliary_losses"):
+            modern_aux = self.gnn.compute_auxiliary_losses(
+                true_X=true_X,
+                xloss_mask=xloss_mask,
+                clean_endpoint_override=clean_override,
+                clean_endpoint_override_mask=clean_override_mask,
+                residue_native_gate=distogram_gate_residue,
+            )
+        else:
+            _zero_aux = X.sum() * 0.0
+            modern_aux = {
+                "distogram_loss": _zero_aux,
+                "distogram_loss_raw": _zero_aux,
+                "confidence_loss": _zero_aux,
+                "plddt_loss": _zero_aux,
+                "pde_loss": _zero_aux,
+                "pae_loss": _zero_aux,
+                "resolved_loss": _zero_aux,
+                "self_condition_rate": _zero_aux.detach(),
+                "confidence_mean_plddt": _zero_aux.detach(),
+                "confidence_mean_pde": _zero_aux.detach(),
+                "confidence_mean_pae": _zero_aux.detach(),
+            }
+        self.last_modern_auxiliary_losses = {
+            k: (v.detach() if torch.is_tensor(v) else v)
+            for k, v in modern_aux.items()
+        }
+
         # sequence negative log likelihood
         snll = X.new_tensor(0.0)
         total = X.new_tensor(0.0)
@@ -6765,7 +7136,7 @@ class AbFlowModel(nn.Module):
             structure_xloss_mask = xloss_mask.clone()
             structure_xloss_mask[paratope_mask] = False
 
-        if self.modern_objective_mode == "transport_sequence_distogram":
+        if self.modern_objective_mode in {"transport_sequence_distogram", "mfdesign_u02_hierarchy", "mfdesign_abx_taskscale", "mfdesign_abx_physical_endpoint"}:
             # Historical static structure terms are diagnostics only under the
             # modern single-authority objective. Evaluate them without autograd
             # so they cannot become a second coordinate authority or retain a
@@ -6797,6 +7168,27 @@ class AbFlowModel(nn.Module):
         interface_atom_mask = (
             interface_atom_pos != self.aa_feature.atom_pos_pad_idx
         )
+
+        if (
+            state_path
+            and self.modern_objective_mode in {"mfdesign_abx_taskscale", "mfdesign_abx_physical_endpoint"}
+            and decoded_clean_interface_X1 is not None
+        ):
+            (
+                aligned_mse_raw_ang2,
+                aligned_mse_scaled,
+                smooth_lddt_full,
+            ) = self._endpoint_geometry_losses(
+                pred_x1=decoded_clean_interface_X1,
+                true_x1=gt_interface_X,
+                atom_mask=interface_atom_mask,
+                interface_batch_id=interface_batch_id,
+            )
+        else:
+            _zero_geo = r_interface_X[-1].sum() * 0.0
+            aligned_mse_raw_ang2 = _zero_geo
+            aligned_mse_scaled = _zero_geo
+            smooth_lddt_full = _zero_geo
 
         satc_residue_weight = None
         if state_path and self.scorefm_loss_mode in {
@@ -6972,31 +7364,80 @@ class AbFlowModel(nn.Module):
             pdev_loss, prmsd_loss = None, None
 
         # =============================================================
-        # Module 6: generator / confidence objective hierarchy
+        # V137 physical-endpoint objective taxonomy
         # =============================================================
-        if self.modern_objective_mode == "transport_sequence_distogram":
-            # Exactly three generator authorities, each already mean-normalized
-            # in its native support:
-            #   1) Score--Flow transport/carrier objective,
-            #   2) final-round discrete sequence CE,
-            #   3) persistent-pair distogram CE.
+        if self.modern_objective_mode in {
+            "mfdesign_abx_taskscale", "mfdesign_abx_physical_endpoint"
+        }:
+            # Full MFDesign loss TYPES, mapped to our Score--Flow semantics:
+            #   MF coordinate denoising  -> U02 primary transport L_T
+            #   MF sequence CE           -> L_S
+            #   MF aligned coordinate MSE -> L_aligned on decoded clean X1
+            #   MF smooth-lDDT           -> L_sLDDT on decoded clean X1
+            #   MF distogram             -> L_D on persistent pair z
+            #   MF confidence family     -> L_conf, generator-detached
             #
-            # No tunable lambda is introduced in the formal V1 objective.
+            # ABX task-scale weights and native-endpoint gating prevent the
+            # auxiliary geometry terms from becoming a second trajectory law.
+            weighted_transport = self.loss_transport_weight * interface_loss
+            weighted_sequence = self.loss_sequence_weight * snll
+            weighted_aligned = self.loss_aligned_weight * aligned_mse_scaled
+            weighted_smooth_lddt = (
+                self.loss_smooth_lddt_weight * smooth_lddt_full
+            )
+            weighted_distogram = (
+                self.loss_distogram_weight * modern_aux["distogram_loss"]
+            )
             generator_loss = (
-                self.seq_ce_weight * snll
-                + interface_loss
-                + modern_aux["distogram_loss"]
+                weighted_transport
+                + weighted_sequence
+                + weighted_aligned
+                + weighted_smooth_lddt
+                + weighted_distogram
                 + (0 if pdev_loss is None else pdev_loss)
             )
-
-            # Confidence has detached generator inputs, hence this term updates
-            # confidence parameters only.  Validation/checkpoint selection uses
-            # generator_loss alone to prevent calibration quality from masking a
-            # worse generator.
+            weighted_confidence = (
+                self.loss_confidence_weight * modern_aux["confidence_loss"]
+            )
             if self.training and self.modern_confidence_training:
-                loss = generator_loss + modern_aux["confidence_loss"]
+                loss = generator_loss + weighted_confidence
             else:
+                # Keep checkpoint ranking generator-only.  Confidence is a
+                # calibration head and must not hide a worse generator.
                 loss = generator_loss
+        elif self.modern_objective_mode in {
+            "transport_sequence_distogram",
+            "mfdesign_u02_hierarchy",
+        }:
+            # Retain v127/v131 only as explicit backward-compatible ablations.
+            seq_main = self.seq_ce_weight * snll
+            transport_main = interface_loss
+            disto_main = modern_aux["distogram_loss"]
+            if self.modern_objective_mode == "mfdesign_u02_hierarchy":
+                main_loss = transport_main + seq_main
+                generator_loss = (
+                    self.mfdesign_main_loss_weight * main_loss
+                    + self.mfdesign_distogram_loss_weight * disto_main
+                    + (0 if pdev_loss is None else pdev_loss)
+                )
+                if self.training and self.modern_confidence_training:
+                    loss = (
+                        generator_loss
+                        + self.mfdesign_confidence_loss_weight
+                        * modern_aux["confidence_loss"]
+                    )
+                else:
+                    loss = generator_loss
+            else:
+                generator_loss = (
+                    seq_main + transport_main + disto_main
+                    + (0 if pdev_loss is None else pdev_loss)
+                )
+                loss = (
+                    generator_loss + modern_aux["confidence_loss"]
+                    if self.training and self.modern_confidence_training
+                    else generator_loss
+                )
         else:
             generator_loss = (
                 self.seq_ce_weight * snll
@@ -7026,7 +7467,7 @@ class AbFlowModel(nn.Module):
                     == "transport_sequence_distogram"
                     else struct_loss
                 ),
-                "endpoint": endpoint_diag,
+                "endpoint": self.loss_transport_weight * endpoint_diag,
                 "satc": satc_diag,
                 "edge": (
                     modern_aux["distogram_loss"]
@@ -7036,8 +7477,10 @@ class AbFlowModel(nn.Module):
                         ed_loss if torch.is_tensor(ed_loss) else zero_actual
                     )
                 ),
-                "distogram": modern_aux["distogram_loss"],
-                "confidence": modern_aux["confidence_loss"],
+                "distogram": self.loss_distogram_weight * modern_aux["distogram_loss"],
+                "confidence": self.loss_confidence_weight * modern_aux["confidence_loss"],
+                "aligned": self.loss_aligned_weight * aligned_mse_scaled,
+                "smooth_lddt": self.loss_smooth_lddt_weight * smooth_lddt_full,
             }
         else:
             self._diagnostic_objective_tensors = {}
@@ -7057,7 +7500,7 @@ class AbFlowModel(nn.Module):
                 "seq_ce_weight": torch.as_tensor(self.seq_ce_weight, device=X.device),
                 "modern_objective_enabled": torch.as_tensor(
                     1.0 if self.modern_objective_mode
-                    == "transport_sequence_distogram" else 0.0,
+                    in {"transport_sequence_distogram", "mfdesign_u02_hierarchy", "mfdesign_abx_taskscale", "mfdesign_abx_physical_endpoint"} else 0.0,
                     device=X.device,
                 ),
                 "modern_sequence_masked_absorbing": torch.as_tensor(
@@ -7073,6 +7516,56 @@ class AbFlowModel(nn.Module):
                     1.0, device=X.device
                 ),
                 "modern_distogram_loss": modern_aux["distogram_loss"].detach(),
+                "modern_distogram_loss_raw": modern_aux.get(
+                    "distogram_loss_raw", modern_aux["distogram_loss"]
+                ).detach(),
+                # V137: gate applies ONLY to distogram; physical X1 geometry
+                # auxiliaries are full-time after exact carrier decoding.
+                "v132_native_geometry_gate_mean": distogram_gate_graph.detach().mean(),
+                "v132_aligned_mse_raw": aligned_mse_raw_ang2.detach(),
+                "v132_aligned_mse_gated": aligned_mse_scaled.detach(),
+                "v132_smooth_lddt_raw": smooth_lddt_full.detach(),
+                "v132_smooth_lddt_gated": smooth_lddt_full.detach(),
+                "v137_distogram_gate_mean": distogram_gate_graph.detach().mean(),
+                "v137_geometry_coordinate_scaling": X.new_tensor(
+                    float(self.geometry_coordinate_scaling)
+                ),
+                "v137_aligned_mse_ang2_raw": aligned_mse_raw_ang2.detach(),
+                "v137_aligned_mse_scaled": aligned_mse_scaled.detach(),
+                "v137_smooth_lddt_full_time": smooth_lddt_full.detach(),
+                "v137_physical_endpoint_geometry_full_time": X.new_tensor(1.0),
+                "v137_clean_override_model_scale": X.new_tensor(
+                    float(self.flow_coordinate_scaling)
+                ),
+                "v132_weight_transport": X.new_tensor(float(self.loss_transport_weight)),
+                "v132_weight_sequence": X.new_tensor(float(self.loss_sequence_weight)),
+                "v132_weight_aligned": X.new_tensor(float(self.loss_aligned_weight)),
+                "v132_weight_smooth_lddt": X.new_tensor(float(self.loss_smooth_lddt_weight)),
+                "v132_weight_distogram": X.new_tensor(float(self.loss_distogram_weight)),
+                "v132_weight_confidence": X.new_tensor(float(self.loss_confidence_weight)),
+                "v132_weighted_transport": (self.loss_transport_weight * interface_loss).detach(),
+                "v132_weighted_sequence": (self.loss_sequence_weight * snll).detach(),
+                "v132_weighted_aligned": (self.loss_aligned_weight * aligned_mse_scaled).detach(),
+                "v132_weighted_smooth_lddt": (self.loss_smooth_lddt_weight * smooth_lddt_full).detach(),
+                "v132_weighted_distogram": (self.loss_distogram_weight * modern_aux["distogram_loss"]).detach(),
+                "v132_weighted_confidence": (self.loss_confidence_weight * modern_aux["confidence_loss"]).detach(),
+                "mfdesign_main_loss_weight": X.new_tensor(
+                    float(self.mfdesign_main_loss_weight)
+                ),
+                "mfdesign_distogram_loss_weight": X.new_tensor(
+                    float(self.mfdesign_distogram_loss_weight)
+                ),
+                "mfdesign_weighted_transport": (
+                    self.mfdesign_main_loss_weight * interface_loss
+                ).detach(),
+                "mfdesign_weighted_sequence": (
+                    self.mfdesign_main_loss_weight
+                    * self.seq_ce_weight * snll
+                ).detach(),
+                "mfdesign_weighted_distogram": (
+                    self.mfdesign_distogram_loss_weight
+                    * modern_aux["distogram_loss"]
+                ).detach(),
                 # Module 11: scale fractions are diagnostic observations only;
                 # they do NOT reweight any objective.  Fractions make it easy to
                 # detect numerical domination after the backbone/objective change.
@@ -7480,6 +7973,9 @@ class AbFlowModel(nn.Module):
                     r_interface_X=r_interface_X,
                     paratope_mask=paratope_mask, smask=smask,
                     batch_id=batch_id, interface_batch_id=interface_batch_id,
+                    state_Xt=Xt if state_path else None,
+                    source_X0=interface_X if state_path else None,
+                    t_int=t_int if state_path else None,
                 ))
             self.last_abflow_diagnostics = {
                 k: v.detach() if torch.is_tensor(v) else v for k, v in diag.items()
@@ -7600,6 +8096,19 @@ class AbFlowModel(nn.Module):
         # Module 10/11: aggregate diagnostics only.  Nothing in these values is
         # fed back into the sampler or model.
         joint_step_rms = []
+
+        # V137 rollout audit: only the first few sample() calls per process are
+        # printed.  These diagnostics never use native X1 and never alter state.
+        if not hasattr(self, "_v137_rollout_audit_calls"):
+            self._v137_rollout_audit_calls = 0
+        _audit_max = max(0, _env_int("ABFLOW_ROLLOUT_AUDIT_MAX_CALLS", 4))
+        _audit_call_id = int(self._v137_rollout_audit_calls)
+        _audit_this_call = bool(
+            getattr(self, "mechanism_diagnostics", True)
+            and _audit_call_id < _audit_max
+        )
+        self._v137_rollout_audit_calls += 1
+        _audit_rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
         joint_mask_fraction = []
         joint_reveal_fraction = []
         joint_sequence_entropy = []
@@ -7641,6 +8150,19 @@ class AbFlowModel(nn.Module):
             )
             pred_clean_X = r_interface_X[-1]
             Xt_before_step = Xt
+
+            # Physical clean-endpoint estimate associated with THIS network
+            # query.  Used only for diagnostics; the matched sampler below is
+            # unchanged and still performs its exact analytic update.
+            _audit_t_int = self._time_for_interface(
+                flow_t_graph, interface_batch_id, Xt
+            )
+            _audit_x1hat = self._decode_u02_clean_endpoint_for_aux(
+                x_t=Xt,
+                x0=interface_X,
+                carrier=pred_clean_X,
+                t=_audit_t_int,
+            )
 
             raw_residual = pred_clean_X - Xt
             if self.scorefm_sampler_mode == "residual":
@@ -7767,11 +8289,57 @@ class AbFlowModel(nn.Module):
 
             if bool(getattr(self, "mechanism_diagnostics", True)):
                 with torch.no_grad():
-                    joint_step_rms.append(
-                        torch.sqrt(
-                            (Xt - Xt_before_step).float().pow(2).mean().clamp_min(0.0)
-                        )
+                    _step_rms = torch.sqrt(
+                        (Xt - Xt_before_step).float().pow(2).mean().clamp_min(0.0)
                     )
+                    joint_step_rms.append(_step_rms)
+
+                    if _audit_this_call:
+                        _carrier_rms = torch.sqrt(
+                            (pred_clean_X - Xt_before_step).float()
+                            .pow(2).mean().clamp_min(0.0)
+                        )
+                        _x1hat_delta = torch.sqrt(
+                            (_audit_x1hat - Xt_before_step).float()
+                            .pow(2).mean().clamp_min(0.0)
+                        )
+                        if not self.struct_only:
+                            _mask_frac = (
+                                ((St == int(self.mask_id)) & design_int)
+                                .float().sum()
+                                / design_int.float().sum().clamp_min(1.0)
+                            )
+                            _entropy_now = -(
+                                cur_probs.clamp_min(1e-8)
+                                * cur_probs.clamp_min(1e-8).log()
+                            ).sum(dim=-1)
+                            _entropy_now = (
+                                _entropy_now[design_int].mean()
+                                if bool(design_int.any())
+                                else _step_rms.new_tensor(0.0)
+                            )
+                            _reveal_now = (
+                                refresh.float().sum()
+                                / masked_before.float().sum().clamp_min(1.0)
+                            )
+                        else:
+                            _mask_frac = _step_rms.new_tensor(0.0)
+                            _entropy_now = _step_rms.new_tensor(0.0)
+                            _reveal_now = _step_rms.new_tensor(0.0)
+
+                        print(
+                            "[RolloutStep] "
+                            f"rank={_audit_rank} call={_audit_call_id} "
+                            f"step={i}/{n_steps} "
+                            f"t={float(t):.3f}->{float(t_next):.3f} "
+                            f"carrier_delta={float(_carrier_rms):.4f}A "
+                            f"x1hat_delta={float(_x1hat_delta):.4f}A "
+                            f"Xt_step={float(_step_rms):.4f}A "
+                            f"mask_frac={float(_mask_frac):.4f} "
+                            f"reveal={float(_reveal_now):.4f} "
+                            f"seq_entropy={float(_entropy_now):.4f}",
+                            flush=True,
+                        )
 
         # Terminal readout.
         #
@@ -7866,25 +8434,82 @@ class AbFlowModel(nn.Module):
         if not self.struct_only:
             gen_S[supdate] = pred_S_final[supdate]
 
-        # Preserve the original AbFlow global-antibody alignment convention, but
-        # align to the integrated terminal interface rather than a second t=1
-        # network query.
+        # V137 literal integrated-endpoint authority.
+        #
+        # 1) Rigidly place the global antibody prediction into the integrated
+        #    terminal H3 frame (preserves historical global-antibody convention).
+        # 2) Explicitly overwrite the designed H3 with the integrated Xt(t=1).
+        #
+        # This makes FINAL_READOUT_MODE=integrated_endpoint literally true:
+        #     X_H3^final == Xt(t=1),
+        # instead of merely using Xt as a Kabsch target for a different H3 shape.
+        _ro_pre, _ro_post, _ro_emit = [], [], []
+        _ro_fw_shift, _ro_rot_deg, _ro_trans = [], [], []
         for b in range(batch_size):
             if not update[b]:
                 continue
             is_cur_graph = batch_id == b
             current_paratope = is_cur_graph & paratope_mask
+            current_interface = interface_batch_id == b
+
             ori_cdr = gen_X[current_paratope][:, :4]
-            pred_cdr = interface_X_final[
-                interface_batch_id == b
-            ][:, :4]
+            pred_cdr = interface_X_final[current_interface][:, :4]
+            _ro_pre.append(torch.sqrt(
+                (ori_cdr - pred_cdr).float().pow(2).mean().clamp_min(0.0)
+            ))
+
             _, R, trans = kabsch_torch(
                 ori_cdr.reshape(-1, 3), pred_cdr.reshape(-1, 3)
             )
             is_cur_ab = is_cur_graph & is_ab
+            is_framework = is_cur_ab & (~paratope_mask)
+            _fw_before = gen_X[is_framework].clone()
+
             gen_X[is_cur_ab] = torch.matmul(
                 gen_X[is_cur_ab], R.T
             ) + trans
+
+            _aligned_cdr = gen_X[current_paratope][:, :4]
+            _ro_post.append(torch.sqrt(
+                (_aligned_cdr - pred_cdr).float()
+                .pow(2).mean().clamp_min(0.0)
+            ))
+            if bool(is_framework.any()):
+                _ro_fw_shift.append(torch.sqrt(
+                    (gen_X[is_framework] - _fw_before).float()
+                    .pow(2).mean().clamp_min(0.0)
+                ))
+
+            _tr = torch.trace(R.float())
+            _cosang = ((_tr - 1.0) * 0.5).clamp(-1.0, 1.0)
+            _ro_rot_deg.append(torch.rad2deg(torch.acos(_cosang)))
+            _ro_trans.append(torch.linalg.norm(trans.float()))
+
+            if self.final_readout_mode == "integrated_endpoint":
+                gen_X[current_paratope] = interface_X_final[current_interface]
+
+            _ro_emit.append(torch.sqrt(
+                (
+                    gen_X[current_paratope][:, :4]
+                    - interface_X_final[current_interface][:, :4]
+                ).float().pow(2).mean().clamp_min(0.0)
+            ))
+
+        if _audit_this_call and _ro_pre:
+            def _m(xs):
+                return float(torch.stack([x.float() for x in xs]).mean())
+            print(
+                "[ReadoutAudit] "
+                f"rank={_audit_rank} call={_audit_call_id} "
+                f"global_vs_integrated={_m(_ro_pre):.4f}A "
+                f"after_kabsch={_m(_ro_post):.4f}A "
+                f"emitted_vs_integrated={_m(_ro_emit):.6f}A "
+                f"framework_shift={_m(_ro_fw_shift) if _ro_fw_shift else 0.0:.4f}A "
+                f"rotation_deg={_m(_ro_rot_deg):.3f} "
+                f"translation={_m(_ro_trans):.4f}A "
+                f"literal_integrated={1 if self.final_readout_mode == 'integrated_endpoint' else 0}",
+                flush=True,
+            )
 
         if bool(getattr(self, "mechanism_diagnostics", True)):
             def _mean_or_zero(values):

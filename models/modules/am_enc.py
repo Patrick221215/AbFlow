@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import math
 import os
+import json
 import inspect
 import random
 from functools import partial
@@ -72,6 +73,36 @@ from data.pdb_utils import VOCAB
 
 
 
+
+
+_ABFLOW_CONFIG_CACHE = None
+
+def _abflow_config():
+    """Load the formal JSON config once from ABFLOW_CONFIG_PATH."""
+    global _ABFLOW_CONFIG_CACHE
+    if _ABFLOW_CONFIG_CACHE is not None:
+        return _ABFLOW_CONFIG_CACHE
+    path = os.environ.get("ABFLOW_CONFIG_PATH", "").strip()
+    if not path:
+        _ABFLOW_CONFIG_CACHE = {}
+        return _ABFLOW_CONFIG_CACHE
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        _ABFLOW_CONFIG_CACHE = cfg if isinstance(cfg, dict) else {}
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load ABFLOW_CONFIG_PATH={path}: {exc}"
+        ) from exc
+    return _ABFLOW_CONFIG_CACHE
+
+
+def _cfg_value(section, key, default):
+    cfg = _abflow_config()
+    block = cfg.get(section, {}) if isinstance(cfg, dict) else {}
+    if isinstance(block, dict) and key in block:
+        return block[key]
+    return default
 
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name, "").strip().lower()
@@ -663,6 +694,10 @@ _ATTN_RUNTIME_STATS = {
     "batched_shadow_atom_calls": 0,
     "real_tokens": 0,
     "padded_tokens": 0,
+    "sc_teacher_calls": 0,
+    "sc_teacher_graphs": 0,
+    "sc_formal_calls": 0,
+    "confidence_calls": 0,
 }
 
 
@@ -1162,8 +1197,12 @@ class PairformerModule(nn.Module):
             )
         self.checkpoint_mode = mode
 
-        pair_heads = 4
-        pair_width = max(16, token_z // pair_heads)
+        pair_heads = max(
+            1, int(_cfg_value("architecture", "pairwise_heads", _env_int("ABFLOW_MFDESIGN_PAIRWISE_HEADS", 4)))
+        )
+        pair_width = max(
+            1, int(_cfg_value("architecture", "pairwise_head_width", _env_int("ABFLOW_MFDESIGN_PAIRWISE_HEAD_WIDTH", 32)))
+        )
         layer_mode = "triangle" if mode == "triangle" else "off"
         self.layers = nn.ModuleList([
             PairformerLayer(
@@ -1376,10 +1415,26 @@ class FixedSlotAtomStructureNetwork(nn.Module):
         self.H = H
         # Diagnostics only.
         self._runtime_trace_call_count = 0
-        atom_s = max(64, token_s // 2) if atom_s is None else atom_s
-        # Make atom_s divisible by atom_heads.
-        atom_s = int(math.ceil(atom_s / atom_heads) * atom_heads)
-        atom_z = max(32, token_z // 2) if atom_z is None else atom_z
+        # MFDesign released gold values: atom_s=128, atom_z=16.
+        atom_s = (
+            int(_cfg_value("architecture", "atom_s", _env_int("ABFLOW_MFDESIGN_ATOM_S", 128)))
+            if atom_s is None else int(atom_s)
+        )
+        atom_heads = max(
+            1, int(_cfg_value("architecture", "atom_encoder_heads", _env_int("ABFLOW_MFDESIGN_ATOM_HEADS", atom_heads)))
+        )
+        if atom_s % atom_heads != 0:
+            raise ValueError(
+                f"atom_s={atom_s} must be divisible by atom_heads={atom_heads}"
+            )
+        atom_z = (
+            int(_cfg_value("architecture", "atom_z", _env_int("ABFLOW_MFDESIGN_ATOM_Z", 16)))
+            if atom_z is None else int(atom_z)
+        )
+        # Stable public diagnostics.  These are metadata only, not new state.
+        self.atom_s = int(atom_s)
+        self.atom_z = int(atom_z)
+        self.atom_heads = int(atom_heads)
 
         self.embed_atom_features = LinearNoBias(atom_input_dim, atom_s)
         self.embed_atompair_pos = LinearNoBias(3, atom_z)
@@ -1409,47 +1464,76 @@ class FixedSlotAtomStructureNetwork(nn.Module):
         )
         final_init_(self.p_mlp[-1].weight)
 
-        atom_depth = max(1, min(3, depth))
+        atom_encoder_depth = max(
+            1, int(_cfg_value("architecture", "atom_encoder_depth", _env_int("ABFLOW_MFDESIGN_ATOM_ENCODER_DEPTH", 3)))
+        )
+        atom_decoder_depth = max(
+            1, int(_cfg_value("architecture", "atom_decoder_depth", _env_int("ABFLOW_MFDESIGN_ATOM_DECODER_DEPTH", 3)))
+        )
+        token_depth = max(
+            1, int(_cfg_value("architecture", "token_transformer_depth", _env_int("ABFLOW_MFDESIGN_TOKEN_TRANSFORMER_DEPTH", 8)))
+        )
+        token_heads = max(
+            1, int(_cfg_value("architecture", "token_transformer_heads", _env_int("ABFLOW_MFDESIGN_TOKEN_TRANSFORMER_HEADS", 16)))
+        )
+        self.token_heads = int(token_heads)
+
         self.atom_encoder = AtomTransformer(
             dim=atom_s,
             dim_single_cond=atom_s,
             dim_pairwise=atom_z,
-            depth=atom_depth,
+            depth=atom_encoder_depth,
             heads=atom_heads,
             attn_window_queries=W,
             attn_window_keys=H,
         )
 
+        # MFDesign structure module uses 2*token_s token activations.
+        self.structure_token_s = 2 * int(token_s)
+        if self.structure_token_s % token_heads != 0:
+            raise ValueError(
+                "2*token_s must be divisible by the MFDesign token-transformer "
+                f"head count; got {self.structure_token_s} and {token_heads}"
+            )
         self.atom_to_token = nn.Sequential(
-            LinearNoBias(atom_s, token_s),
+            LinearNoBias(atom_s, self.structure_token_s),
             nn.ReLU(),
         )
 
-        token_depth = max(1, min(4, depth))
-        self.s_to_a = nn.Sequential(nn.LayerNorm(token_s), LinearNoBias(token_s, token_s))
-        final_init_(self.s_to_a[1].weight)
+        # AbFlow already injects its legal Score--Flow time/state condition into
+        # the trunk token state.  This adapter changes only representation width:
+        # the U02 path/sampler remains owned by AbFlow_model.py.
+        self.s_to_a = nn.Sequential(
+            nn.LayerNorm(token_s),
+            LinearNoBias(token_s, self.structure_token_s),
+        )
         self.token_transformer = DiffusionTransformer(
             depth=token_depth,
             heads=token_heads,
-            dim=token_s,
-            dim_single_cond=token_s,
+            dim=self.structure_token_s,
+            dim_single_cond=self.structure_token_s,
             dim_pairwise=token_z,
         )
-        self.a_norm = nn.LayerNorm(token_s)
+        self.a_norm = nn.LayerNorm(self.structure_token_s)
 
-        self.a_to_q = LinearNoBias(token_s, atom_s)
+        self.a_to_q = LinearNoBias(self.structure_token_s, atom_s)
         final_init_(self.a_to_q.weight)
         self.atom_decoder = AtomTransformer(
             dim=atom_s,
             dim_single_cond=atom_s,
             dim_pairwise=atom_z,
-            depth=atom_depth,
+            depth=atom_decoder_depth,
             heads=atom_heads,
             attn_window_queries=W,
             attn_window_keys=H,
         )
         self.to_xyz = nn.Sequential(nn.LayerNorm(atom_s), LinearNoBias(atom_s, 3))
         final_init_(self.to_xyz[1].weight)
+
+        # Public AbFlow AMEncoder API remains token_s-wide.  The sequence head
+        # receives a separate MFDesign-width adapter below, so this projection
+        # is only an API boundary, not a new generative authority.
+        self.token_out = LinearNoBias(self.structure_token_s, token_s)
 
     def _pad_atoms(self, value, pad_len, fill=0.0):
         if pad_len <= 0:
@@ -1549,25 +1633,21 @@ class FixedSlotAtomStructureNetwork(nn.Module):
         k_valid = k_tid >= 0
         q_safe = q_tid.clamp(min=0, max=max(0, L - 1))
         k_safe = k_tid.clamp(min=0, max=max(0, L - 1))
-        z0 = z[0]
-        z_atom = z0[q_safe, k_safe]
+        # MFDesign gold order: project token-pair 128 -> atom-pair 16 BEFORE
+        # atom-window lifting.  Pointwise LayerNorm+Linear commutes with the
+        # valid-index gather, while avoiding the large [...,128] window tensor.
+        z0_projected = self.z_to_p(z[0])
+        z_atom_projected = z0_projected[q_safe, k_safe]
+        z_atom_projected = z_atom_projected * (
+            q_valid & k_valid
+        ).unsqueeze(-1)
         if _trace_atom:
             _runtime_cuda_line(
-                "atom.z_window_gather",
+                "atom.z_project_before_window",
                 coords.device,
                 extra=(
-                    f"call={_atom_call} z_atom={tuple(z_atom.shape)} "
-                    f"{_runtime_tensor_mib(z_atom):.1f}MiB"
-                ),
-            )
-        z_atom = z_atom * (q_valid & k_valid).unsqueeze(-1)
-        z_atom_projected = self.z_to_p(z_atom)
-        if _trace_atom:
-            _runtime_cuda_line(
-                "atom.z_project",
-                coords.device,
-                extra=(
-                    f"call={_atom_call} projected={tuple(z_atom_projected.shape)} "
+                    f"call={_atom_call} projected_window="
+                    f"{tuple(z_atom_projected.shape)} "
                     f"{_runtime_tensor_mib(z_atom_projected):.1f}MiB"
                 ),
             )
@@ -1599,14 +1679,15 @@ class FixedSlotAtomStructureNetwork(nn.Module):
         a = (self.atom_to_token(q_real) * mask_real).sum(dim=1) / denom
         a = a.unsqueeze(0)
 
-        a = a + self.s_to_a(s).unsqueeze(0)
+        s_cond = self.s_to_a(s).unsqueeze(0)
+        a = a + s_cond
         token_mask = (
             torch.ones((1, L), dtype=coords.dtype, device=coords.device)
             if token_valid_mask is None else token_valid_mask.view(1, L)
         )
         a = self.token_transformer(
             a=a,
-            s=s.unsqueeze(0),
+            s=s_cond,
             z=z,
             mask=token_mask,
         )
@@ -1645,7 +1726,7 @@ class FixedSlotAtomStructureNetwork(nn.Module):
 
         # Endpoint-like residual coordinate readout.
         pred = coords + update
-        return a[0], pred
+        return self.token_out(a[0]), pred
 
     def forward_batched(
         self,
@@ -1786,11 +1867,14 @@ class FixedSlotAtomStructureNetwork(nn.Module):
         b_idx = torch.arange(
             B, device=coords.device
         ).view(B, 1, 1, 1)
-        z_atom = z[b_idx, q_safe, k_safe]
-        z_atom = z_atom * (
+        # MFDesign gold execution order: 128 -> atom_z projection first,
+        # then lift only the narrow tensor into atom windows.
+        z_projected = self.z_to_p(z)
+        z_atom_projected = z_projected[b_idx, q_safe, k_safe]
+        z_atom_projected = z_atom_projected * (
             q_valid & k_valid
         ).unsqueeze(-1)
-        p = p + self.z_to_p(z_atom)
+        p = p + z_atom_projected
 
         p = p + self.c_to_p_q(
             c.view(B, K, self.W, 1, -1)
@@ -1813,10 +1897,11 @@ class FixedSlotAtomStructureNetwork(nn.Module):
             self.atom_to_token(q_real) * mask_real
         ).sum(dim=2) / denom
 
-        a = a + self.s_to_a(s)
+        s_cond = self.s_to_a(s)
+        a = a + s_cond
         a = self.token_transformer(
             a=a,
-            s=s,
+            s=s_cond,
             z=z,
             mask=token_valid_mask,
         )
@@ -1854,7 +1939,7 @@ class FixedSlotAtomStructureNetwork(nn.Module):
             ).view(B, L, 1, 1)
 
         pred = coords + update
-        return a, pred
+        return self.token_out(a), pred
 
 
 
@@ -2249,14 +2334,22 @@ class MFDesignRelativePositionEncoder(nn.Module):
 
 
 class MFDesignSequenceD3PMConditioner(nn.Module):
-    """1:1 MFDesign SequenceD3PM conditioner/head architecture.
+    """MFDesign SequenceD3PM head with an explicit AbFlow boundary adapter.
 
-    The output vocabulary is adapted to AbFlow's existing ``num_classes`` so
-    the MASK/global-token compatibility API is preserved; training CE remains
-    restricted to generated amino-acid residues.
+    MFDesign Stage-1 uses hidden_dim=768 because its structure token activation
+    is 2*token_s (2*384).  AbFlow's public AMEncoder API remains token_s-wide,
+    so v131 performs one explicit input projection before the otherwise
+    MFDesign-identical SequenceD3PM MLP.
     """
     def __init__(self, hidden_dim, vocab_size, dropout=0.1):
         super().__init__()
+        input_dim = int(hidden_dim)
+        hidden_dim = int(int(_cfg_value("architecture", "sequence_hidden", _env_int("ABFLOW_MFDESIGN_SEQUENCE_HIDDEN", 256))))
+        self.input_proj = (
+            nn.Identity()
+            if input_dim == hidden_dim
+            else LinearNoBias(input_dim, hidden_dim)
+        )
         self.type_embed = nn.Embedding(4, hidden_dim, padding_idx=0)
         self.region_embed = nn.Embedding(10, hidden_dim, padding_idx=0)
         self.proj = nn.Sequential(
@@ -2278,6 +2371,7 @@ class MFDesignSequenceD3PMConditioner(nn.Module):
         )
 
     def forward(self, res_feat, cond):
+        res_feat = self.input_proj(res_feat)
         res = self.encoder(res_feat)
         type_embed = self.type_embed(cond['type'].clamp(0, 3))
         region_embed = self.region_embed(cond['region'].clamp(0, 9))
@@ -2656,18 +2750,23 @@ class AMEncoder(nn.Module):
         self.out_node_nf = int(out_node_nf)
         self.n_channel = int(n_channel)
         self.channel_nf = int(channel_nf)
-        self.pair_nf = int(radial_nf)
+        # v131: token pair width follows MFDesign gold independently of
+        # AbFlow token_s/hidden width.  Historical v127 implicitly tied
+        # token_z to hidden_nf through radial_nf, which is not MFDesign parity.
+        self.pair_nf = int(int(_cfg_value("architecture", "token_z", _env_int("ABFLOW_MFDESIGN_TOKEN_Z", 128))))
         self.n_layers = int(n_layers)
         self.num_verts = int(num_verts)
         self.dropout = nn.Dropout(dropout)
 
         # -------------------- Module 6-8 + confidence controls
-        self.clean_self_condition = _env_flag(
-            "ABFLOW_CLEAN_SELF_CONDITION", True
-        )
-        self.clean_self_condition_prob = _env_float(
-            "ABFLOW_CLEAN_SELF_CONDITION_PROB", 0.5
-        )
+        self.clean_self_condition = bool(_cfg_value(
+            "self_conditioning", "enabled",
+            _env_flag("ABFLOW_CLEAN_SELF_CONDITION", True),
+        ))
+        self.clean_self_condition_prob = float(_cfg_value(
+            "self_conditioning", "probability",
+            _env_float("ABFLOW_CLEAN_SELF_CONDITION_PROB", 0.5),
+        ))
         if not (0.0 <= self.clean_self_condition_prob <= 1.0):
             raise ValueError(
                 "ABFLOW_CLEAN_SELF_CONDITION_PROB must be in [0,1]"
@@ -2684,12 +2783,12 @@ class AMEncoder(nn.Module):
                 "ABFLOW_PAIR_DISTOGRAM_SCOPE must be design or local"
             )
 
-        self.confidence_enabled = _env_flag(
-            "ABFLOW_CONFIDENCE", True
-        )
-        self.confidence_pae_enabled = _env_flag(
-            "ABFLOW_CONFIDENCE_PAE", True
-        )
+        self.confidence_enabled = bool(_cfg_value(
+            "confidence", "enabled", _env_flag("ABFLOW_CONFIDENCE", True)
+        ))
+        self.confidence_pae_enabled = bool(_cfg_value(
+            "confidence", "pae_enabled", _env_flag("ABFLOW_CONFIDENCE_PAE", True)
+        ))
         self.coord_scale_angstrom = _env_float(
             "ABFLOW_MODEL_COORD_SCALE_ANGSTROM", 10.0
         )
@@ -2731,8 +2830,8 @@ class AMEncoder(nn.Module):
         nn.init.normal_(self.current_state_dist_embedding.weight, 0.0, 0.02)
 
         # True MFDesign internal recycling becomes the refinement authority.
-        self.recycling_steps = max(0, _env_int('ABFLOW_MFDESIGN_RECYCLING_STEPS', 3))
-        self.random_recycling = _env_flag('ABFLOW_MFDESIGN_RANDOM_RECYCLING', True)
+        self.recycling_steps = max(0, int(_cfg_value("architecture", "recycling_steps", _env_int("ABFLOW_MFDESIGN_RECYCLING_STEPS", 2))))
+        self.random_recycling = bool(_cfg_value("architecture", "random_recycling", _env_flag("ABFLOW_MFDESIGN_RANDOM_RECYCLING", True)))
 
         # v126 MFDesign-style runtime authority.
         self.batched_runtime = _env_flag(
@@ -2764,18 +2863,29 @@ class AMEncoder(nn.Module):
         self._batched_parity_done = False
 
         # -------------------- Module 3: Pairformer
-        token_heads = 8
+        # v131 MFDesign-gold authority.  These defaults match the released
+        # MFDesign Stage-1/2/3 configuration where the AbFlow data boundary
+        # permits an exact architectural mapping.
+        token_heads = max(1, int(_cfg_value("architecture", "pairformer_heads", _env_int("ABFLOW_MFDESIGN_PAIRFORMER_HEADS", 16))))
         if hidden_nf % token_heads != 0:
-            # choose the largest practical divisor <= 8
-            token_heads = next(
-                h for h in (8, 4, 2, 1) if hidden_nf % h == 0
+            raise ValueError(
+                "MFDesign-gold Pairformer requires token_s divisible by "
+                f"num_heads; token_s={hidden_nf}, heads={token_heads}. "
+                "Use hidden_size=384 for the gold profile."
             )
+        pairformer_blocks = max(
+            1, int(_cfg_value("architecture", "pairformer_blocks", _env_int("ABFLOW_MFDESIGN_PAIRFORMER_BLOCKS", 4)))
+        )
+        pairformer_dropout = float(_cfg_value(
+            "architecture", "pairformer_dropout",
+            _env_float("ABFLOW_MFDESIGN_PAIRFORMER_DROPOUT", 0.1),
+        ))
         self.pairformer = PairformerModule(
             token_s=hidden_nf,
             token_z=self.pair_nf,
-            num_blocks=max(1, self.n_layers),
+            num_blocks=pairformer_blocks,
             num_heads=token_heads,
-            dropout=dropout,
+            dropout=pairformer_dropout,
         )
 
         # Instantiate optional trainable modules only when enabled.  This keeps
@@ -2823,11 +2933,16 @@ class AMEncoder(nn.Module):
             token_z=self.pair_nf,
             atom_input_dim=channel_nf + 1,
             n_channel=n_channel,
-            depth=max(1, self.n_layers),
-            atom_heads=4,
-            token_heads=token_heads,
-            W=32,
-            H=128,
+            depth=max(1, self.n_layers),  # compatibility only; gold depths use envs
+            atom_s=int(_cfg_value("architecture", "atom_s", _env_int("ABFLOW_MFDESIGN_ATOM_S", 128))),
+            atom_z=int(_cfg_value("architecture", "atom_z", _env_int("ABFLOW_MFDESIGN_ATOM_Z", 16))),
+            atom_heads=int(_cfg_value("architecture", "atom_encoder_heads", _env_int("ABFLOW_MFDESIGN_ATOM_HEADS", 4))),
+            token_heads=int(_cfg_value(
+                "architecture", "token_transformer_heads",
+                _env_int("ABFLOW_MFDESIGN_TOKEN_TRANSFORMER_HEADS", 16),
+            )),
+            W=int(_cfg_value("architecture", "atom_window_queries", _env_int("ABFLOW_MFDESIGN_ATOM_WINDOW_Q", 32))),
+            H=int(_cfg_value("architecture", "atom_window_keys", _env_int("ABFLOW_MFDESIGN_ATOM_WINDOW_K", 128))),
         )
 
         # -------------------- Keep the validated AbFlow surface geometry
@@ -2849,6 +2964,29 @@ class AMEncoder(nn.Module):
 
         self.linear_out = nn.Linear(hidden_nf, out_node_nf)
 
+        # All referenced modules now exist.  This log is observational only and
+        # is intentionally placed at the end of __init__ to avoid init-order bugs.
+        if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+            print(
+                "[V136Config][Backbone] "
+                f"token_s={hidden_nf} token_z={self.pair_nf} "
+                f"pairformer_blocks={len(self.pairformer.layers)} "
+                f"pairformer_heads={token_heads} "
+                f"pairformer_dropout={pairformer_dropout:.3g} "
+                f"recycle_max={self.recycling_steps} "
+                f"atom_s={self.atom_structure.atom_s} "
+                f"atom_z={self.atom_structure.atom_z} "
+                f"atom_enc_depth={len(self.atom_structure.atom_encoder.transformer.layers)} "
+                f"token_tf_depth={len(self.atom_structure.token_transformer.layers)} "
+                f"token_tf_heads={self.atom_structure.token_heads} "
+                f"atom_dec_depth={len(self.atom_structure.atom_decoder.transformer.layers)} "
+                f"SC={self.clean_self_condition}/p={self.clean_self_condition_prob:.2f} "
+                f"confidence={self.confidence_enabled}/PAE={self.confidence_pae_enabled} "
+                f"checkpoint={self.pairformer.checkpoint_mode} "
+                f"batched={self.batched_runtime}",
+                flush=True,
+            )
+
 
     @staticmethod
     def _max_valid_diff(a, b, mask):
@@ -2858,6 +2996,9 @@ class AMEncoder(nn.Module):
             mask = mask.unsqueeze(-1)
         selected = (a.float() - b.float()).abs() * mask.to(a)
         return float(selected.max().item())
+
+    def consume_runtime_perf_stats(self):
+        return consume_runtime_perf_stats()
 
     def _batched_runtime_log(self, message):
         if not _env_flag("ABFLOW_BATCHED_RUNTIME_DIAGNOSTICS", False):
@@ -2971,7 +3112,12 @@ class AMEncoder(nn.Module):
         token_valid_mask,
         active_graph_ids,
     ):
-        """Batch-first equivalent of per-graph clean self-conditioning."""
+        """Batch-first clean self-conditioning with lazy active-subset teacher.
+
+        One Bernoulli gate is sampled per active graph in graph order.  Only
+        gate=1 graphs enter the detached teacher AtomStructure call.  The formal
+        prediction remains one padded-batched call for the whole local batch.
+        """
         B = s_local.shape[0]
 
         if not self.clean_self_condition:
@@ -2985,48 +3131,18 @@ class AMEncoder(nn.Module):
                 token_valid_mask=token_valid_mask,
             )
             if _env_flag("ABFLOW_PERF_DIAGNOSTICS", False):
-                _ATTN_RUNTIME_STATS[
-                    "batched_shadow_atom_calls"
-                ] += 1
+                _ATTN_RUNTIME_STATS["batched_shadow_atom_calls"] += 1
             gates = current_coords.new_zeros((B,))
             return s_out, pred, z_local, gates
 
-        with torch.no_grad():
-            _, clean0 = self.atom_structure.forward_batched(
-                s=s_local,
-                z=z_local,
-                coords=current_coords,
-                atom_attr=atom_attr,
-                atom_weights=atom_weights,
-                residue_update_mask=residue_update_mask,
-                token_valid_mask=token_valid_mask,
-            )
-            if _env_flag("ABFLOW_PERF_DIAGNOSTICS", False):
-                _ATTN_RUNTIME_STATS[
-                    "batched_shadow_atom_calls"
-                ] += 1
-
-            ca_idx = 1 if clean0.shape[2] > 1 else 0
-            d_ang = torch.cdist(
-                clean0[:, :, ca_idx].float(),
-                clean0[:, :, ca_idx].float(),
-            ) * float(self.coord_scale_angstrom)
-            sc_bins = self.distogram_binner(d_ang)
-
-        # Preserve graphwise gate semantics: one scalar Bernoulli draw per
-        # active graph, in ascending graph order.  A vectorized torch.rand(B)
-        # call is intentionally avoided because exact RNG counter assignment
-        # is implementation-dependent on CUDA.
+        # Preserve graphwise RNG semantics: one scalar draw per graph.
         if self.training:
             gate_list = []
             for _graph_id in active_graph_ids:
                 del _graph_id
                 gate_list.append(
                     (
-                        torch.rand(
-                            (),
-                            device=current_coords.device,
-                        )
+                        torch.rand((), device=current_coords.device)
                         < float(self.clean_self_condition_prob)
                     ).to(current_coords.dtype)
                 )
@@ -3034,10 +3150,39 @@ class AMEncoder(nn.Module):
         else:
             gates = current_coords.new_ones((B,))
 
-        z_sc = z_local + (
-            gates[:, None, None, None]
-            * self.clean_sc_embedding(sc_bins)
-        )
+        active = gates > 0.5
+        if bool(active.any()):
+            active_idx = torch.nonzero(active, as_tuple=False).reshape(-1)
+            with torch.no_grad():
+                _, clean0_active = self.atom_structure.forward_batched(
+                    s=s_local.index_select(0, active_idx),
+                    z=z_local.index_select(0, active_idx),
+                    coords=current_coords.index_select(0, active_idx),
+                    atom_attr=atom_attr.index_select(0, active_idx),
+                    atom_weights=atom_weights.index_select(0, active_idx),
+                    residue_update_mask=residue_update_mask.index_select(0, active_idx),
+                    token_valid_mask=token_valid_mask.index_select(0, active_idx),
+                )
+                if _env_flag("ABFLOW_PERF_DIAGNOSTICS", False):
+                    _ATTN_RUNTIME_STATS["batched_shadow_atom_calls"] += 1
+                    _ATTN_RUNTIME_STATS["sc_teacher_calls"] += 1
+                    _ATTN_RUNTIME_STATS["sc_teacher_graphs"] += int(active_idx.numel())
+
+                ca_idx = 1 if clean0_active.shape[2] > 1 else 0
+                d_ang = torch.cdist(
+                    clean0_active[:, :, ca_idx].float(),
+                    clean0_active[:, :, ca_idx].float(),
+                ) * float(self.coord_scale_angstrom)
+                sc_bins = self.distogram_binner(d_ang)
+
+            sc_update_active = self.clean_sc_embedding(sc_bins)
+            sc_update = torch.zeros_like(z_local).index_copy(
+                0, active_idx, sc_update_active
+            )
+            z_sc = z_local + sc_update
+        else:
+            # DDP-safe zero dependency without the no-grad teacher call.
+            z_sc = z_local + 0.0 * self.clean_sc_embedding.weight.sum()
 
         s_out, pred = self.atom_structure.forward_batched(
             s=s_local,
@@ -3049,9 +3194,8 @@ class AMEncoder(nn.Module):
             token_valid_mask=token_valid_mask,
         )
         if _env_flag("ABFLOW_PERF_DIAGNOSTICS", False):
-            _ATTN_RUNTIME_STATS[
-                "batched_shadow_atom_calls"
-            ] += 1
+            _ATTN_RUNTIME_STATS["batched_shadow_atom_calls"] += 1
+            _ATTN_RUNTIME_STATS["sc_formal_calls"] += 1
         return s_out, pred, z_sc, gates
 
     def _maybe_check_batched_parity(
@@ -3090,6 +3234,22 @@ class AMEncoder(nn.Module):
         atom_training = self.atom_structure.training
         self.pairformer.eval()
         self.atom_structure.eval()
+
+        # This diagnostic is supposed to test *algebraic* batched-vs-graphwise
+        # equivalence, not mixed-precision kernel equivalence.  Disabling AMP
+        # alone is insufficient on Ampere: global allow_tf32=True still lets
+        # FP32 matmul/einsum use TF32 tensor-core kernels, and different batch
+        # shapes can select different kernels/accumulation orders.  That can
+        # create O(1e-4~1e-3) hidden-state differences even when the equations
+        # are identical.  Temporarily disable TF32 only for this no-grad parity
+        # probe, then restore the training flags exactly.
+        _parity_cuda_tf32 = None
+        _parity_cudnn_tf32 = None
+        if torch.cuda.is_available():
+            _parity_cuda_tf32 = bool(torch.backends.cuda.matmul.allow_tf32)
+            _parity_cudnn_tf32 = bool(torch.backends.cudnn.allow_tf32)
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
 
         pair_s_err = 0.0
         pair_z_err = 0.0
@@ -3260,6 +3420,10 @@ class AMEncoder(nn.Module):
         finally:
             self.pairformer.train(pair_training)
             self.atom_structure.train(atom_training)
+            if _parity_cuda_tf32 is not None:
+                torch.backends.cuda.matmul.allow_tf32 = _parity_cuda_tf32
+            if _parity_cudnn_tf32 is not None:
+                torch.backends.cudnn.allow_tf32 = _parity_cudnn_tf32
             # The diagnostic performed no-grad linear calls.  Never allow any
             # low-precision no-grad weight casts to leak into the real
             # grad-enabled training pass.
@@ -3344,7 +3508,7 @@ class AMEncoder(nn.Module):
 
         if self.batched_parity_fail_fast and not parity_ok:
             raise RuntimeError(
-                "v127 batched runtime numerical parity failed: "
+                "v136 strict-FP32 batched runtime numerical parity failed: "
                 f"hidden_max={hidden_max:.6e}, "
                 f"hidden_rms={hidden_rms:.6e}, "
                 f"hidden_rel_l2={hidden_rel_l2:.6e}, "
@@ -3779,12 +3943,17 @@ class AMEncoder(nn.Module):
         atom_weights,
         residue_update_mask,
     ):
-        """Detached first clean estimate -> CA distogram -> pair feedback.
+        """FoldFlow/AbX-style clean self-conditioning with lazy teacher query.
 
-        The first structure query is always no-grad when SC is enabled.  The
-        second query always exists, so DDP sees the same parameter graph on all
-        ranks. A scalar gate controls whether the learned SC embedding is
-        applied for this graph.
+        Training samples the Bernoulli gate *before* the no-grad clean query.
+        If gate=0, the teacher query is skipped entirely; the formal
+        gradient-bearing structure query is still executed once.  A zero-valued
+        dependency on ``clean_sc_embedding.weight`` keeps DDP parameter usage
+        deterministic without paying the teacher-forward cost.
+
+        Expected structure queries per graph at probability p are therefore
+            1 + p
+        instead of the historical unconditional 2.  At p=0.5 this is 1.5.
         """
         if not self.clean_self_condition:
             s_local_out, pred_local = self.atom_structure(
@@ -3797,22 +3966,6 @@ class AMEncoder(nn.Module):
             )
             return s_local_out, pred_local, z_local, current_coords.new_tensor(0.0)
 
-        with torch.no_grad():
-            _, clean0 = self.atom_structure(
-                s=s_local,
-                z=z_local,
-                coords=current_coords,
-                atom_attr=atom_attr,
-                atom_weights=atom_weights,
-                residue_update_mask=residue_update_mask,
-            )
-            ca_idx = 1 if clean0.shape[1] > 1 else 0
-            d_ang = torch.cdist(
-                clean0[:, ca_idx].float(),
-                clean0[:, ca_idx].float(),
-            ) * float(self.coord_scale_angstrom)
-            sc_bins = self.distogram_binner(d_ang)
-
         if self.training:
             gate = (
                 torch.rand((), device=current_coords.device)
@@ -3821,8 +3974,27 @@ class AMEncoder(nn.Module):
         else:
             gate = current_coords.new_tensor(1.0)
 
-        # Keep embedding in the autograd graph even when gate==0.
-        z_sc = z_local + gate * self.clean_sc_embedding(sc_bins).unsqueeze(0)
+        if bool(gate.item() > 0.5):
+            with torch.no_grad():
+                _, clean0 = self.atom_structure(
+                    s=s_local,
+                    z=z_local,
+                    coords=current_coords,
+                    atom_attr=atom_attr,
+                    atom_weights=atom_weights,
+                    residue_update_mask=residue_update_mask,
+                )
+                ca_idx = 1 if clean0.shape[1] > 1 else 0
+                d_ang = torch.cdist(
+                    clean0[:, ca_idx].float(),
+                    clean0[:, ca_idx].float(),
+                ) * float(self.coord_scale_angstrom)
+                sc_bins = self.distogram_binner(d_ang)
+            z_sc = z_local + self.clean_sc_embedding(sc_bins).unsqueeze(0)
+        else:
+            # Keep the SC parameter in the DDP graph with exactly zero gradient.
+            z_sc = z_local + 0.0 * self.clean_sc_embedding.weight.sum()
+
         s_local_out, pred_local = self.atom_structure(
             s=s_local,
             z=z_sc,
@@ -3845,7 +4017,14 @@ class AMEncoder(nn.Module):
         sc_gate,
         confidence_feats,
     ):
-        """Cache tensors required by Module 6/Confidence losses."""
+        """Cache pair/confidence inputs; confidence is evaluated after U02 decode.
+
+        The network output on the canonical branch is a carrier, not yet the
+        physical clean endpoint.  Running confidence here would calibrate the
+        wrong coordinate object.  v132 therefore stores the detached-generator
+        inputs and evaluates confidence inside ``compute_auxiliary_losses`` after
+        ``AbFlowModel`` supplies the analytically decoded clean endpoint.
+        """
         entry = {
             "global_idx": global_idx,
             "design_mask": design_mask.bool(),
@@ -3853,25 +4032,18 @@ class AMEncoder(nn.Module):
             "pred_coords": pred_coords,
             "xloss_hint": xloss_hint,
             "sc_gate": sc_gate,
+            "s_inputs": s_inputs,
+            "s_for_confidence": s_for_confidence,
+            "confidence_feats": confidence_feats,
         }
         if self.pair_distogram_enabled:
             entry["distogram_logits"] = self.pair_distogram_head(z_base[0])
-
-        if self.confidence_enabled:
-            valid_residue = xloss_hint.bool()
-            conf = self.confidence_module(
-                s_inputs=s_inputs,
-                s=s_for_confidence,
-                z=z_base,
-                pred_coords=pred_coords,
-                feats=confidence_feats,
-                pred_distogram_logits=entry.get('distogram_logits'),
-                valid_residue_mask=valid_residue,
-            )
-            entry.update(conf)
         self._modern_aux_cache.append(entry)
 
-    def compute_auxiliary_losses(self, true_X, xloss_mask):
+    def compute_auxiliary_losses(
+        self, true_X, xloss_mask, clean_endpoint_override=None,
+        clean_endpoint_override_mask=None, residue_native_gate=None,
+    ):
         """Compute pair objective and detached confidence calibration losses.
 
         Parameters
@@ -3891,6 +4063,7 @@ class AMEncoder(nn.Module):
         if not self._modern_aux_cache:
             out = {
                 "distogram_loss": zero,
+                "distogram_loss_raw": zero,
                 "confidence_loss": zero,
                 "plddt_loss": zero,
                 "pde_loss": zero,
@@ -3911,16 +4084,46 @@ class AMEncoder(nn.Module):
             return out
 
         dist_losses = []
+        dist_losses_raw = []
         plddt_losses, pde_losses, pae_losses, resolved_losses = [], [], [], []
         sc_gates = []
         pred_plddt_means, pred_pde_means, pred_pae_means = [], [], []
         pred_ptm, pred_iptm, pred_iplddt, pred_ipde = [], [], [], []
 
-        for entry in self._modern_aux_cache:
+        for cached_entry in self._modern_aux_cache:
+            entry = dict(cached_entry)
             gidx = entry["global_idx"]
-            true = true_X[gidx].to(entry["pred_coords"])
+
+            pred_model = entry["pred_coords"]
+            if (
+                clean_endpoint_override is not None
+                and clean_endpoint_override_mask is not None
+            ):
+                local_override = clean_endpoint_override_mask[gidx].bool()
+                if bool(local_override.any()):
+                    pred_model = pred_model.clone()
+                    pred_model[local_override] = clean_endpoint_override[
+                        gidx[local_override]
+                    ].to(pred_model)
+
+            # Confidence remains strictly generator-detached inside the module,
+            # but is now conditioned on the physical clean-endpoint estimate.
+            if self.confidence_enabled:
+                valid_residue = entry["xloss_hint"].bool()
+                conf = self.confidence_module(
+                    s_inputs=entry["s_inputs"],
+                    s=entry["s_for_confidence"],
+                    z=entry["z_base"],
+                    pred_coords=pred_model,
+                    feats=entry["confidence_feats"],
+                    pred_distogram_logits=entry.get("distogram_logits"),
+                    valid_residue_mask=valid_residue,
+                )
+                entry.update(conf)
+
+            true = true_X[gidx].to(pred_model)
             xmask = xloss_mask[gidx].bool()
-            pred_ang = entry["pred_coords"].detach().float() * float(
+            pred_ang = pred_model.detach().float() * float(
                 self.coord_scale_angstrom
             )
             true_ang = true.detach().float()
@@ -3942,7 +4145,18 @@ class AMEncoder(nn.Module):
                     target.reshape(-1),
                     reduction="none",
                 ).reshape_as(target)
-                dist_losses.append(_masked_mean(ce, pair_focus))
+                raw_disto = _masked_mean(ce, pair_focus)
+                dist_losses_raw.append(raw_disto)
+                if residue_native_gate is None:
+                    gate_value = raw_disto.new_tensor(1.0)
+                else:
+                    local_gate = residue_native_gate[gidx].to(raw_disto)
+                    focus_gate = local_gate[design] if bool(design.any()) else local_gate
+                    gate_value = (
+                        focus_gate.mean() if focus_gate.numel() > 0
+                        else raw_disto.new_tensor(0.0)
+                    )
+                dist_losses.append(raw_disto * gate_value)
 
             if self.confidence_enabled:
                 # ----- pLDDT calibration, focused on generated residues.
@@ -4065,6 +4279,7 @@ class AMEncoder(nn.Module):
             return torch.stack(xs).mean() if xs else zero
 
         distogram_loss = avg(dist_losses)
+        distogram_loss_raw = avg(dist_losses_raw)
         plddt_loss = avg(plddt_losses)
         pde_loss = avg(pde_losses)
         pae_loss = avg(pae_losses) if self.confidence_pae_enabled else zero
@@ -4076,6 +4291,7 @@ class AMEncoder(nn.Module):
 
         out = {
             "distogram_loss": distogram_loss,
+            "distogram_loss_raw": distogram_loss_raw,
             "confidence_loss": confidence_loss,
             "plddt_loss": plddt_loss,
             "pde_loss": pde_loss,
