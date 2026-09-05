@@ -23,7 +23,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from data.dataset import E2EDataset
 from generate import load_model_compat, ensure_model_runtime_compat
 from utils.epoch_test import (
-    assigned_logical_batches,
     generate_distributed,
     run_cal_metrics_rank0,
     cleanup_structures,
@@ -105,30 +104,6 @@ def main():
             surf_file=args.surf_file,
             cdr=model.cdr_type,
         )
-
-        assignments = assigned_logical_batches(
-            len(test_set),
-            args.batch_size,
-            rank=rank,
-            world_size=world_size,
-        )
-        local_samples = sum(len(indices) for _, indices in assignments)
-        print(
-            "[StandaloneEpochTestDDP] "
-            f"rank={rank}/{world_size} "
-            f"device={device} "
-            f"logical_batch_size={args.batch_size} "
-            f"assigned_batches={len(assignments)} "
-            f"assigned_samples={local_samples}",
-            flush=True,
-        )
-        if rank == 0:
-            print(
-                "[StandaloneEpochTestDDP] cooperative_same_checkpoint=on "
-                f"world_size={world_size} "
-                "protocol=logical_batch_seeded_v1",
-                flush=True,
-            )
 
         generation = generate_distributed(
             model=model,

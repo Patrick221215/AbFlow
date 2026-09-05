@@ -473,7 +473,7 @@ def parse():
     parser.add_argument('--max_epoch', type=int, default=10, help='max training epoch')
     parser.add_argument('--grad_clip', type=float, default=1.0, help='clip gradients with too big norm')
     parser.add_argument('--save_dir', type=str, required=True, help='directory to save model, logs and experiment records')
-    parser.add_argument('--batch_size', type=int, required=True, help='per-GPU micro-batch size; effective global batch = batch_size * world_size')
+    parser.add_argument('--batch_size', type=int, required=True, help='batch size')
     parser.add_argument('--patience', type=int, default=1000, help='patience before early stopping (set with a large number to turn off early stopping)')
     parser.add_argument('--save_topk', type=int, default=10, help='save topk checkpoint. -1 for saving all ckpt that has a better validation metric than its previous epoch')
     parser.add_argument('--shuffle', action='store_true', help='shuffle data')
@@ -681,48 +681,23 @@ def main(args):
     else:
         raise NotImplementedError(f'model {args.model_type} not implemented')
 
-    # ------------------------------------------------------------
-    # V140 batch contract: JSON batch_size is PER-GPU micro-batch.
-    # This matches the existing ABX trainer and MFDesign/Lightning data-module
-    # convention.  DDP combines one micro-batch from every rank, therefore:
-    #
-    #   effective_global_batch = local_batch * world_size
-    #
-    # No hidden division by world_size is allowed here.
-    # ------------------------------------------------------------
-    local_batch_size = max(1, int(args.batch_size))
-    effective_global_batch_size = local_batch_size * max(1, int(world_size))
-    step_per_epoch = (
-        len(train_set) + effective_global_batch_size - 1
-    ) // effective_global_batch_size
-
-    config.batch_size = local_batch_size
+    step_per_epoch = (len(train_set) + args.batch_size - 1) // args.batch_size
     config.add_parameter(step_per_epoch=step_per_epoch)
-    config.add_parameter(batch_size_per_gpu=local_batch_size)
-    config.add_parameter(global_batch_size=effective_global_batch_size)
-    config.add_parameter(batch_semantics='per_gpu')
 
     if is_ddp:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(
-            train_set, shuffle=args.shuffle
-        )
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_set, shuffle=args.shuffle)
+        # Keep old AbFlow behavior: input batch_size is global, split across GPUs.
+        args.batch_size = max(1, int(args.batch_size / max(1, world_size)))
+        # TrainConfig was already built from original args; keep it consistent.
+        config.batch_size = args.batch_size
+        if _is_main_rank(args.local_rank):
+            print_log(f'Batch size on a single GPU: {args.batch_size}')
     else:
         train_sampler = None
 
-    # DataLoaders below consume args.batch_size, so keep it equal to the
-    # explicit per-rank micro-batch instead of mutating it after TrainConfig.
-    args.batch_size = local_batch_size
     config.local_rank = args.local_rank
 
     if _is_main_rank(args.local_rank):
-        print_log(
-            '[BatchContract] semantics=per_gpu '
-            f'local_batch={local_batch_size} world_size={world_size} '
-            f'effective_global_batch={effective_global_batch_size} '
-            f'step_per_epoch={step_per_epoch}'
-        )
-        print_log(f'Batch size on each GPU: {local_batch_size}')
-        print_log(f'Effective global batch size: {effective_global_batch_size}')
         print_log(f'step per epoch: {step_per_epoch}')
         print_log(f'world_size: {world_size}, rank: {rank}, local_rank: {args.local_rank}')
 
