@@ -857,12 +857,127 @@ class SeperatedCoordNormalizer(nn.Module):
         self.ab_centers = None
         self.is_ag = None
         self.is_ab = None
+        self.center_authority = None
 
     def normalize(self, X):
         return (X - self.mean) / self.std
 
     def unnormalize(self, X):
         return X * self.std + self.mean
+
+    @torch.no_grad()
+    def prepare_proposal_common_center(
+        self,
+        X,
+        S,
+        batch_id,
+        aa_feature: AminoAcidFeature,
+        aligned_template,
+        cmask,
+    ):
+        """Cache a PCS-RC proposal-anchored, inference-available common center.
+
+        ``aligned_template`` is the historical compact antibody template
+        (exactly corresponding to ``X[cmask]``) after one rigid transform has
+        placed it in the PCS-RC proposal/PDB frame.
+
+        The formal V143 center is
+
+            c_0 = mean_i CA(T_proposal-aligned)_i.
+
+        The same c_0 is subtracted from antibody context, antigen, PCS-RC H3,
+        flow state and auxiliary coordinates.
+
+        Native antibody coordinates in ``X`` are never used to define c_0.
+        ``X`` is consulted only for observed antigen atoms to recover the
+        legacy antigen-center convention required by historical surface PKLs.
+        """
+        cmask = cmask.bool()
+        n_compact = int(cmask.sum().item())
+        if aligned_template.shape[0] != n_compact:
+            raise RuntimeError(
+                "V143 proposal-center template contract mismatch: "
+                f"template_rows={aligned_template.shape[0]} "
+                f"cmask.sum={n_compact}."
+            )
+
+        segment_ids = aa_feature._construct_segment_ids(S)
+        is_ag = segment_ids == aa_feature.ag_seg_id
+        is_ab = torch.logical_not(is_ag)
+        is_global = sequential_or(
+            S == aa_feature.boa_idx,
+            S == aa_feature.boh_idx,
+            S == aa_feature.bol_idx,
+        )
+
+        n_graph = int(batch_id.max().item()) + 1 if batch_id.numel() else 1
+        template_batch_id = batch_id[cmask]
+        ca_idx = 1 if aligned_template.shape[1] > 1 else 0
+        template_ca = aligned_template[:, ca_idx].float()
+        valid_ca = torch.isfinite(template_ca).all(dim=-1)
+
+        weights = valid_ca.to(template_ca.dtype)
+        sums = scatter_sum(
+            template_ca * weights[:, None],
+            template_batch_id,
+            dim=0,
+            dim_size=n_graph,
+        )
+        counts = scatter_sum(
+            weights,
+            template_batch_id,
+            dim=0,
+            dim_size=n_graph,
+        )
+        if bool((counts <= 0).any()):
+            raise RuntimeError(
+                "V143 proposal common center found a graph with no valid "
+                "proposal-aligned template CA coordinate."
+            )
+        centers = sums / counts.clamp_min(1.0)[:, None]
+
+        # Historical surface PKLs live in the old antigen-centered frame.
+        # Recompute that antigen center from ANTIGEN coordinates only.
+        atom_pos = aa_feature._construct_atom_pos(S)
+        ag_res_mask = is_ag & (~is_global)
+        ag_X = X[ag_res_mask]
+        ag_atom_pos = atom_pos[ag_res_mask]
+        ag_batch = batch_id[ag_res_mask]
+        atom_valid = (
+            (ag_atom_pos != aa_feature.atom_pos_pad_idx)
+            & torch.isfinite(ag_X).all(dim=-1)
+        )
+        if not bool(atom_valid.any()):
+            raise RuntimeError(
+                "V143 could not recover a valid antigen center for surface "
+                "frame conversion."
+            )
+
+        atom_batch = ag_batch[:, None].expand_as(atom_valid)[atom_valid]
+        atom_coords = ag_X[atom_valid].float()
+        ag_sums = scatter_sum(
+            atom_coords, atom_batch, dim=0, dim_size=n_graph
+        )
+        ag_counts = scatter_sum(
+            torch.ones_like(atom_batch, dtype=atom_coords.dtype),
+            atom_batch,
+            dim=0,
+            dim_size=n_graph,
+        )
+        if bool((ag_counts <= 0).any()):
+            raise RuntimeError(
+                "V143 found a graph with no valid antigen atom for legacy "
+                "surface-center recovery."
+            )
+        legacy_ag = ag_sums / ag_counts.clamp_min(1.0)[:, None]
+
+        self.common_centers = centers.to(dtype=X.dtype, device=X.device)
+        self.legacy_ag_centers = legacy_ag.to(dtype=X.dtype, device=X.device)
+        self.ag_centers = self.common_centers
+        self.ab_centers = self.common_centers
+        self.is_ag, self.is_ab = is_ag, is_ab
+        self.center_authority = "proposal_aligned_template"
+        return self.common_centers
 
     def prepare_common_center(self, X, S, batch_id, aa_feature: AminoAcidFeature):
         """Cache the AbX antibody-backbone CA center for each graph.
@@ -996,4 +1111,5 @@ class SeperatedCoordNormalizer(nn.Module):
         self.ab_centers = None
         self.is_ag = None
         self.is_ab = None
+        self.center_authority = None
 

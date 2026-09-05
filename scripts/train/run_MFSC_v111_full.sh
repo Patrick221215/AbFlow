@@ -20,15 +20,15 @@ if [[ "$MODE" == "test" ]]; then
 else
   GPU_ID="${2:-2,3}"
   if [[ "$MODE" == "flowtest" ]]; then
-    EXP_ID="MFSC_V123_SPEED_PROFILE_BS8"
+    EXP_ID="MFSC_V126_BATCHED_RUNTIME_FLOWTEST_BS8"
   else
-    EXP_ID="MFSC_V119_PCS_RC_ABX_U02_FULL_EXACT_RUNTIME"
+    EXP_ID="MFSC_V127_U02_BATCHED_RUNTIME_200E"
   fi
 fi
 
 if [[ "$MODE" != "train" && "$MODE" != "flowtest" && "$MODE" != "test" ]]; then
   echo "Usage:"
-  echo "  bash $0 flowtest 2,3   # Train=Val, Valid=Val, global bs=10, Pairformer checkpoint+chunking"
+  echo "  bash $0 flowtest 2,3   # v126 integrated batched-runtime validation, global BS8"
   echo "  bash $0 train 2,3"
   echo "  bash $0 test MFSC_V119_PCS_RC_ABX_U02_FULL_EXACT_RUNTIME 2,3 <ckpt> <result_dir> [test.json]"
   exit 2
@@ -134,29 +134,38 @@ export ABFLOW_ROUND_CONSISTENT_COORD_SUPERVISION="off"
 export ABFLOW_OPTIMIZER="adamw"
 export ABFLOW_WEIGHT_DECAY="0.01"
 export ABFLOW_WARMUP_EPOCHS="5"
-# v117 formal runtime optimization is semantics-preserving only.
-# DDP-safe non-reentrant checkpointing is wrapped with the exact BF16 autocast
-# state from the original forward.  No scientific branch is skipped.
+# DDP-safe PyTorch-1.11 checkpoint compatibility keeps exact BF16 autocast
+# semantics and releases recomputation storage at backward completion.
 export ABFLOW_PAIRFORMER_ACTIVATION_CHECKPOINT="${ABFLOW_PAIRFORMER_ACTIVATION_CHECKPOINT:-on}"
 export ABFLOW_PAIRFORMER_CHECKPOINT_MODE="triangle"
+# v126: one MFDesign-style batch-first runtime for Pairformer + AtomStructure.
+export ABFLOW_MFDESIGN_BATCHED_RUNTIME="${ABFLOW_MFDESIGN_BATCHED_RUNTIME:-on}"
+export ABFLOW_BATCHED_RUNTIME_DIAGNOSTICS="${ABFLOW_BATCHED_RUNTIME_DIAGNOSTICS:-on}"
+export ABFLOW_BATCHED_PARITY_HIDDEN_MAX_TOL="${ABFLOW_BATCHED_PARITY_HIDDEN_MAX_TOL:-2e-4}"
+export ABFLOW_BATCHED_PARITY_HIDDEN_RMS_TOL="${ABFLOW_BATCHED_PARITY_HIDDEN_RMS_TOL:-2e-5}"
+export ABFLOW_BATCHED_PARITY_HIDDEN_REL_L2_TOL="${ABFLOW_BATCHED_PARITY_HIDDEN_REL_L2_TOL:-2e-5}"
+export ABFLOW_BATCHED_PARITY_COORD_MAX_TOL="${ABFLOW_BATCHED_PARITY_COORD_MAX_TOL:-1e-5}"
 
-# v118 exact low-memory TriangleAttention.
-# Outer anchor chunking is off by default; AFAttention chooses full or exact
-# blockwise log-sum-exp from the actual FP32 logits memory footprint.
+# Exact TriangleAttention runtime: use full attention while the estimated
+# FP32 logits fit the configured budget; otherwise fall back to exact LMA.
 export ABFLOW_TRIANGLE_ATTENTION_CHUNK_SIZE="${ABFLOW_TRIANGLE_ATTENTION_CHUNK_SIZE:-0}"
 export ABFLOW_TRIANGLE_ATTN_BACKEND="${ABFLOW_TRIANGLE_ATTN_BACKEND:-auto}"
-export ABFLOW_TRIANGLE_FULL_LOGITS_LIMIT_MB="${ABFLOW_TRIANGLE_FULL_LOGITS_LIMIT_MB:-384}"
+export ABFLOW_TRIANGLE_FULL_LOGITS_LIMIT_MB="${ABFLOW_TRIANGLE_FULL_LOGITS_LIMIT_MB:-2048}"
 export ABFLOW_TRIANGLE_LMA_Q_CHUNK_SIZE="${ABFLOW_TRIANGLE_LMA_Q_CHUNK_SIZE:-64}"
 export ABFLOW_TRIANGLE_LMA_KV_CHUNK_SIZE="${ABFLOW_TRIANGLE_LMA_KV_CHUNK_SIZE:-128}"
-# v119: three-layer exact memory architecture.
-# Avoid nested checkpoint recomputation. Per-complex transient attention peak is
-# already bounded by exact LMA; outer complex checkpoint owns activation lifetime.
-
-# v123: OOM root cause is resolved. Remove the expensive per-atom/per-complex
-# trace from ordinary flowtest and profile only the quantities relevant to the
-# current question: where training time goes and whether full/LMA attention is
-# actually selected. Formal train mode has zero profiling synchronization.
+# Flowtest enables only focused parity/gradient/performance diagnostics;
+# formal training uses the identical batched runtime without diagnostic extra passes.
 if [[ "$MODE" == "flowtest" ]]; then
+  # v126 integrated batch-first parity/speed validation.
+  export ABFLOW_BATCHED_PARITY_CHECK="${ABFLOW_BATCHED_PARITY_CHECK:-on}"
+  export ABFLOW_BATCHED_PARITY_FAIL_FAST="${ABFLOW_BATCHED_PARITY_FAIL_FAST:-on}"
+  export ABFLOW_BATCHED_GRAD_DIAGNOSTICS="${ABFLOW_BATCHED_GRAD_DIAGNOSTICS:-on}"
+  export ABFLOW_BATCHED_GRAD_DIAGNOSTIC_STEPS="${ABFLOW_BATCHED_GRAD_DIAGNOSTIC_STEPS:-3}"
+  export ABFLOW_BATCHED_GRAD_FAIL_FAST="${ABFLOW_BATCHED_GRAD_FAIL_FAST:-on}"
+  export ABFLOW_PAIRFORMER_ACTIVATION_CHECKPOINT="on"
+  export ABFLOW_PAIRFORMER_CHECKPOINT_MODE="triangle"
+  export ABFLOW_TRIANGLE_FULL_LOGITS_LIMIT_MB="${ABFLOW_V126_FULL_LOGITS_MB:-2048}"
+
   export ABFLOW_MEMORY_DIAGNOSTICS="${ABFLOW_MEMORY_DIAGNOSTICS:-off}"
   export ABFLOW_MEMORY_OWNER_DIAGNOSTICS="${ABFLOW_MEMORY_OWNER_DIAGNOSTICS:-off}"
   export ABFLOW_RUNTIME_TRACE="${ABFLOW_RUNTIME_TRACE:-off}"
@@ -164,11 +173,27 @@ if [[ "$MODE" == "flowtest" ]]; then
   export ABFLOW_PERF_DIAGNOSTICS="${ABFLOW_PERF_DIAGNOSTICS:-on}"
   export ABFLOW_PERF_DIAGNOSTIC_STEPS="${ABFLOW_PERF_DIAGNOSTIC_STEPS:-8}"
 else
-  export ABFLOW_MEMORY_DIAGNOSTICS="${ABFLOW_MEMORY_DIAGNOSTICS:-off}"
-  export ABFLOW_MEMORY_OWNER_DIAGNOSTICS="${ABFLOW_MEMORY_OWNER_DIAGNOSTICS:-off}"
-  export ABFLOW_RUNTIME_TRACE="${ABFLOW_RUNTIME_TRACE:-off}"
-  export ABFLOW_DEEP_CHECKPOINT_TRACE="${ABFLOW_DEEP_CHECKPOINT_TRACE:-off}"
-  export ABFLOW_PERF_DIAGNOSTICS="${ABFLOW_PERF_DIAGNOSTICS:-off}"
+  # v127 formal U02 reproduction:
+  # startup correctness/performance gates happen INSIDE the same 200-epoch run.
+  # Parity runs once; gradient contract runs only first 3 steps; RuntimePerf
+  # runs only first 8 steps and is then disabled automatically by Trainer.
+  export ABFLOW_BATCHED_RUNTIME_DIAGNOSTICS="off"
+  export ABFLOW_BATCHED_PARITY_CHECK="${ABFLOW_BATCHED_PARITY_CHECK:-on}"
+  export ABFLOW_BATCHED_PARITY_FAIL_FAST="${ABFLOW_BATCHED_PARITY_FAIL_FAST:-on}"
+  export ABFLOW_BATCHED_GRAD_DIAGNOSTICS="${ABFLOW_BATCHED_GRAD_DIAGNOSTICS:-on}"
+  export ABFLOW_BATCHED_GRAD_DIAGNOSTIC_STEPS="${ABFLOW_BATCHED_GRAD_DIAGNOSTIC_STEPS:-3}"
+  export ABFLOW_BATCHED_GRAD_FAIL_FAST="${ABFLOW_BATCHED_GRAD_FAIL_FAST:-on}"
+
+  export ABFLOW_PAIRFORMER_ACTIVATION_CHECKPOINT="on"
+  export ABFLOW_PAIRFORMER_CHECKPOINT_MODE="triangle"
+  export ABFLOW_TRIANGLE_FULL_LOGITS_LIMIT_MB="${ABFLOW_V127_FULL_LOGITS_MB:-2048}"
+
+  export ABFLOW_MEMORY_DIAGNOSTICS="off"
+  export ABFLOW_MEMORY_OWNER_DIAGNOSTICS="off"
+  export ABFLOW_RUNTIME_TRACE="off"
+  export ABFLOW_DEEP_CHECKPOINT_TRACE="off"
+  export ABFLOW_PERF_DIAGNOSTICS="${ABFLOW_PERF_DIAGNOSTICS:-on}"
+  export ABFLOW_PERF_DIAGNOSTIC_STEPS="${ABFLOW_PERF_DIAGNOSTIC_STEPS:-8}"
 fi
 
 export ABFLOW_AMP="${ABFLOW_AMP:-on}"
@@ -323,10 +348,15 @@ echo "Tri outer  : $ABFLOW_TRIANGLE_ATTENTION_CHUNK_SIZE"
 echo "Tri backend: $ABFLOW_TRIANGLE_ATTN_BACKEND"
 echo "Full logits: ${ABFLOW_TRIANGLE_FULL_LOGITS_LIMIT_MB} MB"
 echo "LMA chunks : Q=${ABFLOW_TRIANGLE_LMA_Q_CHUNK_SIZE} KV=${ABFLOW_TRIANGLE_LMA_KV_CHUNK_SIZE}"
-echo "Pair ckpt   : $ABFLOW_PAIRFORMER_CHECKPOINT_MODE (v118 backward-proven path)"
+echo "Pair ckpt   : $ABFLOW_PAIRFORMER_CHECKPOINT_MODE (v126 batch-first final-pass path)"
 if [[ "$MODE" == "flowtest" ]]; then
   echo "Deep trace  : OFF"
   echo "Perf profile: $ABFLOW_PERF_DIAGNOSTICS first=${ABFLOW_PERF_DIAGNOSTIC_STEPS} steps"
+  echo "Safe ckpt   : $ABFLOW_PAIRFORMER_ACTIVATION_CHECKPOINT / $ABFLOW_PAIRFORMER_CHECKPOINT_MODE"
+  echo "Full logits : ${ABFLOW_TRIANGLE_FULL_LOGITS_LIMIT_MB} MB (batched local4,N300 full≈1648MB)"
+  echo "Batched rt  : ${ABFLOW_MFDESIGN_BATCHED_RUNTIME}"
+  echo "Parity      : ${ABFLOW_BATCHED_PARITY_CHECK:-off}"
+  echo "Grad diag   : ${ABFLOW_BATCHED_GRAD_DIAGNOSTICS:-off}"
 fi
 echo "AutoTopK   : OFF"
 echo "============================================================"

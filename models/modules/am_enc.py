@@ -425,6 +425,25 @@ def _checkpoint_tensor_module(module, *args):
     return _checkpoint_nonreentrant_amp_exact(module, *args)
 
 
+def _checkpoint_score_model_layer(function, *args):
+    """DDP-safe MF score-model layer checkpoint for the AbFlow adapter.
+
+    Supplied MFDesign uses FairScale ``checkpoint_wrapper`` for each
+    DiffusionTransformer layer.  The first V142 port used raw PyTorch
+    *reentrant* checkpointing instead.  That is not equivalent in this runtime:
+    ``self.atom_structure`` is shared by two gradient-bearing branches in one
+    AbFlow forward (global full-antibody prediction and H3 formal prediction).
+    PyTorch 1.11 DDP can therefore fire the same reducer hook from multiple
+    reentrant backward engines and raise "Expected to mark a variable ready
+    only once".
+
+    Keep the MFDesign layer-checkpoint *scope*, but use the project-local
+    exact-BF16, RNG-preserving, DDP-safe non-reentrant implementation.  This
+    changes activation storage/backward execution only; forward equations,
+    parameters, losses and U02 transport are unchanged.
+    """
+    return _checkpoint_nonreentrant_amp_exact(function, *args)
+
 def _choose_num_heads(dim: int, maximum: int = 8) -> int:
     for heads in (maximum, 4, 2, 1):
         if heads <= maximum and dim % heads == 0:
@@ -1302,8 +1321,24 @@ class DiffusionTransformerLayer(nn.Module):
 
 
 class DiffusionTransformer(nn.Module):
-    def __init__(self, depth, heads, dim, dim_single_cond, dim_pairwise):
+    """MFDesign-style transformer stack with DDP-safe layer checkpointing.
+
+    MFDesign wraps layers with FairScale ``checkpoint_wrapper``.  This
+    PyTorch-1.11 AbFlow runtime preserves that layer checkpoint scope using
+    the project-local non-reentrant compatibility implementation because the
+    AtomStructure module is reused by two formal gradient branches.
+    """
+    def __init__(
+        self,
+        depth,
+        heads,
+        dim,
+        dim_single_cond,
+        dim_pairwise,
+        activation_checkpointing=False,
+    ):
         super().__init__()
+        self.activation_checkpointing = bool(activation_checkpointing)
         self.layers = nn.ModuleList([
             DiffusionTransformerLayer(
                 heads=heads,
@@ -1316,7 +1351,25 @@ class DiffusionTransformer(nn.Module):
 
     def forward(self, a, s, z, mask, to_keys=None):
         for layer in self.layers:
-            a = layer(a, s, z, mask=mask, to_keys=to_keys)
+            can_checkpoint = (
+                self.training
+                and self.activation_checkpointing
+                and (
+                    bool(a.requires_grad)
+                    or bool(s.requires_grad)
+                    or bool(z.requires_grad)
+                )
+            )
+            if can_checkpoint:
+                def _run(a_, s_, z_, mask_, _layer=layer):
+                    return _layer(
+                        a_, s_, z_, mask=mask_, to_keys=to_keys
+                    )
+                a = _checkpoint_score_model_layer(
+                    _run, a, s, z, mask
+                )
+            else:
+                a = layer(a, s, z, mask=mask, to_keys=to_keys)
         return a
 
 
@@ -1345,17 +1398,28 @@ def single_to_keys(single, indexing_matrix, W, H):
 
 
 class AtomTransformer(nn.Module):
-    def __init__(self, dim, dim_single_cond, dim_pairwise, depth, heads,
-                 attn_window_queries=32, attn_window_keys=128):
+    def __init__(
+        self,
+        dim,
+        dim_single_cond,
+        dim_pairwise,
+        depth,
+        heads,
+        attn_window_queries=32,
+        attn_window_keys=128,
+        activation_checkpointing=False,
+    ):
         super().__init__()
         self.W = attn_window_queries
         self.H = attn_window_keys
+        self.activation_checkpointing = bool(activation_checkpointing)
         self.transformer = DiffusionTransformer(
             depth=depth,
             heads=heads,
             dim=dim,
             dim_single_cond=dim_single_cond,
             dim_pairwise=dim_pairwise,
+            activation_checkpointing=self.activation_checkpointing,
         )
 
     def forward(self, q, c, p, mask, to_keys):
@@ -1413,6 +1477,31 @@ class FixedSlotAtomStructureNetwork(nn.Module):
         self.n_channel = n_channel
         self.W = W
         self.H = H
+
+        # MFDesign released Stage-1/2/3/4 sets activation_checkpointing=true
+        # for Pairformer AND score_model_args.  V136/V141 only checkpointed
+        # Pairformer; the atom encoder, token transformer and atom decoder
+        # therefore retained their full training activations.  Make the score
+        # model checkpoint contract explicit and formal here.
+        self.activation_checkpointing = bool(_cfg_value(
+            "architecture",
+            "activation_checkpointing",
+            _env_flag("ABFLOW_MFDESIGN_ACTIVATION_CHECKPOINT", True),
+        ))
+        self.score_checkpoint_mode = str(_cfg_value(
+            "architecture",
+            "score_model_checkpoint_mode",
+            os.environ.get(
+                "ABFLOW_SCORE_MODEL_CHECKPOINT_MODE", "nonreentrant"
+            ),
+        )).strip().lower()
+        if self.score_checkpoint_mode != "nonreentrant":
+            raise ValueError(
+                "V142 formal PyTorch-1.11/DDP score-model checkpoint mode "
+                "must be nonreentrant because AtomStructure parameters are "
+                "shared by the global and H3 formal gradient branches."
+            )
+
         # Diagnostics only.
         self._runtime_trace_call_count = 0
         # MFDesign released gold values: atom_s=128, atom_z=16.
@@ -1486,6 +1575,7 @@ class FixedSlotAtomStructureNetwork(nn.Module):
             heads=atom_heads,
             attn_window_queries=W,
             attn_window_keys=H,
+            activation_checkpointing=self.activation_checkpointing,
         )
 
         # MFDesign structure module uses 2*token_s token activations.
@@ -1513,6 +1603,7 @@ class FixedSlotAtomStructureNetwork(nn.Module):
             dim=self.structure_token_s,
             dim_single_cond=self.structure_token_s,
             dim_pairwise=token_z,
+            activation_checkpointing=self.activation_checkpointing,
         )
         self.a_norm = nn.LayerNorm(self.structure_token_s)
 
@@ -1526,6 +1617,7 @@ class FixedSlotAtomStructureNetwork(nn.Module):
             heads=atom_heads,
             attn_window_queries=W,
             attn_window_keys=H,
+            activation_checkpointing=self.activation_checkpointing,
         )
         self.to_xyz = nn.Sequential(nn.LayerNorm(atom_s), LinearNoBias(atom_s, 3))
         final_init_(self.to_xyz[1].weight)
@@ -1534,6 +1626,15 @@ class FixedSlotAtomStructureNetwork(nn.Module):
         # receives a separate MFDesign-width adapter below, so this projection
         # is only an API boundary, not a new generative authority.
         self.token_out = LinearNoBias(self.structure_token_s, token_s)
+        # V144 transient side channel.  It is consumed immediately by AMEncoder
+        # and cleared before forward returns, so no autograd graph is retained
+        # on the module across optimizer steps.
+        self._last_structure_latent = None
+
+    def consume_last_structure_latent(self):
+        latent = self._last_structure_latent
+        self._last_structure_latent = None
+        return latent
 
     def _pad_atoms(self, value, pad_len, fill=0.0):
         if pad_len <= 0:
@@ -1726,6 +1827,7 @@ class FixedSlotAtomStructureNetwork(nn.Module):
 
         # Endpoint-like residual coordinate readout.
         pred = coords + update
+        self._last_structure_latent = a[0]
         return self.token_out(a[0]), pred
 
     def forward_batched(
@@ -1939,6 +2041,7 @@ class FixedSlotAtomStructureNetwork(nn.Module):
             ).view(B, L, 1, 1)
 
         pred = coords + update
+        self._last_structure_latent = a
         return self.token_out(a), pred
 
 
@@ -2344,7 +2447,12 @@ class MFDesignSequenceD3PMConditioner(nn.Module):
     def __init__(self, hidden_dim, vocab_size, dropout=0.1):
         super().__init__()
         input_dim = int(hidden_dim)
-        hidden_dim = int(int(_cfg_value("architecture", "sequence_hidden", _env_int("ABFLOW_MFDESIGN_SEQUENCE_HIDDEN", 256))))
+        hidden_dim = int(int(_cfg_value(
+            "architecture", "sequence_hidden",
+            _env_int("ABFLOW_MFDESIGN_SEQUENCE_HIDDEN", 256)
+        )))
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
         self.input_proj = (
             nn.Identity()
             if input_dim == hidden_dim
@@ -2807,6 +2915,57 @@ class AMEncoder(nn.Module):
         self._modern_aux_cache = []
         self.last_modern_auxiliary_losses = {}
         self.last_modern_confidence = {}
+        # V144 transient raw MFDesign sequence latent, consumed by AbFlow_model
+        # immediately after AMEncoder.forward. Never persisted across calls.
+        self.last_sequence_latent = None
+
+        # V152 MF-native stateful recycling.
+        #
+        # Historical MF recycling carried only (s,z) and called AtomStructure
+        # only after all representation recycles.  V152 keeps the MF shared
+        # representation recurrence but extends the recycle state with a
+        # detached clean-endpoint geometry estimate supplied by AbFlow_model.
+        #
+        # IMPORTANT: the transport state X_t remains the AtomStructure/current-
+        # geometry input.  clean_coords only conditions the *next* MF recycle.
+        self.stateful_recycle_enabled = _env_flag(
+            "ABFLOW_MF_STATEFUL_RECYCLING", False
+        )
+        self.stateful_clean_coord_enabled = _env_flag(
+            "ABFLOW_MF_STATEFUL_CLEAN_COORD", True
+        )
+        self.last_stateful_recycle_state = None
+        self.stateful_clean_dist_embedding = nn.Embedding(64, self.pair_nf)
+        # Exact parent function at initialization: a newly enabled clean-state
+        # recycle condition starts at zero numerical authority and learns only
+        # if useful.
+        nn.init.zeros_(self.stateful_clean_dist_embedding.weight)
+
+        # V153 MF-native sequence-state closure.
+        #
+        # Original MFDesign writes masked_seq directly into s_inputs before
+        # single conditioning.  Our fixed-slot adapter has no literal restype
+        # slice in s_inputs, so we reproduce the same *single-stream* authority
+        # with explicit one-hot projections into s_init.  This never changes
+        # atom topology/identity and therefore does not resurrect the old
+        # hard-exact AbFlow shortcut.
+        self.mf_masked_sequence_input = _env_flag(
+            "ABFLOW_MF_MASKED_SEQUENCE_INPUT", False
+        )
+        self.mf_sequence_state_vocab = int(
+            _env_int("ABFLOW_MF_SEQUENCE_STATE_VOCAB", 21)
+        )
+        self.mf_sequence_state_proj = nn.Linear(
+            self.mf_sequence_state_vocab, self.hidden_nf, bias=False
+        )
+        self.mf_clean_sequence_proj = nn.Linear(
+            20, self.hidden_nf, bias=False
+        )
+        # The stochastic masked-state path is formal neural input from step 0,
+        # matching MFDesign.  The clean-posterior recycle path remains a
+        # zero-start self-conditioning residual for stability.
+        nn.init.xavier_uniform_(self.mf_sequence_state_proj.weight)
+        nn.init.zeros_(self.mf_clean_sequence_proj.weight)
 
         # Diagnostics only; plain Python integer, not model state.
         self._runtime_trace_forward_count = 0
@@ -2974,6 +3133,8 @@ class AMEncoder(nn.Module):
                 f"pairformer_heads={token_heads} "
                 f"pairformer_dropout={pairformer_dropout:.3g} "
                 f"recycle_max={self.recycling_steps} "
+                f"stateful_recycle={int(self.stateful_recycle_enabled)} "
+                f"mf_masked_seq={int(self.mf_masked_sequence_input)} "
                 f"atom_s={self.atom_structure.atom_s} "
                 f"atom_z={self.atom_structure.atom_z} "
                 f"atom_enc_depth={len(self.atom_structure.atom_encoder.transformer.layers)} "
@@ -3000,6 +3161,17 @@ class AMEncoder(nn.Module):
     def consume_runtime_perf_stats(self):
         return consume_runtime_perf_stats()
 
+    def consume_stateful_recycle_state(self):
+        """Consume the detached MF (s,z) state produced by the last pass.
+
+        This cache is strictly intra-query.  AbFlow_model consumes it
+        immediately and feeds it to the next recycle at the SAME transport
+        time t.  It is never persisted across batches or sampler time steps.
+        """
+        state = self.last_stateful_recycle_state
+        self.last_stateful_recycle_state = None
+        return state
+
     def _batched_runtime_log(self, message):
         if not _env_flag("ABFLOW_BATCHED_RUNTIME_DIAGNOSTICS", False):
             return
@@ -3018,11 +3190,52 @@ class AMEncoder(nn.Module):
         feats,
         residue_update_mask,
         recycling_steps,
+        stateful_recycle_state=None,
+        stateful_clean_coords=None,
+        mf_sequence_state_features=None,
+        mf_clean_sequence_probs=None,
     ):
         """Batch-first MFDesign trunk + full-complex AtomStructure."""
         B, L, _ = s_raw.shape
 
         s_init = self.s_init(s_raw)
+
+        # V153: MFDesign-native discrete sequence state belongs to the token
+        # single stream, not to legacy residue/atom topology.
+        if self.mf_masked_sequence_input:
+            if mf_sequence_state_features is None:
+                # Keep parameters DDP-visible on non-state / compatibility calls.
+                s_init = s_init + 0.0 * self.mf_sequence_state_proj.weight.sum()
+            else:
+                if (
+                    mf_sequence_state_features.shape[:2] != s_init.shape[:2]
+                    or mf_sequence_state_features.shape[-1]
+                    != self.mf_sequence_state_vocab
+                ):
+                    raise ValueError(
+                        "mf_sequence_state_features shape mismatch: "
+                        f"got={tuple(mf_sequence_state_features.shape)} "
+                        f"expected=(*,{self.mf_sequence_state_vocab})"
+                    )
+                s_init = s_init + self.mf_sequence_state_proj(
+                    mf_sequence_state_features.to(s_init.dtype)
+                )
+
+            if mf_clean_sequence_probs is None:
+                s_init = s_init + 0.0 * self.mf_clean_sequence_proj.weight.sum()
+            else:
+                if (
+                    mf_clean_sequence_probs.shape[:2] != s_init.shape[:2]
+                    or mf_clean_sequence_probs.shape[-1] != 20
+                ):
+                    raise ValueError(
+                        "mf_clean_sequence_probs shape mismatch: "
+                        f"got={tuple(mf_clean_sequence_probs.shape)}"
+                    )
+                s_init = s_init + self.mf_clean_sequence_proj(
+                    mf_clean_sequence_probs.to(s_init.dtype)
+                )
+
         z_init = (
             self.z_init_1(s_raw)[:, :, None, :]
             + self.z_init_2(s_raw)[:, None, :, :]
@@ -3043,12 +3256,60 @@ class AMEncoder(nn.Module):
                 geom_bin
             )
 
+        # V152 clean-endpoint recycle condition.  This is distinct from the
+        # current-state X_t geometry above.  It is detached by the caller and
+        # therefore acts as MF-style self-conditioning, never as a second
+        # transport trajectory.
+        if (
+            self.stateful_recycle_enabled
+            and self.stateful_clean_coord_enabled
+            and stateful_clean_coords is not None
+        ):
+            if stateful_clean_coords.shape != x.shape:
+                raise ValueError(
+                    "stateful_clean_coords shape mismatch: "
+                    f"{tuple(stateful_clean_coords.shape)} vs {tuple(x.shape)}"
+                )
+            ca_idx = 1 if x.shape[2] > 1 else 0
+            clean_d_ang = torch.cdist(
+                stateful_clean_coords[:, :, ca_idx].float(),
+                stateful_clean_coords[:, :, ca_idx].float(),
+            ) * float(self.coord_scale_angstrom)
+            clean_bin = self.distogram_binner(clean_d_ang)
+            z_init = z_init + self.stateful_clean_dist_embedding(clean_bin)
+        elif self.stateful_recycle_enabled and self.stateful_clean_coord_enabled:
+            z_init = z_init + (
+                0.0 * self.stateful_clean_dist_embedding.weight.sum()
+            )
+
         mask = feats["token_pad_mask"].to(s_raw.dtype)
         pair_mask = mask[:, :, None] * mask[:, None, :]
 
-        s = torch.zeros_like(s_init)
-        z = torch.zeros_like(z_init)
+        if stateful_recycle_state is None:
+            s = torch.zeros_like(s_init)
+            z = torch.zeros_like(z_init)
+        else:
+            s_prev = stateful_recycle_state.get("s")
+            z_prev = stateful_recycle_state.get("z")
+            if s_prev is None or z_prev is None:
+                raise ValueError("stateful_recycle_state requires s and z")
+            if s_prev.shape != s_init.shape or z_prev.shape != z_init.shape:
+                raise ValueError(
+                    "stateful recycle representation shape mismatch: "
+                    f"s={tuple(s_prev.shape)}/{tuple(s_init.shape)} "
+                    f"z={tuple(z_prev.shape)}/{tuple(z_init.shape)}"
+                )
+            # Explicit stop-gradient recycle semantics.
+            s = s_prev.detach().to(s_init)
+            z = z_prev.detach().to(z_init)
+
         steps = int(recycling_steps)
+        if self.stateful_recycle_enabled and steps != 0:
+            raise ValueError(
+                "V152 uses ONE recycle authority. Internal AMEncoder "
+                "recycling_steps must be 0; stateful depth is controlled by "
+                "AbFlow_model at fixed X_t."
+            )
 
         for recycle_idx in range(steps + 1):
             final_pass = recycle_idx == steps
@@ -3099,7 +3360,12 @@ class AMEncoder(nn.Module):
             residue_update_mask=residue_update_mask,
             token_valid_mask=mask,
         )
-        return s, z, s_struct, pred_x
+        sequence_latent = self.atom_structure.consume_last_structure_latent()
+        if sequence_latent is None:
+            raise RuntimeError(
+                "V144 failed to capture batched MFDesign structure latent."
+            )
+        return s, z, s_struct, pred_x, sequence_latent
 
     def _clean_self_condition_z_batched(
         self,
@@ -3130,10 +3396,15 @@ class AMEncoder(nn.Module):
                 residue_update_mask=residue_update_mask,
                 token_valid_mask=token_valid_mask,
             )
+            sequence_latent = self.atom_structure.consume_last_structure_latent()
+            if sequence_latent is None:
+                raise RuntimeError(
+                    "V144 failed to capture no-SC local sequence latent."
+                )
             if _env_flag("ABFLOW_PERF_DIAGNOSTICS", False):
                 _ATTN_RUNTIME_STATS["batched_shadow_atom_calls"] += 1
             gates = current_coords.new_zeros((B,))
-            return s_out, pred, z_local, gates
+            return s_out, pred, z_local, gates, sequence_latent
 
         # Preserve graphwise RNG semantics: one scalar draw per graph.
         if self.training:
@@ -3193,10 +3464,15 @@ class AMEncoder(nn.Module):
             residue_update_mask=residue_update_mask,
             token_valid_mask=token_valid_mask,
         )
+        sequence_latent = self.atom_structure.consume_last_structure_latent()
+        if sequence_latent is None:
+            raise RuntimeError(
+                "V144 failed to capture formal clean-SC local sequence latent."
+            )
         if _env_flag("ABFLOW_PERF_DIAGNOSTICS", False):
             _ATTN_RUNTIME_STATS["batched_shadow_atom_calls"] += 1
             _ATTN_RUNTIME_STATS["sc_formal_calls"] += 1
-        return s_out, pred, z_sc, gates
+        return s_out, pred, z_sc, gates, sequence_latent
 
     def _maybe_check_batched_parity(
         self,
@@ -3373,6 +3649,15 @@ class AMEncoder(nn.Module):
                             token_valid_mask=mask,
                         )
                     )
+                    raw_a_b = self.atom_structure.consume_last_structure_latent()
+                    if raw_a_b is None:
+                        raise RuntimeError(
+                            "V144 parity failed to capture batched raw latent."
+                        )
+                    raw_a_err = 0.0
+                    raw_a_sse = 0.0
+                    raw_a_ref_sse = 0.0
+                    raw_a_count = 0
 
                     for bi in range(Bv):
                         Li = int(lengths[bi])
@@ -3387,6 +3672,11 @@ class AMEncoder(nn.Module):
                             residue_update_mask=up[bi, :Li],
                             token_valid_mask=mask[bi, :Li],
                         )
+                        raw_a_i = self.atom_structure.consume_last_structure_latent()
+                        if raw_a_i is None:
+                            raise RuntimeError(
+                                "V144 parity failed to capture graphwise raw latent."
+                            )
                         _das = (
                             as_b[bi, :Li].float() - as_i.float()
                         )
@@ -3409,6 +3699,16 @@ class AMEncoder(nn.Module):
                             (as_i.float() ** 2).sum().item()
                         )
                         atom_s_count += int(_das.numel())
+
+                        _daa = raw_a_b[bi, :Li].float() - raw_a_i.float()
+                        raw_a_err = max(
+                            raw_a_err, float(_daa.abs().max().item())
+                        )
+                        raw_a_sse += float((_daa * _daa).sum().item())
+                        raw_a_ref_sse += float(
+                            (raw_a_i.float() ** 2).sum().item()
+                        )
+                        raw_a_count += int(_daa.numel())
 
                         atom_x_sse += float(
                             (_dax * _dax).sum().item()
@@ -3441,21 +3741,23 @@ class AMEncoder(nn.Module):
         pair_s_rms = _rms(pair_s_sse, pair_s_count)
         pair_z_rms = _rms(pair_z_sse, pair_z_count)
         atom_s_rms = _rms(atom_s_sse, atom_s_count)
+        raw_a_rms = _rms(raw_a_sse, raw_a_count)
         atom_x_rms = _rms(atom_x_sse, atom_x_count)
 
         pair_s_rel = _rel_l2(pair_s_sse, pair_s_ref_sse)
         pair_z_rel = _rel_l2(pair_z_sse, pair_z_ref_sse)
         atom_s_rel = _rel_l2(atom_s_sse, atom_s_ref_sse)
+        raw_a_rel = _rel_l2(raw_a_sse, raw_a_ref_sse)
         atom_x_rel = _rel_l2(atom_x_sse, atom_x_ref_sse)
 
         hidden_max = max(
-            pair_s_err, pair_z_err, atom_s_err
+            pair_s_err, pair_z_err, atom_s_err, raw_a_err
         )
         hidden_rms = max(
-            pair_s_rms, pair_z_rms, atom_s_rms
+            pair_s_rms, pair_z_rms, atom_s_rms, raw_a_rms
         )
         hidden_rel_l2 = max(
-            pair_s_rel, pair_z_rel, atom_s_rel
+            pair_s_rel, pair_z_rel, atom_s_rel, raw_a_rel
         )
 
         line = (
@@ -3470,6 +3772,9 @@ class AMEncoder(nn.Module):
             f"atom_s_max={atom_s_err:.3e} "
             f"atom_s_rms={atom_s_rms:.3e} "
             f"atom_s_rel_l2={atom_s_rel:.3e} "
+            f"raw_a_max={raw_a_err:.3e} "
+            f"raw_a_rms={raw_a_rms:.3e} "
+            f"raw_a_rel_l2={raw_a_rel:.3e} "
             f"atom_x_max={atom_x_err:.3e} "
             f"atom_x_rms={atom_x_rms:.3e} "
             f"atom_x_rel_l2={atom_x_rel:.3e} "
@@ -3535,6 +3840,10 @@ class AMEncoder(nn.Module):
         token_bonds,
         token_pad_mask,
         effective_recycling_steps,
+        stateful_recycle_state=None,
+        stateful_clean_coords=None,
+        mf_sequence_state_features=None,
+        mf_clean_sequence_probs=None,
     ):
         """Complete batch-first MFDesign runtime for the local DDP batch."""
         N = int(h0.shape[0])
@@ -3656,7 +3965,57 @@ class AMEncoder(nn.Module):
             lengths=lengths,
         )
 
-        s_b, z_b, s_struct_b, pred_b = (
+        seq_state_b = None
+        if mf_sequence_state_features is not None:
+            if (
+                mf_sequence_state_features.ndim != 2
+                or mf_sequence_state_features.shape[0] != N
+            ):
+                raise ValueError(
+                    "mf_sequence_state_features must be flat [N,K]"
+                )
+            seq_state_b = mf_sequence_state_features[safe_idx]
+            seq_state_b = (
+                seq_state_b
+                * valid.unsqueeze(-1).to(seq_state_b)
+            )
+
+        clean_seq_b = None
+        if mf_clean_sequence_probs is not None:
+            if (
+                mf_clean_sequence_probs.ndim != 2
+                or mf_clean_sequence_probs.shape != (N, 20)
+            ):
+                raise ValueError(
+                    "mf_clean_sequence_probs must be flat [N,20]"
+                )
+            clean_seq_b = mf_clean_sequence_probs[safe_idx]
+            clean_seq_b = (
+                clean_seq_b
+                * valid.unsqueeze(-1).to(clean_seq_b)
+            )
+
+        clean_b = None
+        if stateful_clean_coords is not None:
+            if stateful_clean_coords.shape != x.shape:
+                raise ValueError(
+                    "stateful_clean_coords must match flat x shape: "
+                    f"{tuple(stateful_clean_coords.shape)} vs {tuple(x.shape)}"
+                )
+            clean_b = stateful_clean_coords[safe_idx]
+            clean_b = clean_b * valid[:, :, None, None].to(clean_b)
+
+        if stateful_recycle_state is not None:
+            state_lengths = tuple(
+                int(v) for v in stateful_recycle_state.get("lengths", ())
+            )
+            if state_lengths != tuple(lengths):
+                raise ValueError(
+                    "stateful recycle graph partition changed inside one query: "
+                    f"{state_lengths} vs {tuple(lengths)}"
+                )
+
+        s_b, z_b, s_struct_b, pred_b, sequence_latent_b = (
             self._run_batched_complexes(
                 s_raw=s_raw_b,
                 x=x_state_b,
@@ -3665,12 +4024,28 @@ class AMEncoder(nn.Module):
                 feats=feats_b,
                 residue_update_mask=update_b,
                 recycling_steps=effective_recycling_steps,
+                stateful_recycle_state=stateful_recycle_state,
+                stateful_clean_coords=clean_b,
+                mf_sequence_state_features=seq_state_b,
+                mf_clean_sequence_probs=clean_seq_b,
             )
         )
+
+        # Persist only the detached MF representation state for the next pass
+        # at the same X_t.  Clean coordinate/sequence estimates are owned by
+        # AbFlow_model and supplied separately.
+        self.last_stateful_recycle_state = {
+            "s": s_b.detach(),
+            "z": z_b.detach(),
+            "lengths": tuple(lengths),
+        }
 
         # Stitch full-complex outputs back to the exact historical flat API.
         h_out = h0.float().clone()
         pred_x = x.clone()
+        sequence_latent_out = sequence_latent_b.new_zeros(
+            (N, int(self.atom_structure.structure_token_s))
+        )
         for g, Lg in enumerate(lengths):
             gidx = flat_idx[g, :Lg]
             s_g = s_struct_b[g, :Lg]
@@ -3678,6 +4053,7 @@ class AMEncoder(nn.Module):
                 s_g = s_g.to(h_out.dtype)
             h_out[gidx] = s_g
             pred_x[gidx] = pred_b[g, :Lg]
+            sequence_latent_out[gidx] = sequence_latent_b[g, :Lg]
 
         inter_h_out = h0[inter_mask].float().clone()
         pred_inter_x = inter_x.clone()
@@ -3756,6 +4132,7 @@ class AMEncoder(nn.Module):
                 pred_local_b,
                 z_local_used_b,
                 gates,
+                sequence_local_b,
             ) = self._clean_self_condition_z_batched(
                 s_local=s_local_b,
                 z_local=z_local_b,
@@ -3774,6 +4151,9 @@ class AMEncoder(nn.Module):
                     s_local = s_local.to(inter_h_out.dtype)
                 inter_h_out[shadow_idx] = s_local
                 pred_inter_x[shadow_idx] = pred_local_b[j, :Lj]
+                sequence_latent_out[gidx[local_pos]] = (
+                    sequence_local_b[j, :Lj]
+                )
 
                 local_feats = {}
                 for key, value in feats_b.items():
@@ -3852,6 +4232,7 @@ class AMEncoder(nn.Module):
         h_out[inter_mask] = inter_h_out
         h_out = self.dropout(h_out)
         h_out = self.linear_out(h_out)
+        self.last_sequence_latent = sequence_latent_out
         return h_out, pred_x, pred_inter_x
 
     def _run_one_complex(
@@ -3924,7 +4305,12 @@ class AMEncoder(nn.Module):
             residue_update_mask=residue_update_mask,
             token_valid_mask=feats['token_pad_mask'][0],
         )
-        return s[0], z, s_struct, pred_x
+        sequence_latent = self.atom_structure.consume_last_structure_latent()
+        if sequence_latent is None:
+            raise RuntimeError(
+                "V144 failed to capture graphwise MFDesign structure latent."
+            )
+        return s[0], z, s_struct, pred_x, sequence_latent
 
     def _pair_focus_mask(self, valid_residue, design_mask):
         L = valid_residue.shape[0]
@@ -3964,7 +4350,15 @@ class AMEncoder(nn.Module):
                 atom_weights=atom_weights,
                 residue_update_mask=residue_update_mask,
             )
-            return s_local_out, pred_local, z_local, current_coords.new_tensor(0.0)
+            sequence_latent = self.atom_structure.consume_last_structure_latent()
+            if sequence_latent is None:
+                raise RuntimeError(
+                    "V144 failed to capture graphwise no-SC local latent."
+                )
+            return (
+                s_local_out, pred_local, z_local,
+                current_coords.new_tensor(0.0), sequence_latent
+            )
 
         if self.training:
             gate = (
@@ -4003,7 +4397,12 @@ class AMEncoder(nn.Module):
             atom_weights=atom_weights,
             residue_update_mask=residue_update_mask,
         )
-        return s_local_out, pred_local, z_sc, gate
+        sequence_latent = self.atom_structure.consume_last_structure_latent()
+        if sequence_latent is None:
+            raise RuntimeError(
+                "V144 failed to capture graphwise formal local latent."
+            )
+        return s_local_out, pred_local, z_sc, gate, sequence_latent
 
     def _append_aux_cache(
         self,
@@ -4376,6 +4775,10 @@ class AMEncoder(nn.Module):
         token_region=None,
         token_bonds=None,
         token_pad_mask=None,
+        stateful_recycle_state=None,
+        stateful_clean_coords=None,
+        mf_sequence_state_features=None,
+        mf_clean_sequence_probs=None,
     ):
         # Pair-Time / old edge attributes are intentionally not part of the
         # modern pair authority.  Formal modern runs must keep Pair-Time off.
@@ -4385,6 +4788,14 @@ class AMEncoder(nn.Module):
         self._modern_aux_cache = []
         self.last_modern_auxiliary_losses = {}
         self.last_modern_confidence = {}
+        self.last_sequence_latent = None
+        self.last_stateful_recycle_state = None
+
+        if self.stateful_recycle_enabled and not self.batched_runtime:
+            raise RuntimeError(
+                "V152 MF-native stateful recycling requires the validated "
+                "batch-first MFDesign runtime."
+            )
 
         h0 = self.dropout(self.linear_in(h))
         N = h0.shape[0]
@@ -4479,6 +4890,10 @@ class AMEncoder(nn.Module):
                 token_bonds=token_bonds,
                 token_pad_mask=token_pad_mask,
                 effective_recycling_steps=effective_recycling_steps,
+                stateful_recycle_state=stateful_recycle_state,
+                stateful_clean_coords=stateful_clean_coords,
+                mf_sequence_state_features=mf_sequence_state_features,
+                mf_clean_sequence_probs=mf_clean_sequence_probs,
             )
 
         _trace_id = int(self._runtime_trace_forward_count)
@@ -4513,6 +4928,9 @@ class AMEncoder(nn.Module):
         # Coordinate buffers keep the coordinate input dtype unchanged.
         h_out = h0.float().clone()
         pred_x = x.clone()
+        sequence_latent_out = h0.float().new_zeros(
+            (N, int(self.atom_structure.structure_token_s))
+        )
         inter_h_out = h0[inter_mask].float().clone()
         pred_inter_x = inter_x.clone()
 
@@ -4555,7 +4973,9 @@ class AMEncoder(nn.Module):
                     x.device,
                     extra=f"fwd={_trace_id} graph={graph_id}/{num_graphs} L={Lg}",
                 )
-            s_trunk_g, z_g, s_struct_g, pred_x_g = self._run_one_complex(
+            (
+                s_trunk_g, z_g, s_struct_g, pred_x_g, sequence_latent_g
+            ) = self._run_one_complex(
                 s_raw=h0[gidx],
                 x=x_state_g,
                 atom_attr=channel_attr[gidx],
@@ -4579,6 +4999,9 @@ class AMEncoder(nn.Module):
                 s_struct_g = s_struct_g.to(dtype=h_out.dtype)
             h_out[gidx] = s_struct_g
             pred_x[gidx] = pred_x_g
+            sequence_latent_out[gidx] = sequence_latent_g.to(
+                sequence_latent_out.dtype
+            )
 
             # Shadow dynamic state: reuse exactly the same persistent trunk
             # representation (s,z), but query the atom structure network with
@@ -4597,21 +5020,25 @@ class AMEncoder(nn.Module):
 
                 # Module 7: clean-state self-conditioning acts ONLY on the true
                 # dynamic shadow Xt, never on the PCS-RC static proposal trunk.
-                s_local, pred_local, z_local_used, sc_gate = (
-                    self._clean_self_condition_z(
-                        s_local=s_trunk_g[local_pos],
-                        z_local=z_local,
-                        current_coords=inter_x[shadow_idx],
-                        atom_attr=local_atom_attr,
-                        atom_weights=local_atom_weights,
-                        residue_update_mask=local_update,
-                    )
+                (
+                    s_local, pred_local, z_local_used, sc_gate,
+                    sequence_local,
+                ) = self._clean_self_condition_z(
+                    s_local=s_trunk_g[local_pos],
+                    z_local=z_local,
+                    current_coords=inter_x[shadow_idx],
+                    atom_attr=local_atom_attr,
+                    atom_weights=local_atom_weights,
+                    residue_update_mask=local_update,
                 )
                 # Same AMP boundary for the dynamic local-shadow state.
                 if s_local.dtype != inter_h_out.dtype:
                     s_local = s_local.to(dtype=inter_h_out.dtype)
                 inter_h_out[shadow_idx] = s_local
                 pred_inter_x[shadow_idx] = pred_local
+                sequence_latent_out[gidx[local_pos]] = sequence_local.to(
+                    sequence_latent_out.dtype
+                )
 
                 # Cache local persistent pair state. Confidence itself is
                 # evaluated after the validated surface refinement so it sees
@@ -4705,4 +5132,5 @@ class AMEncoder(nn.Module):
                 x.device,
                 extra=f"fwd={_trace_id} aux_cache={len(self._modern_aux_cache)}",
             )
+        self.last_sequence_latent = sequence_latent_out
         return h_out, pred_x, pred_inter_x

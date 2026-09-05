@@ -682,7 +682,7 @@ def main(args):
         raise NotImplementedError(f'model {args.model_type} not implemented')
 
     # ------------------------------------------------------------
-    # V138 batch contract: JSON batch_size is PER-GPU micro-batch.
+    # V140 batch contract: JSON batch_size is PER-GPU micro-batch.
     # This matches the existing ABX trainer and MFDesign/Lightning data-module
     # convention.  DDP combines one micro-batch from every rank, therefore:
     #

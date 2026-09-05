@@ -59,32 +59,35 @@ class Trainer:
 
         self.local_rank = -1
 
-        # log / run directory
-        # Strict resume: continue writing into the original version directory.
-        resume_checkpoint = str(getattr(self.config, "resume_checkpoint", "") or "").strip()
+        resume_checkpoint = str(
+            getattr(self.config, "resume_checkpoint", "") or ""
+        ).strip()
         if resume_checkpoint:
             resume_checkpoint = os.path.abspath(resume_checkpoint)
             if not os.path.isfile(resume_checkpoint):
-                raise FileNotFoundError(f"resume_checkpoint not found: {resume_checkpoint}")
-
+                raise FileNotFoundError(
+                    f"resume_checkpoint not found: {resume_checkpoint}"
+                )
             ckpt_dir = os.path.dirname(resume_checkpoint)
             resume_run_dir = os.path.dirname(ckpt_dir)
-
             m = re.search(r"version_(\d+)$", os.path.basename(resume_run_dir))
             if m is None:
                 raise ValueError(
-                    "resume_checkpoint must be under a version_N/checkpoint directory, "
-                    f"got: {resume_checkpoint}"
+                    "resume_checkpoint must be under a version_N/checkpoint "
+                    f"directory, got: {resume_checkpoint}"
                 )
-
             self.version = int(m.group(1))
             self.config.save_dir = resume_run_dir
             self.model_dir = ckpt_dir
             self.config.resume_checkpoint = resume_checkpoint
         else:
             self.version = self._get_version()
-            self.config.save_dir = os.path.join(self.config.save_dir, f'version_{self.version}')
-            self.model_dir = os.path.join(self.config.save_dir, 'checkpoint')
+            self.config.save_dir = os.path.join(
+                self.config.save_dir, f'version_{self.version}'
+            )
+            self.model_dir = os.path.join(
+                self.config.save_dir, 'checkpoint'
+            )
 
         self.writer = None
         self.writer_buffer = {}
@@ -97,22 +100,41 @@ class Trainer:
         self.last_test_metrics = {}
         self.topk_ckpt_map = []
         self.patience = self.config.patience
-        
+
         self.last_state_path = None
-        resume_checkpoint = str(getattr(self.config, "resume_checkpoint", "") or "").strip()
-        if resume_checkpoint and os.path.basename(resume_checkpoint).startswith("last_step"):
+        if resume_checkpoint and os.path.basename(
+            resume_checkpoint
+        ).startswith("last_step"):
             self.last_state_path = resume_checkpoint
         self.ema = None
 
-        # Training-speed controls.  AMP is opt-in through config/env and is
-        # implemented here so all project trainers inherit the same behavior.
         self.use_amp = bool(getattr(self.config, "amp", False))
-        self.amp_dtype = str(getattr(self.config, "amp_dtype", "bf16")).lower()
-        self.log_interval = max(1, int(getattr(self.config, "log_interval", 20) or 20))
-
-        # GradScaler is only needed for fp16.  bf16 has a wider exponent range
-        # and normally does not require scaling.
+        self.amp_dtype = str(
+            getattr(self.config, "amp_dtype", "bf16")
+        ).lower()
+        self.log_interval = max(
+            1, int(getattr(self.config, "log_interval", 20) or 20)
+        )
         self.grad_scaler = None
+
+        # V153 dynamic-graph contract.
+        #
+        # The formal V153 graph is intentionally dynamic:
+        #   - sequence CE is evaluated only on currently MASKed design tokens;
+        #   - recycle depth K is sampled in {1,2,3};
+        #   - self-conditioning and gated auxiliaries are conditional.
+        #
+        # Therefore a parameter can be legitimately absent from a local
+        # iteration's autograd graph.  Treating that as a static-graph error is
+        # wrong.  DDP's find_unused_parameters traversal is the correct
+        # reduction semantics: locally-unused params contribute no local
+        # gradient while gradients from ranks where they are active are still
+        # reduced.  This also preserves Adam's "grad is None -> skip update"
+        # behavior; unlike a fake zero-gradient anchor it does not decay
+        # optimizer momentum for an inactive branch.
+        self.ddp_find_unused_parameters = self._env_on(
+            "ABFLOW_DDP_FIND_UNUSED_PARAMETERS", "off"
+        )
 
     @classmethod
     def to_device(cls, data, device):
@@ -120,7 +142,9 @@ class Trainer:
             for key in data:
                 data[key] = cls.to_device(data[key], device)
         elif isinstance(data, list) or isinstance(data, tuple):
-            data = type(data)([cls.to_device(item, device) for item in data])
+            data = type(data)(
+                [cls.to_device(item, device) for item in data]
+            )
         elif torch.is_tensor(data):
             data = data.to(device, non_blocking=True)
         elif hasattr(data, 'to'):
@@ -138,10 +162,15 @@ class Trainer:
             dtype = torch.float16
         else:
             dtype = torch.bfloat16
-        return torch.cuda.amp.autocast(enabled=enabled, dtype=dtype)
+        return torch.cuda.amp.autocast(
+            enabled=enabled, dtype=dtype
+        )
 
     def _should_log_step(self, step):
-        return self._is_main_proc() and (int(step) % self.log_interval == 0)
+        return (
+            self._is_main_proc()
+            and int(step) % self.log_interval == 0
+        )
 
     def _is_main_proc(self):
         return self.local_rank == 0 or self.local_rank == -1
@@ -156,16 +185,6 @@ class Trainer:
         return int(version + 1)
 
     def _get_version(self):
-        """Choose exactly one run version for the whole DDP job.
-
-        Previous diagnostic code let every rank scan the filesystem
-        independently. Two ranks racing through startup could therefore choose
-        different version_N directories (observed: rank0->version_0,
-        rank1->version_1).
-
-        In DDP, rank0 is now the sole version authority and broadcasts one
-        integer to all ranks. This changes run-directory bookkeeping only.
-        """
         if (
             dist.is_available()
             and dist.is_initialized()
@@ -173,9 +192,9 @@ class Trainer:
         ):
             rank = dist.get_rank()
             local_version = (
-                self._scan_next_version_local() if rank == 0 else -1
+                self._scan_next_version_local()
+                if rank == 0 else -1
             )
-
             backend = str(dist.get_backend()).lower()
             if "nccl" in backend:
                 device = torch.device(
@@ -183,7 +202,6 @@ class Trainer:
                 )
             else:
                 device = torch.device("cpu")
-
             version_tensor = torch.tensor(
                 [local_version],
                 dtype=torch.long,
@@ -191,15 +209,21 @@ class Trainer:
             )
             dist.broadcast(version_tensor, src=0)
             return int(version_tensor.item())
-
         return self._scan_next_version_local()
 
     def _save_train_state(self, tag, metric=None):
         if not self._is_main_proc():
             return
-        path = os.path.join(self.model_dir, f'{tag}_step{self.global_step}.pt')
+        path = os.path.join(
+            self.model_dir,
+            f'{tag}_step{self.global_step}.pt'
+        )
         save_checkpoint(self, path, metric=metric)
-        if tag == 'last' and self.last_state_path and os.path.exists(self.last_state_path):
+        if (
+            tag == 'last'
+            and self.last_state_path
+            and os.path.exists(self.last_state_path)
+        ):
             try:
                 os.remove(self.last_state_path)
             except OSError:
@@ -208,7 +232,10 @@ class Trainer:
             self.last_state_path = path
 
     def _save_eval_model(self, save_path):
-        module_to_save = self.model.module if self.local_rank == 0 else self.model
+        module_to_save = (
+            self.model.module if self.local_rank == 0
+            else self.model
+        )
         torch.save(module_to_save, save_path)
 
     def _optimizer_local_state_bytes(self):
@@ -217,11 +244,20 @@ class Trainer:
             return 0
         local_optim = getattr(optimizer, "optim", optimizer)
         total = 0
-        for state in getattr(local_optim, "state", {}).values():
-            values = state.values() if isinstance(state, dict) else (state,)
+        for state in getattr(
+            local_optim, "state", {}
+        ).values():
+            values = (
+                state.values()
+                if isinstance(state, dict)
+                else (state,)
+            )
             for value in values:
                 if torch.is_tensor(value):
-                    total += int(value.numel()) * int(value.element_size())
+                    total += (
+                        int(value.numel())
+                        * int(value.element_size())
+                    )
         return int(total)
 
     def _ema_state_bytes(self):
@@ -238,11 +274,17 @@ class Trainer:
     def _tensor_nbytes(value):
         if not torch.is_tensor(value):
             return 0
-        return int(value.numel()) * int(value.element_size())
+        return (
+            int(value.numel())
+            * int(value.element_size())
+        )
 
     def _registered_model_state_bytes(self):
-        model = getattr(self, "model", None)
-        raw = getattr(model, "module", model)
+        raw = getattr(
+            getattr(self, "model", None),
+            "module",
+            getattr(self, "model", None),
+        )
         if raw is None:
             return 0, 0, 0
         pb = gb = bb = 0
@@ -255,12 +297,13 @@ class Trainer:
         return int(pb), int(gb), int(bb)
 
     def _runtime_python_tensor_owners(self):
-        """Read-only direct Python Tensor ownership summary."""
-        model = getattr(self, "model", None)
-        raw = getattr(model, "module", model)
+        raw = getattr(
+            getattr(self, "model", None),
+            "module",
+            getattr(self, "model", None),
+        )
         if raw is None:
             return 0, []
-
         keywords = (
             "cache", "diagnostic", "probe", "pending",
             "_last_", "last_", "objective_tensor",
@@ -278,7 +321,9 @@ class Trainer:
                 seen.add(oid)
                 n = self._tensor_nbytes(obj)
                 if n:
-                    owners.append((path, n, bool(obj.requires_grad)))
+                    owners.append(
+                        (path, n, bool(obj.requires_grad))
+                    )
                 return n
             if isinstance(obj, dict):
                 return sum(
@@ -296,20 +341,24 @@ class Trainer:
         for module_name, module in raw.named_modules():
             prefix = module_name or "<root>"
             for name, value in module.__dict__.items():
-                if name in {"_parameters", "_buffers", "_modules"}:
+                if name in {
+                    "_parameters", "_buffers", "_modules"
+                }:
                     continue
                 lname = name.lower()
                 if not any(k in lname for k in keywords):
                     continue
-                total += visit(value, f"{prefix}.{name}")
-
+                total += visit(
+                    value, f"{prefix}.{name}"
+                )
         owners.sort(key=lambda x: x[1], reverse=True)
         return int(total), owners[:12]
 
     def _runtime_log_path(self):
         rank = (
             dist.get_rank()
-            if dist.is_available() and dist.is_initialized()
+            if dist.is_available()
+            and dist.is_initialized()
             else 0
         )
         return os.path.join(
@@ -318,65 +367,74 @@ class Trainer:
         )
 
     def _runtime_log_line(self, message):
-        """Best-effort diagnostic file sink; never affects training."""
-        def _on(name):
-            return os.environ.get(
-                name, "off"
-            ).strip().lower() in {"1", "true", "yes", "y", "on"}
-
         if not (
-            _on("ABFLOW_MEMORY_DIAGNOSTICS")
-            or _on("ABFLOW_PERF_DIAGNOSTICS")
-            or _on("ABFLOW_RUNTIME_TRACE")
+            self._env_on("ABFLOW_MEMORY_DIAGNOSTICS")
+            or self._env_on("ABFLOW_PERF_DIAGNOSTICS")
+            or self._env_on("ABFLOW_RUNTIME_TRACE")
+            or self._env_on("ABFLOW_BATCHED_GRAD_DIAGNOSTICS")
         ):
             return
         try:
-            os.makedirs(self.config.save_dir, exist_ok=True)
+            os.makedirs(
+                self.config.save_dir, exist_ok=True
+            )
             with open(
-                self._runtime_log_path(), "a", encoding="utf-8"
+                self._runtime_log_path(),
+                "a", encoding="utf-8"
             ) as fout:
-                fout.write(str(message).rstrip("\n") + "\n")
+                fout.write(
+                    str(message).rstrip("\n") + "\n"
+                )
         except Exception:
-            # Diagnostics are non-authoritative; never fail the run.
             pass
 
     def _runtime_exception_log(self, stage, step):
         rank = (
             dist.get_rank()
-            if dist.is_available() and dist.is_initialized()
+            if dist.is_available()
+            and dist.is_initialized()
             else 0
         )
         header = (
-            f"[RuntimeException] rank={rank} step={int(step)} "
-            f"stage={stage}"
+            f"[RuntimeException] rank={rank} "
+            f"step={int(step)} stage={stage}"
         )
         body = traceback.format_exc()
         self._runtime_log_line(header)
         for line in body.rstrip("\n").splitlines():
             self._runtime_log_line(line)
 
-    def _cuda_memory_diag(self, device, tag, step):
-        enabled = os.environ.get(
-            "ABFLOW_MEMORY_DIAGNOSTICS", "off"
-        ).strip().lower() in {"1", "true", "yes", "y", "on"}
-        if device.type != "cuda" or not enabled:
+    def _cuda_memory_diag(
+        self, device, tag, step
+    ):
+        if (
+            device.type != "cuda"
+            or not self._env_on(
+                "ABFLOW_MEMORY_DIAGNOSTICS"
+            )
+        ):
             return
-        limit = max(0, int(os.environ.get(
-            "ABFLOW_MEMORY_DIAGNOSTIC_STEPS", "3"
-        ) or 3))
+        limit = max(
+            0,
+            int(os.environ.get(
+                "ABFLOW_MEMORY_DIAGNOSTIC_STEPS", "3"
+            ) or 3),
+        )
         if int(step) >= limit:
             return
 
         rank = (
             dist.get_rank()
-            if dist.is_available() and dist.is_initialized()
+            if dist.is_available()
+            and dist.is_initialized()
             else 0
         )
         mib = 1024.0 * 1024.0
         pb, gb, bb = self._registered_model_state_bytes()
-        cache_b, owners = self._runtime_python_tensor_owners()
-
-        _diag_line = (
+        cache_b, owners = (
+            self._runtime_python_tensor_owners()
+        )
+        line = (
             "[MemoryDiag] "
             f"rank={rank} step={int(step)} tag={tag} "
             f"alloc={torch.cuda.memory_allocated(device)/mib:.1f}MiB "
@@ -388,16 +446,19 @@ class Trainer:
             f"ema={self._ema_state_bytes()/mib:.1f}MiB "
             f"python_cache={cache_b/mib:.1f}MiB"
         )
-        print(_diag_line, flush=True)
-        self._runtime_log_line(_diag_line)
+        print(line, flush=True)
+        self._runtime_log_line(line)
 
-        owner_enabled = os.environ.get(
-            "ABFLOW_MEMORY_OWNER_DIAGNOSTICS", "off"
-        ).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-        if owner_enabled and tag in {
-            "after_forward", "after_backward", "after_ema_update"
-        }:
+        if (
+            self._env_on(
+                "ABFLOW_MEMORY_OWNER_DIAGNOSTICS"
+            )
+            and tag in {
+                "after_forward",
+                "after_backward",
+                "after_ema_update",
+            }
+        ):
             if owners:
                 top = " | ".join(
                     f"{path}={n/mib:.1f}MiB"
@@ -406,12 +467,12 @@ class Trainer:
                 )
             else:
                 top = "<none>"
-            _owner_line = (
-                f"[MemoryOwner] rank={rank} step={int(step)} "
-                f"tag={tag} top={top}"
+            owner_line = (
+                f"[MemoryOwner] rank={rank} "
+                f"step={int(step)} tag={tag} top={top}"
             )
-            print(_owner_line, flush=True)
-            self._runtime_log_line(_owner_line)
+            print(owner_line, flush=True)
+            self._runtime_log_line(owner_line)
 
     def _consolidate_sharded_optimizer_for_checkpoint(self):
         consolidate = getattr(
@@ -421,39 +482,38 @@ class Trainer:
         )
         if callable(consolidate):
             consolidate(to=0)
-            if dist.is_available() and dist.is_initialized():
+            if (
+                dist.is_available()
+                and dist.is_initialized()
+            ):
                 dist.barrier()
 
     @staticmethod
     def _env_on(name, default="off"):
         return os.environ.get(
             name, default
-        ).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-    def _disable_perf_instrumentation_after_gate(self):
-        """Disable all v123/v126 speed counters after startup validation.
-
-        This is called once after the configured profiling window.  It changes
-        diagnostics only; model/training math is untouched.
-        """
-        os.environ["ABFLOW_PERF_DIAGNOSTICS"] = "off"
-        raw = getattr(self.model, "module", self.model)
-        for module in raw.modules():
-            if hasattr(module, "perf_stats_enabled"):
-                module.perf_stats_enabled = False
+        ).strip().lower() in {
+            "1", "true", "yes", "y", "on"
+        }
 
     def _perf_step_enabled(self, step):
-        if not self._env_on("ABFLOW_PERF_DIAGNOSTICS"):
+        if not self._env_on(
+            "ABFLOW_PERF_DIAGNOSTICS"
+        ):
             return False
         limit = max(
             0,
-            int(os.environ.get("ABFLOW_PERF_DIAGNOSTIC_STEPS", "8") or 8),
+            int(os.environ.get(
+                "ABFLOW_PERF_DIAGNOSTIC_STEPS", "8"
+            ) or 8),
         )
         return int(step) < limit
 
     def _consume_model_runtime_perf_stats(self):
         try:
-            from models.modules.am_enc import consume_runtime_perf_stats
+            from models.modules.am_enc import (
+                consume_runtime_perf_stats,
+            )
             return consume_runtime_perf_stats()
         except Exception:
             return {
@@ -472,22 +532,19 @@ class Trainer:
     def _effective_recycling_for_perf(self):
         raw = getattr(self.model, "module", self.model)
         gnn = getattr(raw, "gnn", None)
-        return int(getattr(gnn, "_last_effective_recycling_steps", -1))
+        return int(
+            getattr(
+                gnn,
+                "_last_effective_recycling_steps",
+                -1,
+            )
+        )
 
     def _write_perf_line(
-        self,
-        *,
-        step,
-        rank,
-        data_wait_ms,
-        forward_ms,
-        backward_ms,
-        optimizer_ms,
-        ema_ms,
-        wall_ms,
-        peak_mib,
-        end_alloc_mib,
-        stats,
+        self, *, step, rank, data_wait_ms,
+        forward_ms, backward_ms, optimizer_ms,
+        ema_ms, wall_ms, peak_mib,
+        end_alloc_mib, stats,
     ):
         line = (
             "[RuntimePerf] "
@@ -512,18 +569,20 @@ class Trainer:
             f"real_tokens={stats.get('real_tokens', -1)} "
             f"padded_tokens={stats.get('padded_tokens', -1)}"
         )
-        # All ranks persist their own line. Only global rank0 prints to stdout.
         self._runtime_log_line(line)
         if rank == 0:
             print(line, flush=True)
 
     def _log_gradient_contract(self, step):
-        if not self._env_on("ABFLOW_BATCHED_GRAD_DIAGNOSTICS"):
+        if not self._env_on(
+            "ABFLOW_BATCHED_GRAD_DIAGNOSTICS"
+        ):
             return
         limit = max(
             0,
             int(os.environ.get(
-                "ABFLOW_BATCHED_GRAD_DIAGNOSTIC_STEPS", "3"
+                "ABFLOW_BATCHED_GRAD_DIAGNOSTIC_STEPS",
+                "3",
             ) or 3),
         )
         if int(step) >= limit:
@@ -537,100 +596,131 @@ class Trainer:
         ]
         rank = (
             dist.get_rank()
-            if dist.is_available() and dist.is_initialized()
+            if dist.is_available()
+            and dist.is_initialized()
             else 0
         )
         line = (
             "[BatchedGrad] "
             f"rank={rank} step={int(step)} "
             f"missing={len(missing)} "
-            f"first={missing[:12]}"
+            f"first={missing[:12]} "
+            f"ddp_find_unused={int(self.ddp_find_unused_parameters)}"
         )
         self._runtime_log_line(line)
-        if rank == 0:
+        if rank == 0 and (
+            int(step) < 8 or bool(missing)
+        ):
             print(line, flush=True)
 
+        # In a formally dynamic graph, missing local gradients are allowed and
+        # handled by DDP find_unused_parameters=True.  Do not convert legitimate
+        # masked/recycle branch inactivity into a false runtime failure.
         if (
             missing
+            and not self.ddp_find_unused_parameters
             and self._env_on(
                 "ABFLOW_BATCHED_GRAD_FAIL_FAST", "on"
             )
         ):
             raise RuntimeError(
-                "v126 batched runtime has parameters without gradient: "
-                + ", ".join(missing[:20])
+                "Parameters without gradient while DDP is configured as "
+                "static: " + ", ".join(missing[:20])
             )
 
     def _train_epoch(self, device):
-        # Module 11: the Train phase exposes one epoch-level diagnostic scalar.
-        # Accumulation is device-side and all-reduced once per epoch, so it does
-        # not introduce a per-step CUDA synchronization or change optimization.
-        epoch_loss_sum = torch.zeros((), dtype=torch.float64, device=device)
-        epoch_loss_count = torch.zeros((), dtype=torch.float64, device=device)
+        epoch_loss_sum = torch.zeros(
+            (), dtype=torch.float64, device=device
+        )
+        epoch_loss_count = torch.zeros(
+            (), dtype=torch.float64, device=device
+        )
 
-        if self.train_loader.sampler is not None and self.local_rank != -1:
+        if (
+            self.train_loader.sampler is not None
+            and self.local_rank != -1
+        ):
             self.train_loader.sampler.set_epoch(self.epoch)
 
-        t_iter = tqdm(
-            self.train_loader,
-            dynamic_ncols=True,
-            mininterval=float(getattr(self.config, "tqdm_mininterval", 5.0)),
-            leave=False,
-        ) if self._is_main_proc() else self.train_loader
+        t_iter = (
+            tqdm(
+                self.train_loader,
+                dynamic_ncols=True,
+                mininterval=float(
+                    getattr(
+                        self.config,
+                        "tqdm_mininterval",
+                        5.0,
+                    )
+                ),
+                leave=False,
+            )
+            if self._is_main_proc()
+            else self.train_loader
+        )
 
-        _previous_step_end = time.perf_counter()
+        previous_step_end = time.perf_counter()
 
         for batch in t_iter:
-            _body_start = time.perf_counter()
-            _data_wait_ms = (_body_start - _previous_step_end) * 1000.0
-            _profile = self._perf_step_enabled(self.global_step)
+            body_start = time.perf_counter()
+            data_wait_ms = (
+                body_start - previous_step_end
+            ) * 1000.0
+            profile = self._perf_step_enabled(
+                self.global_step
+            )
 
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
 
             batch = self.to_device(batch, device)
-
             self.optimizer.zero_grad(set_to_none=True)
 
-            if _profile and device.type == "cuda":
-                _ev0 = torch.cuda.Event(enable_timing=True)
-                _ev1 = torch.cuda.Event(enable_timing=True)
-                _ev2 = torch.cuda.Event(enable_timing=True)
-                _ev3 = torch.cuda.Event(enable_timing=True)
-                _ev4 = torch.cuda.Event(enable_timing=True)
-                _ev0.record()
+            if profile and device.type == "cuda":
+                ev0 = torch.cuda.Event(enable_timing=True)
+                ev1 = torch.cuda.Event(enable_timing=True)
+                ev2 = torch.cuda.Event(enable_timing=True)
+                ev3 = torch.cuda.Event(enable_timing=True)
+                ev4 = torch.cuda.Event(enable_timing=True)
+                ev0.record()
             else:
-                _ev0 = _ev1 = _ev2 = _ev3 = _ev4 = None
+                ev0 = ev1 = ev2 = ev3 = ev4 = None
 
             try:
                 with self._amp_autocast(device):
-                    loss = self.train_step(batch, self.global_step)
+                    loss = self.train_step(
+                        batch, self.global_step
+                    )
             except Exception:
                 self._runtime_exception_log(
                     "train_forward", self.global_step
                 )
                 raise
 
-            if _ev1 is not None:
-                _ev1.record()
+            if ev1 is not None:
+                ev1.record()
 
-            # Keep only the scalar value needed for epoch statistics/progress.
-            # This detached scalar has no grad_fn and therefore cannot own the
-            # completed training graph.
             loss_detached = loss.detach()
+
             if self.grad_scaler is not None:
                 self.grad_scaler.scale(loss).backward()
+                self._log_gradient_contract(
+                    self.global_step
+                )
                 if self.config.grad_clip is not None:
-                    self.grad_scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.config.grad_clip
+                    self.grad_scaler.unscale_(
+                        self.optimizer
                     )
-                if _ev2 is not None:
-                    _ev2.record()
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.grad_clip,
+                    )
+                if ev2 is not None:
+                    ev2.record()
                 self.grad_scaler.step(self.optimizer)
                 self.grad_scaler.update()
-                if _ev3 is not None:
-                    _ev3.record()
+                if ev3 is not None:
+                    ev3.record()
             else:
                 try:
                     loss.backward()
@@ -639,113 +729,97 @@ class Trainer:
                         "train_backward", self.global_step
                     )
                     raise
-                self._log_gradient_contract(self.global_step)
+                self._log_gradient_contract(
+                    self.global_step
+                )
                 if self.config.grad_clip is not None:
                     torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.config.grad_clip
+                        self.model.parameters(),
+                        self.config.grad_clip,
                     )
-                if _ev2 is not None:
-                    _ev2.record()
+                if ev2 is not None:
+                    ev2.record()
                 self.optimizer.step()
-                if _ev3 is not None:
-                    _ev3.record()
+                if ev3 is not None:
+                    ev3.record()
 
             after_optimizer_step(self)
-            if _ev4 is not None:
-                _ev4.record()
+            if ev4 is not None:
+                ev4.record()
 
-            epoch_loss_sum = epoch_loss_sum + loss_detached.double()
+            epoch_loss_sum = (
+                epoch_loss_sum
+                + loss_detached.double()
+            )
             epoch_loss_count = epoch_loss_count + 1.0
 
-            if self._should_log_step(self.global_step) and hasattr(t_iter, 'set_postfix'):
+            if (
+                self._should_log_step(self.global_step)
+                and hasattr(t_iter, 'set_postfix')
+            ):
                 t_iter.set_postfix(
                     loss=float(loss_detached.cpu()),
                     version=self.version,
                 )
 
-            # PyTorch evaluates the RHS of the next
-            #     loss = self.train_step(...)
-            # before replacing this local variable.  Without this explicit
-            # release, the previous step's loss.grad_fn remains referenced
-            # throughout the next forward.  This matters on torch 1.11
-            # non-reentrant activation checkpointing, whose recomputation
-            # tensors live in checkpoint-owned storage associated with the
-            # output graph.
-            #
-            # backward/optimizer/EMA and every use of the numerical loss value
-            # have already completed above.  Releasing this Python reference
-            # does not alter gradients, parameters, optimizer state, RNG,
-            # batch composition, or model equations.
             del loss
 
-            if _profile:
+            if profile:
                 rank = (
                     dist.get_rank()
-                    if dist.is_available() and dist.is_initialized()
+                    if dist.is_available()
+                    and dist.is_initialized()
                     else 0
                 )
                 if device.type == "cuda":
-                    # Synchronize only the first few explicit profile steps.
-                    # Formal training keeps ABFLOW_PERF_DIAGNOSTICS=off.
-                    _ev4.synchronize()
-                    _forward_ms = _ev0.elapsed_time(_ev1)
-                    _backward_ms = _ev1.elapsed_time(_ev2)
-                    _optimizer_ms = _ev2.elapsed_time(_ev3)
-                    _ema_ms = _ev3.elapsed_time(_ev4)
-                    _peak_mib = (
-                        torch.cuda.max_memory_allocated(device)
+                    ev4.synchronize()
+                    forward_ms = ev0.elapsed_time(ev1)
+                    backward_ms = ev1.elapsed_time(ev2)
+                    optimizer_ms = ev2.elapsed_time(ev3)
+                    ema_ms = ev3.elapsed_time(ev4)
+                    peak_mib = (
+                        torch.cuda.max_memory_allocated(
+                            device
+                        )
                         / (1024.0 * 1024.0)
                     )
-                    _end_alloc_mib = (
-                        torch.cuda.memory_allocated(device)
+                    end_alloc_mib = (
+                        torch.cuda.memory_allocated(
+                            device
+                        )
                         / (1024.0 * 1024.0)
                     )
                 else:
-                    _forward_ms = _backward_ms = 0.0
-                    _optimizer_ms = _ema_ms = 0.0
-                    _peak_mib = _end_alloc_mib = 0.0
+                    forward_ms = backward_ms = 0.0
+                    optimizer_ms = ema_ms = 0.0
+                    peak_mib = end_alloc_mib = 0.0
 
-                _stats = self._consume_model_runtime_perf_stats()
-                _wall_ms = (time.perf_counter() - _body_start) * 1000.0
+                stats = (
+                    self._consume_model_runtime_perf_stats()
+                )
+                wall_ms = (
+                    time.perf_counter() - body_start
+                ) * 1000.0
                 self._write_perf_line(
                     step=self.global_step,
                     rank=rank,
-                    data_wait_ms=_data_wait_ms,
-                    forward_ms=_forward_ms,
-                    backward_ms=_backward_ms,
-                    optimizer_ms=_optimizer_ms,
-                    ema_ms=_ema_ms,
-                    wall_ms=_wall_ms,
-                    peak_mib=_peak_mib,
-                    end_alloc_mib=_end_alloc_mib,
-                    stats=_stats,
+                    data_wait_ms=data_wait_ms,
+                    forward_ms=forward_ms,
+                    backward_ms=backward_ms,
+                    optimizer_ms=optimizer_ms,
+                    ema_ms=ema_ms,
+                    wall_ms=wall_ms,
+                    peak_mib=peak_mib,
+                    end_alloc_mib=end_alloc_mib,
+                    stats=stats,
                 )
-            else:
-                # Reset counters even after the profile window so a later
-                # diagnostic enable does not inherit stale calls.
-                if self._env_on("ABFLOW_PERF_DIAGNOSTICS"):
-                    self._consume_model_runtime_perf_stats()
+            elif self._env_on(
+                "ABFLOW_PERF_DIAGNOSTICS"
+            ):
+                self._consume_model_runtime_perf_stats()
 
             self.global_step += 1
-
-            _perf_limit = max(
-                0,
-                int(os.environ.get(
-                    "ABFLOW_PERF_DIAGNOSTIC_STEPS", "8"
-                ) or 8),
-            )
-            if (
-                self.global_step == _perf_limit
-                and self._env_on("ABFLOW_PERF_DIAGNOSTICS")
-            ):
-                self._runtime_log_line(
-                    "[RuntimePerf] startup profiling complete; "
-                    "disabling performance instrumentation for the "
-                    "remaining formal 200-epoch run"
-                )
-                self._disable_perf_instrumentation_after_gate()
-
-            _previous_step_end = time.perf_counter()
+            previous_step_end = time.perf_counter()
 
             if self.sched_freq == 'batch':
                 self.scheduler.step()
@@ -753,11 +827,21 @@ class Trainer:
         if self.sched_freq == 'epoch':
             self.scheduler.step()
 
-        train_stats = torch.stack([epoch_loss_sum, epoch_loss_count])
-        if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(train_stats, op=dist.ReduceOp.SUM)
+        train_stats = torch.stack(
+            [epoch_loss_sum, epoch_loss_count]
+        )
+        if (
+            dist.is_available()
+            and dist.is_initialized()
+        ):
+            dist.all_reduce(
+                train_stats, op=dist.ReduceOp.SUM
+            )
         self.last_train_metric = float(
-            (train_stats[0] / train_stats[1].clamp_min(1.0)).item()
+            (
+                train_stats[0]
+                / train_stats[1].clamp_min(1.0)
+            ).item()
         )
 
     def _valid_epoch(self, device):
@@ -769,49 +853,83 @@ class Trainer:
         self.model.eval()
         with validation_ema(self):
             with torch.no_grad():
-                t_iter = tqdm(
-                    self.valid_loader,
-                    dynamic_ncols=True,
-                    mininterval=float(getattr(self.config, "tqdm_mininterval", 5.0)),
-                    leave=False,
-                ) if self._is_main_proc() else self.valid_loader
+                t_iter = (
+                    tqdm(
+                        self.valid_loader,
+                        dynamic_ncols=True,
+                        mininterval=float(
+                            getattr(
+                                self.config,
+                                "tqdm_mininterval",
+                                5.0,
+                            )
+                        ),
+                        leave=False,
+                    )
+                    if self._is_main_proc()
+                    else self.valid_loader
+                )
                 for batch in t_iter:
-                    batch = self.to_device(batch, device)
+                    batch = self.to_device(
+                        batch, device
+                    )
                     with self._amp_autocast(device):
-                        metric = self.valid_step(batch, self.valid_global_step)
-                    metric_arr.append(float(metric.detach().cpu()))
+                        metric = self.valid_step(
+                            batch,
+                            self.valid_global_step,
+                        )
+                    metric_arr.append(
+                        float(metric.detach().cpu())
+                    )
                     self.valid_global_step += 1
 
-            valid_metric = float(np.mean(metric_arr))
-            should_save_best = self._metric_better(valid_metric)
+            valid_metric = float(
+                np.mean(metric_arr)
+            )
+            should_save_best = self._metric_better(
+                valid_metric
+            )
 
             if should_save_best:
-                self.patience = self.config.patience
+                self.patience = (
+                    self.config.patience
+                )
                 if self._is_main_proc():
                     eval_path_to_save = os.path.join(
                         self.model_dir,
-                        f'epoch{self.epoch}_step{self.global_step}.ckpt'
+                        f'epoch{self.epoch}_step'
+                        f'{self.global_step}.ckpt',
                     )
-                    self._save_eval_model(eval_path_to_save)
+                    self._save_eval_model(
+                        eval_path_to_save
+                    )
             else:
                 self.patience -= 1
 
         self.model.train()
 
-        if should_save_best and self._is_main_proc():
-            self._maintain_topk_checkpoint(valid_metric, eval_path_to_save)
+        if (
+            should_save_best
+            and self._is_main_proc()
+        ):
+            self._maintain_topk_checkpoint(
+                valid_metric,
+                eval_path_to_save,
+            )
 
         self.last_valid_metric = valid_metric
 
         if self._is_main_proc():
-            for name, values in self.writer_buffer.items():
+            for name, values in (
+                self.writer_buffer.items()
+            ):
                 value = float(np.mean(values))
-                self.writer.add_scalar(name, value, self.epoch)
-
+                self.writer.add_scalar(
+                    name, value, self.epoch
+                )
         self.writer_buffer = {}
-        
+
     def _test_epoch(self, device):
-        """Optional third epoch phase. Base trainers do nothing by default."""
         self.last_test_metrics = {}
         return self.last_test_metrics
 
@@ -819,70 +937,106 @@ class Trainer:
         old = self.last_valid_metric
         if old is None:
             return True
-        return new < old if self.config.metric_min_better else old < new
+        return (
+            new < old
+            if self.config.metric_min_better
+            else old < new
+        )
 
     def _load_topk_checkpoint_map(self):
         self.topk_ckpt_map = []
-        topk_map_path = os.path.join(self.model_dir, 'topk_map.txt')
+        topk_map_path = os.path.join(
+            self.model_dir, 'topk_map.txt'
+        )
         if not os.path.isfile(topk_map_path):
             return
-
         with open(topk_map_path, 'r') as fin:
             for line in fin:
                 line = line.strip()
                 if not line or ': ' not in line:
                     continue
-                metric_text, path = line.split(': ', 1)
+                metric_text, path = line.split(
+                    ': ', 1
+                )
                 try:
                     metric = float(metric_text)
                 except ValueError:
                     continue
                 if os.path.exists(path):
-                    self.topk_ckpt_map.append((metric, path))
+                    self.topk_ckpt_map.append(
+                        (metric, path)
+                    )
+        self.topk_ckpt_map.sort(
+            key=lambda x: x[0],
+            reverse=not self.config.metric_min_better,
+        )
 
-        if self.config.metric_min_better:
-            self.topk_ckpt_map.sort(key=lambda x: x[0])
-        else:
-            self.topk_ckpt_map.sort(key=lambda x: x[0], reverse=True)
-            
-    def _maintain_topk_checkpoint(self, valid_metric, ckpt_path):
+    def _maintain_topk_checkpoint(
+        self, valid_metric, ckpt_path
+    ):
         topk = self.config.save_topk
-        better = (lambda a, b: a < b) if self.config.metric_min_better else (lambda a, b: a > b)
-
+        better = (
+            (lambda a, b: a < b)
+            if self.config.metric_min_better
+            else (lambda a, b: a > b)
+        )
         insert_pos = len(self.topk_ckpt_map)
-        for i, (metric, _) in enumerate(self.topk_ckpt_map):
+        for i, (metric, _) in enumerate(
+            self.topk_ckpt_map
+        ):
             if better(valid_metric, metric):
                 insert_pos = i
                 break
-
-        self.topk_ckpt_map.insert(insert_pos, (valid_metric, ckpt_path))
-
+        self.topk_ckpt_map.insert(
+            insert_pos,
+            (valid_metric, ckpt_path),
+        )
         if topk > 0:
-            while len(self.topk_ckpt_map) > topk:
-                last_ckpt_path = self.topk_ckpt_map[-1][1]
-                if os.path.exists(last_ckpt_path):
+            while (
+                len(self.topk_ckpt_map) > topk
+            ):
+                last_ckpt_path = (
+                    self.topk_ckpt_map[-1][1]
+                )
+                if os.path.exists(
+                    last_ckpt_path
+                ):
                     os.remove(last_ckpt_path)
                 self.topk_ckpt_map.pop()
 
-        topk_map_path = os.path.join(self.model_dir, 'topk_map.txt')
+        topk_map_path = os.path.join(
+            self.model_dir, 'topk_map.txt'
+        )
         with open(topk_map_path, 'w') as fout:
             for metric, path in self.topk_ckpt_map:
-                fout.write(f'{metric}: {path}\n')
+                fout.write(
+                    f'{metric}: {path}\n'
+                )
 
     def train(self, device_ids, local_rank):
-        # import ipdb; ipdb.set_trace()
         self.local_rank = local_rank
 
-        # The version_N directory is already resolved in __init__.  Every DDP
-        # rank may safely create the same directory.  AMEncoder reads this env
-        # only for diagnostic file output.
         if (
-            self._env_on("ABFLOW_MEMORY_DIAGNOSTICS")
-            or self._env_on("ABFLOW_PERF_DIAGNOSTICS")
-            or self._env_on("ABFLOW_RUNTIME_TRACE")
+            self._env_on(
+                "ABFLOW_MEMORY_DIAGNOSTICS"
+            )
+            or self._env_on(
+                "ABFLOW_PERF_DIAGNOSTICS"
+            )
+            or self._env_on(
+                "ABFLOW_RUNTIME_TRACE"
+            )
+            or self._env_on(
+                "ABFLOW_BATCHED_GRAD_DIAGNOSTICS"
+            )
         ):
-            os.makedirs(self.config.save_dir, exist_ok=True)
-            os.environ["ABFLOW_RUNTIME_TRACE_DIR"] = self.config.save_dir
+            os.makedirs(
+                self.config.save_dir,
+                exist_ok=True,
+            )
+            os.environ[
+                "ABFLOW_RUNTIME_TRACE_DIR"
+            ] = self.config.save_dir
             self._runtime_log_line(
                 "[RuntimeLog] "
                 f"version_dir={self.config.save_dir} "
@@ -890,102 +1044,187 @@ class Trainer:
             )
 
         if self._is_main_proc():
-            self.writer = SummaryWriter(self.config.save_dir)
-            os.makedirs(self.model_dir, exist_ok=True)
-            with open(os.path.join(self.config.save_dir, 'namespace.json'), 'w') as fout:
-                json.dump(self.config.__dict__, fout, indent=2)
+            self.writer = SummaryWriter(
+                self.config.save_dir
+            )
+            os.makedirs(
+                self.model_dir, exist_ok=True
+            )
+            with open(
+                os.path.join(
+                    self.config.save_dir,
+                    'namespace.json',
+                ),
+                'w',
+            ) as fout:
+                json.dump(
+                    self.config.__dict__,
+                    fout,
+                    indent=2,
+                )
 
-        main_device_id = local_rank if local_rank != -1 else device_ids[0]
-        device = torch.device('cpu' if main_device_id == -1 else f'cuda:{main_device_id}')
-
+        main_device_id = (
+            local_rank
+            if local_rank != -1
+            else device_ids[0]
+        )
+        device = torch.device(
+            'cpu'
+            if main_device_id == -1
+            else f'cuda:{main_device_id}'
+        )
         self.model.to(device)
 
         if (
             self.use_amp
             and device.type == "cuda"
-            and self.amp_dtype in {"fp16", "float16", "half"}
+            and self.amp_dtype
+            in {"fp16", "float16", "half"}
         ):
-            self.grad_scaler = torch.cuda.amp.GradScaler(enabled=True)
+            self.grad_scaler = (
+                torch.cuda.amp.GradScaler(
+                    enabled=True
+                )
+            )
         else:
             self.grad_scaler = None
 
         init_resume_ema(self)
         maybe_resume(self, device)
-        
-        if str(getattr(self.config, "resume_checkpoint", "") or "").strip():
+
+        if str(
+            getattr(
+                self.config,
+                "resume_checkpoint",
+                "",
+            )
+            or ""
+        ).strip():
             self._load_topk_checkpoint_map()
 
         if local_rank != -1:
-            print_log(f'Using data parallel, local rank {local_rank}, all {device_ids}')
-            self.model = torch.nn.parallel.DistributedDataParallel(
-                self.model,
-                device_ids=[local_rank],
-                output_device=local_rank,
-                gradient_as_bucket_view=True,
+            print_log(
+                f'Using data parallel, local rank '
+                f'{local_rank}, all {device_ids}'
             )
+            self.model = (
+                torch.nn.parallel.DistributedDataParallel(
+                    self.model,
+                    device_ids=[local_rank],
+                    output_device=local_rank,
+                    gradient_as_bucket_view=True,
+                    find_unused_parameters=(
+                        self.ddp_find_unused_parameters
+                    ),
+                )
+            )
+            if self._is_main_proc():
+                print_log(
+                    "[DDPContract] "
+                    "dynamic_graph="
+                    f"{int(self.ddp_find_unused_parameters)} "
+                    "find_unused_parameters="
+                    f"{self.ddp_find_unused_parameters}"
+                )
         else:
             print_log(f'training on {device_ids}')
 
         while self.epoch < self.config.max_epoch:
-            print_log(f'epoch{self.epoch} starts') if self._is_main_proc() else 1
+            if self._is_main_proc():
+                print_log(
+                    f'epoch{self.epoch} starts'
+                )
             self._train_epoch(device)
-            
-            print_log(f'validating ...') if self._is_main_proc() else 1
+
+            if self._is_main_proc():
+                print_log('validating ...')
             self._valid_epoch(device)
 
-            # Module 11 formal protocol: every completed training epoch has
-            # exactly three ordered phases: Train -> Validation -> Test.  Test is
-            # a separate hook, not hidden inside validation, and cannot modify the
-            # checkpoint-selection metric returned by Validation.
-            print_log(f'testing ...') if self._is_main_proc() else 1
+            if self._is_main_proc():
+                print_log('testing ...')
             self._test_epoch(device)
 
-            # Only after all three phases complete is the epoch committed.
             self.epoch += 1
 
-            save_interval = int(getattr(self.config, 'save_interval', 1) or 0)
-            if save_interval > 0 and self.epoch % save_interval == 0:
+            save_interval = int(
+                getattr(
+                    self.config,
+                    'save_interval',
+                    1,
+                )
+                or 0
+            )
+            if (
+                save_interval > 0
+                and self.epoch
+                % save_interval == 0
+            ):
                 self._consolidate_sharded_optimizer_for_checkpoint()
-                self._save_train_state('last', metric=self.last_valid_metric)
+                self._save_train_state(
+                    'last',
+                    metric=self.last_valid_metric,
+                )
 
             if self.patience <= 0:
                 break
 
-    def log(self, name, value, step, val=False):
+    def log(
+        self, name, value, step, val=False
+    ):
         if not self._is_main_proc():
             return
-
-        # Training scalar logging can synchronize CUDA if every tensor is
-        # converted to a Python float every step.  Log at a fixed interval to keep
-        # TensorBoard useful without throttling the GPU.
-        if not val and (int(step) % self.log_interval != 0):
+        if (
+            not val
+            and int(step) % self.log_interval != 0
+        ):
             return
-
         if isinstance(value, torch.Tensor):
-            value = float(value.detach().cpu())
+            value = float(
+                value.detach().cpu()
+            )
         if val:
             if name not in self.writer_buffer:
                 self.writer_buffer[name] = []
-            self.writer_buffer[name].append(value)
+            self.writer_buffer[name].append(
+                value
+            )
         else:
-            self.writer.add_scalar(name, value, step)
+            self.writer.add_scalar(
+                name, value, step
+            )
 
     def get_optimizer(self):
-        return torch.optim.Adam(self.model.parameters(), lr=self.config.lr)
+        return torch.optim.Adam(
+            self.model.parameters(),
+            lr=self.config.lr,
+        )
 
     def get_scheduler(self, optimizer):
         lam = lambda epoch: 1 / (epoch + 1)
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lam)
-        return {'scheduler': scheduler, 'frequency': 'epoch'}
+        scheduler = (
+            torch.optim.lr_scheduler.LambdaLR(
+                optimizer,
+                lr_lambda=lam,
+            )
+        )
+        return {
+            'scheduler': scheduler,
+            'frequency': 'epoch',
+        }
 
     def train_step(self, batch, batch_idx):
-        # import ipdb; ipdb.set_trace()
         loss = self.model(batch)
-        self.log('Loss/train', loss, batch_idx)
-        # import ipdb; ipdb.set_trace()
+        self.log(
+            'Loss/train', loss, batch_idx
+        )
         return loss
 
     def valid_step(self, batch, batch_idx):
         loss = self.model(batch)
-        self.log('Loss/validation', loss, batch_idx, val=True)
+        self.log(
+            'Loss/validation',
+            loss,
+            batch_idx,
+            val=True,
+        )
         return loss
