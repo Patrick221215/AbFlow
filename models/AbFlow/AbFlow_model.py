@@ -7,7 +7,8 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_scatter import scatter_mean
+from torch.utils.checkpoint import checkpoint
+from torch_scatter import scatter_mean, scatter_softmax
 
 from data.pdb_utils import VOCAB
 from utils.nn_utils import SeparatedAminoAcidFeature, ProteinFeature
@@ -23,6 +24,8 @@ from .abflow_r3_matcher import AbFlowR3Matcher
 
 
 # v101 support-geometry optimization on the validated U02/F01 physical parent.
+# R05MF_SEMANTIC_CLOSURE_V161: atom-head correctness + slot-resolved atom14 pair geometry +
+# post-projection symmetric distogram + direct pair-conditioned R05 EGNN coordinate mechanics.
 
 
 def _env_str(name, default):
@@ -82,6 +85,852 @@ def get_timestep_embedding(timesteps, embedding_dim, max_positions=10000):
     if embedding_dim % 2 == 1:
         emb = F.pad(emb, (0, 1), mode='constant')
     return emb
+
+
+
+
+class _ResidueAtomAttentionBlock(nn.Module):
+    """Task-scale MF-style atom attention within one fixed AbFlow residue.
+
+    This preserves AbFlow's canonical atom slots and uses atom identity plus
+    relative geometry to enrich the residue-level single state.  It deliberately
+    does not decode coordinates; R05 EGNN remains the only coordinate engine.
+    """
+
+    def __init__(self, atom_s, num_heads):
+        super().__init__()
+        atom_s = int(atom_s)
+        num_heads = int(num_heads)
+        if atom_s % num_heads != 0:
+            raise ValueError("atom_s must be divisible by num_heads")
+        self.atom_s = atom_s
+        self.num_heads = num_heads
+        self.head_dim = atom_s // num_heads
+        self.norm_attn = nn.LayerNorm(atom_s)
+        self.q = nn.Linear(atom_s, atom_s, bias=False)
+        self.k = nn.Linear(atom_s, atom_s, bias=False)
+        self.v = nn.Linear(atom_s, atom_s, bias=False)
+        self.g = nn.Linear(atom_s, atom_s, bias=False)
+        self.o = nn.Linear(atom_s, atom_s, bias=False)
+        self.norm_ff = nn.LayerNorm(atom_s)
+        self.ff1 = nn.Linear(atom_s, 4 * atom_s, bias=False)
+        self.ff2 = nn.Linear(atom_s, 4 * atom_s, bias=False)
+        self.ff3 = nn.Linear(4 * atom_s, atom_s, bias=False)
+
+    def forward(self, x, atom_mask):
+        # x: [N, A, C], atom_mask: [N, A] bool
+        y = self.norm_attn(x)
+        n, a, _ = y.shape
+        q = self.q(y).view(n, a, self.num_heads, self.head_dim)
+        k = self.k(y).view(n, a, self.num_heads, self.head_dim)
+        v = self.v(y).view(n, a, self.num_heads, self.head_dim)
+        # q/k/v are [residue, atom, head, head_dim].  Keep the *head*
+        # dimension in the attention logits; the previous v160 einsum used the
+        # head_dim symbol as the retained attention axis, which silently created
+        # head_dim attention maps instead of num_heads maps.
+        logits = torch.einsum("nihd,njhd->nhij", q.float(), k.float())
+        logits = logits / math.sqrt(float(self.head_dim))
+        key_mask = atom_mask[:, None, None, :]
+        logits = logits.masked_fill(~key_mask, -1.0e4)
+        attn = torch.softmax(logits, dim=-1).to(v.dtype)
+        out = torch.einsum("nhij,njhd->nihd", attn, v)
+        out = out.reshape(n, a, self.atom_s)
+        gate = torch.sigmoid(self.g(y))
+        x = x + self.o(gate * out)
+        y = self.norm_ff(x)
+        x = x + self.ff3(F.silu(self.ff1(y)) * self.ff2(y))
+        return x * atom_mask.unsqueeze(-1).to(x.dtype)
+
+
+class _TriangleMultiplication(nn.Module):
+    """Exact ABX/MF-style triangle multiplication on one dense local pair matrix.
+
+    ``z`` has shape [L, L, C] and the local token universe is triangle-closed.
+    Outgoing uses sum_k a_{ik} * b_{jk}; incoming uses sum_k a_{ki} * b_{kj}.
+    The output projection is zero-initialized, matching a residual/final-style
+    Pairformer/Seqformer update while preserving the parent at initialization.
+    """
+    def __init__(self, pair_dim, hidden_dim, outgoing=True):
+        super().__init__()
+        self.outgoing = bool(outgoing)
+        self.norm = nn.LayerNorm(pair_dim)
+        self.left = nn.Linear(pair_dim, hidden_dim, bias=False)
+        self.right = nn.Linear(pair_dim, hidden_dim, bias=False)
+        self.left_gate = nn.Linear(pair_dim, hidden_dim, bias=True)
+        self.right_gate = nn.Linear(pair_dim, hidden_dim, bias=True)
+        self.final_norm = nn.LayerNorm(hidden_dim)
+        self.out = nn.Linear(hidden_dim, pair_dim, bias=False)
+        self.final_gate = nn.Linear(pair_dim, pair_dim, bias=True)
+        nn.init.zeros_(self.out.weight)
+
+    def forward(self, z):
+        x = self.norm(z)
+        left = self.left(x) * torch.sigmoid(self.left_gate(x))
+        right = self.right(x) * torch.sigmoid(self.right_gate(x))
+        if self.outgoing:
+            y = torch.einsum('ikc,jkc->ijc', left, right)
+        else:
+            y = torch.einsum('kic,kjc->ijc', left, right)
+        y = self.out(self.final_norm(y))
+        return y * torch.sigmoid(self.final_gate(x))
+
+
+class _TriangleAttention(nn.Module):
+    """ABX-style triangle attention on starting or ending nodes.
+
+    This follows the supplied AbX Seqformer semantics: pair activations are the
+    Q/K/V stream, a learned projection of the normalized pair matrix is added as
+    an attention bias, and ending-node attention is the transposed analogue.
+    """
+    def __init__(self, pair_dim, num_heads=4, starting=True):
+        super().__init__()
+        if pair_dim % num_heads != 0:
+            raise ValueError('pair_dim must be divisible by triangle heads')
+        self.pair_dim = int(pair_dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.pair_dim // self.num_heads
+        self.starting = bool(starting)
+        self.norm = nn.LayerNorm(pair_dim)
+        self.qkv = nn.Linear(pair_dim, 3 * pair_dim, bias=False)
+        self.bias = nn.Linear(pair_dim, num_heads, bias=False)
+        self.gate = nn.Linear(pair_dim, pair_dim, bias=True)
+        self.out = nn.Linear(pair_dim, pair_dim, bias=False)
+        nn.init.zeros_(self.out.weight)
+
+    def _row_attention(self, z):
+        # z: [S, L, C], with S fixed-start-node rows and L attended edges.
+        x = self.norm(z)
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        s, l, _ = q.shape
+        q = q.view(s, l, self.num_heads, self.head_dim)
+        k = k.view(s, l, self.num_heads, self.head_dim)
+        v = v.view(s, l, self.num_heads, self.head_dim)
+        logits = torch.einsum('sqhd,skhd->shqk', q.float(), k.float())
+        logits = logits / math.sqrt(float(self.head_dim))
+        # Supplied AbX TriangleAttention projects [i,j] pair state to a
+        # [head,q,k] bias shared over the row/column orientation.
+        b = self.bias(x).permute(2, 0, 1).float()  # [H,L,L]
+        logits = logits + b.unsqueeze(0)
+        attn = torch.softmax(logits, dim=-1).to(v.dtype)
+        out = torch.einsum('shqk,skhd->sqhd', attn, v).reshape(s, l, self.pair_dim)
+        out = out * torch.sigmoid(self.gate(x))
+        return self.out(out)
+
+    def forward(self, z):
+        if self.starting:
+            return self._row_attention(z)
+        zt = z.transpose(0, 1)
+        return self._row_attention(zt).transpose(0, 1)
+
+
+class MFRepresentationEnrichment(nn.Module):
+    """MFDesign-style single/pair representation graft for the R05 parent.
+
+    This module deliberately does *not* replace R05 geometry, U02, graph
+    topology, sequence path, or the three-round outer recurrence. It adds an
+    explicit single state s_i and a persistent local pair state z_ij over a
+    bounded, proposal-anchored triangle-closed local token universe (all design
+    residues plus a global 2*k parent-derived antigen context set). All ordered
+    local pairs are explicit, so exact ABX/MF triangle algebra is well-defined.
+    The pair state is recurrent
+    across the existing AbFlow rounds and conditions the single existing R05
+    equivariant edge/coordinate engine through zero-start message residuals.
+    """
+
+    def __init__(
+        self, embed_dim, hidden_dim, atom_dim, num_classes=20,
+        single_dim=128, pair_dim=64, num_blocks=2, num_heads=4,
+        atom_s=128, atom_depth=3, atom_heads=4, rbf_bins=16, time_dim=16,
+        coordinate_scale=0.1, enable_distogram=False, distogram_bins=64,
+        distogram_min=2.0, distogram_max=22.0, enable_clean_sc=False,
+        relpos_dim=32, opm_dim=64, enable_allatom_pair=True,
+        allatom_chunk=512, detach_recycle=True, triangle_heads=4,
+        triangle_hidden=128, triangle_checkpoint=True,
+    ):
+        super().__init__()
+        self.embed_dim = int(embed_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.atom_dim = int(atom_dim)
+        self.single_dim = int(single_dim)
+        self.pair_dim = int(pair_dim)
+        self.num_blocks = int(num_blocks)
+        self.num_heads = int(num_heads)
+        self.rbf_bins = int(rbf_bins)
+        self.time_dim = int(time_dim)
+        self.num_classes = int(num_classes)
+        self.atom_s = int(atom_s)
+        self.atom_depth = int(atom_depth)
+        self.atom_heads = int(atom_heads)
+        self.coordinate_scale = float(coordinate_scale)
+        self.enable_distogram = bool(enable_distogram)
+        self.enable_clean_sc = bool(enable_clean_sc)
+        self.distogram_bins = int(distogram_bins)
+        self.distogram_min = float(distogram_min)
+        self.distogram_max = float(distogram_max)
+        self.relpos_dim = int(relpos_dim)
+        self.opm_dim = int(opm_dim)
+        self.enable_allatom_pair = bool(enable_allatom_pair)
+        self.allatom_chunk = max(1, int(allatom_chunk))
+        self.detach_recycle = bool(detach_recycle)
+        self.triangle_heads = int(triangle_heads)
+        self.triangle_hidden = int(triangle_hidden)
+        self.triangle_checkpoint = bool(triangle_checkpoint)
+
+        if self.single_dim <= 0 or self.pair_dim <= 0:
+            raise ValueError("single_dim and pair_dim must be positive")
+        if self.num_heads <= 0 or self.single_dim % self.num_heads != 0:
+            raise ValueError("single_dim must be divisible by num_heads")
+        if self.num_blocks <= 0:
+            raise ValueError("num_blocks must be positive")
+        if self.relpos_dim <= 0 or self.opm_dim <= 0:
+            raise ValueError("relpos_dim and opm_dim must be positive")
+        if self.triangle_heads <= 0 or self.pair_dim % self.triangle_heads != 0:
+            raise ValueError("pair_dim must be divisible by triangle_heads")
+        if self.triangle_hidden <= 0:
+            raise ValueError("triangle_hidden must be positive")
+
+        self.head_dim = self.single_dim // self.num_heads
+        self.single_from_h = nn.Sequential(
+            nn.LayerNorm(self.embed_dim),
+            nn.Linear(self.embed_dim, self.single_dim),
+            nn.SiLU(),
+            nn.Linear(self.single_dim, self.single_dim),
+        )
+        # MF semantic boundary: atom-level attention enriches token/single state
+        # but does not create a second coordinate decoder.
+        self.atom_input = nn.Linear(self.atom_dim + 5, self.atom_s, bias=False)
+        self.atom_blocks = nn.ModuleList([
+            _ResidueAtomAttentionBlock(self.atom_s, self.atom_heads)
+            for _ in range(self.atom_depth)
+        ])
+        self.atom_to_single = nn.Linear(self.atom_s, self.single_dim, bias=False)
+        self.role_single = nn.Embedding(2, self.single_dim)
+        self.proposal_single = nn.Linear(
+            self.rbf_bins + 1, self.single_dim, bias=False
+        )
+        self.single_recycle_norm = nn.LayerNorm(self.single_dim)
+        self.single_recycle = nn.Linear(self.single_dim, self.single_dim, bias=False)
+
+        pair_single_dim = min(32, self.single_dim)
+        self.single_to_pair = nn.Linear(
+            self.single_dim, pair_single_dim, bias=False
+        )
+        # ABX and MFDesign independently use learned relative-position state in
+        # the persistent pair representation.  Index 0 is reserved for cross-
+        # chain / undefined relative position; 1..65 represent [-32, 32].
+        self.relpos_embed = nn.Embedding(66, self.relpos_dim)
+        pair_input_dim = (
+            2 * pair_single_dim
+            + 3 * self.rbf_bins  # current CA + proposal CA + all-atom geometry
+            + 4                  # directed role / same-segment indicators
+            + self.relpos_dim
+            + self.time_dim
+        )
+        self.pair_init = nn.Sequential(
+            nn.LayerNorm(pair_input_dim),
+            nn.Linear(pair_input_dim, self.pair_dim),
+            nn.SiLU(),
+            nn.Linear(self.pair_dim, self.pair_dim),
+        )
+        self.pair_recycle_norm = nn.LayerNorm(self.pair_dim)
+        self.pair_recycle = nn.Linear(self.pair_dim, self.pair_dim, bias=False)
+
+        # AbX PairEmbedding keeps the atom14 x atom14 slot identity instead of
+        # mean-pooling all atom-pair distances into one histogram.  We retain that
+        # structural semantics without native AA-pair leakage: the 14x14 slot
+        # coefficients are global trainable parameters rather than AA-dependent
+        # lookup tables, and the resulting 196 slot-resolved Gaussian features are
+        # compressed to the existing rbf_bins width.  Coordinates are detached, so
+        # R05 EGNN remains the sole coordinate-gradient engine.
+        self.allatom_slots = 14
+        self.allatom_slot_log_coef = nn.Parameter(
+            torch.zeros(self.allatom_slots, self.allatom_slots)
+        )
+        self.allatom_distance_embed = nn.Sequential(
+            nn.Linear(self.allatom_slots * self.allatom_slots, self.pair_dim),
+            nn.SiLU(),
+            nn.Linear(self.pair_dim, self.rbf_bins),
+        )
+
+        self.pair_updates = nn.ModuleList()
+        self.single_norms = nn.ModuleList()
+        self.pair_bias_norms = nn.ModuleList()
+        self.single_q = nn.ModuleList()
+        self.single_k = nn.ModuleList()
+        self.single_v = nn.ModuleList()
+        self.single_g = nn.ModuleList()
+        self.pair_bias = nn.ModuleList()
+        self.single_o = nn.ModuleList()
+        self.single_updates = nn.ModuleList()
+        # ABX Seqformer and MFDesign both explicitly communicate single->pair.
+        # On the bounded sparse pair universe we can reproduce that semantic
+        # without densifying the graph: the ABX outer-product-mean algebra is
+        # evaluated only for the stored (i,j) pairs.  This is exact on those
+        # edges and keeps O(E), not O(N^2), memory.
+        self.opm_norms = nn.ModuleList()
+        self.opm_left = nn.ModuleList()
+        self.opm_right = nn.ModuleList()
+        self.opm_out = nn.ModuleList()
+        self.tri_mul_out = nn.ModuleList()
+        self.tri_mul_in = nn.ModuleList()
+        self.tri_att_start = nn.ModuleList()
+        self.tri_att_end = nn.ModuleList()
+        for _ in range(self.num_blocks):
+            # Pair transition: z -> z, matching the persistent-state role.
+            pair_transition = nn.Sequential(
+                nn.LayerNorm(self.pair_dim),
+                nn.Linear(self.pair_dim, 4 * self.pair_dim, bias=False),
+                nn.SiLU(),
+                nn.Linear(4 * self.pair_dim, self.pair_dim, bias=False),
+            )
+            nn.init.zeros_(pair_transition[-1].weight)
+            self.pair_updates.append(pair_transition)
+            self.single_norms.append(nn.LayerNorm(self.single_dim))
+            self.pair_bias_norms.append(nn.LayerNorm(self.pair_dim))
+            self.single_q.append(nn.Linear(self.single_dim, self.single_dim, bias=False))
+            self.single_k.append(nn.Linear(self.single_dim, self.single_dim, bias=False))
+            self.single_v.append(nn.Linear(self.single_dim, self.single_dim, bias=False))
+            self.single_g.append(nn.Linear(self.single_dim, self.single_dim, bias=False))
+            self.pair_bias.append(nn.Linear(self.pair_dim, self.num_heads, bias=False))
+            single_o = nn.Linear(self.single_dim, self.single_dim, bias=False)
+            nn.init.zeros_(single_o.weight)
+            self.single_o.append(single_o)
+            single_transition = nn.Sequential(
+                nn.LayerNorm(self.single_dim),
+                nn.Linear(self.single_dim, 4 * self.single_dim, bias=False),
+                nn.SiLU(),
+                nn.Linear(4 * self.single_dim, self.single_dim, bias=False),
+            )
+            nn.init.zeros_(single_transition[-1].weight)
+            self.single_updates.append(single_transition)
+            self.opm_norms.append(nn.LayerNorm(self.single_dim))
+            self.opm_left.append(nn.Linear(self.single_dim, self.opm_dim, bias=False))
+            self.opm_right.append(nn.Linear(self.single_dim, self.opm_dim, bias=False))
+            opm_out = nn.Linear(2 * self.opm_dim, self.pair_dim, bias=False)
+            # ABX uses a final-style projection.  Zero start is also desirable
+            # here: each block initially reduces to the already-defined z state.
+            nn.init.zeros_(opm_out.weight)
+            self.opm_out.append(opm_out)
+            self.tri_mul_out.append(
+                _TriangleMultiplication(self.pair_dim, self.triangle_hidden, outgoing=True)
+            )
+            self.tri_mul_in.append(
+                _TriangleMultiplication(self.pair_dim, self.triangle_hidden, outgoing=False)
+            )
+            self.tri_att_start.append(
+                _TriangleAttention(self.pair_dim, self.triangle_heads, starting=True)
+            )
+            self.tri_att_end.append(
+                _TriangleAttention(self.pair_dim, self.triangle_heads, starting=False)
+            )
+
+        # Parent-preserving adapters. These direct zero Parameters consume no RNG
+        # and leave the R05 forward function exactly unchanged at initialization.
+        self.single_to_base_weight = nn.Parameter(
+            torch.zeros(self.embed_dim, self.single_dim)
+        )
+        # Direct pair-conditioned single -> amino-acid logits residual.
+        # This makes s_i, not a deeper classifier, the new sequence information
+        # carrier while preserving the proven R05 logits at initialization.
+        self.single_seq_norm = nn.LayerNorm(self.single_dim)
+        self.single_to_seq_logits_weight = nn.Parameter(
+            torch.zeros(self.num_classes, self.single_dim)
+        )
+
+        if self.enable_clean_sc:
+            self.clean_sc_weight = nn.Parameter(
+                torch.zeros(self.pair_dim, self.rbf_bins)
+            )
+        else:
+            self.register_parameter("clean_sc_weight", None)
+
+        if self.enable_distogram:
+            self.distogram_norm = nn.LayerNorm(self.pair_dim)
+            self.distogram_head = nn.Linear(
+                self.pair_dim, self.distogram_bins
+            )
+        else:
+            self.distogram_norm = None
+            self.distogram_head = None
+
+        self.register_buffer(
+            "rbf_centers",
+            torch.linspace(
+                self.distogram_min * self.coordinate_scale,
+                self.distogram_max * self.coordinate_scale,
+                self.rbf_bins,
+            ),
+            persistent=True,
+        )
+
+    def _rbf(self, dist):
+        centers = self.rbf_centers.to(device=dist.device, dtype=dist.dtype)
+        if centers.numel() <= 1:
+            width = dist.new_tensor(1.0)
+        else:
+            width = (centers[1] - centers[0]).abs().clamp_min(1.0e-3)
+        return torch.exp(-((dist.unsqueeze(-1) - centers) / width) ** 2)
+
+    @staticmethod
+    def _edge_keys(edges, n_nodes):
+        return edges[0].long() * int(n_nodes) + edges[1].long()
+
+    def gather_pair_features(self, pair_edges, pair_features, query_edges, n_nodes):
+        """Gather arbitrary pair features for dynamic edges; missing pairs are zero."""
+        width = int(pair_features.shape[-1]) if pair_features.dim() > 1 else 1
+        if query_edges.numel() == 0:
+            return pair_features.new_zeros((0, width))
+        if pair_edges.numel() == 0 or pair_features.numel() == 0:
+            return pair_features.new_zeros((query_edges.shape[1], width))
+        base_keys = self._edge_keys(pair_edges, n_nodes)
+        sorted_keys, order = torch.sort(base_keys)
+        query_keys = self._edge_keys(query_edges, n_nodes)
+        pos = torch.searchsorted(sorted_keys, query_keys)
+        pos_safe = pos.clamp(max=sorted_keys.numel() - 1)
+        valid = pos < sorted_keys.numel()
+        valid = valid & (sorted_keys[pos_safe] == query_keys)
+        out = pair_features.new_zeros((query_edges.shape[1], width))
+        out[valid] = pair_features[order[pos_safe[valid]]]
+        return out
+
+    def gather_pair_state(self, pair_edges, pair_state, query_edges, n_nodes):
+        """Gather z_ij for arbitrary dynamic edges; missing pairs become zero."""
+        return self.gather_pair_features(
+            pair_edges, pair_state, query_edges, n_nodes
+        )
+
+    def _atom_to_single(self, local_X, local_atom_embeddings, local_atom_weights):
+        ca_idx = 1 if local_X.shape[1] > 1 else 0
+        ca = local_X[:, ca_idx:ca_idx + 1]
+        rel = local_X - ca
+        radius = torch.linalg.norm(rel, dim=-1, keepdim=True)
+        weights = local_atom_weights.to(local_X.dtype).unsqueeze(-1)
+        atom_mask = local_atom_weights != 0
+        atom_input = torch.cat([
+            local_atom_embeddings.to(local_X.dtype), rel, radius, weights
+        ], dim=-1)
+        atom_hidden = self.atom_input(atom_input)
+        atom_hidden = atom_hidden * atom_mask.unsqueeze(-1).to(atom_hidden.dtype)
+        for block in self.atom_blocks:
+            atom_hidden = block(atom_hidden, atom_mask)
+        denom = atom_mask.to(atom_hidden.dtype).sum(dim=1, keepdim=True).clamp_min(1.0)
+        pooled = atom_hidden.sum(dim=1) / denom
+        return self.atom_to_single(pooled)
+
+    def _pair_geometry_features(self, local_X, pair_edges):
+        if pair_edges.numel() == 0:
+            return local_X.new_zeros((0, self.rbf_bins))
+        ca_idx = 1 if local_X.shape[1] > 1 else 0
+        ca = local_X[:, ca_idx]
+        row, col = pair_edges
+        dist = torch.linalg.norm(ca[row] - ca[col], dim=-1)
+        return self._rbf(dist)
+
+    def _all_atom_pair_geometry_features(
+        self, local_X, local_atom_weights, pair_edges
+    ):
+        """Slot-resolved AbX-style atom14 pair geometry on the bounded universe.
+
+        AbX preserves the 14x14 atom-slot distance field before learned
+        compression.  v160 instead mean-pooled all atom pairs into one RBF
+        histogram, which discarded whether a distance came from CA-CA, CB-O,
+        side-chain/side-chain, etc.  Here we keep all 196 canonical atom-slot
+        positions and use a trainable Gaussian coefficient per slot pair.
+
+        We intentionally do *not* use AbX's AA-pair-dependent coefficient table on
+        designed H3 residues, because native AA identity would leak the sequence
+        target.  A global slot-pair coefficient retains geometry semantics without
+        target leakage.  local_X is detached so the R05 EGNN remains the only
+        coordinate-gradient authority.
+        """
+        if pair_edges.numel() == 0:
+            return local_X.new_zeros((0, self.rbf_bins))
+        if not self.enable_allatom_pair:
+            return local_X.new_zeros((pair_edges.shape[1], self.rbf_bins))
+        if int(local_X.shape[1]) != int(self.allatom_slots):
+            raise RuntimeError(
+                "R05-MF atom-pair geometry requires the canonical 14-slot atom "
+                f"universe, got {int(local_X.shape[1])} slots."
+            )
+
+        row, col = pair_edges
+        atom_mask = (local_atom_weights != 0)
+        coef = F.softplus(self.allatom_slot_log_coef).to(
+            device=local_X.device, dtype=local_X.dtype
+        )
+        chunks = []
+        for start in range(0, row.numel(), self.allatom_chunk):
+            end = min(row.numel(), start + self.allatom_chunk)
+            r = row[start:end]
+            c = col[start:end]
+            xi = local_X.detach()[r]
+            xj = local_X.detach()[c]
+            # Coordinates are already in the R05 0.1 model frame, numerically
+            # matching AbX's physical-distance / 10 convention.
+            d = torch.linalg.norm(
+                xi[:, :, None, :] - xj[:, None, :, :], dim=-1
+            )
+            valid = atom_mask[r][:, :, None] & atom_mask[c][:, None, :]
+            d_gauss = torch.exp(-coef.unsqueeze(0) * d.square())
+            d_gauss = d_gauss * valid.to(d_gauss.dtype)
+            flat = d_gauss.reshape(d_gauss.shape[0], -1)
+            chunks.append(self.allatom_distance_embed(flat))
+        return torch.cat(chunks, dim=0).to(local_X.dtype)
+
+    def _proposal_features(self, local_X, local_is_ab, proposal_interface_X):
+        n_local = int(local_X.shape[0])
+        feat = local_X.new_zeros((n_local, self.rbf_bins + 1))
+        if proposal_interface_X is None:
+            return feat
+        if int(local_is_ab.sum().item()) != int(proposal_interface_X.shape[0]):
+            return feat
+        ca_idx = 1 if local_X.shape[1] > 1 else 0
+        current_ca = local_X[local_is_ab, ca_idx]
+        proposal_ca = proposal_interface_X.to(local_X)[..., ca_idx, :]
+        dist = torch.linalg.norm(current_ca - proposal_ca, dim=-1)
+        feat[local_is_ab, :self.rbf_bins] = self._rbf(dist)
+        feat[local_is_ab, -1] = 1.0
+        return feat
+
+    def _proposal_pair_geometry_features(
+        self, local_X, local_is_ab, pair_edges, proposal_interface_X
+    ):
+        if pair_edges.numel() == 0:
+            return local_X.new_zeros((0, self.rbf_bins))
+        proposal_local = local_X.detach().clone()
+        if (
+            proposal_interface_X is not None
+            and int(local_is_ab.sum().item()) == int(proposal_interface_X.shape[0])
+        ):
+            proposal_local[local_is_ab] = proposal_interface_X.detach().to(local_X)
+        return self._pair_geometry_features(proposal_local, pair_edges)
+
+    def _clean_sc_features(
+        self, local_X, local_is_ab, pair_edges, previous_clean_interface_X,
+        base_interface_X,
+    ):
+        if (
+            not self.enable_clean_sc
+            or previous_clean_interface_X is None
+            or base_interface_X is None
+            or pair_edges.numel() == 0
+        ):
+            return None
+        clean_local = local_X.detach().clone()
+        base_local = local_X.detach().clone()
+        clean_local[local_is_ab] = previous_clean_interface_X.detach().to(
+            device=clean_local.device, dtype=clean_local.dtype
+        )
+        base_local[local_is_ab] = base_interface_X.detach().to(
+            device=base_local.device, dtype=base_local.dtype
+        )
+        clean_rbf = self._pair_geometry_features(clean_local, pair_edges)
+        base_rbf = self._pair_geometry_features(base_local, pair_edges)
+        return clean_rbf - base_rbf
+
+    def _triangle_reasoning(self, pair_state, pair_edges, local_batch_id, block_idx):
+        """Apply exact dense triangle algebra independently inside each local graph.
+
+        ``pair_edges`` is guaranteed by the builder to contain every ordered pair
+        (including the diagonal) of a proposal-anchored local token universe.
+        Therefore each graph chunk is exactly reshapeable to [L,L,C] and the
+        ABX/MF triangle k-sums are mathematically well-defined without inventing
+        zero-valued missing pairs.
+        """
+        if pair_edges.numel() == 0:
+            return pair_state, pair_state.new_tensor(0.0)
+        row = pair_edges[0]
+        pair_graph = local_batch_id[row]
+        chunks = []
+        update_rms = []
+        n_graph = int(local_batch_id.max().item()) + 1
+
+        tri_out = self.tri_mul_out[block_idx]
+        tri_in = self.tri_mul_in[block_idx]
+        tri_start = self.tri_att_start[block_idx]
+        tri_end = self.tri_att_end[block_idx]
+
+        def _apply(z):
+            y = z + tri_out(z)
+            y = y + tri_in(y)
+            y = y + tri_start(y)
+            y = y + tri_end(y)
+            return y
+
+        for gid in range(n_graph):
+            mask = pair_graph == gid
+            z_flat = pair_state[mask]
+            if z_flat.numel() == 0:
+                continue
+            e = int(z_flat.shape[0])
+            n = int(round(math.sqrt(float(e))))
+            if n * n != e:
+                raise RuntimeError(
+                    f"Triangle-closed pair contract violated for graph {gid}: "
+                    f"edge_count={e} is not a perfect square"
+                )
+            z = z_flat.reshape(n, n, self.pair_dim)
+            if self.training and self.triangle_checkpoint and z.requires_grad:
+                y = checkpoint(_apply, z)
+            else:
+                y = _apply(z)
+            chunks.append(y.reshape(e, self.pair_dim))
+            update_rms.append(torch.sqrt(
+                (y - z).float().pow(2).mean() + 1.0e-12
+            ))
+        if not chunks:
+            return pair_state, pair_state.new_tensor(0.0)
+        out = torch.cat(chunks, dim=0)
+        return out, torch.stack(update_rms).mean()
+
+    def forward(
+        self, H0, local_X, atom_embeddings, atom_weights, local_mask,
+        local_is_ab, local_segment_ids, local_batch_id, residue_pos, pair_edges,
+        flow_t=None, previous_single=None, previous_pair=None,
+        previous_clean_interface_X=None, base_interface_X=None,
+        proposal_interface_X=None,
+    ):
+        local_H = H0[local_mask]
+        local_atom_embeddings = atom_embeddings[local_mask]
+        local_atom_weights = atom_weights[local_mask]
+        single = self.single_from_h(local_H) + self._atom_to_single(
+            local_X, local_atom_embeddings, local_atom_weights
+        )
+        role_idx = (~local_is_ab).long()  # 0=H3/Ab, 1=antigen
+        single = single + self.role_single(role_idx)
+        single = single + self.proposal_single(
+            self._proposal_features(local_X, local_is_ab, proposal_interface_X)
+        )
+        if flow_t is not None:
+            t = torch.as_tensor(
+                flow_t, device=local_H.device, dtype=torch.float32
+            ).reshape(-1)
+            if t.numel() == 1:
+                n_graph = int(local_batch_id.max().item()) + 1
+                t = t.expand(n_graph)
+            time_single = get_timestep_embedding(t, self.single_dim).to(local_H.dtype)
+            single = single + time_single[local_batch_id]
+        if previous_single is not None:
+            if previous_single.shape != single.shape:
+                raise RuntimeError(
+                    "MF single recycle shape changed across R05 rounds: "
+                    f"{tuple(previous_single.shape)} vs {tuple(single.shape)}"
+                )
+            previous_single_in = (
+                previous_single.detach() if self.detach_recycle else previous_single
+            )
+            single = single + self.single_recycle(
+                self.single_recycle_norm(previous_single_in)
+            )
+
+        n_local = int(local_H.shape[0])
+        if pair_edges.numel() == 0:
+            pair_state = local_H.new_zeros((0, self.pair_dim))
+        else:
+            row, col = pair_edges
+            single_pair = self.single_to_pair(single)
+            geom = self._pair_geometry_features(local_X, pair_edges)
+            proposal_geom = self._proposal_pair_geometry_features(
+                local_X, local_is_ab, pair_edges, proposal_interface_X
+            )
+            src_ab = local_is_ab[row].to(local_H.dtype).unsqueeze(-1)
+            dst_ab = local_is_ab[col].to(local_H.dtype).unsqueeze(-1)
+            same_segment = (
+                local_segment_ids[row] == local_segment_ids[col]
+            ).to(local_H.dtype).unsqueeze(-1)
+            cross = (src_ab != dst_ab).to(local_H.dtype)
+            if residue_pos is None:
+                local_residue_pos = torch.arange(
+                    n_local, device=local_H.device, dtype=local_H.dtype
+                )
+            else:
+                local_residue_pos = residue_pos[local_mask].to(
+                    device=local_H.device, dtype=local_H.dtype
+                )
+                if local_residue_pos.dim() > 1:
+                    # AbFlow normally supplies a scalar residue position.  If a
+                    # future dataset supplies extra columns, only the first
+                    # positional coordinate is used for this relative-position
+                    # feature rather than silently changing pair dimensionality.
+                    local_residue_pos = local_residue_pos[..., 0]
+            rel_bucket = (
+                local_residue_pos[row] - local_residue_pos[col]
+            ).round().long().clamp(min=-32, max=32)
+            # 0 means cross-segment / undefined; 1..65 encode -32..32.
+            rel_index = torch.zeros_like(rel_bucket)
+            same_segment_bool = same_segment.squeeze(-1).bool()
+            rel_index[same_segment_bool] = rel_bucket[same_segment_bool] + 33
+            rel_embed = self.relpos_embed(rel_index)
+
+            allatom_geom = self._all_atom_pair_geometry_features(
+                local_X, local_atom_weights, pair_edges
+            )
+
+            if flow_t is None:
+                time_edge = local_H.new_zeros((row.shape[0], self.time_dim))
+            else:
+                t = torch.as_tensor(
+                    flow_t, device=local_H.device, dtype=torch.float32
+                ).reshape(-1)
+                if t.numel() == 1:
+                    n_graph = int(local_batch_id.max().item()) + 1
+                    t = t.expand(n_graph)
+                time_graph = get_timestep_embedding(t, self.time_dim).to(
+                    local_H.dtype
+                )
+                time_edge = time_graph[local_batch_id[row]]
+
+            pair_input = torch.cat([
+                single_pair[row], single_pair[col],
+                geom, proposal_geom, allatom_geom,
+                src_ab, dst_ab, same_segment, cross,
+                rel_embed.to(local_H.dtype), time_edge,
+            ], dim=-1)
+            pair_state = self.pair_init(pair_input)
+
+            if previous_pair is not None:
+                if previous_pair.shape != pair_state.shape:
+                    raise RuntimeError(
+                        "MF pair recycle shape changed across R05 rounds: "
+                        f"{tuple(previous_pair.shape)} vs {tuple(pair_state.shape)}"
+                    )
+                previous_pair_in = (
+                    previous_pair.detach() if self.detach_recycle else previous_pair
+                )
+                pair_state = pair_state + self.pair_recycle(
+                    self.pair_recycle_norm(previous_pair_in)
+                )
+
+            clean_sc = self._clean_sc_features(
+                local_X, local_is_ab, pair_edges,
+                previous_clean_interface_X, base_interface_X,
+            )
+            if clean_sc is not None:
+                pair_state = pair_state + torch.nn.functional.linear(
+                    clean_sc.to(pair_state.dtype),
+                    self.clean_sc_weight.to(pair_state.dtype),
+                )
+
+            opm_rms_terms = []
+            triangle_rms_terms = []
+            for block_idx, (
+                pair_update, norm_s, norm_z, q_proj, k_proj, v_proj, g_proj,
+                z_bias_proj, o_proj, single_update,
+                opm_norm, opm_left, opm_right, opm_out
+            ) in enumerate(zip(
+                self.pair_updates, self.single_norms, self.pair_bias_norms,
+                self.single_q, self.single_k, self.single_v, self.single_g,
+                self.pair_bias, self.single_o, self.single_updates,
+                self.opm_norms, self.opm_left, self.opm_right, self.opm_out
+            )):
+                # Shared MF/ABX semantic: single attention is conditioned by z.
+                s_norm = norm_s(single)
+                q = q_proj(s_norm).view(n_local, self.num_heads, self.head_dim)
+                k = k_proj(s_norm).view(n_local, self.num_heads, self.head_dim)
+                v = v_proj(s_norm).view(n_local, self.num_heads, self.head_dim)
+                logits = (q[row].float() * k[col].float()).sum(dim=-1)
+                logits = logits / math.sqrt(float(self.head_dim))
+                logits = logits + z_bias_proj(norm_z(pair_state)).float()
+                weights = scatter_softmax(logits, row, dim=0).to(v.dtype)
+                weighted = v[col] * weights.unsqueeze(-1)
+                agg = v.new_zeros((n_local, self.num_heads, self.head_dim))
+                agg.index_add_(0, row, weighted)
+                agg = agg.reshape(n_local, self.single_dim)
+                gate = torch.sigmoid(g_proj(s_norm))
+                single = single + o_proj(gate * agg)
+                single = single + single_update(single)
+
+                # ABX Seqformer-style single->pair communication.  Their OPM
+                # implementation uses [left_i * right_j, left_i - right_j].
+                # Evaluating it only on the stable edges preserves the algebra
+                # while avoiding dense LxL pair storage.
+                opm_s = opm_norm(single)
+                left = opm_left(opm_s)
+                right = opm_right(opm_s)
+                opm_feat = torch.cat([
+                    left[row] * right[col], left[row] - right[col]
+                ], dim=-1)
+                opm_delta = opm_out(opm_feat)
+                pair_state = pair_state + opm_delta
+
+                # Exact ABX/MF triangle algebra is now valid because the local
+                # proposal-anchored token universe is dense/triangle-closed.
+                pair_before_triangle = pair_state
+                pair_state, tri_rms = self._triangle_reasoning(
+                    pair_state, pair_edges, local_batch_id, block_idx
+                )
+                pair_state = pair_state + pair_update(pair_state)
+                opm_rms_terms.append(torch.sqrt(
+                    opm_delta.float().pow(2).mean() + 1.0e-12
+                ))
+                triangle_rms_terms.append(tri_rms)
+
+        base_residual = torch.nn.functional.linear(
+            single, self.single_to_base_weight.to(single.dtype)
+        )
+        seq_logits_residual = torch.nn.functional.linear(
+            self.single_seq_norm(single),
+            self.single_to_seq_logits_weight.to(single.dtype),
+        )
+        allatom_pair_rms = (
+            torch.sqrt(allatom_geom.float().pow(2).mean() + 1.0e-12)
+            if pair_edges.numel() and 'allatom_geom' in locals()
+            else single.new_tensor(0.0)
+        )
+        opm_update_rms = (
+            torch.stack(opm_rms_terms).mean()
+            if pair_edges.numel() and opm_rms_terms
+            else single.new_tensor(0.0)
+        )
+        triangle_update_rms = (
+            torch.stack(triangle_rms_terms).mean()
+            if pair_edges.numel() and triangle_rms_terms
+            else single.new_tensor(0.0)
+        )
+        return {
+            "single": single,
+            "pair": pair_state,
+            "base_residual": base_residual,
+            "seq_logits_residual": seq_logits_residual,
+            "allatom_pair_rbf_rms": allatom_pair_rms,
+            "opm_update_rms": opm_update_rms,
+            "triangle_update_rms": triangle_update_rms,
+            "n_local": n_local,
+        }
+
+    def distogram_loss(self, true_local_X, pair_edges, pair_state):
+        if not self.enable_distogram:
+            return pair_state.new_tensor(0.0), None
+        if pair_edges.numel() == 0:
+            return pair_state.sum() * 0.0, pair_state.new_zeros(
+                (0, self.distogram_bins)
+            )
+        n_local = int(true_local_X.shape[0])
+        # Match the supplied AbX DistogramHead: project the directed pair state
+        # first, then symmetrize logits.  Symmetrizing z before a nonlinear
+        # normalization/projection can erase directed pair information.
+        logits_directed = self.distogram_head(self.distogram_norm(pair_state))
+        reverse_edges = torch.stack([pair_edges[1], pair_edges[0]], dim=0)
+        logits_reverse = self.gather_pair_features(
+            pair_edges, logits_directed, reverse_edges, n_local
+        )
+        logits = 0.5 * (logits_directed + logits_reverse)
+        ca_idx = 1 if true_local_X.shape[1] > 1 else 0
+        ca = true_local_X[:, ca_idx]
+        row, col = pair_edges
+        dist = torch.linalg.norm(ca[row] - ca[col], dim=-1)
+        boundaries = torch.linspace(
+            self.distogram_min, self.distogram_max,
+            self.distogram_bins - 1,
+            device=dist.device, dtype=dist.dtype
+        )
+        target = torch.bucketize(dist.detach(), boundaries).long()
+        non_diag = row != col
+        if non_diag.any():
+            loss = F.cross_entropy(logits[non_diag], target[non_diag], reduction="mean")
+        else:
+            loss = logits.sum() * 0.0
+        return loss, logits
 
 class AbFlowModel(nn.Module):
     def __init__(self, embed_size, hidden_size, n_channel, num_classes, num_verts, 
@@ -1269,6 +2118,118 @@ class AbFlowModel(nn.Module):
 
         self._last_structure_seq_diagnostics = {}
 
+        # =========================================================
+        # R05 x MFDesign representation enrichment (R08-R10)
+        # =========================================================
+        # The complete historical R05 model has already been constructed above.
+        # New trainable representation modules are appended only here, so legacy
+        # parameter initialization and RNG order are preserved exactly.
+        self.mf_repr_core = _env_flag("ABFLOW_MF_REPR_CORE", False)
+        self.mf_repr_distogram = _env_flag("ABFLOW_MF_DISTOGRAM", False)
+        self.mf_repr_clean_sc = _env_flag("ABFLOW_MF_CLEAN_SC", False)
+        self.mf_single_dim = _env_int("ABFLOW_MF_SINGLE_DIM", 128)
+        self.mf_pair_dim = _env_int("ABFLOW_MF_PAIR_DIM", 64)
+        self.mf_repr_blocks = _env_int("ABFLOW_MF_REPR_BLOCKS", 1)
+        self.mf_repr_heads = _env_int("ABFLOW_MF_REPR_HEADS", 4)
+        self.mf_atom_s = _env_int("ABFLOW_MF_ATOM_S", 128)
+        self.mf_atom_depth = _env_int("ABFLOW_MF_ATOM_DEPTH", 3)
+        self.mf_atom_heads = _env_int("ABFLOW_MF_ATOM_HEADS", 4)
+        self.mf_pair_antigen_k = _env_int(
+            "ABFLOW_MF_LOCAL_ANTIGEN_K",
+            _env_int("ABFLOW_MF_PAIR_ANTIGEN_K", 18)
+        )
+        self.mf_coordinate_scale = _env_float("ABFLOW_MF_COORD_SCALE", 0.1)
+        self.mf_relpos_dim = _env_int("ABFLOW_MF_RELPOS_DIM", 32)
+        self.mf_opm_dim = _env_int("ABFLOW_MF_OPM_DIM", 64)
+        self.mf_allatom_pair = _env_flag("ABFLOW_MF_ALLATOM_PAIR", True)
+        self.mf_allatom_chunk = _env_int("ABFLOW_MF_ALLATOM_CHUNK", 512)
+        self.mf_detach_recycle = _env_flag("ABFLOW_MF_DETACH_RECYCLE", True)
+        self.mf_triangle_heads = _env_int("ABFLOW_MF_TRIANGLE_HEADS", 4)
+        self.mf_triangle_hidden = _env_int("ABFLOW_MF_TRIANGLE_HIDDEN", 128)
+        self.mf_triangle_checkpoint = _env_flag("ABFLOW_MF_TRIANGLE_CHECKPOINT", True)
+        self.mf_distogram_bins = _env_int("ABFLOW_MF_DISTOGRAM_BINS", 64)
+        self.mf_distogram_min = _env_float("ABFLOW_MF_DISTOGRAM_MIN", 2.0)
+        self.mf_distogram_max = _env_float("ABFLOW_MF_DISTOGRAM_MAX", 22.0)
+
+        if (self.mf_repr_distogram or self.mf_repr_clean_sc) and not self.mf_repr_core:
+            raise ValueError(
+                "MF distogram/clean self-conditioning require "
+                "ABFLOW_MF_REPR_CORE=on."
+            )
+        if self.mf_repr_core and self.pair_time_conditioning:
+            raise ValueError(
+                "R08-R10 keep Pair-Time off: MF pair representation and the "
+                "historical Pair-Time ablation must not be mixed in one run."
+            )
+
+        # Centralized objective weights. Defaults reproduce R05 exactly.  The
+        # three formal JSON configs are the authority and the launcher exports
+        # their whitelisted values into these variables.
+        self.loss_sequence_weight = _env_float(
+            "ABFLOW_LOSS_SEQUENCE_WEIGHT", self.seq_ce_weight
+        )
+        self.loss_structure_weight = _env_float(
+            "ABFLOW_LOSS_STRUCTURE_WEIGHT", 1.0
+        )
+        self.loss_interface_weight = _env_float(
+            "ABFLOW_LOSS_INTERFACE_WEIGHT", 1.0
+        )
+        self.loss_edge_weight = _env_float(
+            "ABFLOW_LOSS_EDGE_WEIGHT", 1.0
+        )
+        self.loss_distogram_weight = _env_float(
+            "ABFLOW_LOSS_DISTOGRAM_WEIGHT", 0.0
+        )
+        if self.loss_distogram_weight != 0.0 and not self.mf_repr_distogram:
+            raise ValueError(
+                "ABFLOW_LOSS_DISTOGRAM_WEIGHT is non-zero but "
+                "ABFLOW_MF_DISTOGRAM is off."
+            )
+
+        self.mf_repr = None
+        if self.mf_repr_core:
+            self.mf_repr = MFRepresentationEnrichment(
+                embed_dim=embed_size,
+                hidden_dim=hidden_size,
+                atom_dim=atom_embed_size,
+                num_classes=self.num_classes,
+                single_dim=self.mf_single_dim,
+                pair_dim=self.mf_pair_dim,
+                num_blocks=self.mf_repr_blocks,
+                num_heads=self.mf_repr_heads,
+                atom_s=self.mf_atom_s,
+                atom_depth=self.mf_atom_depth,
+                atom_heads=self.mf_atom_heads,
+                coordinate_scale=self.mf_coordinate_scale,
+                enable_distogram=self.mf_repr_distogram,
+                distogram_bins=self.mf_distogram_bins,
+                distogram_min=self.mf_distogram_min,
+                distogram_max=self.mf_distogram_max,
+                enable_clean_sc=self.mf_repr_clean_sc,
+                relpos_dim=self.mf_relpos_dim,
+                opm_dim=self.mf_opm_dim,
+                enable_allatom_pair=self.mf_allatom_pair,
+                allatom_chunk=self.mf_allatom_chunk,
+                detach_recycle=self.mf_detach_recycle,
+                triangle_heads=self.mf_triangle_heads,
+                triangle_hidden=self.mf_triangle_hidden,
+                triangle_checkpoint=self.mf_triangle_checkpoint,
+            )
+            # Final pair information enters the existing local R05 EGNN edge
+            # message through a zero-start residual.  The same enriched invariant
+            # edge message is consumed by the existing node *and coordinate*
+            # updates; no second coordinate decoder is introduced.  Global/context
+            # topology and dynamic KNN selection remain the R05 authority.
+            if not hasattr(self.gnn, "enable_pair_representation"):
+                raise RuntimeError(
+                    "MF representation requires the updated AMEncoder with "
+                    "enable_pair_representation()."
+                )
+            self.gnn.enable_pair_representation(self.mf_pair_dim)
+
+        self._last_mf_repr_state = {}
+        self._last_mf_repr_diagnostics = {}
+
 
     def init_mask(self, X, S, cmask, smask, template):
         if not self.struct_only:
@@ -2124,7 +3085,12 @@ class AbFlowModel(nn.Module):
                         coord_pep_condition_mask=None,
                         seq_pep_condition=None,
                         seq_pep_condition_mask=None,
-                        sequence_state_full=None):
+                        sequence_state_full=None,
+                        mf_previous_single=None,
+                        mf_previous_pair=None,
+                        mf_previous_clean_interface_X=None,
+                        mf_base_interface_X=None,
+                        mf_proposal_interface_X=None):
         # embeddings, hidden state, (internal edges, external edges),
         # (A : c*d, w : c*1)
         H_0, (ctx_edges, inter_edges), (atom_embeddings, atom_weights) = self.aa_feature(
@@ -2543,10 +3509,217 @@ class AbFlowModel(nn.Module):
         aligned_local_inter_edges, epi_index = self.align_epi_ab(local_inter_edges, local_is_ab)
         # self.timing_stats['surface_processing'] += time.time() - surf_start
 
+        # ---------------------------------------------------------
+        # R05 x MFDesign representation core.
+        # ---------------------------------------------------------
+        # Dynamic KNN topology remains frozen to the parent decision above.  The
+        # new representation enriches message content only after those edges are
+        # selected, which avoids turning pair-state learning into an uncontrolled
+        # graph-topology intervention.
+        mf_state = None
+        mf_local_edge_attr = None
+        mf_surf_edge_attr = None
+        # For R08-R10 the common objective probe must sit *before* the MF
+        # representation branch: endpoint/sequence/structure flow through it,
+        # and the distogram branch is also downstream of it.  Probing the
+        # post-representation H_0 would make distogram appear disconnected even
+        # when z_ij is learning correctly.
+        if (
+            self.mf_repr_core
+            and bool(getattr(self, "_diagnostic_capture", False))
+            and int(round_idx) == int(self.round) - 1
+        ):
+            self._diagnostic_probe_tensor = H_0
+        if self.mf_repr_core:
+            if not bool(self.batch_constants.get('mf_pair_edges_initialized', False)):
+                self.batch_constants['mf_pair_edges'] = self._build_bounded_mf_pair_edges(
+                    local_X=local_X,
+                    local_is_ab=local_is_ab,
+                    local_batch_id=local_batch_id,
+                    proposal_interface_X=mf_proposal_interface_X,
+                )
+                self.batch_constants['mf_pair_edges_initialized'] = True
+            pair_edges = self.batch_constants['mf_pair_edges']
+            mf_state = self.mf_repr(
+                H0=H_0,
+                local_X=local_X,
+                atom_embeddings=atom_embeddings,
+                atom_weights=atom_weights,
+                local_mask=local_mask,
+                local_is_ab=local_is_ab,
+                local_segment_ids=self.batch_constants['local_segment_ids'],
+                local_batch_id=local_batch_id,
+                residue_pos=residue_pos,
+                pair_edges=pair_edges,
+                flow_t=flow_t,
+                previous_single=mf_previous_single,
+                previous_pair=mf_previous_pair,
+                previous_clean_interface_X=mf_previous_clean_interface_X,
+                base_interface_X=mf_base_interface_X,
+                proposal_interface_X=mf_proposal_interface_X,
+            )
+
+            # Explicit single state influences the parent residue representation
+            # through a zero-start residual.  At initialization this is exactly 0.
+            H_0 = H_0.clone()
+            H_0[local_mask] = H_0[local_mask] + mf_state['base_residual']
+
+            n_local = int(local_X.shape[0])
+            mf_ctx_attr = self.mf_repr.gather_pair_state(
+                pair_edges, mf_state['pair'], local_ctx_edges, n_local
+            )
+            mf_inter_attr = self.mf_repr.gather_pair_state(
+                pair_edges, mf_state['pair'], local_inter_edges, n_local
+            )
+            mf_local_edge_attr = torch.cat(
+                [mf_ctx_attr, mf_inter_attr], dim=0
+            )
+            mf_surf_edge_attr = self.mf_repr.gather_pair_state(
+                pair_edges, mf_state['pair'],
+                aligned_local_inter_edges, n_local
+            )
+
+            if diagnostics_active:
+                with torch.no_grad():
+                    mf_single_det = mf_state['single'].detach().float()
+                    mf_pair_det = mf_state['pair'].detach().float()
+                    self._last_condition_diagnostics[
+                        'mf_single_rms'
+                    ] = torch.sqrt(
+                        mf_single_det.pow(2).mean() + self.scorefm_eps
+                    ).to(H_0.dtype)
+                    self._last_condition_diagnostics[
+                        'mf_pair_rms'
+                    ] = (
+                        torch.sqrt(
+                            mf_pair_det.pow(2).mean() + self.scorefm_eps
+                        ).to(H_0.dtype)
+                        if mf_state['pair'].numel()
+                        else H_0.detach().new_tensor(0.0)
+                    )
+                    self._last_condition_diagnostics[
+                        'mf_pair_count'
+                    ] = H_0.detach().new_tensor(
+                        float(mf_state['pair'].shape[0])
+                    )
+                    if pair_edges.numel():
+                        pair_graph = local_batch_id[pair_edges[0]]
+                        n_graph_pair = int(local_batch_id.max().item()) + 1
+                        pair_counts = torch.bincount(
+                            pair_graph, minlength=n_graph_pair
+                        ).float()
+                        self._last_condition_diagnostics[
+                            'mf_pair_count_graph_mean'
+                        ] = pair_counts.mean().to(H_0.dtype)
+                        self._last_condition_diagnostics[
+                            'mf_pair_count_graph_max'
+                        ] = pair_counts.max().to(H_0.dtype)
+                        local_tokens = torch.sqrt(pair_counts.clamp_min(0.0))
+                        self._last_condition_diagnostics[
+                            'mf_local_token_count_graph_mean'
+                        ] = local_tokens.mean().to(H_0.dtype)
+                        self._last_condition_diagnostics[
+                            'mf_local_token_count_graph_max'
+                        ] = local_tokens.max().to(H_0.dtype)
+                    else:
+                        self._last_condition_diagnostics[
+                            'mf_pair_count_graph_mean'
+                        ] = H_0.detach().new_tensor(0.0)
+                        self._last_condition_diagnostics[
+                            'mf_pair_count_graph_max'
+                        ] = H_0.detach().new_tensor(0.0)
+                        self._last_condition_diagnostics[
+                            'mf_local_token_count_graph_mean'
+                        ] = H_0.detach().new_tensor(0.0)
+                        self._last_condition_diagnostics[
+                            'mf_local_token_count_graph_max'
+                        ] = H_0.detach().new_tensor(0.0)
+                    self._last_condition_diagnostics[
+                        'mf_allatom_pair_rbf_rms'
+                    ] = mf_state['allatom_pair_rbf_rms'].detach().to(H_0.dtype)
+                    self._last_condition_diagnostics[
+                        'mf_opm_update_rms'
+                    ] = mf_state['opm_update_rms'].detach().to(H_0.dtype)
+                    self._last_condition_diagnostics[
+                        'mf_triangle_update_rms'
+                    ] = mf_state['triangle_update_rms'].detach().to(H_0.dtype)
+                    self._last_condition_diagnostics[
+                        'mf_base_residual_rms'
+                    ] = torch.sqrt(
+                        mf_state['base_residual'].detach().float().pow(2).mean()
+                        + self.scorefm_eps
+                    ).to(H_0.dtype)
+                    self._last_condition_diagnostics[
+                        'mf_seq_residual_rms'
+                    ] = torch.sqrt(
+                        mf_state['seq_logits_residual'].detach().float().pow(2).mean()
+                        + self.scorefm_eps
+                    ).to(H_0.dtype)
+                    if (
+                        mf_previous_single is not None
+                        and mf_previous_single.shape == mf_state['single'].shape
+                    ):
+                        self._last_condition_diagnostics[
+                            'mf_single_round_delta_rms'
+                        ] = torch.sqrt(
+                            (
+                                mf_state['single'].detach().float()
+                                - mf_previous_single.detach().float()
+                            ).pow(2).mean() + self.scorefm_eps
+                        ).to(H_0.dtype)
+                    else:
+                        self._last_condition_diagnostics[
+                            'mf_single_round_delta_rms'
+                        ] = H_0.detach().new_tensor(0.0)
+                    if (
+                        mf_previous_pair is not None
+                        and mf_previous_pair.shape == mf_state['pair'].shape
+                        and mf_state['pair'].numel()
+                    ):
+                        self._last_condition_diagnostics[
+                            'mf_pair_round_delta_rms'
+                        ] = torch.sqrt(
+                            (
+                                mf_state['pair'].detach().float()
+                                - mf_previous_pair.detach().float()
+                            ).pow(2).mean() + self.scorefm_eps
+                        ).to(H_0.dtype)
+                    else:
+                        self._last_condition_diagnostics[
+                            'mf_pair_round_delta_rms'
+                        ] = H_0.detach().new_tensor(0.0)
+                    self._last_condition_diagnostics[
+                        'mf_base_adapter_weight_rms'
+                    ] = torch.sqrt(
+                        self.mf_repr.single_to_base_weight.detach().float()
+                        .pow(2).mean() + self.scorefm_eps
+                    ).to(H_0.dtype)
+                    self._last_condition_diagnostics[
+                        'mf_seq_adapter_weight_rms'
+                    ] = torch.sqrt(
+                        self.mf_repr.single_to_seq_logits_weight.detach().float()
+                        .pow(2).mean() + self.scorefm_eps
+                    ).to(H_0.dtype)
+                    if (
+                        self.mf_repr_clean_sc
+                        and self.mf_repr.clean_sc_weight is not None
+                    ):
+                        self._last_condition_diagnostics[
+                            'mf_clean_sc_weight_rms'
+                        ] = torch.sqrt(
+                            self.mf_repr.clean_sc_weight.detach().float()
+                            .pow(2).mean() + self.scorefm_eps
+                        ).to(H_0.dtype)
+                    else:
+                        self._last_condition_diagnostics[
+                            'mf_clean_sc_weight_rms'
+                        ] = H_0.detach().new_tensor(0.0)
+
         # Capture the final-round shared activation only on diagnostic probe
         # steps. Sequence logits and coordinate outputs both depend on H_0.
         if (
-            bool(getattr(self, "_diagnostic_capture", False))
+            (not self.mf_repr_core)
+            and bool(getattr(self, "_diagnostic_capture", False))
             and int(round_idx) == int(self.round) - 1
         ):
             self._diagnostic_probe_tensor = H_0
@@ -2565,7 +3738,15 @@ class AbFlowModel(nn.Module):
 
         # message passing
         # sme_start = time.time()
-        if self.pair_time_conditioning:
+        if self.mf_repr_core:
+            H, pred_X, pred_local_X = self.gnn(
+                H_0, X, ctx_edges, local_mask, local_X, surf, local_edges,
+                paratope_mask, local_is_ab, aligned_local_inter_edges, epi_index,
+                channel_attr=atom_embeddings, channel_weights=atom_weights,
+                inter_edge_attr=mf_local_edge_attr,
+                surf_edge_attr=mf_surf_edge_attr,
+            )
+        elif self.pair_time_conditioning:
             H, pred_X, pred_local_X = self.gnn(
                 H_0, X, ctx_edges, local_mask, local_X, surf, local_edges,
                 paratope_mask, local_is_ab, aligned_local_inter_edges, epi_index,
@@ -2599,8 +3780,24 @@ class AbFlowModel(nn.Module):
                 local_batch_id=local_batch_id,
             )
             pred_logits = self.ffn_residue(H_seq)
+            if mf_state is not None:
+                # Direct enriched-single sequence semantics:
+                #   logits = legacy_R05(H) + W_s LN(tilde{s}).
+                # The residual head is zero at initialization, so the proven R05
+                # sequence predictor is preserved while sequence gradients can
+                # learn amino-acid-discriminative information in s/z.
+                pred_logits = pred_logits.clone()
+                pred_logits[local_mask] = (
+                    pred_logits[local_mask]
+                    + mf_state['seq_logits_residual']
+                )
 
-        return pred_logits, pred_X, interface_X, H, p_edge_dist  # [N, num_classes], [N, n_channel, 3], [Ncdr, n_channel, 3], [N, hidden_size]
+        mf_single_out = None if mf_state is None else mf_state['single']
+        mf_pair_out = None if mf_state is None else mf_state['pair']
+        return (
+            pred_logits, pred_X, interface_X, H, p_edge_dist,
+            mf_single_out, mf_pair_out
+        )
     
     @torch.no_grad()
     def init_interface(self, X, S, paratope_mask, batch_id, init_noise=None):
@@ -2620,6 +3817,65 @@ class AbFlowModel(nn.Module):
         return init_local_X, init_local_S
 
     @torch.no_grad()
+    def _build_bounded_mf_pair_edges(
+        self, local_X, local_is_ab, local_batch_id, proposal_interface_X=None
+    ):
+        """Build a proposal-anchored *triangle-closed* local pair universe.
+
+        For each complex we keep every current design/paratope residue and the
+        globally nearest K antigen context residues, where K is measured from
+        the inference-available PCS-RC proposal.  We then instantiate *all*
+        ordered pairs (including self pairs) inside that bounded token set.
+
+        This changes the previous per-H3 KNN sparse pair graph into a dense but
+        bounded local matrix.  The local matrix is therefore closed under the k
+        index required by exact TriangleMultiplication/TriangleAttention, while
+        its size is capped by N_design + K rather than N_design * N_antigen.
+        The same construction automatically generalizes from H3 to all six CDRs
+        because all design residues are retained and only antigen context is
+        capped.
+        """
+        device = local_X.device
+        ca_idx = 1 if local_X.shape[1] > 1 else 0
+        proposal_local = local_X.detach().clone()
+        if (
+            proposal_interface_X is not None
+            and int(local_is_ab.sum().item()) == int(proposal_interface_X.shape[0])
+        ):
+            proposal_local[local_is_ab] = proposal_interface_X.detach().to(local_X)
+        ca = proposal_local[:, ca_idx].float()
+        n_graph = int(local_batch_id.max().item()) + 1 if local_batch_id.numel() else 0
+        chunks = []
+        for gid in range(n_graph):
+            graph = local_batch_id == gid
+            design = torch.nonzero(graph & local_is_ab, as_tuple=False).reshape(-1)
+            antigen = torch.nonzero(graph & (~local_is_ab), as_tuple=False).reshape(-1)
+            if design.numel() == 0:
+                continue
+
+            if antigen.numel():
+                k = min(int(self.mf_pair_antigen_k), int(antigen.numel()))
+                # One global antigen context set per complex: score every antigen
+                # by its minimum PCS-RC proposal distance to any design residue.
+                # This is stable across R05 rounds and inference-available.
+                d = torch.cdist(ca[design], ca[antigen])
+                min_d = d.min(dim=0).values
+                selected = antigen[torch.topk(min_d, k=k, largest=False).indices]
+                nodes = torch.cat([design, selected], dim=0)
+            else:
+                nodes = design
+
+            # Dense ordered local pair matrix, including diagonal entries.  The
+            # row-major order is relied upon by the triangle block reshape.
+            n = int(nodes.numel())
+            src = nodes[:, None].expand(n, n).reshape(-1)
+            dst = nodes[None, :].expand(n, n).reshape(-1)
+            chunks.append(torch.stack([src, dst], dim=0))
+
+        if not chunks:
+            return torch.empty((2, 0), device=device, dtype=torch.long)
+        return torch.cat(chunks, dim=1).long()
+
     def _prepare_batch_constants(self, S, paratope_mask, lengths):
         # generate batch id
         batch_id = torch.zeros_like(S)  # [N]
@@ -2656,9 +3912,19 @@ class AbFlowModel(nn.Module):
         is_inter = torch.logical_xor(row_is_ag, col_is_ag)
         is_ctx = torch.logical_not(is_inter)
 
-        self.batch_constants['local_ctx_edges'] = torch.stack([row[is_ctx], col[is_ctx]])  # [2, Ec]
-        self.batch_constants['local_inter_edges'] = torch.stack([row[is_inter], col[is_inter]])  # [2, Ei]
+        local_ctx_base = torch.stack([row[is_ctx], col[is_ctx]])  # [2, Ec]
+        local_inter_base = torch.stack([row[is_inter], col[is_inter]])  # [2, Ei]
+        self.batch_constants['local_ctx_edges'] = local_ctx_base
+        self.batch_constants['local_inter_edges'] = local_inter_base
         self.batch_constants['local_edge_infos'] = (offsets, max_n, gni2lni)
+
+        # R08-R10 pair universe is built lazily from the inference-available
+        # PCS-RC proposal geometry at the first message-passing round.  This keeps
+        # it stable across the existing R05 recurrence while bounding pair count.
+        self.batch_constants['mf_pair_edges'] = torch.empty(
+            (2, 0), device=S.device, dtype=torch.long
+        )
+        self.batch_constants['mf_pair_edges_initialized'] = False
 
         interface_batch_id = batch_id[paratope_mask]
         self.batch_constants['interface_batch_id'] = interface_batch_id
@@ -5468,6 +6734,17 @@ class AbFlowModel(nn.Module):
         r_interface_X = [interface_X.clone()]
         r_edge_dist = []
         memory_H = None
+
+        # MF representation recycling is carried by the existing three R05
+        # rounds; there is no nested recycle loop.  The fixed base interface is
+        # the transport state at entry to this model query and is used only by
+        # the optional detached clean-state residual conditioner.
+        mf_previous_single = None
+        mf_previous_pair = None
+        mf_previous_clean_interface_X = None
+        mf_base_interface_X = (
+            interface_X.detach().clone() if self.mf_repr_core else None
+        )
         diagnostics_active = bool(
             self.condition_diagnostics_enabled
             and getattr(self, "_diagnostic_capture", False)
@@ -5501,7 +6778,10 @@ class AbFlowModel(nn.Module):
                 seq_pep_condition_this = None
                 seq_pep_condition_mask_this = None
 
-            pred_S_logits, pred_X, interface_X, H, edge_dist = self.message_passing(
+            (
+                pred_S_logits, pred_X, interface_X, H, edge_dist,
+                mf_single_out, mf_pair_out
+            ) = self.message_passing(
                 X, S, residue_pos, interface_X, surface, paratope_mask,
                 batch_id, round_idx, memory_H, pred_S_dist, smask,
                 flow_t=flow_t,
@@ -5510,6 +6790,11 @@ class AbFlowModel(nn.Module):
                 seq_pep_condition=seq_pep_condition_this,
                 seq_pep_condition_mask=seq_pep_condition_mask_this,
                 sequence_state_full=sequence_state_full,
+                mf_previous_single=mf_previous_single,
+                mf_previous_pair=mf_previous_pair,
+                mf_previous_clean_interface_X=mf_previous_clean_interface_X,
+                mf_base_interface_X=mf_base_interface_X,
+                mf_proposal_interface_X=pep_X_model,
             )
 
             if condition_diag_rounds is not None:
@@ -5519,6 +6804,17 @@ class AbFlowModel(nn.Module):
                 })
 
             memory_H = H
+            if self.mf_repr_core:
+                # ABX/MF recycling semantics: representation carriers are state,
+                # not a second backprop-through-time authority across R05 rounds.
+                # The R05 coordinate/hidden recurrence itself is left untouched.
+                if self.mf_detach_recycle:
+                    mf_previous_single = mf_single_out.detach()
+                    mf_previous_pair = mf_pair_out.detach()
+                else:
+                    mf_previous_single = mf_single_out
+                    mf_previous_pair = mf_pair_out
+                mf_previous_clean_interface_X = interface_X.detach()
             r_interface_X.append(interface_X.clone())
             r_pred_S_logits.append((pred_S_logits, smask))
             r_edge_dist.append(edge_dist)
@@ -5546,8 +6842,27 @@ class AbFlowModel(nn.Module):
                 ).mean()
                 for key in keys
             }
+            # Keep the historical mean diagnostics, but also expose per-round
+            # MF representation dynamics.  This is observational only and makes
+            # the existing three-round R05 recurrence directly auditable.
+            for ridx, round_diag in enumerate(condition_diag_rounds):
+                for key, value in round_diag.items():
+                    if key.startswith("mf_"):
+                        self._latest_condition_diagnostics[
+                            f"round{ridx}_{key}"
+                        ] = value
         else:
             self._latest_condition_diagnostics = {}
+
+        if self.mf_repr_core:
+            self._last_mf_repr_state = {
+                'single': mf_previous_single,
+                'pair': mf_previous_pair,
+                'pair_edges': self.batch_constants['mf_pair_edges'],
+                'local_mask': self.batch_constants['local_mask'],
+            }
+        else:
+            self._last_mf_repr_state = {}
 
         interface_batch_id = self.batch_constants['interface_batch_id']
         if self.struct_only:
@@ -5571,7 +6886,7 @@ class AbFlowModel(nn.Module):
     @torch.no_grad()
     def _validation_proxy_diagnostics(
             self, *, true_X, true_S, pred_S, r_pred_S_logits, r_interface_X,
-            paratope_mask, smask, batch_id, interface_batch_id):
+            paratope_mask, smask, batch_id, interface_batch_id, t_graph=None):
         """Cheap validation proxies aligned with the final evaluation axes.
 
         These are not substitutes for TM-score/lDDT/DockQ and are never used as
@@ -5589,22 +6904,30 @@ class AbFlowModel(nn.Module):
 
         round_raw = []
         round_aligned = []
-        for ridx, pred_int in enumerate(r_interface_X[1:]):
+        final_raw_by_graph = {}
+        final_aligned_by_graph = {}
+        predicted_rounds = list(r_interface_X[1:])
+        for ridx, pred_int in enumerate(predicted_rounds):
             pred_ca = pred_int[:, ca_idx].float()
             raw_values, aligned_values = [], []
+            raw_graph_values, aligned_graph_values = {}, {}
             for g in range(n_graph):
                 m = interface_batch_id == g
                 if not bool(m.any()):
                     continue
                 p, q = pred_ca[m], true_ca[m]
-                raw_values.append(torch.sqrt(((p - q) ** 2).sum(-1).mean()))
+                raw_g = torch.sqrt(((p - q) ** 2).sum(-1).mean())
+                raw_values.append(raw_g)
+                raw_graph_values[g] = raw_g
                 if p.shape[0] >= 3:
                     try:
                         _, rot, trans = kabsch_torch(p, q)
                         p_aligned = torch.matmul(p, rot.T) + trans
-                        aligned_values.append(
-                            torch.sqrt(((p_aligned - q) ** 2).sum(-1).mean())
+                        aligned_g = torch.sqrt(
+                            ((p_aligned - q) ** 2).sum(-1).mean()
                         )
+                        aligned_values.append(aligned_g)
+                        aligned_graph_values[g] = aligned_g
                     except Exception:
                         pass
             if raw_values:
@@ -5615,6 +6938,9 @@ class AbFlowModel(nn.Module):
                 av = torch.stack(aligned_values).mean()
                 out[f"val_proxy_round{ridx}_h3_ca_aligned_rmsd"] = av
                 round_aligned.append(av)
+            if ridx == len(predicted_rounds) - 1:
+                final_raw_by_graph = raw_graph_values
+                final_aligned_by_graph = aligned_graph_values
 
         for ridx, (logits, mask) in enumerate(r_pred_S_logits):
             if bool(mask.any()):
@@ -5622,6 +6948,65 @@ class AbFlowModel(nn.Module):
                 out[f"val_proxy_round{ridx}_aar"] = (
                     pred_round == true_S[mask]
                 ).float().mean()
+
+        # Posterior diagnostics on the final recurrent sequence readout.  These
+        # detect prior-collapse / overconfidence without changing the sequence
+        # path or its loss.
+        if r_pred_S_logits:
+            final_logits, final_mask = r_pred_S_logits[-1]
+            if bool(final_mask.any()):
+                probs = torch.softmax(final_logits[final_mask].float(), dim=-1)
+                entropy = -(
+                    probs * torch.log(probs.clamp_min(self.scorefm_eps))
+                ).sum(dim=-1)
+                max_prob, map_token = probs.max(dim=-1)
+                counts = torch.bincount(
+                    map_token, minlength=int(self.num_classes)
+                ).float()
+                out["val_proxy_seq_entropy"] = entropy.mean()
+                out["val_proxy_seq_max_prob"] = max_prob.mean()
+                out["val_proxy_seq_dominant_map_fraction"] = (
+                    counts.max() / counts.sum().clamp_min(1.0)
+                )
+                out["val_proxy_seq_unique_map_classes"] = (
+                    counts > 0
+                ).float().sum()
+
+        # Score--Flow time-bin diagnostics.  Validation uses the exact same
+        # generated t_graph as the loss; the bins are observational only.
+        if t_graph is not None and final_raw_by_graph:
+            t_values = torch.as_tensor(
+                t_graph, device=true_X.device, dtype=torch.float32
+            ).reshape(-1)
+            if t_values.numel() == 1:
+                t_values = t_values.expand(n_graph)
+            if t_values.numel() == n_graph:
+                edges = (0.0, 0.2, 0.4, 0.6, 0.8, 1.000001)
+                for bidx in range(5):
+                    raw_bin = []
+                    aligned_bin = []
+                    for g, raw_g in final_raw_by_graph.items():
+                        tg = float(t_values[g].item())
+                        if edges[bidx] <= tg < edges[bidx + 1]:
+                            raw_bin.append(raw_g)
+                            if g in final_aligned_by_graph:
+                                aligned_bin.append(final_aligned_by_graph[g])
+                    out[f"val_proxy_timebin{bidx}_count"] = true_X.new_tensor(
+                        float(len(raw_bin))
+                    )
+                    out[f"val_proxy_timebin{bidx}_aligned_count"] = true_X.new_tensor(
+                        float(len(aligned_bin))
+                    )
+                    out[f"val_proxy_timebin{bidx}_h3_ca_rmsd_sum"] = (
+                        torch.stack(raw_bin).sum()
+                        if raw_bin else true_X.new_tensor(0.0)
+                    )
+                    out[
+                        f"val_proxy_timebin{bidx}_h3_ca_aligned_rmsd_sum"
+                    ] = (
+                        torch.stack(aligned_bin).sum()
+                        if aligned_bin else true_X.new_tensor(0.0)
+                    )
 
         if round_raw:
             out["val_proxy_refinement_raw_rmsd_delta"] = (
@@ -5726,6 +7111,9 @@ class AbFlowModel(nn.Module):
             ("seq", "satc"),
             ("endpoint", "seq"),
             ("structure", "satc"),
+            ("endpoint", "distogram"),
+            ("seq", "distogram"),
+            ("structure", "distogram"),
         ]
         for a, b in pairs:
             if a in grads and b in grads:
@@ -6625,8 +8013,8 @@ class AbFlowModel(nn.Module):
             scorefm_details.update(traj_details)
             scorefm_details["scorefm_total"] = interface_loss.detach()
 
-        self.last_scorefm_losses = scorefm_details
-
+        # Delay publishing scorefm_details until the representation auxiliaries
+        # below have been added to the same machine-readable record.
 
         # 2. edge dist loss
         if self.pred_edge_dist:
@@ -6641,6 +8029,54 @@ class AbFlowModel(nn.Module):
             ed_loss = 0
         dock_loss = interface_loss + ed_loss
 
+        # 3. MFDesign-style persistent-pair distogram auxiliary.
+        # This supervises z_ij, not a second coordinate decoder.  The target is
+        # native CA--CA distance over the same stable H3--antigen/H3--H3 pair
+        # universe, with mean CE normalization so its configured weight is not
+        # sequence-length dependent.
+        mf_distogram_loss = X.new_tensor(0.0)
+        if self.mf_repr_distogram:
+            mf_state = self._last_mf_repr_state
+            if not mf_state or mf_state.get('pair') is None:
+                raise RuntimeError(
+                    "MF distogram is enabled but no final pair state was produced."
+                )
+            true_local_X = true_X[mf_state['local_mask']]
+            mf_distogram_loss, _ = self.mf_repr.distogram_loss(
+                true_local_X=true_local_X,
+                pair_edges=mf_state['pair_edges'],
+                pair_state=mf_state['pair'],
+            )
+
+        scorefm_details["mf_repr_core_enabled"] = X.detach().new_tensor(
+            1.0 if self.mf_repr_core else 0.0
+        )
+        scorefm_details["mf_distogram_enabled"] = X.detach().new_tensor(
+            1.0 if self.mf_repr_distogram else 0.0
+        )
+        scorefm_details["mf_clean_sc_enabled"] = X.detach().new_tensor(
+            1.0 if self.mf_repr_clean_sc else 0.0
+        )
+        scorefm_details["mf_distogram_loss"] = mf_distogram_loss.detach()
+        scorefm_details["mf_distogram_weight"] = X.detach().new_tensor(
+            float(self.loss_distogram_weight)
+        )
+        if self.mf_repr_core and self._last_mf_repr_state:
+            _single = self._last_mf_repr_state.get('single')
+            _pair = self._last_mf_repr_state.get('pair')
+            if _single is not None and _single.numel():
+                scorefm_details["mf_single_rms"] = torch.sqrt(
+                    _single.detach().float().pow(2).mean() + self.scorefm_eps
+                ).to(X.dtype)
+            if _pair is not None and _pair.numel():
+                scorefm_details["mf_pair_rms"] = torch.sqrt(
+                    _pair.detach().float().pow(2).mean() + self.scorefm_eps
+                ).to(X.dtype)
+                scorefm_details["mf_pair_count"] = X.detach().new_tensor(
+                    float(_pair.shape[0])
+                )
+        self.last_scorefm_losses = scorefm_details
+
         if self.struct_only:
             # predicted rmsd
             prmsd_loss = F.smooth_l1_loss(prmsd, bb_rmsd)
@@ -6648,23 +8084,31 @@ class AbFlowModel(nn.Module):
         else:
             pdev_loss, prmsd_loss = None, None
 
-        # comprehensive loss
+        # Comprehensive loss with one centralized, explicit hierarchy.
+        # Defaults are exactly the historical R05 coefficients.  R09/R10 add
+        # only the mean-normalized distogram auxiliary at the configured weight.
+        edge_loss_tensor = (
+            ed_loss if torch.is_tensor(ed_loss) else interface_loss * 0.0
+        )
         loss = (
-            self.seq_ce_weight * snll
-            + struct_loss
-            + dock_loss
+            self.loss_sequence_weight * snll
+            + self.loss_structure_weight * struct_loss
+            + self.loss_interface_weight * interface_loss
+            + self.loss_edge_weight * edge_loss_tensor
+            + self.loss_distogram_weight * mf_distogram_loss
             + (0 if pdev_loss is None else pdev_loss)
         )
         self._diagnostic_objective_tensors = {
-            "seq": self.seq_ce_weight * snll,
-            "structure": struct_loss,
-            "endpoint": getattr(
+            "seq": self.loss_sequence_weight * snll,
+            "structure": self.loss_structure_weight * struct_loss,
+            "endpoint": self.loss_interface_weight * getattr(
                 self, "_last_endpoint_objective_tensor", interface_loss
             ),
             "satc": getattr(
                 self, "_last_satc_objective_tensor", interface_loss * 0.0
             ),
-            "edge": ed_loss if torch.is_tensor(ed_loss) else loss * 0.0,
+            "edge": self.loss_edge_weight * edge_loss_tensor,
+            "distogram": self.loss_distogram_weight * mf_distogram_loss,
         }
 
         # AAR and conditioning diagnostics.
@@ -6679,7 +8123,11 @@ class AbFlowModel(nn.Module):
                 aar = X.new_tensor(0.0)
 
             diag = {
-                "seq_ce_weight": torch.as_tensor(self.seq_ce_weight, device=X.device),
+                "seq_ce_weight": torch.as_tensor(self.loss_sequence_weight, device=X.device),
+                "loss_structure_weight": torch.as_tensor(self.loss_structure_weight, device=X.device),
+                "loss_interface_weight": torch.as_tensor(self.loss_interface_weight, device=X.device),
+                "loss_edge_weight": torch.as_tensor(self.loss_edge_weight, device=X.device),
+                "loss_distogram_weight": torch.as_tensor(self.loss_distogram_weight, device=X.device),
                 "coordinate_authority_carrier_single": torch.as_tensor(
                     1.0 if self.coordinate_authority == "carrier_single" else 0.0,
                     device=X.device,
@@ -7037,6 +8485,7 @@ class AbFlowModel(nn.Module):
                     r_interface_X=r_interface_X,
                     paratope_mask=paratope_mask, smask=smask,
                     batch_id=batch_id, interface_batch_id=interface_batch_id,
+                    t_graph=t_graph,
                 ))
             self.last_abflow_diagnostics = {
                 k: v.detach() if torch.is_tensor(v) else v for k, v in diag.items()

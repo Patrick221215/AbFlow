@@ -41,6 +41,24 @@ class TrainConfig:
         return str(self.__class__) + ': ' + str(self.__dict__)
 
 
+def _normalize_optional_path(value):
+    """Normalize optional path values crossing JSON -> shell -> argparse.
+
+    Historical launchers may serialize an empty JSON string as the literal
+    tokens ``''`` or ``""``.  Those are scratch sentinels, not paths.
+    Strip only whole-string matching quotes and common null sentinels; real
+    non-empty checkpoint paths are left unchanged.
+    """
+    if value is None:
+        return ""
+    text = str(value).strip()
+    while len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1].strip()
+    if text.lower() in {"", "none", "null"}:
+        return ""
+    return text
+
+
 class Trainer:
     def __init__(self, model, train_loader, valid_loader, config):
         self.model = model
@@ -58,7 +76,7 @@ class Trainer:
 
         # log / run directory
         # Strict resume: continue writing into the original version directory.
-        resume_checkpoint = str(getattr(self.config, "resume_checkpoint", "") or "").strip()
+        resume_checkpoint = _normalize_optional_path(getattr(self.config, "resume_checkpoint", ""))
         if resume_checkpoint:
             resume_checkpoint = os.path.abspath(resume_checkpoint)
             if not os.path.isfile(resume_checkpoint):
@@ -79,8 +97,25 @@ class Trainer:
             self.model_dir = ckpt_dir
             self.config.resume_checkpoint = resume_checkpoint
         else:
-            self.version = self._get_version()
-            self.config.save_dir = os.path.join(self.config.save_dir, f'version_{self.version}')
+            # Formal R08-R10 launchers set one explicit version for the whole
+            # torchrun job.  Without this, two DDP ranks can race in _get_version():
+            # rank0 observes no directory and chooses version_0 while rank1 sees
+            # the just-created version_0 and chooses version_1.
+            fixed_version = str(os.environ.get("ABFLOW_FIXED_VERSION", "") or "").strip()
+            if fixed_version:
+                try:
+                    self.version = int(fixed_version)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"ABFLOW_FIXED_VERSION must be a non-negative integer, got {fixed_version!r}"
+                    ) from exc
+                if self.version < 0:
+                    raise ValueError("ABFLOW_FIXED_VERSION must be non-negative")
+            else:
+                self.version = self._get_version()
+            self.config.save_dir = os.path.join(
+                self.config.save_dir, f'version_{self.version}'
+            )
             self.model_dir = os.path.join(self.config.save_dir, 'checkpoint')
 
         self.writer = None
@@ -94,7 +129,7 @@ class Trainer:
         self.patience = self.config.patience
         
         self.last_state_path = None
-        resume_checkpoint = str(getattr(self.config, "resume_checkpoint", "") or "").strip()
+        resume_checkpoint = _normalize_optional_path(getattr(self.config, "resume_checkpoint", ""))
         if resume_checkpoint and os.path.basename(resume_checkpoint).startswith("last_step"):
             self.last_state_path = resume_checkpoint
         self.ema = None
@@ -356,12 +391,63 @@ class Trainer:
 
         if local_rank != -1:
             print_log(f'Using data parallel, local rank {local_rank}, all {device_ids}')
+
+            def _env_bool(name, default=False):
+                raw = str(os.environ.get(name, 'on' if default else 'off')).strip().lower()
+                if raw in {'1', 'true', 'yes', 'y', 'on'}:
+                    return True
+                if raw in {'0', 'false', 'no', 'n', 'off'}:
+                    return False
+                raise ValueError(f'{name} must be on/off, got {raw!r}')
+
+            # R08-R10 use a genuinely dynamic parameter-use graph: the triangle
+            # representation is routed through local pair -> dynamic EGNN edges,
+            # while representation recycle is detached.  Therefore static_graph
+            # is not a valid DDP contract for these runs.  On torch 1.11, re-entrant
+            # activation checkpointing of the same shared triangle parameters also
+            # conflicts with normal DDP reduction.  The formal runtime is therefore:
+            #   triangle checkpoint OFF, static graph OFF, find_unused ON.
+            # Historical R05 runs keep their original false/false behavior because
+            # the launcher does not enable ABFLOW_DDP_FIND_UNUSED_PARAMETERS for them.
+            find_unused = _env_bool('ABFLOW_DDP_FIND_UNUSED_PARAMETERS', False)
+            static_graph = _env_bool('ABFLOW_DDP_STATIC_GRAPH', False)
+            triangle_ckpt = _env_bool('ABFLOW_MF_TRIANGLE_CHECKPOINT', False)
+
+            if static_graph and find_unused:
+                raise RuntimeError(
+                    'ABFLOW_DDP_STATIC_GRAPH=on is incompatible with the formal '
+                    'R08-R10 dynamic-used-parameter contract. Set static_graph=off.'
+                )
+            if triangle_ckpt and find_unused:
+                raise RuntimeError(
+                    'PyTorch 1.11 DDP cannot safely combine shared re-entrant triangle '
+                    'checkpointing with the dynamic R08-R10 graph. Set '
+                    'ABFLOW_MF_TRIANGLE_CHECKPOINT=off.'
+                )
+
             self.model = torch.nn.parallel.DistributedDataParallel(
                 self.model,
                 device_ids=[local_rank],
                 output_device=local_rank,
                 gradient_as_bucket_view=True,
+                find_unused_parameters=find_unused,
             )
+
+            if static_graph:
+                if not hasattr(self.model, '_set_static_graph'):
+                    raise RuntimeError(
+                        'ABFLOW_DDP_STATIC_GRAPH=on was requested, but this torch DDP '
+                        'implementation does not expose _set_static_graph().'
+                    )
+                self.model._set_static_graph()
+
+            if self._is_main_proc():
+                print_log(
+                    '[DDPGraphContract] '
+                    f'find_unused_parameters={str(find_unused).lower()} '
+                    f'static_graph={str(static_graph).lower()} '
+                    f'triangle_checkpoint={str(triangle_ckpt).lower()}'
+                )
         else:
             print_log(f'training on {device_ids}')
 

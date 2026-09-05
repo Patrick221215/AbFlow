@@ -30,7 +30,7 @@ from pathlib import Path
 from datetime import datetime
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from torch.utils.tensorboard import SummaryWriter
 
 from utils.logger import print_log
@@ -41,6 +41,130 @@ setup_seed(SEED)
 from data.dataset import E2EDataset, VOCAB
 from trainer import TrainConfig
 
+
+
+
+class CostBalancedDistributedSampler(Sampler):
+    """DDP sampler that preserves each global batch but balances memory cost.
+
+    Ordinary ``DistributedSampler`` shuffles globally and then takes every
+    ``world_size``-th sample per rank.  With variable-length antibody complexes
+    this can put the same expensive samples on local-rank 0 every epoch/run.
+    Here we keep the *same shuffled global sample multiset* and the same number
+    of samples per optimizer step, but repartition each global batch between
+    ranks using a deterministic cost proxy.  Therefore the DDP-averaged gradient
+    sees the same global batch; only device ownership changes.
+
+    For the R05×MF triangle-closed representation the dominant local attention
+    tensor scales as O(L_local^3), so the cost proxy is
+        whole_residue_count + local_token_count^3.
+    """
+    def __init__(self, dataset, global_batch_size, num_replicas, rank, shuffle=True, seed=0, local_antigen_k=18):
+        self.dataset = dataset
+        self.global_batch_size = int(global_batch_size)
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.local_antigen_k = int(local_antigen_k)
+        if self.num_replicas <= 0 or not (0 <= self.rank < self.num_replicas):
+            raise ValueError('invalid distributed sampler rank/world_size')
+        if self.global_batch_size <= 0:
+            raise ValueError('global_batch_size must be positive')
+        if self.global_batch_size % self.num_replicas != 0:
+            raise ValueError('global_batch_size must be divisible by world_size')
+        self.local_batch_size = self.global_batch_size // self.num_replicas
+        self.num_samples = (len(dataset) + self.num_replicas - 1) // self.num_replicas
+        self.total_size = self.num_samples * self.num_replicas
+        self.costs = self._estimate_costs()
+
+    def _estimate_costs(self):
+        # The formal RAbD runs use one in-memory processed part.  Avoid calling
+        # dataset.__getitem__ here because that would regenerate templates and
+        # reload proposal/surface data merely to schedule a batch.
+        if not (hasattr(self.dataset, 'data') and hasattr(self.dataset, 'idx_mapping')):
+            return [1.0] * len(self.dataset)
+        if hasattr(self.dataset, 'file_names') and len(self.dataset.file_names) != 1:
+            return [1.0] * len(self.dataset)
+        cdrs = self.dataset.cdr
+        if cdrs is None:
+            cdrs = []
+        elif isinstance(cdrs, str):
+            cdrs = [cdrs]
+        else:
+            cdrs = list(cdrs)
+        out = []
+        try:
+            for logical_idx in range(len(self.dataset)):
+                raw_idx = int(self.dataset.idx_mapping[logical_idx])
+                item = self.dataset.data[raw_idx]
+                h = item.get_heavy_chain()
+                l = item.get_light_chain()
+                if getattr(self.dataset, 'full_antigen', False):
+                    ag_obj = item.get_antigen()
+                    ag_n = 0
+                    for chain_name in ag_obj.get_chain_names():
+                        ag_n += len(ag_obj.get_chain(chain_name))
+                else:
+                    ag_n = len(item.get_epitope())
+                if cdrs:
+                    design_n = 0
+                    for cdr in cdrs:
+                        a, b = item.get_cdr_pos(cdr)
+                        design_n += int(b - a + 1)
+                else:
+                    design_n = int(len(h) + len(l))
+                whole_n = int(ag_n + len(h) + len(l) + 3)
+                local_n = int(design_n + min(ag_n, self.local_antigen_k))
+                out.append(float(whole_n + local_n ** 3))
+            return out
+        except Exception as exc:
+            print_log(f'[DDPBatchBalance][WARN] cost estimation fallback to uniform: {exc}', level='WARN')
+            return [1.0] * len(self.dataset)
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        n = len(self.dataset)
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            indices = torch.randperm(n, generator=g).tolist()
+        else:
+            indices = list(range(n))
+        if len(indices) < self.total_size:
+            padding = self.total_size - len(indices)
+            indices += (indices * ((padding + len(indices) - 1) // len(indices)))[:padding]
+        else:
+            indices = indices[:self.total_size]
+
+        rank_indices = []
+        for start in range(0, self.total_size, self.global_batch_size):
+            global_batch = indices[start:start + self.global_batch_size]
+            if not global_batch:
+                continue
+            if len(global_batch) % self.num_replicas != 0:
+                raise RuntimeError('balanced DDP final batch is not divisible by world_size')
+            target = len(global_batch) // self.num_replicas
+            buckets = [[] for _ in range(self.num_replicas)]
+            loads = [0.0 for _ in range(self.num_replicas)]
+            # Largest-first greedy partition with an exact sample-count cap.
+            for idx in sorted(global_batch, key=lambda x: self.costs[x], reverse=True):
+                candidates = [r for r in range(self.num_replicas) if len(buckets[r]) < target]
+                r = min(candidates, key=lambda rr: (loads[rr], rr))
+                buckets[r].append(idx)
+                loads[r] += self.costs[idx]
+            rank_indices.extend(buckets[self.rank])
+        if len(rank_indices) != self.num_samples:
+            raise RuntimeError(
+                f'balanced sampler produced {len(rank_indices)} samples, expected {self.num_samples}'
+            )
+        return iter(rank_indices)
+
+    def __len__(self):
+        return self.num_samples
 
 # ============================================================
 # 0. Recording helpers
@@ -685,9 +809,24 @@ def main(args):
     config.add_parameter(step_per_epoch=step_per_epoch)
 
     if is_ddp:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_set, shuffle=args.shuffle)
+        global_batch_size = int(args.batch_size)
+        use_cost_balance = str(os.environ.get('ABFLOW_DDP_COST_BALANCED', 'off')).lower() in {'1','true','yes','y','on'}
+        if use_cost_balance:
+            local_antigen_k = int(os.environ.get('ABFLOW_MF_LOCAL_ANTIGEN_K', os.environ.get('ABFLOW_MF_PAIR_ANTIGEN_K', '18')))
+            train_sampler = CostBalancedDistributedSampler(
+                train_set, global_batch_size=global_batch_size,
+                num_replicas=world_size, rank=rank, shuffle=args.shuffle,
+                seed=0, local_antigen_k=local_antigen_k,
+            )
+            if _is_main_rank(args.local_rank):
+                print_log(
+                    '[DDPBatchBalance] enabled: preserves each shuffled global batch; '
+                    'rank ownership is balanced by whole_residues + local_tokens^3'
+                )
+        else:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(train_set, shuffle=args.shuffle)
         # Keep old AbFlow behavior: input batch_size is global, split across GPUs.
-        args.batch_size = max(1, int(args.batch_size / max(1, world_size)))
+        args.batch_size = max(1, int(global_batch_size / max(1, world_size)))
         # TrainConfig was already built from original args; keep it consistent.
         config.batch_size = args.batch_size
         if _is_main_rank(args.local_rank):
