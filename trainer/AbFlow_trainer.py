@@ -102,7 +102,8 @@ class AbFlowTrainer(Trainer):
         # We keep only the formal top-level objective components so the canonical
         # epoch table stays compact and directly comparable across R08/R09/R10.
         self._train_component_names = (
-            "loss", "seq", "structure", "interface", "edge", "distogram"
+            "loss", "seq", "structure", "interface", "edge",
+            "distogram", "smooth_lddt"
         )
         self._epoch_train_acc_epoch = -1
         self._epoch_train_sums = {name: 0.0 for name in self._train_component_names}
@@ -682,6 +683,15 @@ class AbFlowTrainer(Trainer):
             "loss_interface": m("Dock/SPLoss/Validation"),
             "loss_edge": m("Dock/EDLoss/Validation"),
             "mf_distogram_loss": m("DTM/mf_distogram_loss/Validation"),
+            "mf_smooth_lddt_loss": m("DTM/mf_smooth_lddt_loss/Validation"),
+            "mf_smooth_lddt_intra_loss": m("AbFlowDiag/mf_smooth_lddt_intra_loss/Validation"),
+            "mf_smooth_lddt_scaffold_loss": m("AbFlowDiag/mf_smooth_lddt_scaffold_loss/Validation"),
+            "mf_smooth_lddt_antigen_loss": m("AbFlowDiag/mf_smooth_lddt_antigen_loss/Validation"),
+            "mf_smooth_lddt_intra_pairs": m("AbFlowDiag/mf_smooth_lddt_intra_pairs/Validation"),
+            "mf_smooth_lddt_scaffold_pairs": m("AbFlowDiag/mf_smooth_lddt_scaffold_pairs/Validation"),
+            "mf_smooth_lddt_antigen_pairs": m("AbFlowDiag/mf_smooth_lddt_antigen_pairs/Validation"),
+            "mf_smooth_lddt_perfect_floor": m("AbFlowDiag/mf_smooth_lddt_perfect_floor/Validation"),
+            "mf_smooth_lddt_excess": m("AbFlowDiag/mf_smooth_lddt_excess/Validation"),
             "h3ca_raw_r0": m("AbFlowDiag/val_proxy_round0_h3_ca_rmsd/Validation"),
             "h3ca_raw_r1": m("AbFlowDiag/val_proxy_round1_h3_ca_rmsd/Validation"),
             "h3ca_raw_r2": m("AbFlowDiag/val_proxy_round2_h3_ca_rmsd/Validation"),
@@ -711,13 +721,15 @@ class AbFlowTrainer(Trainer):
             "mf_allatom_pair_rbf_rms": m("AbFlowDiag/mf_allatom_pair_rbf_rms/Validation"),
             "mf_opm_update_rms": m("AbFlowDiag/mf_opm_update_rms/Validation"),
             "mf_triangle_update_rms": m("AbFlowDiag/mf_triangle_update_rms/Validation"),
+            "mf_pair_atom_update_rms": m("AbFlowDiag/mf_pair_atom_update_rms/Validation"),
+            "mf_pair_atom_residual_rms": m("AbFlowDiag/mf_pair_atom_residual_rms/Validation"),
+            "mf_pair_atom_adapter_weight_rms": m("AbFlowDiag/mf_pair_atom_adapter_weight_rms/Validation"),
             "mf_base_residual_rms": m("AbFlowDiag/mf_base_residual_rms/Validation"),
             "mf_seq_residual_rms": m("AbFlowDiag/mf_seq_residual_rms/Validation"),
             "mf_single_round_delta_rms": m("AbFlowDiag/mf_single_round_delta_rms/Validation"),
             "mf_pair_round_delta_rms": m("AbFlowDiag/mf_pair_round_delta_rms/Validation"),
             "mf_base_adapter_weight_rms": m("AbFlowDiag/mf_base_adapter_weight_rms/Validation"),
             "mf_seq_adapter_weight_rms": m("AbFlowDiag/mf_seq_adapter_weight_rms/Validation"),
-            "mf_clean_sc_weight_rms": m("AbFlowDiag/mf_clean_sc_weight_rms/Validation"),
             "t_mean": m("AbFlowDiag/t_mean/Validation"),
             "t_min": m("AbFlowDiag/t_min/Validation"),
             "t_max": m("AbFlowDiag/t_max/Validation"),
@@ -726,7 +738,7 @@ class AbFlowTrainer(Trainer):
             for name in (
                 "mf_single_rms", "mf_pair_rms", "mf_base_residual_rms",
                 "mf_seq_residual_rms", "mf_single_round_delta_rms",
-                "mf_pair_round_delta_rms", "mf_clean_sc_weight_rms",
+                "mf_pair_round_delta_rms",
             ):
                 summary[f"round{ridx}_{name}"] = m(
                     f"AbFlowDiag/round{ridx}_{name}/Validation"
@@ -794,14 +806,25 @@ class AbFlowTrainer(Trainer):
             f"atom_pair={self._fmt(summary.get('mf_allatom_pair_rbf_rms'), 5)} "
             f"opm={self._fmt(summary.get('mf_opm_update_rms'), 6)} "
             f"triangle={self._fmt(summary.get('mf_triangle_update_rms'), 6)} "
+            f"pair_atom={self._fmt(summary.get('mf_pair_atom_update_rms'), 6)} "
+            f"pair_atom_res={self._fmt(summary.get('mf_pair_atom_residual_rms'), 6)} "
+            f"pair_atom_w={self._fmt(summary.get('mf_pair_atom_adapter_weight_rms'), 6)} "
             f"base_res={self._fmt(summary.get('mf_base_residual_rms'), 6)} "
             f"seq_res={self._fmt(summary.get('mf_seq_residual_rms'), 6)} "
             f"single_delta={self._fmt(summary.get('mf_single_round_delta_rms'), 6)} "
             f"pair_delta={self._fmt(summary.get('mf_pair_round_delta_rms'), 6)} "
             f"base_w={self._fmt(summary.get('mf_base_adapter_weight_rms'), 6)} "
             f"seq_w={self._fmt(summary.get('mf_seq_adapter_weight_rms'), 6)} "
-            f"clean_sc_w={self._fmt(summary.get('mf_clean_sc_weight_rms'), 6)} "
-            f"disto={self._fmt(summary.get('mf_distogram_loss'), 5)}"
+            f"disto={self._fmt(summary.get('mf_distogram_loss'), 5)} "
+            f"slddt={self._fmt(summary.get('mf_smooth_lddt_loss'), 5)} "
+            f"slddt_intra={self._fmt(summary.get('mf_smooth_lddt_intra_loss'), 5)} "
+            f"slddt_scaf={self._fmt(summary.get('mf_smooth_lddt_scaffold_loss'), 5)} "
+            f"slddt_ag={self._fmt(summary.get('mf_smooth_lddt_antigen_loss'), 5)} "
+            f"slddt_pairs=({self._fmt(summary.get('mf_smooth_lddt_intra_pairs'), 0)},"
+            f"{self._fmt(summary.get('mf_smooth_lddt_scaffold_pairs'), 0)},"
+            f"{self._fmt(summary.get('mf_smooth_lddt_antigen_pairs'), 0)}) "
+            f"slddt_floor={self._fmt(summary.get('mf_smooth_lddt_perfect_floor'), 5)} "
+            f"slddt_excess={self._fmt(summary.get('mf_smooth_lddt_excess'), 5)}"
         )
         bins = []
         for bidx in range(5):
@@ -827,10 +850,13 @@ class AbFlowTrainer(Trainer):
             f"|gStruct|={self._fmte(g('grad_probe_norm_structure'), 3)} "
             f"|gEdge|={self._fmte(g('grad_probe_norm_edge'), 3)} "
             f"|gD|={self._fmte(g('grad_probe_norm_distogram'), 3)} "
+            f"|gL|={self._fmte(g('grad_probe_norm_smooth_lddt'), 3)} "
             f"cos(T,S)={self._fmt(g('grad_probe_cos_endpoint_seq'), 3)} "
             f"cos(T,D)={self._fmt(g('grad_probe_cos_endpoint_distogram'), 3)} "
             f"cos(S,D)={self._fmt(g('grad_probe_cos_seq_distogram'), 3)} "
-            f"cos(Struct,D)={self._fmt(g('grad_probe_cos_structure_distogram'), 3)}"
+            f"cos(Struct,D)={self._fmt(g('grad_probe_cos_structure_distogram'), 3)} "
+            f"cos(T,L)={self._fmt(g('grad_probe_cos_endpoint_smooth_lddt'), 3)} "
+            f"cos(Struct,L)={self._fmt(g('grad_probe_cos_structure_smooth_lddt'), 3)}"
         )
 
 
@@ -878,9 +904,9 @@ class AbFlowTrainer(Trainer):
         fields = [
             "epoch",
             "train_loss", "train_seq", "train_structure", "train_interface",
-            "train_edge", "train_distogram",
+            "train_edge", "train_distogram", "train_smooth_lddt",
             "val_loss", "val_seq", "val_structure", "val_interface",
-            "val_edge", "val_distogram",
+            "val_edge", "val_distogram", "val_smooth_lddt",
             "test_AAR", "test_CAAR", "test_H3raw", "test_H3aligned",
             "test_TM", "test_lDDT", "test_DockQ",
             "best_val_epoch", "best_val_loss",
@@ -949,12 +975,14 @@ class AbFlowTrainer(Trainer):
             "train_interface": train_summary.get("interface", float("nan")),
             "train_edge": train_summary.get("edge", float("nan")),
             "train_distogram": train_summary.get("distogram", float("nan")),
+            "train_smooth_lddt": train_summary.get("smooth_lddt", float("nan")),
             "val_loss": validation_summary.get("validation_metric", float("nan")),
             "val_seq": validation_summary.get("loss_seq", float("nan")),
             "val_structure": validation_summary.get("loss_structure", float("nan")),
             "val_interface": validation_summary.get("loss_interface", float("nan")),
             "val_edge": validation_summary.get("loss_edge", float("nan")),
             "val_distogram": validation_summary.get("mf_distogram_loss", float("nan")),
+            "val_smooth_lddt": validation_summary.get("mf_smooth_lddt_loss", float("nan")),
         }
         for key, value in current_test.items():
             row[f"test_{key}"] = value
@@ -984,13 +1012,15 @@ class AbFlowTrainer(Trainer):
                 f"struct={self._fmt(row['train_structure'], 5)} "
                 f"interface={self._fmt(row['train_interface'], 5)} "
                 f"edge={self._fmt(row['train_edge'], 5)} "
-                f"disto={self._fmt(row['train_distogram'], 5)} | "
+                f"disto={self._fmt(row['train_distogram'], 5)} "
+                f"slddt={self._fmt(row['train_smooth_lddt'], 5)} | "
                 f"val={self._fmt(row['val_loss'], 5)} "
                 f"vseq={self._fmt(row['val_seq'], 5)} "
                 f"vstruct={self._fmt(row['val_structure'], 5)} "
                 f"vinterface={self._fmt(row['val_interface'], 5)} "
                 f"vedge={self._fmt(row['val_edge'], 5)} "
-                f"vdisto={self._fmt(row['val_distogram'], 5)} | "
+                f"vdisto={self._fmt(row['val_distogram'], 5)} "
+                f"vslddt={self._fmt(row['val_smooth_lddt'], 5)} | "
                 f"AAR={self._fmt(row['test_AAR'], 5)} "
                 f"CAAR={self._fmt(row['test_CAAR'], 5)} "
                 f"H3raw={self._fmt(row['test_H3raw'], 5, 'A')} "
@@ -1123,5 +1153,8 @@ class AbFlowTrainer(Trainer):
             self._accumulate_train_component("edge", ed_loss)
             self._accumulate_train_component(
                 "distogram", scorefm_losses.get("mf_distogram_loss")
+            )
+            self._accumulate_train_component(
+                "smooth_lddt", scorefm_losses.get("mf_smooth_lddt_loss")
             )
         return loss

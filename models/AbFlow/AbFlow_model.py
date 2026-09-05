@@ -24,8 +24,8 @@ from .abflow_r3_matcher import AbFlowR3Matcher
 
 
 # v101 support-geometry optimization on the validated U02/F01 physical parent.
-# R05MF_SEMANTIC_CLOSURE_V161: atom-head correctness + slot-resolved atom14 pair geometry +
-# post-projection symmetric distogram + direct pair-conditioned R05 EGNN coordinate mechanics.
+# R05MF_CLOSED_CORE_V164: no-MSA closed single/pair operator + corrected atom-head algebra +
+# slot-resolved atom14 pair geometry + direct final-pair -> R05 EGNN mechanics + design-region factored smooth-lDDT.
 
 
 def _env_str(name, default):
@@ -142,6 +142,120 @@ class _ResidueAtomAttentionBlock(nn.Module):
         return x * atom_mask.unsqueeze(-1).to(x.dtype)
 
 
+class _PairConditionedAtomAttentionBlock(nn.Module):
+    """MF/AF3-inspired pair-conditioned atom refinement on the local universe.
+
+    MF's AtomAttentionEncoder injects token-pair z into atom-pair state before an
+    AtomTransformer. AbFlow does not expose the same Boltz atom-feature contract,
+    so copying that module verbatim would be a semantic mismatch. This task-scale
+    adaptation keeps the transferable part: final token-pair z_ij plus invariant
+    current atom distance define atom-attention bias. It refines representation
+    only; R05 EGNN remains the sole coordinate engine.
+    """
+    def __init__(self, atom_s, pair_dim, num_heads=4, rbf_bins=16, query_chunk=64):
+        super().__init__()
+        atom_s, num_heads = int(atom_s), int(num_heads)
+        if atom_s % num_heads != 0:
+            raise ValueError("pair-conditioned atom_s must be divisible by heads")
+        self.atom_s = atom_s
+        self.pair_dim = int(pair_dim)
+        self.num_heads = num_heads
+        self.head_dim = atom_s // num_heads
+        self.query_chunk = max(1, int(query_chunk))
+        self.norm_atom = nn.LayerNorm(atom_s)
+        self.q = nn.Linear(atom_s, atom_s, bias=False)
+        self.k = nn.Linear(atom_s, atom_s, bias=False)
+        self.v = nn.Linear(atom_s, atom_s, bias=False)
+        self.g = nn.Linear(atom_s, atom_s, bias=False)
+        self.o = nn.Linear(atom_s, atom_s, bias=False)
+        self.norm_pair = nn.LayerNorm(pair_dim)
+        self.pair_bias = nn.Linear(pair_dim, num_heads, bias=False)
+        self.distance_bias = nn.Linear(int(rbf_bins), num_heads, bias=False)
+        self.norm_ff = nn.LayerNorm(atom_s)
+        self.ff1 = nn.Linear(atom_s, 4 * atom_s, bias=False)
+        self.ff2 = nn.Linear(atom_s, 4 * atom_s, bias=False)
+        self.ff3 = nn.Linear(4 * atom_s, atom_s, bias=False)
+
+    def forward(self, atom_hidden, atom_mask, local_X, pair_state, pair_edges,
+                local_batch_id, rbf_fn):
+        if atom_hidden.numel() == 0 or pair_edges.numel() == 0:
+            return atom_hidden
+        out_all = atom_hidden.clone()
+        pair_graph = local_batch_id[pair_edges[0]]
+        # ``pair_edges`` is intentionally defined on a *bounded subset* of the
+        # full local graph: every design residue plus K proposal-nearest antigen
+        # residues.  The full ``local_batch_id`` graph can therefore contain many
+        # more antigen residues than the triangle-closed pair universe.  The v163
+        # implementation incorrectly used that full-graph residue count here,
+        # e.g. comparing a valid 44^2 pair matrix against 74^2.
+        #
+        # Recover the exact compact token order from the row-major dense pair
+        # matrix built by ``_build_bounded_mf_pair_edges``.  This preserves the
+        # same node order used by ``pair_state.reshape(L,L,C)`` and refines only
+        # those atoms for which a z_ij state actually exists.  Non-selected local
+        # antigen residues remain unchanged; no pair-universe expansion or new
+        # coordinate authority is introduced.
+        for gid in torch.unique(pair_graph).tolist():
+            edge_mask = pair_graph == int(gid)
+            z_flat = pair_state[edge_mask]
+            edge_flat = pair_edges[:, edge_mask]
+            pair_count = int(z_flat.shape[0])
+            if pair_count <= 0:
+                continue
+            n_pair = int(math.isqrt(pair_count))
+            if n_pair * n_pair != pair_count:
+                raise RuntimeError(
+                    "Pair-conditioned atom refiner requires a square triangle-closed "
+                    f"pair matrix: graph={gid} pair_count={pair_count}"
+                )
+
+            # Builder contract (row-major): for nodes [u0,...,uL-1], the first
+            # source row is (u0,u0...u0) and its destinations are exactly the
+            # compact node order [u0,...,uL-1].
+            pair_nodes = edge_flat[1, :n_pair]
+            if pair_nodes.numel() != n_pair:
+                raise RuntimeError(
+                    f"Pair-conditioned atom node recovery failed: graph={gid} "
+                    f"nodes={pair_nodes.numel()} expected={n_pair}"
+                )
+
+            z = z_flat.reshape(n_pair, n_pair, self.pair_dim)
+            z_bias = self.pair_bias(self.norm_pair(z)).float()  # [L,L,H]
+            x = atom_hidden[pair_nodes]
+            m = atom_mask[pair_nodes].bool()
+            coords = local_X[pair_nodes]
+            n_atom = int(x.shape[1])
+            flat_x = x.reshape(n_pair * n_atom, self.atom_s)
+            flat_m = m.reshape(-1)
+            flat_coords = coords.reshape(n_pair * n_atom, 3)
+            token_idx = torch.arange(n_pair, device=x.device).repeat_interleave(n_atom)
+            y = self.norm_atom(flat_x)
+            q = self.q(y).view(-1, self.num_heads, self.head_dim)
+            k = self.k(y).view(-1, self.num_heads, self.head_dim)
+            v = self.v(y).view(-1, self.num_heads, self.head_dim)
+            atom_out = torch.zeros_like(q)
+            for q0 in range(0, q.shape[0], self.query_chunk):
+                q1 = min(q0 + self.query_chunk, q.shape[0])
+                logits = torch.einsum(
+                    'qhd,khd->hqk', q[q0:q1].float(), k.float()
+                ) / math.sqrt(float(self.head_dim))
+                tq = token_idx[q0:q1]
+                pair_b = z_bias[tq[:, None], token_idx[None, :], :].permute(2, 0, 1)
+                d = torch.cdist(flat_coords[q0:q1].float(), flat_coords.float()).to(flat_coords.dtype)
+                geom_b = self.distance_bias(rbf_fn(d)).permute(2, 0, 1).float()
+                logits = logits + pair_b + geom_b
+                logits = logits.masked_fill(~flat_m[None, None, :], -1.0e4)
+                attn = torch.softmax(logits, dim=-1).to(v.dtype)
+                atom_out[q0:q1] = torch.einsum('hqk,khd->qhd', attn, v)
+            atom_out = atom_out.reshape(-1, self.atom_s)
+            flat_x = flat_x + self.o(torch.sigmoid(self.g(y)) * atom_out)
+            ff = self.norm_ff(flat_x)
+            flat_x = flat_x + self.ff3(F.silu(self.ff1(ff)) * self.ff2(ff))
+            flat_x = flat_x * flat_m.unsqueeze(-1).to(flat_x.dtype)
+            out_all[pair_nodes] = flat_x.reshape(n_pair, n_atom, self.atom_s)
+        return out_all
+
+
 class _TriangleMultiplication(nn.Module):
     """Exact ABX/MF-style triangle multiplication on one dense local pair matrix.
 
@@ -242,10 +356,12 @@ class MFRepresentationEnrichment(nn.Module):
         single_dim=128, pair_dim=64, num_blocks=2, num_heads=4,
         atom_s=128, atom_depth=3, atom_heads=4, rbf_bins=16, time_dim=16,
         coordinate_scale=0.1, enable_distogram=False, distogram_bins=64,
-        distogram_min=2.0, distogram_max=22.0, enable_clean_sc=False,
+        distogram_min=2.0, distogram_max=22.0,
         relpos_dim=32, opm_dim=64, enable_allatom_pair=True,
-        allatom_chunk=512, detach_recycle=True, triangle_heads=4,
+        allatom_chunk=512, detach_state_carry=True, triangle_heads=4,
         triangle_hidden=128, triangle_checkpoint=True,
+        enable_pair_atom_refiner=False, pair_atom_depth=1,
+        pair_atom_heads=4, pair_atom_query_chunk=64,
     ):
         super().__init__()
         self.embed_dim = int(embed_dim)
@@ -263,7 +379,6 @@ class MFRepresentationEnrichment(nn.Module):
         self.atom_heads = int(atom_heads)
         self.coordinate_scale = float(coordinate_scale)
         self.enable_distogram = bool(enable_distogram)
-        self.enable_clean_sc = bool(enable_clean_sc)
         self.distogram_bins = int(distogram_bins)
         self.distogram_min = float(distogram_min)
         self.distogram_max = float(distogram_max)
@@ -271,10 +386,14 @@ class MFRepresentationEnrichment(nn.Module):
         self.opm_dim = int(opm_dim)
         self.enable_allatom_pair = bool(enable_allatom_pair)
         self.allatom_chunk = max(1, int(allatom_chunk))
-        self.detach_recycle = bool(detach_recycle)
+        self.detach_state_carry = bool(detach_state_carry)
         self.triangle_heads = int(triangle_heads)
         self.triangle_hidden = int(triangle_hidden)
         self.triangle_checkpoint = bool(triangle_checkpoint)
+        self.enable_pair_atom_refiner = bool(enable_pair_atom_refiner)
+        self.pair_atom_depth = int(pair_atom_depth)
+        self.pair_atom_heads = int(pair_atom_heads)
+        self.pair_atom_query_chunk = max(1, int(pair_atom_query_chunk))
 
         if self.single_dim <= 0 or self.pair_dim <= 0:
             raise ValueError("single_dim and pair_dim must be positive")
@@ -304,12 +423,25 @@ class MFRepresentationEnrichment(nn.Module):
             for _ in range(self.atom_depth)
         ])
         self.atom_to_single = nn.Linear(self.atom_s, self.single_dim, bias=False)
+        self.pair_atom_blocks = nn.ModuleList([
+            _PairConditionedAtomAttentionBlock(
+                self.atom_s, self.pair_dim, self.pair_atom_heads,
+                rbf_bins=self.rbf_bins, query_chunk=self.pair_atom_query_chunk,
+            )
+            for _ in range(self.pair_atom_depth)
+        ]) if self.enable_pair_atom_refiner else nn.ModuleList()
+        self.pair_atom_to_single = (
+            nn.Linear(self.atom_s, self.single_dim, bias=False)
+            if self.enable_pair_atom_refiner else None
+        )
+        if self.pair_atom_to_single is not None:
+            nn.init.zeros_(self.pair_atom_to_single.weight)
         self.role_single = nn.Embedding(2, self.single_dim)
         self.proposal_single = nn.Linear(
             self.rbf_bins + 1, self.single_dim, bias=False
         )
-        self.single_recycle_norm = nn.LayerNorm(self.single_dim)
-        self.single_recycle = nn.Linear(self.single_dim, self.single_dim, bias=False)
+        self.single_carry_norm = nn.LayerNorm(self.single_dim)
+        self.single_carry = nn.Linear(self.single_dim, self.single_dim, bias=False)
 
         pair_single_dim = min(32, self.single_dim)
         self.single_to_pair = nn.Linear(
@@ -332,8 +464,8 @@ class MFRepresentationEnrichment(nn.Module):
             nn.SiLU(),
             nn.Linear(self.pair_dim, self.pair_dim),
         )
-        self.pair_recycle_norm = nn.LayerNorm(self.pair_dim)
-        self.pair_recycle = nn.Linear(self.pair_dim, self.pair_dim, bias=False)
+        self.pair_carry_norm = nn.LayerNorm(self.pair_dim)
+        self.pair_carry = nn.Linear(self.pair_dim, self.pair_dim, bias=False)
 
         # AbX PairEmbedding keeps the atom14 x atom14 slot identity instead of
         # mean-pooling all atom-pair distances into one histogram.  We retain that
@@ -362,9 +494,10 @@ class MFRepresentationEnrichment(nn.Module):
         self.pair_bias = nn.ModuleList()
         self.single_o = nn.ModuleList()
         self.single_updates = nn.ModuleList()
-        # ABX Seqformer and MFDesign both explicitly communicate single->pair.
-        # On the bounded sparse pair universe we can reproduce that semantic
-        # without densifying the graph: the ABX outer-product-mean algebra is
+        # AbX Seqformer supplies explicit single->pair communication through OPM.
+        # MF keeps OPM in its MSA stack rather than in Pairformer; because this
+        # project deliberately has no MSA, we retain AbX OPM before the MF-style
+        # pair-first Pairformer ordering. On the bounded pair universe the OPM
         # evaluated only for the stored (i,j) pairs.  This is exact on those
         # edges and keeps O(E), not O(N^2), memory.
         self.opm_norms = nn.ModuleList()
@@ -437,13 +570,6 @@ class MFRepresentationEnrichment(nn.Module):
             torch.zeros(self.num_classes, self.single_dim)
         )
 
-        if self.enable_clean_sc:
-            self.clean_sc_weight = nn.Parameter(
-                torch.zeros(self.pair_dim, self.rbf_bins)
-            )
-        else:
-            self.register_parameter("clean_sc_weight", None)
-
         if self.enable_distogram:
             self.distogram_norm = nn.LayerNorm(self.pair_dim)
             self.distogram_head = nn.Linear(
@@ -515,7 +641,7 @@ class MFRepresentationEnrichment(nn.Module):
             atom_hidden = block(atom_hidden, atom_mask)
         denom = atom_mask.to(atom_hidden.dtype).sum(dim=1, keepdim=True).clamp_min(1.0)
         pooled = atom_hidden.sum(dim=1) / denom
-        return self.atom_to_single(pooled)
+        return self.atom_to_single(pooled), atom_hidden, atom_mask
 
     def _pair_geometry_features(self, local_X, pair_edges):
         if pair_edges.numel() == 0:
@@ -605,29 +731,6 @@ class MFRepresentationEnrichment(nn.Module):
             proposal_local[local_is_ab] = proposal_interface_X.detach().to(local_X)
         return self._pair_geometry_features(proposal_local, pair_edges)
 
-    def _clean_sc_features(
-        self, local_X, local_is_ab, pair_edges, previous_clean_interface_X,
-        base_interface_X,
-    ):
-        if (
-            not self.enable_clean_sc
-            or previous_clean_interface_X is None
-            or base_interface_X is None
-            or pair_edges.numel() == 0
-        ):
-            return None
-        clean_local = local_X.detach().clone()
-        base_local = local_X.detach().clone()
-        clean_local[local_is_ab] = previous_clean_interface_X.detach().to(
-            device=clean_local.device, dtype=clean_local.dtype
-        )
-        base_local[local_is_ab] = base_interface_X.detach().to(
-            device=base_local.device, dtype=base_local.dtype
-        )
-        clean_rbf = self._pair_geometry_features(clean_local, pair_edges)
-        base_rbf = self._pair_geometry_features(base_local, pair_edges)
-        return clean_rbf - base_rbf
-
     def _triangle_reasoning(self, pair_state, pair_edges, local_batch_id, block_idx):
         """Apply exact dense triangle algebra independently inside each local graph.
 
@@ -687,15 +790,15 @@ class MFRepresentationEnrichment(nn.Module):
         self, H0, local_X, atom_embeddings, atom_weights, local_mask,
         local_is_ab, local_segment_ids, local_batch_id, residue_pos, pair_edges,
         flow_t=None, previous_single=None, previous_pair=None,
-        previous_clean_interface_X=None, base_interface_X=None,
         proposal_interface_X=None,
     ):
         local_H = H0[local_mask]
         local_atom_embeddings = atom_embeddings[local_mask]
         local_atom_weights = atom_weights[local_mask]
-        single = self.single_from_h(local_H) + self._atom_to_single(
+        atom_single, atom_hidden, atom_mask = self._atom_to_single(
             local_X, local_atom_embeddings, local_atom_weights
         )
+        single = self.single_from_h(local_H) + atom_single
         role_idx = (~local_is_ab).long()  # 0=H3/Ab, 1=antigen
         single = single + self.role_single(role_idx)
         single = single + self.proposal_single(
@@ -713,14 +816,14 @@ class MFRepresentationEnrichment(nn.Module):
         if previous_single is not None:
             if previous_single.shape != single.shape:
                 raise RuntimeError(
-                    "MF single recycle shape changed across R05 rounds: "
+                    "MF single state-carry shape changed across R05 rounds: "
                     f"{tuple(previous_single.shape)} vs {tuple(single.shape)}"
                 )
             previous_single_in = (
-                previous_single.detach() if self.detach_recycle else previous_single
+                previous_single.detach() if self.detach_state_carry else previous_single
             )
-            single = single + self.single_recycle(
-                self.single_recycle_norm(previous_single_in)
+            single = single + self.single_carry(
+                self.single_carry_norm(previous_single_in)
             )
 
         n_local = int(local_H.shape[0])
@@ -791,24 +894,14 @@ class MFRepresentationEnrichment(nn.Module):
             if previous_pair is not None:
                 if previous_pair.shape != pair_state.shape:
                     raise RuntimeError(
-                        "MF pair recycle shape changed across R05 rounds: "
+                        "MF pair state-carry shape changed across R05 rounds: "
                         f"{tuple(previous_pair.shape)} vs {tuple(pair_state.shape)}"
                     )
                 previous_pair_in = (
-                    previous_pair.detach() if self.detach_recycle else previous_pair
+                    previous_pair.detach() if self.detach_state_carry else previous_pair
                 )
-                pair_state = pair_state + self.pair_recycle(
-                    self.pair_recycle_norm(previous_pair_in)
-                )
-
-            clean_sc = self._clean_sc_features(
-                local_X, local_is_ab, pair_edges,
-                previous_clean_interface_X, base_interface_X,
-            )
-            if clean_sc is not None:
-                pair_state = pair_state + torch.nn.functional.linear(
-                    clean_sc.to(pair_state.dtype),
-                    self.clean_sc_weight.to(pair_state.dtype),
+                pair_state = pair_state + self.pair_carry(
+                    self.pair_carry_norm(previous_pair_in)
                 )
 
             opm_rms_terms = []
@@ -823,7 +916,30 @@ class MFRepresentationEnrichment(nn.Module):
                 self.pair_bias, self.single_o, self.single_updates,
                 self.opm_norms, self.opm_left, self.opm_right, self.opm_out
             )):
-                # Shared MF/ABX semantic: single attention is conditioned by z.
+                # No-MSA closed representation operator.  AbX contributes the
+                # explicit single->pair OPM communication; MF Pairformer contributes
+                # the pair-first ordering in which triangle-refined z is consumed by
+                # the single stream in the SAME block.  This closes
+                #     single -> pair -> relational reasoning -> single
+                # without inventing a nested recycling loop.
+                opm_s = opm_norm(single)
+                left = opm_left(opm_s)
+                right = opm_right(opm_s)
+                opm_feat = torch.cat([
+                    left[row] * right[col], left[row] - right[col]
+                ], dim=-1)
+                opm_delta = opm_out(opm_feat)
+                pair_state = pair_state + opm_delta
+
+                # Pair reasoning is exact on the bounded triangle-closed universe.
+                pair_state, tri_rms = self._triangle_reasoning(
+                    pair_state, pair_edges, local_batch_id, block_idx
+                )
+                pair_state = pair_state + pair_update(pair_state)
+
+                # MF Pairformer ordering: the FINAL refined pair state is now read
+                # back into single through pair-biased attention.  This is the
+                # missing same-round z->s closure in the former AbX-order graft.
                 s_norm = norm_s(single)
                 q = q_proj(s_norm).view(n_local, self.num_heads, self.head_dim)
                 k = k_proj(s_norm).view(n_local, self.num_heads, self.head_dim)
@@ -840,30 +956,29 @@ class MFRepresentationEnrichment(nn.Module):
                 single = single + o_proj(gate * agg)
                 single = single + single_update(single)
 
-                # ABX Seqformer-style single->pair communication.  Their OPM
-                # implementation uses [left_i * right_j, left_i - right_j].
-                # Evaluating it only on the stable edges preserves the algebra
-                # while avoiding dense LxL pair storage.
-                opm_s = opm_norm(single)
-                left = opm_left(opm_s)
-                right = opm_right(opm_s)
-                opm_feat = torch.cat([
-                    left[row] * right[col], left[row] - right[col]
-                ], dim=-1)
-                opm_delta = opm_out(opm_feat)
-                pair_state = pair_state + opm_delta
-
-                # Exact ABX/MF triangle algebra is now valid because the local
-                # proposal-anchored token universe is dense/triangle-closed.
-                pair_before_triangle = pair_state
-                pair_state, tri_rms = self._triangle_reasoning(
-                    pair_state, pair_edges, local_batch_id, block_idx
-                )
-                pair_state = pair_state + pair_update(pair_state)
                 opm_rms_terms.append(torch.sqrt(
                     opm_delta.float().pow(2).mean() + 1.0e-12
                 ))
                 triangle_rms_terms.append(tri_rms)
+
+        pair_atom_residual = single.new_zeros(single.shape)
+        pair_atom_update_rms = single.new_tensor(0.0)
+        if self.enable_pair_atom_refiner and pair_edges.numel():
+            atom_before = atom_hidden
+            for atom_block in self.pair_atom_blocks:
+                atom_hidden = atom_block(
+                    atom_hidden, atom_mask, local_X, pair_state, pair_edges,
+                    local_batch_id, self._rbf,
+                )
+            atom_denom = atom_mask.to(atom_hidden.dtype).sum(
+                dim=1, keepdim=True
+            ).clamp_min(1.0)
+            atom_pooled = atom_hidden.sum(dim=1) / atom_denom
+            pair_atom_residual = self.pair_atom_to_single(atom_pooled)
+            single = single + pair_atom_residual
+            pair_atom_update_rms = torch.sqrt(
+                (atom_hidden - atom_before).float().pow(2).mean() + 1.0e-12
+            )
 
         base_residual = torch.nn.functional.linear(
             single, self.single_to_base_weight.to(single.dtype)
@@ -895,6 +1010,14 @@ class MFRepresentationEnrichment(nn.Module):
             "allatom_pair_rbf_rms": allatom_pair_rms,
             "opm_update_rms": opm_update_rms,
             "triangle_update_rms": triangle_update_rms,
+            "pair_atom_update_rms": pair_atom_update_rms,
+            "pair_atom_residual_rms": torch.sqrt(
+                pair_atom_residual.float().pow(2).mean() + 1.0e-12
+            ),
+            "pair_atom_adapter_weight_rms": (
+                torch.sqrt(self.pair_atom_to_single.weight.float().pow(2).mean() + 1.0e-12)
+                if self.pair_atom_to_single is not None else single.new_tensor(0.0)
+            ),
             "n_local": n_local,
         }
 
@@ -931,6 +1054,168 @@ class MFRepresentationEnrichment(nn.Module):
         else:
             loss = logits.sum() * 0.0
         return loss, logits
+
+    @staticmethod
+    def design_region_smooth_lddt_loss(
+        pred_X, true_X, valid_atom_mask, design_residue_mask, batch_id,
+        is_antigen_mask=None, cutoff=15.0,
+        intra_weight=1.0, scaffold_weight=1.0, antigen_weight=1.0,
+    ):
+        """Design-region factored smooth-lDDT for H3, 6CDR and related tasks.
+
+        Retains the MF/Boltz all-atom smooth-lDDT metric itself (0.5/1/2/4 A
+        smooth thresholds and a 15 A protein cutoff) but adapts the pair universe
+        to conditional design.  Three relation types are normalized independently
+        per complex before a configurable equal-priority combination:
+
+          1) design--design, between distinct designed residues only;
+          2) design--scaffold, versus fixed non-antigen context;
+          3) design--antigen, versus antigen context.
+
+        Context--context pairs are never evaluated because they are not generated.
+        Same-residue pairs are excluded so near-rigid canonical atom geometry cannot
+        dilute the inter-residue/interface signal.  Only design x design and
+        design x context distance matrices are constructed, avoiding O(N_context^2)
+        work as the design region grows from H3 to all six CDRs.
+
+        ``design_residue_mask`` is the task contract.  For H3 it is the H3 mask;
+        for 6CDR it can contain H1/H2/H3/L1/L2/L3 simultaneously without changing
+        this loss implementation.  Coordinates must be physical Angstrom values.
+        """
+        if pred_X.numel() == 0:
+            zero = pred_X.sum() * 0.0
+            return zero, {
+                "intra": zero.detach(), "scaffold": zero.detach(),
+                "antigen": zero.detach(), "intra_pairs": zero.detach(),
+                "scaffold_pairs": zero.detach(), "antigen_pairs": zero.detach(),
+                "perfect_floor": zero.detach(), "excess": zero.detach(),
+            }
+        if is_antigen_mask is None:
+            is_antigen_mask = torch.zeros_like(design_residue_mask, dtype=torch.bool)
+
+        cutoff = float(cutoff)
+        relation_weights = {
+            "intra": float(intra_weight),
+            "scaffold": float(scaffold_weight),
+            "antigen": float(antigen_weight),
+        }
+
+        def _smooth_loss(delta, mask):
+            if not bool(mask.any()):
+                return None, 0
+            score = (
+                torch.sigmoid(0.5 - delta)
+                + torch.sigmoid(1.0 - delta)
+                + torch.sigmoid(2.0 - delta)
+                + torch.sigmoid(4.0 - delta)
+            ) * 0.25
+            return 1.0 - score[mask].mean(), int(mask.sum().item())
+
+        graph_losses = []
+        relation_losses = {"intra": [], "scaffold": [], "antigen": []}
+        relation_pair_counts = {"intra": 0, "scaffold": 0, "antigen": 0}
+
+        for gid_t in torch.unique(batch_id):
+            gid = int(gid_t.item())
+            graph = batch_id == gid
+            pred = pred_X[graph]
+            true = true_X[graph]
+            valid = valid_atom_mask[graph].bool()
+            design = design_residue_mask[graph].bool()
+            antigen = is_antigen_mask[graph].bool()
+            if not bool(design.any()):
+                continue
+
+            n_res, n_atom = valid.shape
+            residue_ids = torch.arange(n_res, device=pred.device)[:, None].expand(
+                n_res, n_atom
+            )
+
+            def _flatten_residue_set(residue_mask):
+                atom_select = residue_mask[:, None].expand(-1, n_atom) & valid
+                return (
+                    pred[atom_select].float(),
+                    true[atom_select].float(),
+                    residue_ids[atom_select],
+                )
+
+            pred_d, true_d, rid_d = _flatten_residue_set(design)
+            if pred_d.numel() == 0:
+                continue
+
+            components = []
+
+            # design--design: distinct residue pairs only; rid_i < rid_j removes
+            # same-residue pairs and counts each residue-pair direction once.
+            if torch.unique(rid_d).numel() >= 2:
+                d_true = torch.cdist(true_d, true_d)
+                d_pred = torch.cdist(pred_d, pred_d)
+                mask = (rid_d[:, None] < rid_d[None, :]) & (d_true < cutoff)
+                loss_rel, n_pair = _smooth_loss((d_pred - d_true).abs(), mask)
+                if loss_rel is not None and relation_weights["intra"] > 0.0:
+                    relation_losses["intra"].append(loss_rel.detach())
+                    relation_pair_counts["intra"] += n_pair
+                    components.append((relation_weights["intra"], loss_rel))
+
+            scaffold = (~design) & (~antigen)
+            _, true_c, _ = _flatten_residue_set(scaffold)
+            if true_c.numel():
+                d_true = torch.cdist(true_d, true_c)
+                # Fixed scaffold is conditioning context, not a generated state.
+                # Anchor the predicted design directly to the true/fixed context
+                # so this auxiliary cannot create a gradient authority that moves
+                # non-designed framework coordinates.
+                d_pred = torch.cdist(pred_d, true_c.detach())
+                mask = d_true < cutoff
+                loss_rel, n_pair = _smooth_loss((d_pred - d_true).abs(), mask)
+                if loss_rel is not None and relation_weights["scaffold"] > 0.0:
+                    relation_losses["scaffold"].append(loss_rel.detach())
+                    relation_pair_counts["scaffold"] += n_pair
+                    components.append((relation_weights["scaffold"], loss_rel))
+
+            antigen_context = (~design) & antigen
+            _, true_a, _ = _flatten_residue_set(antigen_context)
+            if true_a.numel():
+                d_true = torch.cdist(true_d, true_a)
+                # Antigen is fixed conditioning context in the current AbFlow
+                # design tasks; only designed coordinates receive gradients.
+                d_pred = torch.cdist(pred_d, true_a.detach())
+                mask = d_true < cutoff
+                loss_rel, n_pair = _smooth_loss((d_pred - d_true).abs(), mask)
+                if loss_rel is not None and relation_weights["antigen"] > 0.0:
+                    relation_losses["antigen"].append(loss_rel.detach())
+                    relation_pair_counts["antigen"] += n_pair
+                    components.append((relation_weights["antigen"], loss_rel))
+
+            if components:
+                denom = sum(w for w, _ in components)
+                graph_losses.append(sum(w * value for w, value in components) / denom)
+
+        zero = pred_X.sum() * 0.0
+        total = torch.stack(graph_losses).mean().to(pred_X.dtype) if graph_losses else zero
+
+        def _diag_mean(name):
+            vals = relation_losses[name]
+            return torch.stack(vals).mean().to(pred_X.dtype) if vals else zero.detach()
+
+        if graph_losses:
+            thresholds = pred_X.detach().new_tensor([0.5, 1.0, 2.0, 4.0])
+            perfect_floor = 1.0 - torch.sigmoid(thresholds).mean()
+            excess = (total.detach().float() - perfect_floor.float()).clamp_min(0.0).to(pred_X.dtype)
+        else:
+            perfect_floor = zero.detach()
+            excess = zero.detach()
+        diagnostics = {
+            "intra": _diag_mean("intra"),
+            "scaffold": _diag_mean("scaffold"),
+            "antigen": _diag_mean("antigen"),
+            "intra_pairs": pred_X.detach().new_tensor(float(relation_pair_counts["intra"])),
+            "scaffold_pairs": pred_X.detach().new_tensor(float(relation_pair_counts["scaffold"])),
+            "antigen_pairs": pred_X.detach().new_tensor(float(relation_pair_counts["antigen"])),
+            "perfect_floor": perfect_floor.to(pred_X.dtype),
+            "excess": excess,
+        }
+        return total, diagnostics
 
 class AbFlowModel(nn.Module):
     def __init__(self, embed_size, hidden_size, n_channel, num_classes, num_verts, 
@@ -2126,7 +2411,11 @@ class AbFlowModel(nn.Module):
         # parameter initialization and RNG order are preserved exactly.
         self.mf_repr_core = _env_flag("ABFLOW_MF_REPR_CORE", False)
         self.mf_repr_distogram = _env_flag("ABFLOW_MF_DISTOGRAM", False)
-        self.mf_repr_clean_sc = _env_flag("ABFLOW_MF_CLEAN_SC", False)
+        self.mf_smooth_lddt = _env_flag("ABFLOW_MF_SMOOTH_LDDT", False)
+        self.mf_smooth_lddt_cutoff = _env_float("ABFLOW_MF_SMOOTH_LDDT_CUTOFF", 15.0)
+        self.mf_smooth_lddt_intra_weight = _env_float("ABFLOW_MF_SMOOTH_LDDT_INTRA_WEIGHT", 1.0)
+        self.mf_smooth_lddt_scaffold_weight = _env_float("ABFLOW_MF_SMOOTH_LDDT_SCAFFOLD_WEIGHT", 1.0)
+        self.mf_smooth_lddt_antigen_weight = _env_float("ABFLOW_MF_SMOOTH_LDDT_ANTIGEN_WEIGHT", 1.0)
         self.mf_single_dim = _env_int("ABFLOW_MF_SINGLE_DIM", 128)
         self.mf_pair_dim = _env_int("ABFLOW_MF_PAIR_DIM", 64)
         self.mf_repr_blocks = _env_int("ABFLOW_MF_REPR_BLOCKS", 1)
@@ -2143,18 +2432,26 @@ class AbFlowModel(nn.Module):
         self.mf_opm_dim = _env_int("ABFLOW_MF_OPM_DIM", 64)
         self.mf_allatom_pair = _env_flag("ABFLOW_MF_ALLATOM_PAIR", True)
         self.mf_allatom_chunk = _env_int("ABFLOW_MF_ALLATOM_CHUNK", 512)
-        self.mf_detach_recycle = _env_flag("ABFLOW_MF_DETACH_RECYCLE", True)
+        self.mf_detach_state_carry = _env_flag("ABFLOW_MF_DETACH_STATE_CARRY", True)
         self.mf_triangle_heads = _env_int("ABFLOW_MF_TRIANGLE_HEADS", 4)
         self.mf_triangle_hidden = _env_int("ABFLOW_MF_TRIANGLE_HIDDEN", 128)
         self.mf_triangle_checkpoint = _env_flag("ABFLOW_MF_TRIANGLE_CHECKPOINT", True)
+        self.mf_pair_atom_refiner = _env_flag("ABFLOW_MF_PAIR_ATOM_REFINER", False)
+        self.mf_pair_atom_depth = _env_int("ABFLOW_MF_PAIR_ATOM_DEPTH", 1)
+        self.mf_pair_atom_heads = _env_int("ABFLOW_MF_PAIR_ATOM_HEADS", 4)
+        self.mf_pair_atom_query_chunk = _env_int("ABFLOW_MF_PAIR_ATOM_QUERY_CHUNK", 64)
         self.mf_distogram_bins = _env_int("ABFLOW_MF_DISTOGRAM_BINS", 64)
         self.mf_distogram_min = _env_float("ABFLOW_MF_DISTOGRAM_MIN", 2.0)
         self.mf_distogram_max = _env_float("ABFLOW_MF_DISTOGRAM_MAX", 22.0)
 
-        if (self.mf_repr_distogram or self.mf_repr_clean_sc) and not self.mf_repr_core:
+        if (self.mf_repr_distogram or self.mf_smooth_lddt) and not self.mf_repr_core:
             raise ValueError(
-                "MF distogram/clean self-conditioning require "
-                "ABFLOW_MF_REPR_CORE=on."
+                "MF distogram/smooth-lDDT require ABFLOW_MF_REPR_CORE=on."
+            )
+        if _env_flag("ABFLOW_MF_CLEAN_SC", False):
+            raise ValueError(
+                "ABFLOW_MF_CLEAN_SC was retired in v163: previous-clean geometry "
+                "is a derived history summary on top of the existing R05 physical state."
             )
         if self.mf_repr_core and self.pair_time_conditioning:
             raise ValueError(
@@ -2180,10 +2477,16 @@ class AbFlowModel(nn.Module):
         self.loss_distogram_weight = _env_float(
             "ABFLOW_LOSS_DISTOGRAM_WEIGHT", 0.0
         )
+        self.loss_smooth_lddt_weight = _env_float(
+            "ABFLOW_LOSS_SMOOTH_LDDT_WEIGHT", 0.0
+        )
         if self.loss_distogram_weight != 0.0 and not self.mf_repr_distogram:
             raise ValueError(
-                "ABFLOW_LOSS_DISTOGRAM_WEIGHT is non-zero but "
-                "ABFLOW_MF_DISTOGRAM is off."
+                "ABFLOW_LOSS_DISTOGRAM_WEIGHT is non-zero but ABFLOW_MF_DISTOGRAM is off."
+            )
+        if self.loss_smooth_lddt_weight != 0.0 and not self.mf_smooth_lddt:
+            raise ValueError(
+                "ABFLOW_LOSS_SMOOTH_LDDT_WEIGHT is non-zero but ABFLOW_MF_SMOOTH_LDDT is off."
             )
 
         self.mf_repr = None
@@ -2205,15 +2508,18 @@ class AbFlowModel(nn.Module):
                 distogram_bins=self.mf_distogram_bins,
                 distogram_min=self.mf_distogram_min,
                 distogram_max=self.mf_distogram_max,
-                enable_clean_sc=self.mf_repr_clean_sc,
                 relpos_dim=self.mf_relpos_dim,
                 opm_dim=self.mf_opm_dim,
                 enable_allatom_pair=self.mf_allatom_pair,
                 allatom_chunk=self.mf_allatom_chunk,
-                detach_recycle=self.mf_detach_recycle,
+                detach_state_carry=self.mf_detach_state_carry,
                 triangle_heads=self.mf_triangle_heads,
                 triangle_hidden=self.mf_triangle_hidden,
                 triangle_checkpoint=self.mf_triangle_checkpoint,
+                enable_pair_atom_refiner=self.mf_pair_atom_refiner,
+                pair_atom_depth=self.mf_pair_atom_depth,
+                pair_atom_heads=self.mf_pair_atom_heads,
+                pair_atom_query_chunk=self.mf_pair_atom_query_chunk,
             )
             # Final pair information enters the existing local R05 EGNN edge
             # message through a zero-start residual.  The same enriched invariant
@@ -3088,8 +3394,6 @@ class AbFlowModel(nn.Module):
                         sequence_state_full=None,
                         mf_previous_single=None,
                         mf_previous_pair=None,
-                        mf_previous_clean_interface_X=None,
-                        mf_base_interface_X=None,
                         mf_proposal_interface_X=None):
         # embeddings, hidden state, (internal edges, external edges),
         # (A : c*d, w : c*1)
@@ -3554,8 +3858,6 @@ class AbFlowModel(nn.Module):
                 flow_t=flow_t,
                 previous_single=mf_previous_single,
                 previous_pair=mf_previous_pair,
-                previous_clean_interface_X=mf_previous_clean_interface_X,
-                base_interface_X=mf_base_interface_X,
                 proposal_interface_X=mf_proposal_interface_X,
             )
 
@@ -3644,6 +3946,15 @@ class AbFlowModel(nn.Module):
                         'mf_triangle_update_rms'
                     ] = mf_state['triangle_update_rms'].detach().to(H_0.dtype)
                     self._last_condition_diagnostics[
+                        'mf_pair_atom_update_rms'
+                    ] = mf_state['pair_atom_update_rms'].detach().to(H_0.dtype)
+                    self._last_condition_diagnostics[
+                        'mf_pair_atom_residual_rms'
+                    ] = mf_state['pair_atom_residual_rms'].detach().to(H_0.dtype)
+                    self._last_condition_diagnostics[
+                        'mf_pair_atom_adapter_weight_rms'
+                    ] = mf_state['pair_atom_adapter_weight_rms'].detach().to(H_0.dtype)
+                    self._last_condition_diagnostics[
                         'mf_base_residual_rms'
                     ] = torch.sqrt(
                         mf_state['base_residual'].detach().float().pow(2).mean()
@@ -3700,20 +4011,6 @@ class AbFlowModel(nn.Module):
                         self.mf_repr.single_to_seq_logits_weight.detach().float()
                         .pow(2).mean() + self.scorefm_eps
                     ).to(H_0.dtype)
-                    if (
-                        self.mf_repr_clean_sc
-                        and self.mf_repr.clean_sc_weight is not None
-                    ):
-                        self._last_condition_diagnostics[
-                            'mf_clean_sc_weight_rms'
-                        ] = torch.sqrt(
-                            self.mf_repr.clean_sc_weight.detach().float()
-                            .pow(2).mean() + self.scorefm_eps
-                        ).to(H_0.dtype)
-                    else:
-                        self._last_condition_diagnostics[
-                            'mf_clean_sc_weight_rms'
-                        ] = H_0.detach().new_tensor(0.0)
 
         # Capture the final-round shared activation only on diagnostic probe
         # steps. Sequence logits and coordinate outputs both depend on H_0.
@@ -6735,16 +7032,11 @@ class AbFlowModel(nn.Module):
         r_edge_dist = []
         memory_H = None
 
-        # MF representation recycling is carried by the existing three R05
-        # rounds; there is no nested recycle loop.  The fixed base interface is
-        # the transport state at entry to this model query and is used only by
-        # the optional detached clean-state residual conditioner.
+        # The existing three R05 rounds carry genuine learned s/z state across
+        # evolving physical states.  This is NOT MF fixed-input latent recycling,
+        # and there is no nested recycle loop or derived previous-clean summary.
         mf_previous_single = None
         mf_previous_pair = None
-        mf_previous_clean_interface_X = None
-        mf_base_interface_X = (
-            interface_X.detach().clone() if self.mf_repr_core else None
-        )
         diagnostics_active = bool(
             self.condition_diagnostics_enabled
             and getattr(self, "_diagnostic_capture", False)
@@ -6792,8 +7084,6 @@ class AbFlowModel(nn.Module):
                 sequence_state_full=sequence_state_full,
                 mf_previous_single=mf_previous_single,
                 mf_previous_pair=mf_previous_pair,
-                mf_previous_clean_interface_X=mf_previous_clean_interface_X,
-                mf_base_interface_X=mf_base_interface_X,
                 mf_proposal_interface_X=pep_X_model,
             )
 
@@ -6805,16 +7095,15 @@ class AbFlowModel(nn.Module):
 
             memory_H = H
             if self.mf_repr_core:
-                # ABX/MF recycling semantics: representation carriers are state,
+                # Detached representation-state carry: s/z are genuine learned state,
                 # not a second backprop-through-time authority across R05 rounds.
                 # The R05 coordinate/hidden recurrence itself is left untouched.
-                if self.mf_detach_recycle:
+                if self.mf_detach_state_carry:
                     mf_previous_single = mf_single_out.detach()
                     mf_previous_pair = mf_pair_out.detach()
                 else:
                     mf_previous_single = mf_single_out
                     mf_previous_pair = mf_pair_out
-                mf_previous_clean_interface_X = interface_X.detach()
             r_interface_X.append(interface_X.clone())
             r_pred_S_logits.append((pred_S_logits, smask))
             r_edge_dist.append(edge_dist)
@@ -7114,6 +7403,9 @@ class AbFlowModel(nn.Module):
             ("endpoint", "distogram"),
             ("seq", "distogram"),
             ("structure", "distogram"),
+            ("endpoint", "smooth_lddt"),
+            ("seq", "smooth_lddt"),
+            ("structure", "smooth_lddt"),
         ]
         for a, b in pairs:
             if a in grads and b in grads:
@@ -8048,18 +8340,63 @@ class AbFlowModel(nn.Module):
                 pair_state=mf_state['pair'],
             )
 
+        # 4. MF/Boltz-inspired design-region factored smooth-lDDT auxiliary.
+        # The donor metric is retained, but the task pair universe is generalized
+        # to the supplied design mask and balanced across design--design,
+        # design--fixed-scaffold and design--antigen relations.
+        mf_smooth_lddt_loss = X.new_tensor(0.0)
+        mf_smooth_lddt_diag = {
+            'intra': X.new_tensor(0.0), 'scaffold': X.new_tensor(0.0),
+            'antigen': X.new_tensor(0.0), 'intra_pairs': X.new_tensor(0.0),
+            'scaffold_pairs': X.new_tensor(0.0), 'antigen_pairs': X.new_tensor(0.0),
+            'perfect_floor': X.new_tensor(0.0), 'excess': X.new_tensor(0.0),
+        }
+        if self.mf_smooth_lddt:
+            valid_atom_mask = (
+                self.aa_feature._construct_atom_pos(true_S)
+                != self.aa_feature.atom_pos_pad_idx
+            )
+            mf_smooth_lddt_loss, mf_smooth_lddt_diag = (
+                self.mf_repr.design_region_smooth_lddt_loss(
+                    pred_X=pred_X, true_X=true_X,
+                    valid_atom_mask=valid_atom_mask,
+                    design_residue_mask=paratope_mask,
+                    batch_id=batch_id,
+                    is_antigen_mask=self.batch_constants['is_ag'],
+                    cutoff=self.mf_smooth_lddt_cutoff,
+                    intra_weight=self.mf_smooth_lddt_intra_weight,
+                    scaffold_weight=self.mf_smooth_lddt_scaffold_weight,
+                    antigen_weight=self.mf_smooth_lddt_antigen_weight,
+                )
+            )
+
         scorefm_details["mf_repr_core_enabled"] = X.detach().new_tensor(
             1.0 if self.mf_repr_core else 0.0
+        )
+        scorefm_details["mf_pair_atom_refiner_enabled"] = X.detach().new_tensor(
+            1.0 if self.mf_pair_atom_refiner else 0.0
         )
         scorefm_details["mf_distogram_enabled"] = X.detach().new_tensor(
             1.0 if self.mf_repr_distogram else 0.0
         )
-        scorefm_details["mf_clean_sc_enabled"] = X.detach().new_tensor(
-            1.0 if self.mf_repr_clean_sc else 0.0
+        scorefm_details["mf_smooth_lddt_enabled"] = X.detach().new_tensor(
+            1.0 if self.mf_smooth_lddt else 0.0
         )
         scorefm_details["mf_distogram_loss"] = mf_distogram_loss.detach()
+        scorefm_details["mf_smooth_lddt_loss"] = mf_smooth_lddt_loss.detach()
+        scorefm_details["mf_smooth_lddt_intra_loss"] = mf_smooth_lddt_diag['intra'].detach()
+        scorefm_details["mf_smooth_lddt_scaffold_loss"] = mf_smooth_lddt_diag['scaffold'].detach()
+        scorefm_details["mf_smooth_lddt_antigen_loss"] = mf_smooth_lddt_diag['antigen'].detach()
+        scorefm_details["mf_smooth_lddt_intra_pairs"] = mf_smooth_lddt_diag['intra_pairs'].detach()
+        scorefm_details["mf_smooth_lddt_scaffold_pairs"] = mf_smooth_lddt_diag['scaffold_pairs'].detach()
+        scorefm_details["mf_smooth_lddt_antigen_pairs"] = mf_smooth_lddt_diag['antigen_pairs'].detach()
+        scorefm_details["mf_smooth_lddt_perfect_floor"] = mf_smooth_lddt_diag['perfect_floor'].detach()
+        scorefm_details["mf_smooth_lddt_excess"] = mf_smooth_lddt_diag['excess'].detach()
         scorefm_details["mf_distogram_weight"] = X.detach().new_tensor(
             float(self.loss_distogram_weight)
+        )
+        scorefm_details["mf_smooth_lddt_weight"] = X.detach().new_tensor(
+            float(self.loss_smooth_lddt_weight)
         )
         if self.mf_repr_core and self._last_mf_repr_state:
             _single = self._last_mf_repr_state.get('single')
@@ -8096,6 +8433,7 @@ class AbFlowModel(nn.Module):
             + self.loss_interface_weight * interface_loss
             + self.loss_edge_weight * edge_loss_tensor
             + self.loss_distogram_weight * mf_distogram_loss
+            + self.loss_smooth_lddt_weight * mf_smooth_lddt_loss
             + (0 if pdev_loss is None else pdev_loss)
         )
         self._diagnostic_objective_tensors = {
@@ -8109,6 +8447,7 @@ class AbFlowModel(nn.Module):
             ),
             "edge": self.loss_edge_weight * edge_loss_tensor,
             "distogram": self.loss_distogram_weight * mf_distogram_loss,
+            "smooth_lddt": self.loss_smooth_lddt_weight * mf_smooth_lddt_loss,
         }
 
         # AAR and conditioning diagnostics.
@@ -8128,6 +8467,7 @@ class AbFlowModel(nn.Module):
                 "loss_interface_weight": torch.as_tensor(self.loss_interface_weight, device=X.device),
                 "loss_edge_weight": torch.as_tensor(self.loss_edge_weight, device=X.device),
                 "loss_distogram_weight": torch.as_tensor(self.loss_distogram_weight, device=X.device),
+                "loss_smooth_lddt_weight": torch.as_tensor(self.loss_smooth_lddt_weight, device=X.device),
                 "coordinate_authority_carrier_single": torch.as_tensor(
                     1.0 if self.coordinate_authority == "carrier_single" else 0.0,
                     device=X.device,

@@ -29,11 +29,12 @@ PYSELF
 #      implemented U03 boundary-regular carrier and its matched sampler.
 # R07: R05 + R06 factor combination: residue-level R3 support + U03 carrier.
 #      Relative to R05, only the carrier changes; no model code is changed.
-# R08: R05 + v161 MF/AbX semantic-closure single/pair representation core.
-#      Correct atom-head algebra, slot-resolved atom14 pair geometry, and direct
-#      final-pair -> same R05 EGNN node+coordinate message coupling.
-# R09: R08 + persistent-pair distogram supervision only (AbX post-projection symmetry).
-# R10: R09 + detached refinement-history pair residual only.
+# R08: R05 + v164 closed no-MSA single/pair representation core.
+#      AbX OPM supplies s->z; MF pair-first ordering supplies refined z->s;
+#      final z directly conditions the sole R05 EGNN node+coordinate mechanics.
+# R09: R08 + MF/AF3-inspired pair-conditioned atom representation refinement only.
+# R10: R09 + design-region factored smooth-lDDT only (weight 0.1).
+# Distogram remains implemented but is deliberately deferred to a later optional ablation.
 #      R08-R10 preserve R05 PCS-RC/residue-R3/U02 physics, three-round task
 #      recurrence, sequence path, optimizer and global batch semantics.
 #
@@ -74,8 +75,9 @@ export ABFLOW_R3_TRANSPORT_FRACTION="0.05"
 export ABFLOW_R3_TRANSPORT_MAX="20.0"
 export ABFLOW_F01_HYBRID_T_MIN="0.20"
 
-# Sequence is deliberately frozen in this structure/noise stage.  Do not mix an
-# AbX CTMC change into a g/support/carrier causality experiment.
+# Sequence *mechanism* is deliberately kept on the proven R05 path.  Sequence
+# CE remains trained; we simply do not mix a new CTMC/D3PM authority into this
+# representation/geometry causality experiment.
 export ABFLOW_SEQ_INPUT_MODE="pep_condition"
 export ABFLOW_SHADOW_SEQ_STATE="off"
 export ABFLOW_DUAL_SEQUENCE_STATE="off"
@@ -113,7 +115,11 @@ export ABFLOW_STRUCTURE_SEQ_READOUT="off"
 # above remains launcher-owned and cannot be changed by the experiment metadata.
 export ABFLOW_MF_REPR_CORE="off"
 export ABFLOW_MF_DISTOGRAM="off"
-export ABFLOW_MF_CLEAN_SC="off"
+export ABFLOW_MF_SMOOTH_LDDT="off"
+export ABFLOW_MF_SMOOTH_LDDT_CUTOFF="15.0"
+export ABFLOW_MF_SMOOTH_LDDT_INTRA_WEIGHT="1.0"
+export ABFLOW_MF_SMOOTH_LDDT_SCAFFOLD_WEIGHT="1.0"
+export ABFLOW_MF_SMOOTH_LDDT_ANTIGEN_WEIGHT="1.0"
 export ABFLOW_MF_SINGLE_DIM="128"
 export ABFLOW_MF_PAIR_DIM="64"
 export ABFLOW_MF_REPR_BLOCKS="1"
@@ -128,10 +134,14 @@ export ABFLOW_MF_RELPOS_DIM="32"
 export ABFLOW_MF_OPM_DIM="64"
 export ABFLOW_MF_ALLATOM_PAIR="on"
 export ABFLOW_MF_ALLATOM_CHUNK="512"
-export ABFLOW_MF_DETACH_RECYCLE="on"
+export ABFLOW_MF_DETACH_STATE_CARRY="on"
 export ABFLOW_MF_TRIANGLE_HEADS="4"
 export ABFLOW_MF_TRIANGLE_HIDDEN="128"
 export ABFLOW_MF_TRIANGLE_CHECKPOINT="off"
+export ABFLOW_MF_PAIR_ATOM_REFINER="off"
+export ABFLOW_MF_PAIR_ATOM_DEPTH="1"
+export ABFLOW_MF_PAIR_ATOM_HEADS="4"
+export ABFLOW_MF_PAIR_ATOM_QUERY_CHUNK="64"
 export ABFLOW_DDP_FIND_UNUSED_PARAMETERS="off"
 export ABFLOW_DDP_STATIC_GRAPH="off"
 export ABFLOW_DDP_COST_BALANCED="off"
@@ -143,6 +153,7 @@ export ABFLOW_LOSS_STRUCTURE_WEIGHT="1.0"
 export ABFLOW_LOSS_INTERFACE_WEIGHT="1.0"
 export ABFLOW_LOSS_EDGE_WEIGHT="1.0"
 export ABFLOW_LOSS_DISTOGRAM_WEIGHT="0.0"
+export ABFLOW_LOSS_SMOOTH_LDDT_WEIGHT="0.0"
 # Observational-only forensic for the repeated epoch-0 1e5-1e6 structure summary.
 export ABFLOW_TRAIN_LOSS_OUTLIER_THRESHOLD="10000"
 
@@ -213,11 +224,11 @@ case "$EXP_ID" in
     export ABFLOW_FLOW_T_MAX="1.0"
     ;;
 
-  R08_R05_MF_REPR_CORE_U02)
+  R08_R05_MF_CLOSED_CORE_U02)
     export ABFLOW_ABLATION_PARENT="R05_PCS_RC_LC_R1_ABX_FF_FIXEDG_RESIDUE_U02_SCOREFLOW"
-    export ABFLOW_EXPERIMENT_FACTOR="mf_single_pair_atom_representation_core_only"
+    export ABFLOW_EXPERIMENT_FACTOR="closed_no_msa_single_pair_core_only"
     export ABFLOW_SINGLE_FACTOR_ABLATION="false"
-    export ABFLOW_MODULE_ID="R08_R05_MF_REPR_CORE"
+    export ABFLOW_MODULE_ID="R08_R05_MF_CLOSED_CORE"
     export ABFLOW_MODULE_PARENT="R05_FF_FIXEDG_RESIDUE_U02"
 
     export ABFLOW_R3_NOISE_SCOPE="residue"
@@ -230,14 +241,19 @@ case "$EXP_ID" in
     export ABFLOW_DDP_FIND_UNUSED_PARAMETERS="on"
     export ABFLOW_DDP_STATIC_GRAPH="off"
     export ABFLOW_MF_TRIANGLE_CHECKPOINT="off"
+    export ABFLOW_MF_PAIR_ATOM_REFINER="off"
+    export ABFLOW_MF_SMOOTH_LDDT="off"
+    export ABFLOW_LOSS_SMOOTH_LDDT_WEIGHT="0.0"
+    export ABFLOW_MF_DISTOGRAM="off"
+    export ABFLOW_LOSS_DISTOGRAM_WEIGHT="0.0"
     ;;
 
-  R09_R05_MF_REPR_DISTOGRAM_U02)
-    export ABFLOW_ABLATION_PARENT="R08_R05_MF_REPR_CORE_U02"
-    export ABFLOW_EXPERIMENT_FACTOR="add_mf_persistent_pair_distogram_only"
+  R09_R05_MF_CLOSED_CORE_PAIRATOM_U02)
+    export ABFLOW_ABLATION_PARENT="R08_R05_MF_CLOSED_CORE_U02"
+    export ABFLOW_EXPERIMENT_FACTOR="add_pair_conditioned_atom_representation_only"
     export ABFLOW_SINGLE_FACTOR_ABLATION="true"
-    export ABFLOW_MODULE_ID="R09_R05_MF_REPR_DISTOGRAM"
-    export ABFLOW_MODULE_PARENT="R08_R05_MF_REPR_CORE"
+    export ABFLOW_MODULE_ID="R09_R05_MF_CLOSED_CORE_PAIRATOM"
+    export ABFLOW_MODULE_PARENT="R08_R05_MF_CLOSED_CORE"
 
     export ABFLOW_R3_NOISE_SCOPE="residue"
     export ABFLOW_SCOREFM_LOSS_MODE="f01_r3_endpoint_canonical_hybrid"
@@ -249,14 +265,15 @@ case "$EXP_ID" in
     export ABFLOW_DDP_FIND_UNUSED_PARAMETERS="on"
     export ABFLOW_DDP_STATIC_GRAPH="off"
     export ABFLOW_MF_TRIANGLE_CHECKPOINT="off"
+    export ABFLOW_MF_PAIR_ATOM_REFINER="on"
     ;;
 
-  R10_R05_MF_REPR_DISTOGRAM_SC_U02)
-    export ABFLOW_ABLATION_PARENT="R09_R05_MF_REPR_DISTOGRAM_U02"
-    export ABFLOW_EXPERIMENT_FACTOR="add_detached_clean_pair_residual_self_conditioning_only"
+  R10_R05_MF_CLOSED_CORE_PAIRATOM_DESIGNLDDT_U02)
+    export ABFLOW_ABLATION_PARENT="R09_R05_MF_CLOSED_CORE_PAIRATOM_U02"
+    export ABFLOW_EXPERIMENT_FACTOR="add_design_region_factored_smooth_lddt_on_top_of_pair_atom"
     export ABFLOW_SINGLE_FACTOR_ABLATION="true"
-    export ABFLOW_MODULE_ID="R10_R05_MF_REPR_DISTOGRAM_SC"
-    export ABFLOW_MODULE_PARENT="R09_R05_MF_REPR_DISTOGRAM"
+    export ABFLOW_MODULE_ID="R10_R05_MF_CLOSED_CORE_PAIRATOM_DESIGNLDDT"
+    export ABFLOW_MODULE_PARENT="R09_R05_MF_CLOSED_CORE_PAIRATOM"
 
     export ABFLOW_R3_NOISE_SCOPE="residue"
     export ABFLOW_SCOREFM_LOSS_MODE="f01_r3_endpoint_canonical_hybrid"
@@ -268,6 +285,11 @@ case "$EXP_ID" in
     export ABFLOW_DDP_FIND_UNUSED_PARAMETERS="on"
     export ABFLOW_DDP_STATIC_GRAPH="off"
     export ABFLOW_MF_TRIANGLE_CHECKPOINT="off"
+    export ABFLOW_MF_PAIR_ATOM_REFINER="on"
+    export ABFLOW_MF_DISTOGRAM="off"
+    export ABFLOW_LOSS_DISTOGRAM_WEIGHT="0.0"
+    export ABFLOW_LOSS_SMOOTH_LDDT_WEIGHT="0.1"
+    export ABFLOW_MF_SMOOTH_LDDT="on"
     ;;
 
   *)
@@ -277,9 +299,9 @@ case "$EXP_ID" in
     echo "  R05_PCS_RC_LC_R1_ABX_FF_FIXEDG_RESIDUE_U02_SCOREFLOW"
     echo "  R06_PCS_RC_LC_R1_ABX_FF_FIXEDG_GLOBAL_U03_SCOREFLOW"
     echo "  R07_PCS_RC_LC_R1_ABX_FF_FIXEDG_RESIDUE_U03_SCOREFLOW"
-    echo "  R08_R05_MF_REPR_CORE_U02"
-    echo "  R09_R05_MF_REPR_DISTOGRAM_U02"
-    echo "  R10_R05_MF_REPR_DISTOGRAM_SC_U02"
+    echo "  R08_R05_MF_CLOSED_CORE_U02"
+    echo "  R09_R05_MF_CLOSED_CORE_PAIRATOM_U02"
+    echo "  R10_R05_MF_CLOSED_CORE_PAIRATOM_DESIGNLDDT_U02"
     exit 2
     ;;
 esac
@@ -291,7 +313,7 @@ esac
 export ABFLOW_CONDITION_DIAGNOSTICS="${ABFLOW_CONDITION_DIAGNOSTICS:-on}"
 export ABFLOW_GRAD_DIAGNOSTIC_INTERVAL="${ABFLOW_GRAD_DIAGNOSTIC_INTERVAL:-0}"
 case "$EXP_ID" in
-  R08_R05_MF_REPR_CORE_U02|R09_R05_MF_REPR_DISTOGRAM_U02|R10_R05_MF_REPR_DISTOGRAM_SC_U02)
+  R08_R05_MF_CLOSED_CORE_U02|R09_R05_MF_CLOSED_CORE_PAIRATOM_U02|R10_R05_MF_CLOSED_CORE_PAIRATOM_DESIGNLDDT_U02)
     # One gradient-authority probe per epoch is worth the tiny overhead because
     # these runs are explicitly testing a new representation state.
     export ABFLOW_GRAD_CONFLICT_DIAGNOSTICS="${ABFLOW_GRAD_CONFLICT_DIAGNOSTICS:-on}"
@@ -352,16 +374,16 @@ _is_on() {
 }
 
 # ------------------------------------------------------------------
-# R08-R10 formal hardware/batch contract
+# R08-R10 v164 formal hardware/batch contract
 # ------------------------------------------------------------------
 # The JSON keeps the historical R05 GLOBAL batch_size=56.  train.py divides
 # that global batch by the DDP world size, so a formal two-GPU run is exactly
 # 28 complexes/rank.  We enforce two selected physical GPUs here to prevent an
 # accidental 4-GPU launch from silently changing the per-rank batch semantics.
 case "$EXP_ID" in
-  R08_R05_MF_REPR_CORE_U02) _ABFLOW_EXPECTED_GPUS="2,3" ;;
-  R09_R05_MF_REPR_DISTOGRAM_U02) _ABFLOW_EXPECTED_GPUS="4,5" ;;
-  R10_R05_MF_REPR_DISTOGRAM_SC_U02) _ABFLOW_EXPECTED_GPUS="6,7" ;;
+  R08_R05_MF_CLOSED_CORE_U02) _ABFLOW_EXPECTED_GPUS="2,3" ;;
+  R09_R05_MF_CLOSED_CORE_PAIRATOM_U02) _ABFLOW_EXPECTED_GPUS="4,5" ;;
+  R10_R05_MF_CLOSED_CORE_PAIRATOM_DESIGNLDDT_U02) _ABFLOW_EXPECTED_GPUS="6,7" ;;
   *) _ABFLOW_EXPECTED_GPUS="" ;;
 esac
 
@@ -569,6 +591,10 @@ print_settings() {
   echo "MF_TRIANGLE_HEADS=${ABFLOW_MF_TRIANGLE_HEADS:-}"
   echo "MF_TRIANGLE_HIDDEN=${ABFLOW_MF_TRIANGLE_HIDDEN:-}"
   echo "MF_TRIANGLE_CHECKPOINT=${ABFLOW_MF_TRIANGLE_CHECKPOINT:-off}"
+  echo "MF_PAIR_ATOM_REFINER=${ABFLOW_MF_PAIR_ATOM_REFINER:-off}"
+  echo "MF_PAIR_ATOM_DEPTH=${ABFLOW_MF_PAIR_ATOM_DEPTH:-}"
+  echo "MF_PAIR_ATOM_HEADS=${ABFLOW_MF_PAIR_ATOM_HEADS:-}"
+  echo "MF_PAIR_ATOM_QUERY_CHUNK=${ABFLOW_MF_PAIR_ATOM_QUERY_CHUNK:-}"
   echo "DDP_FIND_UNUSED_PARAMETERS=${ABFLOW_DDP_FIND_UNUSED_PARAMETERS:-off}"
   echo "DDP_STATIC_GRAPH=${ABFLOW_DDP_STATIC_GRAPH:-off}"
   echo "DDP_COST_BALANCED=${ABFLOW_DDP_COST_BALANCED:-off}"
@@ -577,14 +603,17 @@ print_settings() {
   echo "MF_OPM_DIM=${ABFLOW_MF_OPM_DIM:-}"
   echo "MF_ALLATOM_PAIR=${ABFLOW_MF_ALLATOM_PAIR:-off}"
   echo "MF_ALLATOM_CHUNK=${ABFLOW_MF_ALLATOM_CHUNK:-}"
-  echo "MF_DETACH_RECYCLE=${ABFLOW_MF_DETACH_RECYCLE:-off}"
+  echo "MF_DETACH_STATE_CARRY=${ABFLOW_MF_DETACH_STATE_CARRY:-off}"
   echo "MF_DISTOGRAM=${ABFLOW_MF_DISTOGRAM:-off}"
-  echo "MF_CLEAN_SC=${ABFLOW_MF_CLEAN_SC:-off}"
+  echo "MF_SMOOTH_LDDT=${ABFLOW_MF_SMOOTH_LDDT:-off}"
+  echo "MF_SMOOTH_LDDT_CUTOFF=${ABFLOW_MF_SMOOTH_LDDT_CUTOFF:-}"
+  echo "MF_SMOOTH_LDDT_REL_WEIGHTS=${ABFLOW_MF_SMOOTH_LDDT_INTRA_WEIGHT:-}/${ABFLOW_MF_SMOOTH_LDDT_SCAFFOLD_WEIGHT:-}/${ABFLOW_MF_SMOOTH_LDDT_ANTIGEN_WEIGHT:-}"
   echo "LOSS_SEQUENCE_WEIGHT=${ABFLOW_LOSS_SEQUENCE_WEIGHT:-}"
   echo "LOSS_STRUCTURE_WEIGHT=${ABFLOW_LOSS_STRUCTURE_WEIGHT:-}"
   echo "LOSS_INTERFACE_WEIGHT=${ABFLOW_LOSS_INTERFACE_WEIGHT:-}"
   echo "LOSS_EDGE_WEIGHT=${ABFLOW_LOSS_EDGE_WEIGHT:-}"
   echo "LOSS_DISTOGRAM_WEIGHT=${ABFLOW_LOSS_DISTOGRAM_WEIGHT:-}"
+  echo "LOSS_SMOOTH_LDDT_WEIGHT=${ABFLOW_LOSS_SMOOTH_LDDT_WEIGHT:-}"
   echo "GRAD_CONFLICT_DIAGNOSTICS=$ABFLOW_GRAD_CONFLICT_DIAGNOSTICS"
   echo "GRAD_DIAGNOSTIC_INTERVAL=$ABFLOW_GRAD_DIAGNOSTIC_INTERVAL"
   echo "GPU=$GPU_ID"
@@ -704,7 +733,7 @@ PYMFENV
 # an extra method component: expensive training must not start if the selected
 # JSON, source files, or R05 invariants disagree.
 case "$EXP_ID" in
-  R08_R05_MF_REPR_CORE_U02|R09_R05_MF_REPR_DISTOGRAM_U02|R10_R05_MF_REPR_DISTOGRAM_SC_U02)
+  R08_R05_MF_CLOSED_CORE_U02|R09_R05_MF_CLOSED_CORE_PAIRATOM_U02|R10_R05_MF_CLOSED_CORE_PAIRATOM_DESIGNLDDT_U02)
     MODEL_FILE="$PROJECT_ROOT/models/AbFlow/AbFlow_model.py"
     AMENC_FILE="$PROJECT_ROOT/models/modules/am_enc.py"
     TRAINER_FILE="$PROJECT_ROOT/trainer/AbFlow_trainer.py"
@@ -714,8 +743,8 @@ case "$EXP_ID" in
     grep -q "class MFRepresentationEnrichment" "$MODEL_FILE" || {
       echo "ERROR: AbFlow_model.py is not the R05 x MF representation version." >&2; exit 2;
     }
-    grep -q "R05MF_SEMANTIC_CLOSURE_V161" "$MODEL_FILE" || {
-      echo "ERROR: R08-R10 require v161 MF/AbX semantic-closure AbFlow_model.py." >&2; exit 2;
+    grep -q "R05MF_CLOSED_CORE_V164" "$MODEL_FILE" || {
+      echo "ERROR: R08-R10 require v164 closed-core AbFlow_model.py." >&2; exit 2;
     }
     grep -q "enriched_edge_feat" "$AMENC_FILE" || {
       echo "ERROR: R08-R10 require final-pair -> same-step R05 EGNN coordinate coupling." >&2; exit 2;
@@ -742,9 +771,9 @@ for key, expected in required.items():
 if not math.isclose(float(cfg.get('ema_decay', -1)), 0.999, rel_tol=0, abs_tol=1e-12):
     raise SystemExit('ERROR: R08-R10 require ema_decay=0.999')
 meta = cfg.get('_experiment') or {}
-if meta.get('implementation_revision') != 'v161_r05_mf_abx_semantic_closure':
+if meta.get('implementation_revision') != 'v164_r05_mf_pair_atom_pair_universe_fix':
     raise SystemExit(
-        f"ERROR: {exp_id} requires implementation_revision=v161_r05_mf_abx_semantic_closure, "
+        f"ERROR: {exp_id} requires implementation_revision=v164_r05_mf_pair_atom_pair_universe_fix, "
         f"got {meta.get('implementation_revision')!r}"
     )
 env = meta.get('runtime_env') or {}
@@ -761,6 +790,9 @@ common = {
     'ABFLOW_MF_TRIANGLE_HEADS': '4',
     'ABFLOW_MF_TRIANGLE_HIDDEN': '128',
     'ABFLOW_MF_TRIANGLE_CHECKPOINT': 'off',
+    'ABFLOW_MF_PAIR_ATOM_DEPTH': '1',
+    'ABFLOW_MF_PAIR_ATOM_HEADS': '4',
+    'ABFLOW_MF_PAIR_ATOM_QUERY_CHUNK': '64',
     'ABFLOW_DDP_FIND_UNUSED_PARAMETERS': 'on',
     'ABFLOW_DDP_STATIC_GRAPH': 'off',
     'ABFLOW_MF_COORD_SCALE': '0.1',
@@ -768,27 +800,39 @@ common = {
     'ABFLOW_MF_OPM_DIM': '64',
     'ABFLOW_MF_ALLATOM_PAIR': 'on',
     'ABFLOW_MF_ALLATOM_CHUNK': '512',
-    'ABFLOW_MF_DETACH_RECYCLE': 'on',
+    'ABFLOW_MF_DETACH_STATE_CARRY': 'on',
+    'ABFLOW_MF_SMOOTH_LDDT_CUTOFF': '15.0',
+    'ABFLOW_MF_SMOOTH_LDDT_INTRA_WEIGHT': '1.0',
+    'ABFLOW_MF_SMOOTH_LDDT_SCAFFOLD_WEIGHT': '1.0',
+    'ABFLOW_MF_SMOOTH_LDDT_ANTIGEN_WEIGHT': '1.0',
     'ABFLOW_LOSS_SEQUENCE_WEIGHT': '1.0',
     'ABFLOW_LOSS_STRUCTURE_WEIGHT': '1.0',
     'ABFLOW_LOSS_INTERFACE_WEIGHT': '1.0',
     'ABFLOW_LOSS_EDGE_WEIGHT': '1.0',
 }
 expected_by_exp = {
-    'R08_R05_MF_REPR_CORE_U02': ('off', 'off', 0.0),
-    'R09_R05_MF_REPR_DISTOGRAM_U02': ('on', 'off', 0.03),
-    'R10_R05_MF_REPR_DISTOGRAM_SC_U02': ('on', 'on', 0.03),
+    'R08_R05_MF_CLOSED_CORE_U02': ('off', 'off', 0.0, 'off', 0.0),
+    'R09_R05_MF_CLOSED_CORE_PAIRATOM_U02': ('on', 'off', 0.0, 'off', 0.0),
+    'R10_R05_MF_CLOSED_CORE_PAIRATOM_DESIGNLDDT_U02': ('on', 'off', 0.0, 'on', 0.1),
 }
 for key, expected in common.items():
     if str(env.get(key, '')) != expected:
         raise SystemExit(f'ERROR: {exp_id} requires {key}={expected}, got {env.get(key)!r}')
-disto, clean_sc, disto_w = expected_by_exp[exp_id]
+pair_atom, disto, disto_w, slddt, slddt_w = expected_by_exp[exp_id]
+if str(env.get('ABFLOW_MF_PAIR_ATOM_REFINER', '')) != pair_atom:
+    raise SystemExit(f'ERROR: {exp_id} pair-atom flag mismatch')
 if str(env.get('ABFLOW_MF_DISTOGRAM', '')) != disto:
     raise SystemExit(f'ERROR: {exp_id} distogram flag mismatch')
-if str(env.get('ABFLOW_MF_CLEAN_SC', '')) != clean_sc:
-    raise SystemExit(f'ERROR: {exp_id} clean-SC flag mismatch')
+if str(env.get('ABFLOW_MF_SMOOTH_LDDT', '')) != slddt:
+    raise SystemExit(f'ERROR: {exp_id} smooth-lDDT flag mismatch')
+if str(env.get('ABFLOW_MF_SMOOTH_LDDT_CUTOFF', '')) != '15.0':
+    raise SystemExit(f'ERROR: {exp_id} smooth-lDDT cutoff must be 15.0 A')
 if not math.isclose(float(env.get('ABFLOW_LOSS_DISTOGRAM_WEIGHT', -1)), disto_w, rel_tol=0, abs_tol=1e-12):
     raise SystemExit(f'ERROR: {exp_id} distogram weight mismatch')
+if not math.isclose(float(env.get('ABFLOW_LOSS_SMOOTH_LDDT_WEIGHT', -1)), slddt_w, rel_tol=0, abs_tol=1e-12):
+    raise SystemExit(f'ERROR: {exp_id} smooth-lDDT weight mismatch')
+if 'ABFLOW_MF_CLEAN_SC' in env:
+    raise SystemExit(f'ERROR: {exp_id} must not define retired ABFLOW_MF_CLEAN_SC')
 print(f'[R05MFPreflight] config PASS: {exp_id}')
 PYR05MF
 
@@ -874,7 +918,7 @@ if [[ "$RUN_MODE" == "resume" ]]; then
   esac
 else
   case "$EXP_ID" in
-    R08_R05_MF_REPR_CORE_U02|R09_R05_MF_REPR_DISTOGRAM_U02|R10_R05_MF_REPR_DISTOGRAM_SC_U02)
+    R08_R05_MF_CLOSED_CORE_U02|R09_R05_MF_CLOSED_CORE_PAIRATOM_U02|R10_R05_MF_CLOSED_CORE_PAIRATOM_DESIGNLDDT_U02)
       # Formal R08-R10 use exactly one run directory: version_0.  This removes the
       # DDP race that previously produced rank0/version_0 and rank1/version_1.
       # Existing scientific state is never deleted automatically.
@@ -902,7 +946,7 @@ fi
 # stdout/stderr that is visible in tmux, including model diagnostics and errors.
 # epoch_summary.csv is the only compact machine-readable epoch table.
 case "$EXP_ID" in
-  R08_R05_MF_REPR_CORE_U02|R09_R05_MF_REPR_DISTOGRAM_U02|R10_R05_MF_REPR_DISTOGRAM_SC_U02)
+  R08_R05_MF_CLOSED_CORE_U02|R09_R05_MF_CLOSED_CORE_PAIRATOM_U02|R10_R05_MF_CLOSED_CORE_PAIRATOM_DESIGNLDDT_U02)
     if [[ "$RUN_MODE" == "resume" ]]; then
       unset ABFLOW_FIXED_VERSION || true
       RUN_VERSION_DIR=$(dirname "$(dirname "$(realpath "$EFFECTIVE_RESUME_CHECKPOINT")")")

@@ -35,9 +35,9 @@
   "log_interval": 20,
   "tqdm_mininterval": 5.0,
   "_experiment": {
-    "exp_id": "R10_R05_MF_REPR_DISTOGRAM_SC_U02",
-    "parent": "R09_R05_MF_REPR_DISTOGRAM_U02",
-    "scientific_factor": "R09 plus one optional detached pair-level refinement-history residual derived from previous-round predicted interface geometry relative to the fixed model-query entry state; all v161 representation-core semantic-closure fixes are shared with R08/R09.",
+    "exp_id": "R08_R05_MF_CLOSED_CORE_U02",
+    "parent": "R05_PCS_RC_LC_R1_ABX_FF_FIXEDG_RESIDUE_U02_SCOREFLOW",
+    "scientific_factor": "R05 + v164 closed no-MSA token-level representation core only: corrected residue-local atom attention, slot-resolved atom14 pair geometry, AbX OPM single->pair communication, MF pair-first Triangle/Pairformer z->single readback, detached s/z state carry, and zero-start final-pair integration into the sole R05 EGNN node+coordinate mechanics. Pair-conditioned cross-residue atom refinement, smooth-lDDT and distogram are off.",
     "r05_invariants": [
       "PCS-RC source/context",
       "AbX whole-antibody common frame",
@@ -57,11 +57,11 @@
       "sequence_integration": "legacy R05 sequence logits are read from post-EGNN H, so final pair information reaches sequence through the structure trunk; an additional zero-start enriched-single -> 20-AA logits residual preserves the proven parent while testing direct amino-acid-discriminative information",
       "coordinate_decoder": "original R05 equivariant coordinate engine remains the only coordinate decoder",
       "coordinate_units": "R05 model-frame coordinates are scaled by 0.1, so representation geometry RBF centers use 0.2-2.2 model units corresponding to physical 2-22 A; distogram labels remain physical 2-22 A on native coordinates",
-      "pair_reasoning": "one task-scale AbX Seqformer-order block: z-biased single attention -> single transition -> OPM -> triangle multiplication out/in -> triangle attention start/end -> pair transition. No artificial post-triangle second single-attention is inserted because the supplied AbX one-block Seqformer does not contain one; final pair readback occurs through the downstream structure trunk (IPA in AbX, the sole R05 EGNN here).",
-      "recycling": "single/pair states are detached and recycled only across the existing three R05 rounds; there is no nested MF/AbX recycle loop and no extra representation BPTT authority",
+      "pair_reasoning": "one no-MSA closed block: AbX-style OPM supplies single->pair communication; then MF Pairformer ordering applies triangle multiplication out/in, triangle attention start/end, pair transition, and finally pair-biased single attention + single transition. Thus each block is single -> pair -> relational reasoning -> single in the same R05 round.",
+      "recycling": "detached s/z representation-state carry only across the existing three evolving R05 physical rounds; this is explicitly not MF fixed-input latent recycling. No nested recycle loop and no derived previous-clean history summary.",
       "triangle_autograd": "Triangle/OPM mathematics unchanged; only re-entrant activation checkpointing is disabled under torch1.11 DDP. Dynamic used-parameter discovery is enabled because the triangle-to-loss route can be batch-dependent through dynamic R05 EGNN edges and detached recycle.",
       "allatom_geometry": "AbX-semantic slot-resolved atom14xatom14 distance field: 196 canonical atom-slot Gaussian features with trainable slot-pair coefficients are chunked and compressed; unlike AbX, coefficients are not conditioned on native H3 AA-pair identity, avoiding sequence-target leakage.",
-      "clean_sc": "R10 is an optional detached trajectory-history residual: previous-round predicted interface geometry is compared with the fixed model-query entry state and injected into z. Because R05 already evolves X_r -> X_{r+1}, this is not claimed as a literal copy of AbX fixed-input prev_pos recycling; it tests whether explicit refinement-history information adds value beyond recurrent X/s/z state."
+      "atom_level": "R08 uses corrected residue-local atom attention plus slot-resolved atom14xatom14 geometry in z, but deliberately keeps the new MF/AF3-style pair-conditioned cross-residue atom refiner off so its value can be tested as a single factor in R09."
     },
     "runtime_env": {
       "ABFLOW_MF_REPR_CORE": "on",
@@ -76,9 +76,8 @@
       "ABFLOW_LOSS_STRUCTURE_WEIGHT": "1.0",
       "ABFLOW_LOSS_INTERFACE_WEIGHT": "1.0",
       "ABFLOW_LOSS_EDGE_WEIGHT": "1.0",
-      "ABFLOW_MF_DISTOGRAM": "on",
-      "ABFLOW_MF_CLEAN_SC": "on",
-      "ABFLOW_LOSS_DISTOGRAM_WEIGHT": "0.03",
+      "ABFLOW_MF_DISTOGRAM": "off",
+      "ABFLOW_LOSS_DISTOGRAM_WEIGHT": "0.0",
       "ABFLOW_MF_ATOM_S": "128",
       "ABFLOW_MF_ATOM_DEPTH": "3",
       "ABFLOW_MF_ATOM_HEADS": "4",
@@ -87,17 +86,27 @@
       "ABFLOW_MF_OPM_DIM": "64",
       "ABFLOW_MF_ALLATOM_PAIR": "on",
       "ABFLOW_MF_ALLATOM_CHUNK": "512",
-      "ABFLOW_MF_DETACH_RECYCLE": "on",
       "ABFLOW_MF_LOCAL_ANTIGEN_K": "18",
       "ABFLOW_MF_TRIANGLE_HEADS": "4",
       "ABFLOW_MF_TRIANGLE_HIDDEN": "128",
       "ABFLOW_MF_TRIANGLE_CHECKPOINT": "off",
       "ABFLOW_DDP_FIND_UNUSED_PARAMETERS": "on",
-      "ABFLOW_DDP_STATIC_GRAPH": "off"
+      "ABFLOW_DDP_STATIC_GRAPH": "off",
+      "ABFLOW_MF_DETACH_STATE_CARRY": "on",
+      "ABFLOW_MF_SMOOTH_LDDT": "off",
+      "ABFLOW_MF_SMOOTH_LDDT_CUTOFF": "15.0",
+      "ABFLOW_LOSS_SMOOTH_LDDT_WEIGHT": "0.0",
+      "ABFLOW_MF_PAIR_ATOM_REFINER": "off",
+      "ABFLOW_MF_PAIR_ATOM_DEPTH": "1",
+      "ABFLOW_MF_PAIR_ATOM_HEADS": "4",
+      "ABFLOW_MF_PAIR_ATOM_QUERY_CHUNK": "64",
+      "ABFLOW_MF_SMOOTH_LDDT_INTRA_WEIGHT": "1.0",
+      "ABFLOW_MF_SMOOTH_LDDT_SCAFFOLD_WEIGHT": "1.0",
+      "ABFLOW_MF_SMOOTH_LDDT_ANTIGEN_WEIGHT": "1.0"
     },
     "formal_runtime": {
       "gpu_world_size": 2,
-      "recommended_physical_gpus": "6,7",
+      "recommended_physical_gpus": "2,3",
       "global_batch_size": 56,
       "local_batch_size_per_gpu": 28,
       "epoch_test": "every epoch, observational only",
@@ -108,24 +117,26 @@
     },
     "observability": [
       "run_time.log: canonical human-readable tmux/stdout/stderr stream; includes only mechanism diagnostics needed for R05×MF analysis",
-      "ValidationPhysical: validation H3 CA raw/aligned, native-contact F1 and CAAR",
-      "R05RoundAudit: per-round H3 CA raw/aligned and AAR across the original three R05 rounds",
-      "MFRepresentationAudit: single/pair RMS, local-token/pair counts, atom14-pair geometry RMS, OPM and exact triangle update RMS, zero-start adapter magnitude, recurrent single/pair delta, clean-SC weight and distogram",
+      "ValidationPhysical: validation designed-region/H3-current CA raw/aligned, native-contact F1 and CAAR",
+      "R05RoundAudit: per-round designed-region/H3-current CA raw/aligned and AAR across the original three R05 rounds",
+      "MFRepresentationAudit: single/pair RMS, local-token/pair counts, atom14-pair geometry RMS, OPM and exact triangle update RMS, zero-start adapter magnitude, recurrent single/pair delta, pair-conditioned atom refinement, distogram and design-region factored smooth-lDDT",
       "SequenceForensic: CE/AAR, posterior entropy/max probability/MAP collapse statistics and proposal agreement",
       "ValidationPhysicalBins: count-weighted H3 CA raw RMSD in five flow-time bins",
-      "LossAuthority: once-per-epoch gradient norms/cosines to diagnose whether representation/distogram objectives actually reach the shared R05 state",
-      "epoch_summary.csv: epoch + train/validation formal loss components + seven core Test metrics + all-time minimum-validation matched Test metrics"
+      "LossAuthority: once-per-epoch gradient norms/cosines to diagnose whether representation/geometry auxiliary objectives actually reach the shared R05 state",
+      "epoch_summary.csv: epoch + train/validation formal loss components + seven core Test metrics + train/val distogram/smooth-lDDT + all-time minimum-validation matched Test metrics"
     ],
     "loss_hierarchy": {
-      "formula": "L = 1.0*L_seq + 1.0*L_structure + 1.0*L_U02_interface + 1.0*L_edge + lambda_disto*L_distogram",
+      "formula": "L = 1.0*L_seq + 1.0*L_structure + 1.0*L_U02_interface + 1.0*L_edge + lambda_slddt*L_design_region_smooth_lddt + lambda_disto*L_distogram",
       "sequence_weight": 1.0,
       "structure_weight": 1.0,
       "interface_weight": 1.0,
       "edge_weight": 1.0,
-      "distogram_weight": 0.03,
-      "rationale": "The four R05 parent authorities remain at their historical coefficients to preserve the verified R05 optimization regime. The MF-backbone task-scale weights (sequence=0.4, aligned=0.5, smooth-lDDT=0.1, distogram=0.5, confidence=0.025) are not transplanted because those losses have different definitions and normalizations. R09/R10 add only mean-normalized persistent-pair distogram CE at the conservative MF prior 0.03; LossAuthority logs test whether this auxiliary is numerically negligible or dominant before any later weight ablation."
+      "distogram_weight": 0.0,
+      "rationale": "R05 parent losses remain unchanged. The optional design-region factored smooth-lDDT retains the MF/Boltz 0.5/1/2/4A smooth score and 15A protein cutoff, but normalizes design-design, design-fixed-scaffold and design-antigen relations separately per complex. Same-residue and context-context pairs are excluded. This prevents trivial local geometry or context size from dominating as the task scales from H3 to 6CDR; weight 0.1 keeps it a weak rigid-motion-invariant geometry regularizer rather than a second transport authority.",
+      "smooth_lddt_weight": 0.0
     },
-    "representation_fidelity": "v161 ABX/MF semantic closure at antibody task scale: explicit s/z, corrected atom multi-head attention, learned relpos, slot-resolved atom14 pair geometry, pair-biased single attention, OPM, exact triangle multiplication/attention on a triangle-closed local universe, pair transition, detached s/z recycle, final pair -> sole R05 EGNN node+coordinate mechanics, and AbX-style post-projection distogram symmetry when enabled. Intentional donor differences remain: no ESM/MSA, no native H3 AA-pair leakage, no IPA/AtomStructure second decoder, no SO(3) diffusion, no nested recycle loop.",
-    "implementation_revision": "v161_r05_mf_abx_semantic_closure"
+    "representation_fidelity": "v164 task-consistent donor fusion: AbX supplies explicit single->pair OPM semantics; MF supplies pair-first Pairformer z->single readback; both are adapted to the bounded proposal-anchored triangle-closed universe. Final z directly conditions the sole R05 EGNN node+coordinate mechanics. The optional geometry auxiliary is a design-region factored MF/Boltz smooth-lDDT adaptation, not an H3-specific loss. Intentional donor differences: no MSA/ESM, no native design-AA leakage, no IPA or AF3 AtomAttentionDecoder second coordinate authority, no EDM sampler and no nested fixed-input recycle.",
+    "implementation_revision": "v164_r05_mf_pair_atom_pair_universe_fix",
+    "runtime_bugfix": "Pair-conditioned atom refinement uses the exact bounded triangle-closed pair-universe token order recovered from pair_edges; full local antigen context outside that universe is left unchanged. This fixes the v163 44^2-vs-74^2 contract bug without changing the scientific factor."
   }
 }
