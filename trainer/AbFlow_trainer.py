@@ -1,10 +1,17 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
+# R05MF_AUTHORITY_LADDER_V169: three-run causal ladder; diagnostics/protocol unchanged from v168.
 """AbFlow trainer with low-overhead, machine-readable diagnostics.
 
 The TensorBoard logging behavior is preserved.  Main-rank JSONL/latest files are
 added so each epoch can be inspected without opening TensorBoard or evaluating
 all test checkpoints.  Periodic gradient-conflict probes are observational only.
+
+R05MF_DIAGNOSTIC_V167 is a diagnostics-only overlay.  It preserves the formal
+R05MF_PARENT_AUTHORITY_V168 adds observational Test-trajectory logging for the
+new parent-anchored authority experiment while preserving Train->Val->Test.
+Train -> Validation -> Test epoch order, checkpoint rule, sampler, RNG, losses,
+optimizer and scheduler.
 """
 from math import cos, pi, log, exp, isfinite
 import csv
@@ -391,6 +398,11 @@ class AbFlowTrainer(Trainer):
             # v103 validation_ema applies EMA whenever EMA exists.  This is the
             # same parameter snapshot that is serialized by validation .ckpt.
             with validation_ema(self):
+                if (
+                    bool(getattr(raw_model, 'sample_authority_diagnostics', False))
+                    and hasattr(raw_model, 'reset_sample_authority_diagnostics')
+                ):
+                    raw_model.reset_sample_authority_diagnostics()
                 generation = generate_distributed(
                     model=raw_model,
                     dataset=dataset,
@@ -407,6 +419,12 @@ class AbFlowTrainer(Trainer):
                     project_root=self._epoch_test_project_root,
                     num_workers=self._epoch_test_metric_workers,
                 )
+                if (
+                    bool(getattr(raw_model, 'sample_authority_diagnostics', False))
+                    and hasattr(raw_model, 'consume_sample_authority_diagnostics')
+                ):
+                    local_trace = raw_model.consume_sample_authority_diagnostics()
+                    self._print_epoch_test_authority_trace(local_trace)
 
 
             if self._is_main_proc():
@@ -449,6 +467,80 @@ class AbFlowTrainer(Trainer):
                 torch.cuda.empty_cache()
 
         return metrics
+
+    def _print_epoch_test_authority_trace(self, local_records):
+        """Aggregate model.sample authority diagnostics across Test ranks.
+
+        This is observation-only: records were collected from the exact forwards
+        already performed by the formal Test sampler.  No extra model query, RNG
+        call, sampler step, or metric computation is introduced.
+        """
+        gathered = [local_records]
+        if dist.is_available() and dist.is_initialized():
+            gathered = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(gathered, local_records)
+        if not self._is_main_proc():
+            return
+        rows = []
+        for item in gathered:
+            if item:
+                rows.extend(item)
+        if not rows:
+            return
+        fields = (
+            'seq_raw_ratio', 'seq_applied_ratio', 'seq_clip', 'seq_map_change',
+            'base_raw_ratio', 'base_applied_ratio', 'base_clip',
+            'edge_raw_ratio', 'edge_applied_ratio', 'edge_clip',
+            'coord_field_rms_A',
+        )
+        by_step = {}
+        for row in rows:
+            step = int(row.get('step', -1))
+            if step < 0:
+                continue
+            by_step.setdefault(step, []).append(row)
+
+        def mean_at(step, field):
+            vals = []
+            for row in by_step.get(step, []):
+                try:
+                    val = float(row.get(field, float('nan')))
+                except Exception:
+                    continue
+                if isfinite(val):
+                    vals.append(val)
+            return sum(vals) / len(vals) if vals else float('nan')
+
+        steps = sorted(by_step)
+        def arr(field, nd=3):
+            return '(' + ','.join(self._fmt(mean_at(st, field), nd) for st in steps) + ')'
+        tvals = []
+        for st in steps:
+            vals = []
+            for row in by_step[st]:
+                try:
+                    v = float(row.get('t', float('nan')))
+                except Exception:
+                    continue
+                if isfinite(v):
+                    vals.append(v)
+            tvals.append(sum(vals) / len(vals) if vals else float('nan'))
+        print(
+            '[EpochTestAuthorityTrace] '
+            f'epoch={self.epoch} '
+            f't=(' + ','.join(self._fmt(v, 2) for v in tvals) + ') '
+            f'seq_raw={arr("seq_raw_ratio")} '
+            f'seq_applied={arr("seq_applied_ratio")} '
+            f'seq_clip={arr("seq_clip")} '
+            f'seq_map_change={arr("seq_map_change")} '
+            f'base_raw={arr("base_raw_ratio")} '
+            f'base_applied={arr("base_applied_ratio")} '
+            f'base_clip={arr("base_clip")} '
+            f'edge_raw={arr("edge_raw_ratio")} '
+            f'edge_applied={arr("edge_applied_ratio")} '
+            f'edge_clip={arr("edge_clip")} '
+            f'coord_field_A={arr("coord_field_rms_A", 4)}'
+        )
 
     def _valid_epoch(self, device):
         """Exact EMA validation on the full set, sharded across DDP ranks.
@@ -684,14 +776,14 @@ class AbFlowTrainer(Trainer):
             "loss_edge": m("Dock/EDLoss/Validation"),
             "mf_distogram_loss": m("DTM/mf_distogram_loss/Validation"),
             "mf_smooth_lddt_loss": m("DTM/mf_smooth_lddt_loss/Validation"),
-            "mf_smooth_lddt_intra_loss": m("AbFlowDiag/mf_smooth_lddt_intra_loss/Validation"),
-            "mf_smooth_lddt_scaffold_loss": m("AbFlowDiag/mf_smooth_lddt_scaffold_loss/Validation"),
-            "mf_smooth_lddt_antigen_loss": m("AbFlowDiag/mf_smooth_lddt_antigen_loss/Validation"),
-            "mf_smooth_lddt_intra_pairs": m("AbFlowDiag/mf_smooth_lddt_intra_pairs/Validation"),
-            "mf_smooth_lddt_scaffold_pairs": m("AbFlowDiag/mf_smooth_lddt_scaffold_pairs/Validation"),
-            "mf_smooth_lddt_antigen_pairs": m("AbFlowDiag/mf_smooth_lddt_antigen_pairs/Validation"),
-            "mf_smooth_lddt_perfect_floor": m("AbFlowDiag/mf_smooth_lddt_perfect_floor/Validation"),
-            "mf_smooth_lddt_excess": m("AbFlowDiag/mf_smooth_lddt_excess/Validation"),
+            "mf_smooth_lddt_intra_loss": m("DTM/mf_smooth_lddt_intra_loss/Validation"),
+            "mf_smooth_lddt_scaffold_loss": m("DTM/mf_smooth_lddt_scaffold_loss/Validation"),
+            "mf_smooth_lddt_antigen_loss": m("DTM/mf_smooth_lddt_antigen_loss/Validation"),
+            "mf_smooth_lddt_intra_pairs": m("DTM/mf_smooth_lddt_intra_pairs/Validation"),
+            "mf_smooth_lddt_scaffold_pairs": m("DTM/mf_smooth_lddt_scaffold_pairs/Validation"),
+            "mf_smooth_lddt_antigen_pairs": m("DTM/mf_smooth_lddt_antigen_pairs/Validation"),
+            "mf_smooth_lddt_perfect_floor": m("DTM/mf_smooth_lddt_perfect_floor/Validation"),
+            "mf_smooth_lddt_excess": m("DTM/mf_smooth_lddt_excess/Validation"),
             "h3ca_raw_r0": m("AbFlowDiag/val_proxy_round0_h3_ca_rmsd/Validation"),
             "h3ca_raw_r1": m("AbFlowDiag/val_proxy_round1_h3_ca_rmsd/Validation"),
             "h3ca_raw_r2": m("AbFlowDiag/val_proxy_round2_h3_ca_rmsd/Validation"),
@@ -711,6 +803,10 @@ class AbFlowTrainer(Trainer):
             "seq_unique_map_classes": m("AbFlowDiag/val_proxy_seq_unique_map_classes/Validation"),
             "proposal_aar": m("AbFlowDiag/seq_pep_vs_native_aar/Validation"),
             "pred_vs_proposal_aar": m("AbFlowDiag/seq_pred_vs_pep_aar/Validation"),
+            "proposal_change_rate": m("AbFlowDiag/seq_change_from_proposal_rate/Validation"),
+            "proposal_preservation_rate": m("AbFlowDiag/seq_proposal_correct_preservation_rate/Validation"),
+            "proposal_damage_rate": m("AbFlowDiag/seq_proposal_correct_damage_rate/Validation"),
+            "proposal_correction_rate": m("AbFlowDiag/seq_proposal_wrong_correction_rate/Validation"),
             "mf_single_rms": m("AbFlowDiag/mf_single_rms/Validation"),
             "mf_pair_rms": m("AbFlowDiag/mf_pair_rms/Validation"),
             "mf_pair_count": m("AbFlowDiag/mf_pair_count/Validation"),
@@ -725,7 +821,24 @@ class AbFlowTrainer(Trainer):
             "mf_pair_atom_residual_rms": m("AbFlowDiag/mf_pair_atom_residual_rms/Validation"),
             "mf_pair_atom_adapter_weight_rms": m("AbFlowDiag/mf_pair_atom_adapter_weight_rms/Validation"),
             "mf_base_residual_rms": m("AbFlowDiag/mf_base_residual_rms/Validation"),
+            "mf_base_residual_applied_rms": m("AbFlowDiag/mf_base_residual_applied_rms/Validation"),
+            "mf_base_raw_to_parent_ratio": m("AbFlowDiag/mf_base_raw_to_parent_ratio/Validation"),
+            "mf_base_applied_to_parent_ratio": m("AbFlowDiag/mf_base_applied_to_parent_ratio/Validation"),
+            "mf_base_authority_clip_fraction": m("AbFlowDiag/mf_base_authority_clip_fraction/Validation"),
+            "mf_base_authority_mean_scale": m("AbFlowDiag/mf_base_authority_mean_scale/Validation"),
+            "mf_edge_raw_ratio": m("AbFlowDiag/mf_edge_raw_ratio/Validation"),
+            "mf_edge_applied_ratio": m("AbFlowDiag/mf_edge_applied_ratio/Validation"),
+            "mf_edge_clip_fraction": m("AbFlowDiag/mf_edge_clip_fraction/Validation"),
+            "mf_edge_mean_scale": m("AbFlowDiag/mf_edge_mean_scale/Validation"),
             "mf_seq_residual_rms": m("AbFlowDiag/mf_seq_residual_rms/Validation"),
+            "mf_seq_parent_logit_rms": m("AbFlowDiag/mf_seq_parent_logit_rms/Validation"),
+            "mf_seq_final_logit_rms": m("AbFlowDiag/mf_seq_final_logit_rms/Validation"),
+            "mf_seq_raw_residual_to_parent_ratio": m("AbFlowDiag/mf_seq_raw_residual_to_parent_ratio/Validation"),
+            "mf_seq_residual_to_parent_ratio": m("AbFlowDiag/mf_seq_residual_to_parent_ratio/Validation"),
+            "mf_seq_parent_residual_cos": m("AbFlowDiag/mf_seq_parent_residual_cos/Validation"),
+            "mf_seq_parent_to_final_map_change_rate": m("AbFlowDiag/mf_seq_parent_to_final_map_change_rate/Validation"),
+            "mf_seq_authority_clip_fraction": m("AbFlowDiag/mf_seq_authority_clip_fraction/Validation"),
+            "mf_seq_authority_mean_scale": m("AbFlowDiag/mf_seq_authority_mean_scale/Validation"),
             "mf_single_round_delta_rms": m("AbFlowDiag/mf_single_round_delta_rms/Validation"),
             "mf_pair_round_delta_rms": m("AbFlowDiag/mf_pair_round_delta_rms/Validation"),
             "mf_base_adapter_weight_rms": m("AbFlowDiag/mf_base_adapter_weight_rms/Validation"),
@@ -737,12 +850,37 @@ class AbFlowTrainer(Trainer):
         for ridx in range(3):
             for name in (
                 "mf_single_rms", "mf_pair_rms", "mf_base_residual_rms",
-                "mf_seq_residual_rms", "mf_single_round_delta_rms",
-                "mf_pair_round_delta_rms",
+                "mf_base_residual_applied_rms",
+                "mf_base_raw_to_parent_ratio", "mf_base_applied_to_parent_ratio",
+                "mf_base_authority_clip_fraction", "mf_base_authority_mean_scale",
+                "mf_edge_raw_ratio", "mf_edge_applied_ratio",
+                "mf_edge_clip_fraction", "mf_edge_mean_scale",
+                "mf_seq_residual_rms", "mf_seq_parent_logit_rms",
+                "mf_seq_final_logit_rms", "mf_seq_raw_residual_to_parent_ratio",
+                "mf_seq_residual_to_parent_ratio",
+                "mf_seq_parent_residual_cos",
+                "mf_seq_parent_to_final_map_change_rate",
+                "mf_seq_authority_clip_fraction", "mf_seq_authority_mean_scale",
+                "mf_single_round_delta_rms", "mf_pair_round_delta_rms",
             ):
                 summary[f"round{ridx}_{name}"] = m(
                     f"AbFlowDiag/round{ridx}_{name}/Validation"
                 )
+            for name in (
+                "seq_entropy", "seq_max_prob", "seq_native_prob",
+                "seq_top1_margin",
+            ):
+                summary[f"round{ridx}_{name}"] = m(
+                    f"AbFlowDiag/val_proxy_round{ridx}_{name}/Validation"
+                )
+        for a, b, key in ((0, 1, "aar_delta01"), (1, 2, "aar_delta12")):
+            va, vb = summary.get(f"aar_r{a}"), summary.get(f"aar_r{b}")
+            summary[key] = (
+                float(vb) - float(va)
+                if va is not None and vb is not None
+                and isfinite(float(va)) and isfinite(float(vb))
+                else float("nan")
+            )
         for bidx in range(5):
             raw, count = self._weighted_timebin_metric(
                 merged_buffer, bidx, aligned=False
@@ -792,6 +930,80 @@ class AbFlowTrainer(Trainer):
             f"unique_MAP={self._fmt(summary.get('seq_unique_map_classes'), 1)} "
             f"proposal_AAR={self._fmt(summary.get('proposal_aar'), 4)} "
             f"pred_vs_proposal={self._fmt(summary.get('pred_vs_proposal_aar'), 4)}"
+        )
+        print(
+            "[SequenceRoundAudit] "
+            f"epoch={self.epoch} "
+            f"AAR=({self._fmt(summary.get('aar_r0'), 4)},"
+            f"{self._fmt(summary.get('aar_r1'), 4)},"
+            f"{self._fmt(summary.get('aar_r2'), 4)}) "
+            f"dAAR01={self._fmt(summary.get('aar_delta01'), 4)} "
+            f"dAAR12={self._fmt(summary.get('aar_delta12'), 4)} "
+            f"entropy=({self._fmt(summary.get('round0_seq_entropy'), 4)},"
+            f"{self._fmt(summary.get('round1_seq_entropy'), 4)},"
+            f"{self._fmt(summary.get('round2_seq_entropy'), 4)}) "
+            f"native_p=({self._fmt(summary.get('round0_seq_native_prob'), 4)},"
+            f"{self._fmt(summary.get('round1_seq_native_prob'), 4)},"
+            f"{self._fmt(summary.get('round2_seq_native_prob'), 4)}) "
+            f"margin=({self._fmt(summary.get('round0_seq_top1_margin'), 4)},"
+            f"{self._fmt(summary.get('round1_seq_top1_margin'), 4)},"
+            f"{self._fmt(summary.get('round2_seq_top1_margin'), 4)})"
+        )
+        print(
+            "[SequenceAuthority] "
+            f"epoch={self.epoch} "
+            f"parent_logit_rms=({self._fmt(summary.get('round0_mf_seq_parent_logit_rms'), 5)},"
+            f"{self._fmt(summary.get('round1_mf_seq_parent_logit_rms'), 5)},"
+            f"{self._fmt(summary.get('round2_mf_seq_parent_logit_rms'), 5)}) "
+            f"modern_to_parent=({self._fmt(summary.get('round0_mf_seq_residual_to_parent_ratio'), 5)},"
+            f"{self._fmt(summary.get('round1_mf_seq_residual_to_parent_ratio'), 5)},"
+            f"{self._fmt(summary.get('round2_mf_seq_residual_to_parent_ratio'), 5)}) "
+            f"cos=({self._fmt(summary.get('round0_mf_seq_parent_residual_cos'), 4)},"
+            f"{self._fmt(summary.get('round1_mf_seq_parent_residual_cos'), 4)},"
+            f"{self._fmt(summary.get('round2_mf_seq_parent_residual_cos'), 4)}) "
+            f"map_change=({self._fmt(summary.get('round0_mf_seq_parent_to_final_map_change_rate'), 4)},"
+            f"{self._fmt(summary.get('round1_mf_seq_parent_to_final_map_change_rate'), 4)},"
+            f"{self._fmt(summary.get('round2_mf_seq_parent_to_final_map_change_rate'), 4)})"
+        )
+        print(
+            "[ParentAuthorityAudit] "
+            f"epoch={self.epoch} "
+            f"seq_raw=({self._fmt(summary.get('round0_mf_seq_raw_residual_to_parent_ratio'), 4)},"
+            f"{self._fmt(summary.get('round1_mf_seq_raw_residual_to_parent_ratio'), 4)},"
+            f"{self._fmt(summary.get('round2_mf_seq_raw_residual_to_parent_ratio'), 4)}) "
+            f"seq_applied=({self._fmt(summary.get('round0_mf_seq_residual_to_parent_ratio'), 4)},"
+            f"{self._fmt(summary.get('round1_mf_seq_residual_to_parent_ratio'), 4)},"
+            f"{self._fmt(summary.get('round2_mf_seq_residual_to_parent_ratio'), 4)}) "
+            f"seq_clip=({self._fmt(summary.get('round0_mf_seq_authority_clip_fraction'), 4)},"
+            f"{self._fmt(summary.get('round1_mf_seq_authority_clip_fraction'), 4)},"
+            f"{self._fmt(summary.get('round2_mf_seq_authority_clip_fraction'), 4)}) "
+            f"base_raw=({self._fmt(summary.get('round0_mf_base_raw_to_parent_ratio'), 4)},"
+            f"{self._fmt(summary.get('round1_mf_base_raw_to_parent_ratio'), 4)},"
+            f"{self._fmt(summary.get('round2_mf_base_raw_to_parent_ratio'), 4)}) "
+            f"base_applied=({self._fmt(summary.get('round0_mf_base_applied_to_parent_ratio'), 4)},"
+            f"{self._fmt(summary.get('round1_mf_base_applied_to_parent_ratio'), 4)},"
+            f"{self._fmt(summary.get('round2_mf_base_applied_to_parent_ratio'), 4)}) "
+            f"base_clip=({self._fmt(summary.get('round0_mf_base_authority_clip_fraction'), 4)},"
+            f"{self._fmt(summary.get('round1_mf_base_authority_clip_fraction'), 4)},"
+            f"{self._fmt(summary.get('round2_mf_base_authority_clip_fraction'), 4)}) "
+            f"edge_raw=({self._fmt(summary.get('round0_mf_edge_raw_ratio'), 4)},"
+            f"{self._fmt(summary.get('round1_mf_edge_raw_ratio'), 4)},"
+            f"{self._fmt(summary.get('round2_mf_edge_raw_ratio'), 4)}) "
+            f"edge_applied=({self._fmt(summary.get('round0_mf_edge_applied_ratio'), 4)},"
+            f"{self._fmt(summary.get('round1_mf_edge_applied_ratio'), 4)},"
+            f"{self._fmt(summary.get('round2_mf_edge_applied_ratio'), 4)}) "
+            f"edge_clip=({self._fmt(summary.get('round0_mf_edge_clip_fraction'), 4)},"
+            f"{self._fmt(summary.get('round1_mf_edge_clip_fraction'), 4)},"
+            f"{self._fmt(summary.get('round2_mf_edge_clip_fraction'), 4)})"
+        )
+        print(
+            "[SequenceProposalAudit] "
+            f"epoch={self.epoch} proposal_AAR={self._fmt(summary.get('proposal_aar'), 4)} "
+            f"pred_eq_proposal={self._fmt(summary.get('pred_vs_proposal_aar'), 4)} "
+            f"change={self._fmt(summary.get('proposal_change_rate'), 4)} "
+            f"preserve_correct={self._fmt(summary.get('proposal_preservation_rate'), 4)} "
+            f"correct_wrong={self._fmt(summary.get('proposal_correction_rate'), 4)} "
+            f"damage_correct={self._fmt(summary.get('proposal_damage_rate'), 4)}"
         )
         print(
             "[MFRepresentationAudit] "
@@ -857,6 +1069,51 @@ class AbFlowTrainer(Trainer):
             f"cos(Struct,D)={self._fmt(g('grad_probe_cos_structure_distogram'), 3)} "
             f"cos(T,L)={self._fmt(g('grad_probe_cos_endpoint_smooth_lddt'), 3)} "
             f"cos(Struct,L)={self._fmt(g('grad_probe_cos_structure_smooth_lddt'), 3)}"
+        )
+        raw_model = self.model.module if hasattr(self.model, "module") else self.model
+        weights = {
+            "endpoint": float(getattr(raw_model, "loss_interface_weight", 1.0)),
+            "seq": float(getattr(raw_model, "loss_sequence_weight", 1.0)),
+            "structure": float(getattr(raw_model, "loss_structure_weight", 1.0)),
+            "edge": float(getattr(raw_model, "loss_edge_weight", 1.0)),
+            "distogram": float(getattr(raw_model, "loss_distogram_weight", 0.0)),
+            "smooth_lddt": float(getattr(raw_model, "loss_smooth_lddt_weight", 0.0)),
+        }
+        gT = g("grad_probe_norm_endpoint")
+        wT = weights["endpoint"]
+
+        def ratio(name):
+            gx = g(f"grad_probe_norm_{name}")
+            if gx is None or gT is None or abs(float(gT)) <= 1.0e-20:
+                return None
+            return float(gx) / float(gT)
+
+        def unit_ratio(name):
+            gx = g(f"grad_probe_norm_{name}")
+            wx = weights[name]
+            if (
+                gx is None or gT is None or abs(float(gT)) <= 1.0e-20
+                or abs(float(wx)) <= 1.0e-20 or abs(float(wT)) <= 1.0e-20
+            ):
+                return None
+            return (float(gx) / float(wx)) / (float(gT) / float(wT))
+
+        print(
+            "[LossAuthorityNormalized] "
+            f"epoch={self.epoch} step={self.global_step} "
+            f"A_S/T={self._fmt(ratio('seq'), 4)} "
+            f"A_Struct/T={self._fmt(ratio('structure'), 4)} "
+            f"A_Edge/T={self._fmt(ratio('edge'), 4)} "
+            f"A_D/T={self._fmt(ratio('distogram'), 4)} "
+            f"A_L/T={self._fmt(ratio('smooth_lddt'), 4)} "
+            f"unit_S/T={self._fmt(unit_ratio('seq'), 4)} "
+            f"unit_Struct/T={self._fmt(unit_ratio('structure'), 4)} "
+            f"unit_Edge/T={self._fmt(unit_ratio('edge'), 4)} "
+            f"unit_D/T={self._fmt(unit_ratio('distogram'), 4)} "
+            f"unit_L/T={self._fmt(unit_ratio('smooth_lddt'), 4)} "
+            f"weights=T:{weights['endpoint']:.4g},S:{weights['seq']:.4g},"
+            f"Struct:{weights['structure']:.4g},Edge:{weights['edge']:.4g},"
+            f"D:{weights['distogram']:.4g},L:{weights['smooth_lddt']:.4g}"
         )
 
 
@@ -1079,6 +1336,55 @@ class AbFlowTrainer(Trainer):
                     f"loss={self._fmte(loss_scalar, 6)} "
                     f"struct={self._fmte(struct_scalar, 6)} "
                     f"threshold={self._fmte(self._train_loss_outlier_threshold, 3)}"
+                )
+
+                abdiag = getattr(raw_model, "last_abflow_diagnostics", None) or {}
+                print(
+                    "[TrainLossOutlierDetails] "
+                    f"epoch={self.epoch} step={self.global_step} rank={rank} "
+                    f"xloss={self._fmte(self._scalar(xloss), 6)} "
+                    f"bond={self._fmte(self._scalar(bond_loss), 6)} "
+                    f"scbond={self._fmte(self._scalar(sc_bond_loss), 6)} "
+                    f"interface={self._fmte(self._scalar(interface_loss), 6)} "
+                    f"edge={self._fmte(self._scalar(ed_loss), 6)} "
+                    f"t_min={self._fmt(self._scalar(abdiag.get('t_min')), 5)} "
+                    f"t_mean={self._fmt(self._scalar(abdiag.get('t_mean')), 5)} "
+                    f"t_max={self._fmt(self._scalar(abdiag.get('t_max')), 5)} "
+                    f"path_cov={self._fmt(self._scalar(abdiag.get('sequence_path_mask_rate')), 5)} "
+                    f"loss_cov={self._fmt(self._scalar(abdiag.get('sequence_loss_mask_rate')), 5)} "
+                    f"context_ratio={self._fmt(self._scalar(batch.get('context_ratio')), 5)}"
+                )
+
+                def _safe_preview(value, limit=8):
+                    try:
+                        if torch.is_tensor(value):
+                            v = value.detach().cpu()
+                            if v.numel() <= limit:
+                                return str(v.reshape(-1).tolist())
+                            return str(v.reshape(-1)[:limit].tolist()) + "..."
+                        if isinstance(value, (list, tuple)):
+                            return repr(list(value[:limit])) + ("..." if len(value) > limit else "")
+                        if isinstance(value, (str, int, float, bool)):
+                            return repr(value)
+                    except Exception:
+                        pass
+                    return None
+
+                meta = []
+                for key in (
+                    "pdb", "pdb_id", "complex_id", "sample_id", "id",
+                    "name", "summary", "lengths"
+                ):
+                    if key in batch:
+                        preview = _safe_preview(batch[key])
+                        if preview is not None:
+                            meta.append(f"{key}={preview}")
+                if not meta:
+                    meta.append("keys=" + ",".join(sorted(map(str, batch.keys()))))
+                print(
+                    "[TrainLossOutlierBatch] "
+                    f"epoch={self.epoch} step={self.global_step} rank={rank} "
+                    + " ".join(meta)
                 )
                 self._train_loss_outlier_logged_epoch = int(self.epoch)
 

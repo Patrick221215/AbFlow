@@ -1,10 +1,48 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
+# R05MF_AUTHORITY_LADDER_V169: three-run causal ladder; pair-edge authority operator unchanged from v168.
+# R05MF_PARENT_AUTHORITY_V168: non-dominant pair->R05 edge-message trust region.
 import torch
 import torch.nn as nn
 
 from torch_scatter import scatter_softmax
 from .am_egnn import AM_E_GCL, MS_E_GCL, coord2radial, coord_SR
+
+
+def _parent_anchored_edge_residual(base, residual, eps=1.0e-8):
+    """Parameter-free per-edge RMS trust region for MF->R05 messages.
+
+    The applied donor residual is never allowed to exceed the already-computed
+    parent R05 edge message in RMS.  Norms are detached so the constraint cannot
+    be gamed by inflating parent activations; gradients still train residual
+    direction and content through the fixed multiplicative scale.
+    """
+    if base.shape != residual.shape:
+        raise ValueError(
+            f"edge parent/residual shape mismatch: {tuple(base.shape)} vs "
+            f"{tuple(residual.shape)}"
+        )
+    p_rms = torch.sqrt(
+        base.detach().float().pow(2).mean(dim=-1, keepdim=True) + eps
+    )
+    r_rms = torch.sqrt(
+        residual.detach().float().pow(2).mean(dim=-1, keepdim=True) + eps
+    )
+    scale = torch.minimum(
+        torch.ones_like(p_rms), p_rms / r_rms.clamp_min(eps)
+    )
+    applied = residual * scale.to(device=residual.device, dtype=residual.dtype)
+    with torch.no_grad():
+        applied_rms = torch.sqrt(
+            applied.detach().float().pow(2).mean(dim=-1, keepdim=True) + eps
+        )
+        diag = {
+            'raw_ratio': (r_rms / p_rms.clamp_min(eps)).mean(),
+            'applied_ratio': (applied_rms / p_rms.clamp_min(eps)).mean(),
+            'clip_fraction': (scale < (1.0 - 1.0e-6)).float().mean(),
+            'mean_scale': scale.mean(),
+        }
+    return applied, diag
 
 
 class _PairResidualAMEGCL(nn.Module):
@@ -20,9 +58,11 @@ class _PairResidualAMEGCL(nn.Module):
     initialization of later legacy parameters.
     """
 
-    def __init__(self, base_gcl, pair_dim):
+    def __init__(self, base_gcl, pair_dim, parent_authority=False):
         super().__init__()
         self.base = base_gcl
+        self.parent_authority = bool(parent_authority)
+        self._last_authority_diag = {}
         hidden_nf = int(base_gcl.edge_mlp[0].out_features)
         self.pair_norm = nn.LayerNorm(int(pair_dim))
         self.pair_weight = nn.Parameter(torch.zeros(hidden_nf, int(pair_dim)))
@@ -38,13 +78,33 @@ class _PairResidualAMEGCL(nn.Module):
             h[row], h[col], radial, edge_attr=None
         )
         enriched_edge_feat = base_edge_feat
+        self._last_authority_diag = {}
         if edge_attr is not None:
             pair = self.pair_norm(edge_attr.to(
                 device=base_edge_feat.device, dtype=base_edge_feat.dtype
             ))
-            enriched_edge_feat = base_edge_feat + torch.nn.functional.linear(
+            pair_residual = torch.nn.functional.linear(
                 pair, self.pair_weight.to(base_edge_feat.dtype)
             )
+            if self.parent_authority:
+                pair_residual, self._last_authority_diag = (
+                    _parent_anchored_edge_residual(base_edge_feat, pair_residual)
+                )
+            else:
+                with torch.no_grad():
+                    p_rms = torch.sqrt(
+                        base_edge_feat.detach().float().pow(2).mean(dim=-1) + 1.0e-8
+                    )
+                    r_rms = torch.sqrt(
+                        pair_residual.detach().float().pow(2).mean(dim=-1) + 1.0e-8
+                    )
+                    ratio = (r_rms / p_rms.clamp_min(1.0e-8)).mean()
+                    self._last_authority_diag = {
+                        'raw_ratio': ratio, 'applied_ratio': ratio,
+                        'clip_fraction': ratio.new_tensor(0.0),
+                        'mean_scale': ratio.new_tensor(1.0),
+                    }
+            enriched_edge_feat = base_edge_feat + pair_residual
         # Semantic closure: AbX consumes its final pair state directly inside the
         # structure trunk.  In the R05 hybrid, the analogous consumer is the *same*
         # existing EGNN layer.  Therefore the enriched invariant edge message must
@@ -61,9 +121,11 @@ class _PairResidualAMEGCL(nn.Module):
 class _PairResidualMSGCL(nn.Module):
     """Surface counterpart of _PairResidualAMEGCL."""
 
-    def __init__(self, base_gcl, pair_dim):
+    def __init__(self, base_gcl, pair_dim, parent_authority=False):
         super().__init__()
         self.base = base_gcl
+        self.parent_authority = bool(parent_authority)
+        self._last_authority_diag = {}
         hidden_nf = int(base_gcl.edge_mlp[0].out_features)
         self.pair_norm = nn.LayerNorm(int(pair_dim))
         self.pair_weight = nn.Parameter(torch.zeros(hidden_nf, int(pair_dim)))
@@ -79,13 +141,33 @@ class _PairResidualMSGCL(nn.Module):
             h[row], h[col], radial, edge_attr=None
         )
         enriched_edge_feat = base_edge_feat
+        self._last_authority_diag = {}
         if edge_attr is not None:
             pair = self.pair_norm(edge_attr.to(
                 device=base_edge_feat.device, dtype=base_edge_feat.dtype
             ))
-            enriched_edge_feat = base_edge_feat + torch.nn.functional.linear(
+            pair_residual = torch.nn.functional.linear(
                 pair, self.pair_weight.to(base_edge_feat.dtype)
             )
+            if self.parent_authority:
+                pair_residual, self._last_authority_diag = (
+                    _parent_anchored_edge_residual(base_edge_feat, pair_residual)
+                )
+            else:
+                with torch.no_grad():
+                    p_rms = torch.sqrt(
+                        base_edge_feat.detach().float().pow(2).mean(dim=-1) + 1.0e-8
+                    )
+                    r_rms = torch.sqrt(
+                        pair_residual.detach().float().pow(2).mean(dim=-1) + 1.0e-8
+                    )
+                    ratio = (r_rms / p_rms.clamp_min(1.0e-8)).mean()
+                    self._last_authority_diag = {
+                        'raw_ratio': ratio, 'applied_ratio': ratio,
+                        'clip_fraction': ratio.new_tensor(0.0),
+                        'mean_scale': ratio.new_tensor(1.0),
+                    }
+            enriched_edge_feat = base_edge_feat + pair_residual
         coord = self.base.coord_model(
             coord, edge_index, abX, enriched_edge_feat, channel_weights
         )
@@ -143,7 +225,7 @@ class AMEncoder(nn.Module):
             radial_nf, edges_in_d=in_edge_nf, act_fn=act_fn, residual=residual
         )
 
-    def enable_pair_representation(self, pair_dim):
+    def enable_pair_representation(self, pair_dim, parent_authority=False):
         """Inject persistent pair states into local interface messages.
 
         Only the local inter/surface pathways are wrapped.  Global/context R05
@@ -157,14 +239,37 @@ class AMEncoder(nn.Module):
             raise ValueError("pair_dim must be positive")
         for i in range(self.n_layers):
             self._modules[f'inter_gcl_{i}'] = _PairResidualAMEGCL(
-                self._modules[f'inter_gcl_{i}'], pair_dim
+                self._modules[f'inter_gcl_{i}'], pair_dim,
+                parent_authority=parent_authority,
             )
             self._modules[f'surf_gcl_{i}'] = _PairResidualMSGCL(
-                self._modules[f'surf_gcl_{i}'], pair_dim
+                self._modules[f'surf_gcl_{i}'], pair_dim,
+                parent_authority=parent_authority,
             )
         self._pair_representation_enabled = True
         self._pair_representation_dim = pair_dim
-    
+        self._pair_parent_authority = bool(parent_authority)
+
+    def pair_authority_diagnostics(self):
+        """Return mean local/surface pair->EGNN authority diagnostics.
+
+        Plain attributes are used rather than buffers, so checkpoint/state_dict
+        compatibility with v164/v167 is exact.
+        """
+        values = {}
+        for i in range(self.n_layers):
+            for key in ('raw_ratio', 'applied_ratio', 'clip_fraction', 'mean_scale'):
+                for prefix in ('inter_gcl_', 'surf_gcl_'):
+                    mod = self._modules.get(f'{prefix}{i}')
+                    diag = getattr(mod, '_last_authority_diag', {}) if mod is not None else {}
+                    val = diag.get(key, None)
+                    if torch.is_tensor(val) and val.numel() == 1:
+                        values.setdefault(key, []).append(val.detach())
+        out = {}
+        for key, vals in values.items():
+            out[key] = torch.stack([v.float() for v in vals]).mean()
+        return out
+
     def forward(self, h, x, ctx_edges, inter_mask, inter_x, surf_verts, inter_edges, update_mask, inter_update_mask, aligned_edges, epi_index, channel_attr, channel_weights,
                 ctx_edge_attr=None, inter_edge_attr=None, surf_edge_attr=None):
         h = self.linear_in(h)

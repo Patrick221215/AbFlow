@@ -33,10 +33,18 @@ PYSELF
 #      AbX OPM supplies s->z; MF pair-first ordering supplies refined z->s;
 #      final z directly conditions the sole R05 EGNN node+coordinate mechanics.
 # R09: R08 + MF/AF3-inspired pair-conditioned atom representation refinement only.
-# R10: R09 + design-region factored smooth-lDDT only (weight 0.1).
-# Distogram remains implemented but is deliberately deferred to a later optional ablation.
-#      R08-R10 preserve R05 PCS-RC/residue-R3/U02 physics, three-round task
-#      recurrence, sequence path, optimizer and global batch semantics.
+# R10: R09 + design-region factored smooth-lDDT only (weight 0.1); historical evidence run.
+# R05MF_DIAGNOSTIC_V167: diagnostics-only overlay; formal Train->Val->Test unchanged.
+# R05MF_PARENT_AUTHORITY_V168: implements the parent-anchored non-dominant MF->R05
+#      residual operator and Test-trajectory authority diagnostics.
+# R05MF_AUTHORITY_LADDER_V169: new three-run causal ladder after stopping R08-R10:
+# R11: R08 closed core + parent-authority closure only (pair-atom OFF).
+# R12: R11 + pair-conditioned atom representation only.
+# R13: R12 + MFDesign persistent-pair distogram only (weight 0.03).
+#      R11-R13 all preserve R05 PCS-RC/residue-R3/U02 physics, three-round task
+#      recurrence, legacy sequence process, optimizer and global batch semantics.
+#      smooth-lDDT is deliberately OFF in the new ladder because its DF/DA terms
+#      were empirically saturated and its measured gradient authority was weak.
 #
 # Physical path min_sigma is intentionally 0 for all three formal runs.  This
 # keeps PCS-RC/native as exact endpoints and preserves the exact canonical
@@ -110,7 +118,7 @@ export ABFLOW_ROUND_CONSISTENT_COORD_SUPERVISION="off"
 export ABFLOW_COORDINATE_AUTHORITY="legacy_dual"
 export ABFLOW_STRUCTURE_SEQ_READOUT="off"
 
-# R05 x MFDesign representation defaults.  The three R08-R10 JSON configs
+# R05 x MFDesign representation defaults.  Formal R08-R13 JSON configs
 # override only this whitelisted representation/loss namespace; all R05 physics
 # above remains launcher-owned and cannot be changed by the experiment metadata.
 export ABFLOW_MF_REPR_CORE="off"
@@ -292,6 +300,89 @@ case "$EXP_ID" in
     export ABFLOW_MF_SMOOTH_LDDT="on"
     ;;
 
+  R11_R05_MF_CLOSED_CORE_PARENT_ANCHORED_U02)
+    # R11 = R08 + one factor: close the shared MF->R05 residual authority boundary.
+    # Pair-atom and all auxiliary geometry losses stay OFF to isolate the P0 mechanism.
+    export ABFLOW_ABLATION_PARENT="R08_R05_MF_CLOSED_CORE_U02"
+    export ABFLOW_EXPERIMENT_FACTOR="parent_anchored_nondominant_residual_authority_on_closed_core_only"
+    export ABFLOW_SINGLE_FACTOR_ABLATION="true"
+    export ABFLOW_MODULE_ID="R11_R05_MF_CLOSED_CORE_PARENT_ANCHORED"
+    export ABFLOW_MODULE_PARENT="R08_R05_MF_CLOSED_CORE"
+
+    export ABFLOW_R3_NOISE_SCOPE="residue"
+    export ABFLOW_SCOREFM_LOSS_MODE="f01_r3_endpoint_canonical_hybrid"
+    export ABFLOW_SCOREFM_SAMPLER_MODE="f01_canonical_carrier"
+    export ABFLOW_FLOW_T_MIN="0.0"
+    export ABFLOW_FLOW_T_MAX="1.0"
+
+    export ABFLOW_DDP_COST_BALANCED="on"
+    export ABFLOW_DDP_FIND_UNUSED_PARAMETERS="on"
+    export ABFLOW_DDP_STATIC_GRAPH="off"
+    export ABFLOW_MF_TRIANGLE_CHECKPOINT="off"
+    export ABFLOW_MF_PAIR_ATOM_REFINER="off"
+    export ABFLOW_MF_DISTOGRAM="off"
+    export ABFLOW_LOSS_DISTOGRAM_WEIGHT="0.0"
+    export ABFLOW_MF_SMOOTH_LDDT="off"
+    export ABFLOW_LOSS_SMOOTH_LDDT_WEIGHT="0.0"
+    export ABFLOW_MF_PARENT_AUTHORITY="on"
+    export ABFLOW_MF_SAMPLE_AUTHORITY_DIAGNOSTICS="on"
+    ;;
+
+  R12_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_U02)
+    # R12 = R11 + one donor-validated semantic: MF-style z->atom-pair representation.
+    export ABFLOW_ABLATION_PARENT="R11_R05_MF_CLOSED_CORE_PARENT_ANCHORED_U02"
+    export ABFLOW_EXPERIMENT_FACTOR="add_pair_conditioned_atom_representation_under_fixed_parent_authority"
+    export ABFLOW_SINGLE_FACTOR_ABLATION="true"
+    export ABFLOW_MODULE_ID="R12_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM"
+    export ABFLOW_MODULE_PARENT="R11_R05_MF_CLOSED_CORE_PARENT_ANCHORED"
+
+    export ABFLOW_R3_NOISE_SCOPE="residue"
+    export ABFLOW_SCOREFM_LOSS_MODE="f01_r3_endpoint_canonical_hybrid"
+    export ABFLOW_SCOREFM_SAMPLER_MODE="f01_canonical_carrier"
+    export ABFLOW_FLOW_T_MIN="0.0"
+    export ABFLOW_FLOW_T_MAX="1.0"
+
+    export ABFLOW_DDP_COST_BALANCED="on"
+    export ABFLOW_DDP_FIND_UNUSED_PARAMETERS="on"
+    export ABFLOW_DDP_STATIC_GRAPH="off"
+    export ABFLOW_MF_TRIANGLE_CHECKPOINT="off"
+    export ABFLOW_MF_PAIR_ATOM_REFINER="on"
+    export ABFLOW_MF_DISTOGRAM="off"
+    export ABFLOW_LOSS_DISTOGRAM_WEIGHT="0.0"
+    export ABFLOW_MF_SMOOTH_LDDT="off"
+    export ABFLOW_LOSS_SMOOTH_LDDT_WEIGHT="0.0"
+    export ABFLOW_MF_PARENT_AUTHORITY="on"
+    export ABFLOW_MF_SAMPLE_AUTHORITY_DIAGNOSTICS="on"
+    ;;
+
+  R13_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_DISTOGRAM_U02)
+    # R13 = R12 + one MFDesign-native objective: persistent-pair distogram CE.
+    # 0.03 is the uploaded MFDesign Stage-2/3/4 prior; actual AbFlow authority is audited.
+    export ABFLOW_ABLATION_PARENT="R12_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_U02"
+    export ABFLOW_EXPERIMENT_FACTOR="add_mfdesign_persistent_pair_distogram_003_only"
+    export ABFLOW_SINGLE_FACTOR_ABLATION="true"
+    export ABFLOW_MODULE_ID="R13_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_DISTOGRAM"
+    export ABFLOW_MODULE_PARENT="R12_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM"
+
+    export ABFLOW_R3_NOISE_SCOPE="residue"
+    export ABFLOW_SCOREFM_LOSS_MODE="f01_r3_endpoint_canonical_hybrid"
+    export ABFLOW_SCOREFM_SAMPLER_MODE="f01_canonical_carrier"
+    export ABFLOW_FLOW_T_MIN="0.0"
+    export ABFLOW_FLOW_T_MAX="1.0"
+
+    export ABFLOW_DDP_COST_BALANCED="on"
+    export ABFLOW_DDP_FIND_UNUSED_PARAMETERS="on"
+    export ABFLOW_DDP_STATIC_GRAPH="off"
+    export ABFLOW_MF_TRIANGLE_CHECKPOINT="off"
+    export ABFLOW_MF_PAIR_ATOM_REFINER="on"
+    export ABFLOW_MF_DISTOGRAM="on"
+    export ABFLOW_LOSS_DISTOGRAM_WEIGHT="0.03"
+    export ABFLOW_MF_SMOOTH_LDDT="off"
+    export ABFLOW_LOSS_SMOOTH_LDDT_WEIGHT="0.0"
+    export ABFLOW_MF_PARENT_AUTHORITY="on"
+    export ABFLOW_MF_SAMPLE_AUTHORITY_DIAGNOSTICS="on"
+    ;;
+
   *)
     echo "Unknown EXP_ID: $EXP_ID"
     echo "Supported v104:"
@@ -302,18 +393,21 @@ case "$EXP_ID" in
     echo "  R08_R05_MF_CLOSED_CORE_U02"
     echo "  R09_R05_MF_CLOSED_CORE_PAIRATOM_U02"
     echo "  R10_R05_MF_CLOSED_CORE_PAIRATOM_DESIGNLDDT_U02"
+    echo "  R11_R05_MF_CLOSED_CORE_PARENT_ANCHORED_U02"
+    echo "  R12_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_U02"
+    echo "  R13_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_DISTOGRAM_U02"
     exit 2
     ;;
 esac
 
 # Diagnostics are observational only; they do not change gradients.  Formal
-# R08-R10 diagnostics are printed to stdout and therefore captured by the single
+# R08-R13 diagnostics are printed to stdout and therefore captured by the single
 # canonical version_0/run_time.log.  We intentionally do not maintain a second
 # fragmented metrics/latest/alerts file tree.
 export ABFLOW_CONDITION_DIAGNOSTICS="${ABFLOW_CONDITION_DIAGNOSTICS:-on}"
 export ABFLOW_GRAD_DIAGNOSTIC_INTERVAL="${ABFLOW_GRAD_DIAGNOSTIC_INTERVAL:-0}"
 case "$EXP_ID" in
-  R08_R05_MF_CLOSED_CORE_U02|R09_R05_MF_CLOSED_CORE_PAIRATOM_U02|R10_R05_MF_CLOSED_CORE_PAIRATOM_DESIGNLDDT_U02)
+  R08_R05_MF_CLOSED_CORE_U02|R09_R05_MF_CLOSED_CORE_PAIRATOM_U02|R10_R05_MF_CLOSED_CORE_PAIRATOM_DESIGNLDDT_U02|R11_R05_MF_CLOSED_CORE_PARENT_ANCHORED_U02|R12_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_U02|R13_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_DISTOGRAM_U02)
     # One gradient-authority probe per epoch is worth the tiny overhead because
     # these runs are explicitly testing a new representation state.
     export ABFLOW_GRAD_CONFLICT_DIAGNOSTICS="${ABFLOW_GRAD_CONFLICT_DIAGNOSTICS:-on}"
@@ -384,6 +478,9 @@ case "$EXP_ID" in
   R08_R05_MF_CLOSED_CORE_U02) _ABFLOW_EXPECTED_GPUS="2,3" ;;
   R09_R05_MF_CLOSED_CORE_PAIRATOM_U02) _ABFLOW_EXPECTED_GPUS="4,5" ;;
   R10_R05_MF_CLOSED_CORE_PAIRATOM_DESIGNLDDT_U02) _ABFLOW_EXPECTED_GPUS="6,7" ;;
+  R11_R05_MF_CLOSED_CORE_PARENT_ANCHORED_U02) _ABFLOW_EXPECTED_GPUS="2,3" ;;
+  R12_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_U02) _ABFLOW_EXPECTED_GPUS="4,5" ;;
+  R13_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_DISTOGRAM_U02) _ABFLOW_EXPECTED_GPUS="6,7" ;;
   *) _ABFLOW_EXPECTED_GPUS="" ;;
 esac
 
@@ -570,6 +667,8 @@ print_settings() {
   echo "EPOCH_TEST_BATCH_SIZE=$ABFLOW_EPOCH_TEST_BATCH_SIZE"
   echo "EPOCH_TEST_N_STEPS=$ABFLOW_EPOCH_TEST_N_STEPS"
   echo "EPOCH_TEST_BASE_SEED=$ABFLOW_EPOCH_TEST_BASE_SEED"
+  echo "FORMAL_EPOCH_PHASES=Train->Validation->Test"
+  echo "DIAGNOSTIC_REVISION=R05MF_DIAGNOSTIC_V167+R05MF_PARENT_AUTHORITY_V168+R05MF_AUTHORITY_LADDER_V169"
   echo "COORDINATE_AUTHORITY=$ABFLOW_COORDINATE_AUTHORITY"
   echo "STRUCTURE_SEQ_READOUT=$ABFLOW_STRUCTURE_SEQ_READOUT"
   echo "DUAL_SEQUENCE_STATE=$ABFLOW_DUAL_SEQUENCE_STATE"
@@ -604,6 +703,8 @@ print_settings() {
   echo "MF_ALLATOM_PAIR=${ABFLOW_MF_ALLATOM_PAIR:-off}"
   echo "MF_ALLATOM_CHUNK=${ABFLOW_MF_ALLATOM_CHUNK:-}"
   echo "MF_DETACH_STATE_CARRY=${ABFLOW_MF_DETACH_STATE_CARRY:-off}"
+  echo "MF_PARENT_AUTHORITY=${ABFLOW_MF_PARENT_AUTHORITY:-off}"
+  echo "MF_SAMPLE_AUTHORITY_DIAGNOSTICS=${ABFLOW_MF_SAMPLE_AUTHORITY_DIAGNOSTICS:-off}"
   echo "MF_DISTOGRAM=${ABFLOW_MF_DISTOGRAM:-off}"
   echo "MF_SMOOTH_LDDT=${ABFLOW_MF_SMOOTH_LDDT:-off}"
   echo "MF_SMOOTH_LDDT_CUTOFF=${ABFLOW_MF_SMOOTH_LDDT_CUTOFF:-}"
@@ -729,11 +830,11 @@ for key, value in env.items():
 PYMFENV
 )"
 
-# R08-R10 fail-fast scientific contract. This is validation infrastructure, not
+# R08-R13 fail-fast scientific contract. This is validation infrastructure, not
 # an extra method component: expensive training must not start if the selected
 # JSON, source files, or R05 invariants disagree.
 case "$EXP_ID" in
-  R08_R05_MF_CLOSED_CORE_U02|R09_R05_MF_CLOSED_CORE_PAIRATOM_U02|R10_R05_MF_CLOSED_CORE_PAIRATOM_DESIGNLDDT_U02)
+  R08_R05_MF_CLOSED_CORE_U02|R09_R05_MF_CLOSED_CORE_PAIRATOM_U02|R10_R05_MF_CLOSED_CORE_PAIRATOM_DESIGNLDDT_U02|R11_R05_MF_CLOSED_CORE_PARENT_ANCHORED_U02|R12_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_U02|R13_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_DISTOGRAM_U02)
     MODEL_FILE="$PROJECT_ROOT/models/AbFlow/AbFlow_model.py"
     AMENC_FILE="$PROJECT_ROOT/models/modules/am_enc.py"
     TRAINER_FILE="$PROJECT_ROOT/trainer/AbFlow_trainer.py"
@@ -755,6 +856,28 @@ case "$EXP_ID" in
     grep -q "_print_validation_audits" "$TRAINER_FILE" || {
       echo "ERROR: AbFlow_trainer.py lacks the R05-MF observability contract." >&2; exit 2;
     }
+    grep -q "R05MF_DIAGNOSTIC_V167" "$MODEL_FILE" || {
+      echo "ERROR: R08-R10 resume requires the v167 diagnostics-only model overlay." >&2; exit 2;
+    }
+    grep -q "R05MF_DIAGNOSTIC_V167" "$TRAINER_FILE" || {
+      echo "ERROR: R08-R10 resume requires the v167 diagnostics-only trainer overlay." >&2; exit 2;
+    }
+    case "$EXP_ID" in
+      R11_R05_MF_CLOSED_CORE_PARENT_ANCHORED_U02|R12_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_U02|R13_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_DISTOGRAM_U02)
+        grep -q "R05MF_PARENT_AUTHORITY_V168" "$MODEL_FILE" || { echo "ERROR: R11-R13 require the v168 parent-authority operator." >&2; exit 2; }
+        grep -q "R05MF_PARENT_AUTHORITY_V168" "$TRAINER_FILE" || { echo "ERROR: R11-R13 require the v168 Test-trajectory diagnostics trainer." >&2; exit 2; }
+        grep -q "R05MF_PARENT_AUTHORITY_V168" "$AMENC_FILE" || { echo "ERROR: R11-R13 require the v168 pair-edge authority operator." >&2; exit 2; }
+        grep -q "R05MF_AUTHORITY_LADDER_V169" "$MODEL_FILE" || { echo "ERROR: R11-R13 require the v169 authority-ladder model overlay." >&2; exit 2; }
+        grep -q "R05MF_AUTHORITY_LADDER_V169" "$TRAINER_FILE" || { echo "ERROR: R11-R13 require the v169 authority-ladder trainer overlay." >&2; exit 2; }
+        grep -q "R05MF_AUTHORITY_LADDER_V169" "$AMENC_FILE" || { echo "ERROR: R11-R13 require the v169 authority-ladder am_enc overlay." >&2; exit 2; }
+        ;;
+    esac
+    _is_on "$ABFLOW_EPOCH_TEST" || {
+      echo "ERROR: formal R08-R13 protocol requires Epoch Test ON." >&2; exit 2;
+    }
+    [[ "$ABFLOW_EPOCH_TEST_INTERVAL" == "1" ]] || {
+      echo "ERROR: formal R08-R13 protocol requires Epoch Test every epoch (interval=1)." >&2; exit 2;
+    }
 
     python - "$BASE_CONFIG" "$EXP_ID" <<'PYR05MF'
 import json, math, sys
@@ -771,9 +894,19 @@ for key, expected in required.items():
 if not math.isclose(float(cfg.get('ema_decay', -1)), 0.999, rel_tol=0, abs_tol=1e-12):
     raise SystemExit('ERROR: R08-R10 require ema_decay=0.999')
 meta = cfg.get('_experiment') or {}
-if meta.get('implementation_revision') != 'v164_r05_mf_pair_atom_pair_universe_fix':
+authority_ladder_ids = {
+    'R11_R05_MF_CLOSED_CORE_PARENT_ANCHORED_U02',
+    'R12_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_U02',
+    'R13_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_DISTOGRAM_U02',
+}
+expected_revision = (
+    'v169_r05_mf_authority_ladder'
+    if exp_id in authority_ladder_ids
+    else 'v164_r05_mf_pair_atom_pair_universe_fix'
+)
+if meta.get('implementation_revision') != expected_revision:
     raise SystemExit(
-        f"ERROR: {exp_id} requires implementation_revision=v164_r05_mf_pair_atom_pair_universe_fix, "
+        f"ERROR: {exp_id} requires implementation_revision={expected_revision}, "
         f"got {meta.get('implementation_revision')!r}"
     )
 env = meta.get('runtime_env') or {}
@@ -814,6 +947,9 @@ expected_by_exp = {
     'R08_R05_MF_CLOSED_CORE_U02': ('off', 'off', 0.0, 'off', 0.0),
     'R09_R05_MF_CLOSED_CORE_PAIRATOM_U02': ('on', 'off', 0.0, 'off', 0.0),
     'R10_R05_MF_CLOSED_CORE_PAIRATOM_DESIGNLDDT_U02': ('on', 'off', 0.0, 'on', 0.1),
+    'R11_R05_MF_CLOSED_CORE_PARENT_ANCHORED_U02': ('off', 'off', 0.0, 'off', 0.0),
+    'R12_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_U02': ('on', 'off', 0.0, 'off', 0.0),
+    'R13_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_DISTOGRAM_U02': ('on', 'on', 0.03, 'off', 0.0),
 }
 for key, expected in common.items():
     if str(env.get(key, '')) != expected:
@@ -831,6 +967,14 @@ if not math.isclose(float(env.get('ABFLOW_LOSS_DISTOGRAM_WEIGHT', -1)), disto_w,
     raise SystemExit(f'ERROR: {exp_id} distogram weight mismatch')
 if not math.isclose(float(env.get('ABFLOW_LOSS_SMOOTH_LDDT_WEIGHT', -1)), slddt_w, rel_tol=0, abs_tol=1e-12):
     raise SystemExit(f'ERROR: {exp_id} smooth-lDDT weight mismatch')
+if exp_id in authority_ladder_ids:
+    if str(env.get('ABFLOW_MF_PARENT_AUTHORITY', '')) != 'on':
+        raise SystemExit('ERROR: R11-R13 require ABFLOW_MF_PARENT_AUTHORITY=on')
+    if str(env.get('ABFLOW_MF_SAMPLE_AUTHORITY_DIAGNOSTICS', '')) != 'on':
+        raise SystemExit('ERROR: R11-R13 require Test sample authority diagnostics on')
+else:
+    if str(env.get('ABFLOW_MF_PARENT_AUTHORITY', 'off')) not in {'', 'off'}:
+        raise SystemExit(f'ERROR: {exp_id} must keep parent authority closure off')
 if 'ABFLOW_MF_CLEAN_SC' in env:
     raise SystemExit(f'ERROR: {exp_id} must not define retired ABFLOW_MF_CLEAN_SC')
 print(f'[R05MFPreflight] config PASS: {exp_id}')
@@ -844,10 +988,10 @@ PYR05MF
     grep -q "class _TriangleMultiplication" "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo "ERROR: triangle-closed representation model not installed." >&2; exit 2; }
     grep -q "CostBalancedDistributedSampler" "$PROJECT_ROOT/train.py" || { echo "ERROR: cost-balanced DDP train.py not installed." >&2; exit 2; }
     grep -q "find_unused_parameters=find_unused" "$PROJECT_ROOT/trainer/abs_trainer.py" || { echo "ERROR: dynamic-graph DDP abs_trainer.py not installed." >&2; exit 2; }
-    [[ "${ABFLOW_DDP_COST_BALANCED:-off}" == "on" ]] || { echo "ERROR: R08-R10 require cost-balanced DDP sharding." >&2; exit 2; }
-    [[ "${ABFLOW_MF_TRIANGLE_CHECKPOINT:-off}" == "off" ]] || { echo "ERROR: torch1.11 R08-R10 require triangle checkpoint off." >&2; exit 2; }
-    [[ "${ABFLOW_DDP_FIND_UNUSED_PARAMETERS:-off}" == "on" ]] || { echo "ERROR: R08-R10 require DDP find_unused_parameters on." >&2; exit 2; }
-    [[ "${ABFLOW_DDP_STATIC_GRAPH:-off}" == "off" ]] || { echo "ERROR: R08-R10 require DDP static_graph off." >&2; exit 2; }
+    [[ "${ABFLOW_DDP_COST_BALANCED:-off}" == "on" ]] || { echo "ERROR: R08-R13 require cost-balanced DDP sharding." >&2; exit 2; }
+    [[ "${ABFLOW_MF_TRIANGLE_CHECKPOINT:-off}" == "off" ]] || { echo "ERROR: torch1.11 R08-R13 require triangle checkpoint off." >&2; exit 2; }
+    [[ "${ABFLOW_DDP_FIND_UNUSED_PARAMETERS:-off}" == "on" ]] || { echo "ERROR: R08-R13 require DDP find_unused_parameters on." >&2; exit 2; }
+    [[ "${ABFLOW_DDP_STATIC_GRAPH:-off}" == "off" ]] || { echo "ERROR: R08-R13 require DDP static_graph off." >&2; exit 2; }
     echo "[R05MFPreflight] source/code/physics PASS"
     ;;
 esac
@@ -918,8 +1062,8 @@ if [[ "$RUN_MODE" == "resume" ]]; then
   esac
 else
   case "$EXP_ID" in
-    R08_R05_MF_CLOSED_CORE_U02|R09_R05_MF_CLOSED_CORE_PAIRATOM_U02|R10_R05_MF_CLOSED_CORE_PAIRATOM_DESIGNLDDT_U02)
-      # Formal R08-R10 use exactly one run directory: version_0.  This removes the
+    R08_R05_MF_CLOSED_CORE_U02|R09_R05_MF_CLOSED_CORE_PAIRATOM_U02|R10_R05_MF_CLOSED_CORE_PAIRATOM_DESIGNLDDT_U02|R11_R05_MF_CLOSED_CORE_PARENT_ANCHORED_U02|R12_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_U02|R13_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_DISTOGRAM_U02)
+      # Formal R08-R13 use exactly one run directory: version_0.  This removes the
       # DDP race that previously produced rank0/version_0 and rank1/version_1.
       # Existing scientific state is never deleted automatically.
       if compgen -G "$RUN_DIR/version_*" > /dev/null; then
@@ -930,7 +1074,7 @@ else
       export ABFLOW_FIXED_VERSION="0"
       ;;
     *)
-      # Historical behavior for non-R08-R10 experiments.
+      # Historical behavior for non-R08-R13 experiments.
       if [[ -d "$RUN_DIR" ]] && [[ -n "$(find "$RUN_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
         if ! _is_on "${ABFLOW_ALLOW_NONEMPTY_RUN_DIR:-off}"; then
           echo "ERROR: fresh-run directory is not empty: $RUN_DIR" >&2
@@ -946,7 +1090,7 @@ fi
 # stdout/stderr that is visible in tmux, including model diagnostics and errors.
 # epoch_summary.csv is the only compact machine-readable epoch table.
 case "$EXP_ID" in
-  R08_R05_MF_CLOSED_CORE_U02|R09_R05_MF_CLOSED_CORE_PAIRATOM_U02|R10_R05_MF_CLOSED_CORE_PAIRATOM_DESIGNLDDT_U02)
+  R08_R05_MF_CLOSED_CORE_U02|R09_R05_MF_CLOSED_CORE_PAIRATOM_U02|R10_R05_MF_CLOSED_CORE_PAIRATOM_DESIGNLDDT_U02|R11_R05_MF_CLOSED_CORE_PARENT_ANCHORED_U02|R12_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_U02|R13_R05_MF_CLOSED_CORE_PARENT_ANCHORED_PAIRATOM_DISTOGRAM_U02)
     if [[ "$RUN_MODE" == "resume" ]]; then
       unset ABFLOW_FIXED_VERSION || true
       RUN_VERSION_DIR=$(dirname "$(dirname "$(realpath "$EFFECTIVE_RESUME_CHECKPOINT")")")

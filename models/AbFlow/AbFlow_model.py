@@ -1,5 +1,6 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
+# R05MF_AUTHORITY_LADDER_V169: three-run causal ladder; numerical authority operator unchanged from v168.
 import math, time, os
 from contextlib import nullcontext
 from tqdm import tqdm
@@ -26,6 +27,8 @@ from .abflow_r3_matcher import AbFlowR3Matcher
 # v101 support-geometry optimization on the validated U02/F01 physical parent.
 # R05MF_CLOSED_CORE_V164: no-MSA closed single/pair operator + corrected atom-head algebra +
 # slot-resolved atom14 pair geometry + direct final-pair -> R05 EGNN mechanics + design-region factored smooth-lDDT.
+# R05MF_DIAGNOSTIC_V167: diagnostics-only overlay; no trainable parameter, loss, sampler, or state semantics change.
+# R05MF_PARENT_AUTHORITY_V168: parent-anchored non-dominant residual trust region at every MF->R05 authority interface.
 
 
 def _env_str(name, default):
@@ -2440,6 +2443,16 @@ class AbFlowModel(nn.Module):
         self.mf_pair_atom_depth = _env_int("ABFLOW_MF_PAIR_ATOM_DEPTH", 1)
         self.mf_pair_atom_heads = _env_int("ABFLOW_MF_PAIR_ATOM_HEADS", 4)
         self.mf_pair_atom_query_chunk = _env_int("ABFLOW_MF_PAIR_ATOM_QUERY_CHUNK", 64)
+        # v168 authority closure.  The modern representation may refine the
+        # proven R05 parent, but it may not become a larger-magnitude replacement
+        # at any direct donor->parent interface.  The bound is parameter-free and
+        # uses a fixed semantic ratio of exactly 1 (non-dominance), not a tuned
+        # loss coefficient.  Norms used to compute the scale are detached so the
+        # model cannot game the trust region by inflating the parent norm.
+        self.mf_parent_authority = _env_flag("ABFLOW_MF_PARENT_AUTHORITY", False)
+        self.sample_authority_diagnostics = _env_flag(
+            "ABFLOW_MF_SAMPLE_AUTHORITY_DIAGNOSTICS", False
+        )
         self.mf_distogram_bins = _env_int("ABFLOW_MF_DISTOGRAM_BINS", 64)
         self.mf_distogram_min = _env_float("ABFLOW_MF_DISTOGRAM_MIN", 2.0)
         self.mf_distogram_max = _env_float("ABFLOW_MF_DISTOGRAM_MAX", 22.0)
@@ -2531,11 +2544,79 @@ class AbFlowModel(nn.Module):
                     "MF representation requires the updated AMEncoder with "
                     "enable_pair_representation()."
                 )
-            self.gnn.enable_pair_representation(self.mf_pair_dim)
+            self.gnn.enable_pair_representation(
+                self.mf_pair_dim,
+                parent_authority=self.mf_parent_authority,
+            )
 
         self._last_mf_repr_state = {}
+        self._sample_authority_records = []
         self._last_mf_repr_diagnostics = {}
 
+
+    @staticmethod
+    def _parent_anchored_residual(parent, residual, *, center_last_dim=False, eps=1.0e-8):
+        """Apply a parameter-free local RMS trust region to a donor residual.
+
+        For every token/edge row, enforce
+
+            RMS(residual_applied) <= RMS(parent).
+
+        This is the exact mathematical meaning of *non-dominant residual
+        authority*.  The scale is computed from detached norms, so gradients
+        still train the residual direction/weights but cannot enlarge the parent
+        merely to loosen the bound.  For categorical logits, additive class-wise
+        gauge is removed first; subtracting a per-residue constant is exactly
+        softmax-invariant.
+        """
+        if parent.shape != residual.shape:
+            raise ValueError(
+                f"parent/residual shape mismatch: {tuple(parent.shape)} vs "
+                f"{tuple(residual.shape)}"
+            )
+        p = parent
+        r = residual
+        if center_last_dim:
+            p_norm_view = p - p.mean(dim=-1, keepdim=True)
+            r = r - r.mean(dim=-1, keepdim=True)
+        else:
+            p_norm_view = p
+
+        p_rms = torch.sqrt(
+            p_norm_view.detach().float().pow(2).mean(dim=-1, keepdim=True) + eps
+        )
+        r_rms = torch.sqrt(
+            r.detach().float().pow(2).mean(dim=-1, keepdim=True) + eps
+        )
+        scale = torch.minimum(
+            torch.ones_like(p_rms),
+            p_rms / r_rms.clamp_min(eps),
+        )
+        applied = r * scale.to(device=r.device, dtype=r.dtype)
+        with torch.no_grad():
+            raw_ratio = (r_rms / p_rms.clamp_min(eps)).mean()
+            applied_rms = torch.sqrt(
+                applied.detach().float().pow(2).mean(dim=-1, keepdim=True) + eps
+            )
+            applied_ratio = (
+                applied_rms / p_rms.clamp_min(eps)
+            ).mean()
+            clip_fraction = (scale < (1.0 - 1.0e-6)).float().mean()
+            mean_scale = scale.mean()
+        return applied, {
+            "raw_ratio": raw_ratio,
+            "applied_ratio": applied_ratio,
+            "clip_fraction": clip_fraction,
+            "mean_scale": mean_scale,
+        }
+
+    def reset_sample_authority_diagnostics(self):
+        self._sample_authority_records = []
+
+    def consume_sample_authority_diagnostics(self):
+        records = list(getattr(self, "_sample_authority_records", []) or [])
+        self._sample_authority_records = []
+        return records
 
     def init_mask(self, X, S, cmask, smask, template):
         if not self.struct_only:
@@ -3862,9 +3943,39 @@ class AbFlowModel(nn.Module):
             )
 
             # Explicit single state influences the parent residue representation
-            # through a zero-start residual.  At initialization this is exactly 0.
+            # through a zero-start residual.  R11 adds a *function-space trust
+            # region*: the modern residual can refine but cannot have a larger
+            # per-token RMS than the R05 parent hidden state.
             H_0 = H_0.clone()
-            H_0[local_mask] = H_0[local_mask] + mf_state['base_residual']
+            base_parent_local = H_0[local_mask]
+            base_residual_raw = mf_state['base_residual']
+            if self.mf_parent_authority:
+                base_residual_applied, base_authority_diag = (
+                    self._parent_anchored_residual(
+                        base_parent_local, base_residual_raw,
+                        center_last_dim=False, eps=self.scorefm_eps,
+                    )
+                )
+            else:
+                base_residual_applied = base_residual_raw
+                with torch.no_grad():
+                    p_rms = torch.sqrt(
+                        base_parent_local.detach().float().pow(2).mean(dim=-1)
+                        + self.scorefm_eps
+                    )
+                    r_rms = torch.sqrt(
+                        base_residual_raw.detach().float().pow(2).mean(dim=-1)
+                        + self.scorefm_eps
+                    )
+                    ratio = (r_rms / p_rms.clamp_min(self.scorefm_eps)).mean()
+                    base_authority_diag = {
+                        'raw_ratio': ratio, 'applied_ratio': ratio,
+                        'clip_fraction': ratio.new_tensor(0.0),
+                        'mean_scale': ratio.new_tensor(1.0),
+                    }
+            mf_state['base_residual_applied'] = base_residual_applied
+            mf_state['base_authority_diag'] = base_authority_diag
+            H_0[local_mask] = base_parent_local + base_residual_applied
 
             n_local = int(local_X.shape[0])
             mf_ctx_attr = self.mf_repr.gather_pair_state(
@@ -3960,6 +4071,22 @@ class AbFlowModel(nn.Module):
                         mf_state['base_residual'].detach().float().pow(2).mean()
                         + self.scorefm_eps
                     ).to(H_0.dtype)
+                    self._last_condition_diagnostics[
+                        'mf_base_residual_applied_rms'
+                    ] = torch.sqrt(
+                        mf_state['base_residual_applied'].detach().float().pow(2).mean()
+                        + self.scorefm_eps
+                    ).to(H_0.dtype)
+                    for _key, _diag_key in (
+                        ('mf_base_raw_to_parent_ratio', 'raw_ratio'),
+                        ('mf_base_applied_to_parent_ratio', 'applied_ratio'),
+                        ('mf_base_authority_clip_fraction', 'clip_fraction'),
+                        ('mf_base_authority_mean_scale', 'mean_scale'),
+                    ):
+                        self._last_condition_diagnostics[_key] = (
+                            mf_state['base_authority_diag'][_diag_key]
+                            .detach().to(H_0.dtype)
+                        )
                     self._last_condition_diagnostics[
                         'mf_seq_residual_rms'
                     ] = torch.sqrt(
@@ -4060,6 +4187,15 @@ class AbFlowModel(nn.Module):
             )
         # self.timing_stats['sme_encoding'] += time.time() - sme_start
 
+        if self.mf_repr_core and diagnostics_active and hasattr(
+            self.gnn, 'pair_authority_diagnostics'
+        ):
+            with torch.no_grad():
+                for _name, _value in self.gnn.pair_authority_diagnostics().items():
+                    self._last_condition_diagnostics[
+                        'mf_edge_' + _name
+                    ] = _value.detach().to(H_0.dtype)
+
         interface_X = pred_local_X[local_is_ab]
 
         if self.struct_only:
@@ -4078,16 +4214,134 @@ class AbFlowModel(nn.Module):
             )
             pred_logits = self.ffn_residue(H_seq)
             if mf_state is not None:
-                # Direct enriched-single sequence semantics:
-                #   logits = legacy_R05(H) + W_s LN(tilde{s}).
-                # The residual head is zero at initialization, so the proven R05
-                # sequence predictor is preserved while sequence gradients can
-                # learn amino-acid-discriminative information in s/z.
+                # Direct enriched-single sequence semantics.  v168 turns the
+                # historical unconstrained residual into a parent-anchored
+                # refinement: after removing the softmax-irrelevant class gauge,
+                # each local residue's modern residual is bounded to at most the
+                # centered RMS of the R05 parent logits.  This is the same
+                # non-dominance contract used at hidden/edge authority interfaces.
+                seq_parent_local = pred_logits[local_mask]
+                seq_residual_raw = mf_state['seq_logits_residual']
+                if self.mf_parent_authority:
+                    seq_residual_applied, seq_authority_diag = (
+                        self._parent_anchored_residual(
+                            seq_parent_local, seq_residual_raw,
+                            center_last_dim=True, eps=self.scorefm_eps,
+                        )
+                    )
+                else:
+                    seq_residual_applied = seq_residual_raw
+                    with torch.no_grad():
+                        p = seq_parent_local.detach().float()
+                        r = seq_residual_raw.detach().float()
+                        p = p - p.mean(dim=-1, keepdim=True)
+                        r = r - r.mean(dim=-1, keepdim=True)
+                        p_rms = torch.sqrt(
+                            p.pow(2).mean(dim=-1) + self.scorefm_eps
+                        )
+                        r_rms = torch.sqrt(
+                            r.pow(2).mean(dim=-1) + self.scorefm_eps
+                        )
+                        ratio = (
+                            r_rms / p_rms.clamp_min(self.scorefm_eps)
+                        ).mean()
+                        seq_authority_diag = {
+                            'raw_ratio': ratio, 'applied_ratio': ratio,
+                            'clip_fraction': ratio.new_tensor(0.0),
+                            'mean_scale': ratio.new_tensor(1.0),
+                        }
+                mf_state['seq_logits_residual_applied'] = seq_residual_applied
+                mf_state['seq_authority_diag'] = seq_authority_diag
+
+                if diagnostics_active:
+                    with torch.no_grad():
+                        design_local = paratope_mask[local_mask]
+                        if bool(design_local.any()):
+                            parent_design = pred_logits[paratope_mask].detach().float()
+                            modern_raw_design = (
+                                seq_residual_raw[design_local].detach().float()
+                            )
+                            modern_design = (
+                                seq_residual_applied[design_local].detach().float()
+                            )
+                        else:
+                            parent_design = None
+                            modern_raw_design = None
+                            modern_design = None
+                        if (
+                            parent_design is not None
+                            and modern_design is not None
+                            and parent_design.shape == modern_design.shape
+                            and parent_design.numel() > 0
+                        ):
+                            parent_centered = parent_design - parent_design.mean(
+                                dim=-1, keepdim=True
+                            )
+                            modern_raw_centered = modern_raw_design - modern_raw_design.mean(
+                                dim=-1, keepdim=True
+                            )
+                            modern_centered = modern_design - modern_design.mean(
+                                dim=-1, keepdim=True
+                            )
+                            parent_rms = torch.sqrt(
+                                parent_centered.pow(2).mean() + self.scorefm_eps
+                            )
+                            raw_modern_rms = torch.sqrt(
+                                modern_raw_centered.pow(2).mean() + self.scorefm_eps
+                            )
+                            modern_rms = torch.sqrt(
+                                modern_centered.pow(2).mean() + self.scorefm_eps
+                            )
+                            final_design = parent_design + modern_design
+                            final_rms = torch.sqrt(
+                                (final_design - final_design.mean(dim=-1, keepdim=True))
+                                .pow(2).mean() + self.scorefm_eps
+                            )
+                            parent_flat = parent_centered.reshape(-1)
+                            modern_flat = modern_centered.reshape(-1)
+                            parent_modern_cos = (
+                                torch.dot(parent_flat, modern_flat)
+                                / (
+                                    torch.linalg.norm(parent_flat)
+                                    * torch.linalg.norm(modern_flat)
+                                    + self.scorefm_eps
+                                )
+                            )
+                            parent_map = torch.argmax(parent_design, dim=-1)
+                            final_map = torch.argmax(final_design, dim=-1)
+                            self._last_condition_diagnostics['mf_seq_parent_logit_rms'] = parent_rms.to(H_0.dtype)
+                            self._last_condition_diagnostics['mf_seq_final_logit_rms'] = final_rms.to(H_0.dtype)
+                            self._last_condition_diagnostics['mf_seq_raw_residual_to_parent_ratio'] = (
+                                raw_modern_rms / parent_rms.clamp_min(self.scorefm_eps)
+                            ).to(H_0.dtype)
+                            self._last_condition_diagnostics['mf_seq_residual_to_parent_ratio'] = (
+                                modern_rms / parent_rms.clamp_min(self.scorefm_eps)
+                            ).to(H_0.dtype)
+                            self._last_condition_diagnostics['mf_seq_parent_residual_cos'] = parent_modern_cos.to(H_0.dtype)
+                            self._last_condition_diagnostics['mf_seq_parent_to_final_map_change_rate'] = (
+                                parent_map != final_map
+                            ).float().mean().to(H_0.dtype)
+                            self._last_condition_diagnostics['mf_seq_authority_clip_fraction'] = (
+                                seq_authority_diag['clip_fraction'].detach().to(H_0.dtype)
+                            )
+                            self._last_condition_diagnostics['mf_seq_authority_mean_scale'] = (
+                                seq_authority_diag['mean_scale'].detach().to(H_0.dtype)
+                            )
+                        else:
+                            for _name in (
+                                'mf_seq_parent_logit_rms',
+                                'mf_seq_final_logit_rms',
+                                'mf_seq_raw_residual_to_parent_ratio',
+                                'mf_seq_residual_to_parent_ratio',
+                                'mf_seq_parent_residual_cos',
+                                'mf_seq_parent_to_final_map_change_rate',
+                                'mf_seq_authority_clip_fraction',
+                                'mf_seq_authority_mean_scale',
+                            ):
+                                self._last_condition_diagnostics[_name] = zero_diag
+
                 pred_logits = pred_logits.clone()
-                pred_logits[local_mask] = (
-                    pred_logits[local_mask]
-                    + mf_state['seq_logits_residual']
-                )
+                pred_logits[local_mask] = seq_parent_local + seq_residual_applied
 
         mf_single_out = None if mf_state is None else mf_state['single']
         mf_pair_out = None if mf_state is None else mf_state['pair']
@@ -7233,10 +7487,36 @@ class AbFlowModel(nn.Module):
 
         for ridx, (logits, mask) in enumerate(r_pred_S_logits):
             if bool(mask.any()):
-                pred_round = torch.argmax(logits[mask], dim=-1)
+                round_logits = logits[mask].float()
+                round_probs = torch.softmax(round_logits, dim=-1)
+                pred_round = torch.argmax(round_logits, dim=-1)
+                target_round = true_S[mask].long()
                 out[f"val_proxy_round{ridx}_aar"] = (
-                    pred_round == true_S[mask]
+                    pred_round == target_round
                 ).float().mean()
+
+                # v167 sequence forensic: confidence can move in the opposite
+                # direction from AAR.  Record the posterior trajectory for every
+                # existing R05 refinement round without changing sequence loss.
+                entropy = -(
+                    round_probs
+                    * torch.log(round_probs.clamp_min(self.scorefm_eps))
+                ).sum(dim=-1)
+                max_prob = round_probs.max(dim=-1).values
+                native_prob = round_probs.gather(
+                    -1, target_round[:, None]
+                ).squeeze(-1)
+                top2 = torch.topk(
+                    round_probs, k=min(2, round_probs.shape[-1]), dim=-1
+                ).values
+                if top2.shape[-1] >= 2:
+                    margin = top2[:, 0] - top2[:, 1]
+                else:
+                    margin = top2[:, 0]
+                out[f"val_proxy_round{ridx}_seq_entropy"] = entropy.mean()
+                out[f"val_proxy_round{ridx}_seq_max_prob"] = max_prob.mean()
+                out[f"val_proxy_round{ridx}_seq_native_prob"] = native_prob.mean()
+                out[f"val_proxy_round{ridx}_seq_top1_margin"] = margin.mean()
 
         # Posterior diagnostics on the final recurrent sequence readout.  These
         # detect prior-collapse / overconfidence without changing the sequence
@@ -8734,8 +9014,33 @@ class AbFlowModel(nn.Module):
                 pep_mask = smask
                 pred_pep_hit = pred_S[pep_mask] == pep_full[pep_mask]
                 pep_native_hit = pep_full[pep_mask] == true_S[pep_mask]
+                pred_native_hit = pred_S[pep_mask] == true_S[pep_mask]
                 diag["seq_pred_vs_pep_aar"] = pred_pep_hit.float().mean()
                 diag["seq_pep_vs_native_aar"] = pep_native_hit.float().mean()
+                diag["seq_change_from_proposal_rate"] = (
+                    ~pred_pep_hit
+                ).float().mean()
+
+                # PCS-RC proposal is a task prior.  Separate useful correction
+                # from harmful overwriting instead of reporting only aggregate AAR.
+                proposal_correct = pep_native_hit
+                proposal_wrong = ~pep_native_hit
+                if bool(proposal_correct.any()):
+                    diag["seq_proposal_correct_preservation_rate"] = (
+                        pred_native_hit[proposal_correct].float().mean()
+                    )
+                    diag["seq_proposal_correct_damage_rate"] = (
+                        (~pred_native_hit[proposal_correct]).float().mean()
+                    )
+                else:
+                    diag["seq_proposal_correct_preservation_rate"] = X.new_tensor(0.0)
+                    diag["seq_proposal_correct_damage_rate"] = X.new_tensor(0.0)
+                if bool(proposal_wrong.any()):
+                    diag["seq_proposal_wrong_correction_rate"] = (
+                        pred_native_hit[proposal_wrong].float().mean()
+                    )
+                else:
+                    diag["seq_proposal_wrong_correction_rate"] = X.new_tensor(0.0)
 
             # Measure the proposal's own coordinate quality.  Without this
             # diagnostic, an improvement or degradation from coordinate
@@ -8928,16 +9233,48 @@ class AbFlowModel(nn.Module):
                 step_iter.set_postfix(t=f'{float(t):.2f}', model_t=f'{float(model_t):.2f}')
 
             sequence_state_for_model = St if not self.struct_only else None
-            H, pred_S, r_pred_S_logits, pred_X, r_interface_X, _, prmsd = self._forward(
-                X, S, cmask, smask, paratope_mask, X_pep, S_pep,
-                surface, residue_pos, template, lengths,
-                interface_init=Xt,
-                sequence_init=sequence_state_for_model,
-                flow_t=flow_t_graph
-            )
+            _capture_saved = bool(getattr(self, '_diagnostic_capture', False))
+            if self.sample_authority_diagnostics:
+                self._diagnostic_capture = True
+            try:
+                H, pred_S, r_pred_S_logits, pred_X, r_interface_X, _, prmsd = self._forward(
+                    X, S, cmask, smask, paratope_mask, X_pep, S_pep,
+                    surface, residue_pos, template, lengths,
+                    interface_init=Xt,
+                    sequence_init=sequence_state_for_model,
+                    flow_t=flow_t_graph
+                )
+            finally:
+                self._diagnostic_capture = _capture_saved
             pred_clean_X = r_interface_X[-1]
 
             raw_residual = pred_clean_X - Xt
+            if self.sample_authority_diagnostics:
+                d = getattr(self, '_latest_condition_diagnostics', {}) or {}
+                def _sv(key):
+                    v = d.get(key, None)
+                    if torch.is_tensor(v) and v.numel() == 1:
+                        return float(v.detach().float().cpu().item())
+                    return float('nan')
+                coord_field_rms_A = float(
+                    torch.sqrt(raw_residual.detach().float().pow(2).mean() + self.scorefm_eps)
+                    .cpu().item()
+                ) / max(float(self.flow_coordinate_scaling), self.scorefm_eps)
+                self._sample_authority_records.append({
+                    'step': int(i),
+                    't': float(t.detach().float().cpu().item()),
+                    'seq_raw_ratio': _sv('round2_mf_seq_raw_residual_to_parent_ratio'),
+                    'seq_applied_ratio': _sv('round2_mf_seq_residual_to_parent_ratio'),
+                    'seq_clip': _sv('round2_mf_seq_authority_clip_fraction'),
+                    'seq_map_change': _sv('round2_mf_seq_parent_to_final_map_change_rate'),
+                    'base_raw_ratio': _sv('round2_mf_base_raw_to_parent_ratio'),
+                    'base_applied_ratio': _sv('round2_mf_base_applied_to_parent_ratio'),
+                    'base_clip': _sv('round2_mf_base_authority_clip_fraction'),
+                    'edge_raw_ratio': _sv('round2_mf_edge_raw_ratio'),
+                    'edge_applied_ratio': _sv('round2_mf_edge_applied_ratio'),
+                    'edge_clip': _sv('round2_mf_edge_clip_fraction'),
+                    'coord_field_rms_A': coord_field_rms_A,
+                })
             if self.scorefm_sampler_mode == "residual":
                 dX = raw_residual
                 Xt = Xt + dX * dt
