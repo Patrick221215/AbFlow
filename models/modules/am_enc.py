@@ -80,12 +80,17 @@ class _PairResidualAMEGCL(nn.Module):
         enriched_edge_feat = base_edge_feat
         self._last_authority_diag = {}
         if edge_attr is not None:
-            pair = self.pair_norm(edge_attr.to(
-                device=base_edge_feat.device, dtype=base_edge_feat.dtype
-            ))
+            attrs = edge_attr.to(device=base_edge_feat.device, dtype=base_edge_feat.dtype)
+            presence = None
+            if attrs.shape[-1] == self.pair_weight.shape[-1] + 1:
+                presence = attrs[:, -1:]
+                attrs = attrs[:, :-1]
+            pair = self.pair_norm(attrs)
             pair_residual = torch.nn.functional.linear(
                 pair, self.pair_weight.to(base_edge_feat.dtype)
             )
+            if presence is not None:
+                pair_residual = pair_residual * presence
             if self.parent_authority:
                 pair_residual, self._last_authority_diag = (
                     _parent_anchored_edge_residual(base_edge_feat, pair_residual)
@@ -143,12 +148,17 @@ class _PairResidualMSGCL(nn.Module):
         enriched_edge_feat = base_edge_feat
         self._last_authority_diag = {}
         if edge_attr is not None:
-            pair = self.pair_norm(edge_attr.to(
-                device=base_edge_feat.device, dtype=base_edge_feat.dtype
-            ))
+            attrs = edge_attr.to(device=base_edge_feat.device, dtype=base_edge_feat.dtype)
+            presence = None
+            if attrs.shape[-1] == self.pair_weight.shape[-1] + 1:
+                presence = attrs[:, -1:]
+                attrs = attrs[:, :-1]
+            pair = self.pair_norm(attrs)
             pair_residual = torch.nn.functional.linear(
                 pair, self.pair_weight.to(base_edge_feat.dtype)
             )
+            if presence is not None:
+                pair_residual = pair_residual * presence
             if self.parent_authority:
                 pair_residual, self._last_authority_diag = (
                     _parent_anchored_edge_residual(base_edge_feat, pair_residual)

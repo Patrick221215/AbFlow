@@ -1,6 +1,10 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
 # R05MF_AUTHORITY_LADDER_V169: three-run causal ladder; diagnostics/protocol unchanged from v168.
+# R05MF_LIVEPAIR_DISTOGRAM_V170: first-batch end-to-end gradient contract for
+# R05MF_SEQUENCE_PATH_AUTHORITY_V171: audits exact categorical path and path-noisy CE.
+# the replacement R13; aborts if weighted distogram CE does not reach the shared
+# pre-MF generator activation.
 """AbFlow trainer with low-overhead, machine-readable diagnostics.
 
 The TensorBoard logging behavior is preserved.  Main-rank JSONL/latest files are
@@ -129,6 +133,10 @@ class AbFlowTrainer(Trainer):
             if requested_grad_interval <= 0
             else max(1, requested_grad_interval)
         )
+        # V170: the replacement R13 is not allowed to burn even one full epoch
+        # with a silently detached distogram path. A one-time first-batch probe
+        # verifies weighted L_distogram -> shared pre-MF activation connectivity.
+        self._live_pair_gradient_contract_verified = False
         self._grad_diag_enabled = _env_flag(
             "ABFLOW_GRAD_CONFLICT_DIAGNOSTICS", False
         )
@@ -843,6 +851,17 @@ class AbFlowTrainer(Trainer):
             "mf_pair_round_delta_rms": m("AbFlowDiag/mf_pair_round_delta_rms/Validation"),
             "mf_base_adapter_weight_rms": m("AbFlowDiag/mf_base_adapter_weight_rms/Validation"),
             "mf_seq_adapter_weight_rms": m("AbFlowDiag/mf_seq_adapter_weight_rms/Validation"),
+            "sequence_path_contract_exact": m("AbFlowDiag/sequence_path_contract_exact/Validation"),
+            "sequence_loss_scope_path_noisy": m("AbFlowDiag/sequence_loss_scope_path_noisy/Validation"),
+            "sequence_path_mask_rate": m("AbFlowDiag/sequence_path_mask_rate/Validation"),
+            "sequence_loss_mask_rate": m("AbFlowDiag/sequence_loss_mask_rate/Validation"),
+            "sequence_path_participation_rate": m("AbFlowDiag/sequence_path_participation_rate/Validation"),
+            "sequence_loss_coverage_design": m("AbFlowDiag/sequence_loss_coverage_design/Validation"),
+            "sequence_external_native_context_rate": m("AbFlowDiag/sequence_external_native_context_rate/Validation"),
+            "sequence_noisy_branch_rate": m("AbFlowDiag/sequence_noisy_branch_rate/Validation"),
+            "sequence_clean_branch_rate": m("AbFlowDiag/sequence_clean_branch_rate/Validation"),
+            "sequence_loss_on_noisy_precision": m("AbFlowDiag/sequence_loss_on_noisy_precision/Validation"),
+            "sequence_state_native_fraction": m("AbFlowDiag/sequence_state_native_fraction/Validation"),
             "t_mean": m("AbFlowDiag/t_mean/Validation"),
             "t_min": m("AbFlowDiag/t_min/Validation"),
             "t_max": m("AbFlowDiag/t_max/Validation"),
@@ -892,11 +911,31 @@ class AbFlowTrainer(Trainer):
             summary[f"timebin{bidx}_h3ca_aligned"] = aligned
             summary[f"timebin{bidx}_count"] = count
             summary[f"timebin{bidx}_aligned_count"] = aligned_count
+        # New observers use existing exact DDP validation buffers. CE/AAR bins
+        # use token-count-weighted sums; empty bins have no fabricated score.
+        prefix = 'DTM/r05v173_'
+        for key in merged_buffer:
+            if key.startswith(prefix) and key.endswith('/Validation'):
+                short = key[len(prefix):-len('/Validation')]
+                summary['r05v173_'+short] = m(key)
+        for b in range(5):
+            count = self._buffer_sum(merged_buffer, prefix+'seq_bin%d_count/Validation'%b)
+            if count > 0:
+                ce_sum = self._buffer_sum(merged_buffer, prefix+'seq_bin%d_ce_sum/Validation'%b)
+                hits = self._buffer_sum(merged_buffer, prefix+'seq_bin%d_correct/Validation'%b)
+                summary['r05v173_seq_bin%d_ce'%b] = ce_sum/count
+                summary['r05v173_seq_bin%d_aar'%b] = hits/count
+                summary['r05v173_seq_bin%d_count'%b] = count
         return summary
 
     def _print_validation_audits(self, summary):
         if not self._is_main_proc():
             return
+        module_diag = {k.replace('r05v173_', ''): v for k, v in summary.items()
+                       if k.startswith('r05v173_')}
+        if module_diag:
+            print('[R05ModuleAudit:Validation] epoch='+str(self.epoch)+' '+
+                  ' '.join(k+'='+self._fmt(v, 5) for k,v in sorted(module_diag.items())))
         print(
             "[ValidationPhysical] "
             f"epoch={self.epoch} val={self._fmt(summary.get('validation_metric'), 5)} "
@@ -922,7 +961,7 @@ class AbFlowTrainer(Trainer):
         )
         print(
             "[SequenceForensic] "
-            f"epoch={self.epoch} val_AAR={self._fmt(summary.get('aar'), 4)} "
+            f"epoch={self.epoch} lossmask_AAR={self._fmt(summary.get('aar'), 4)} "
             f"val_CE={self._fmt(summary.get('loss_seq'), 4)} "
             f"entropy={self._fmt(summary.get('seq_entropy'), 4)} "
             f"max_prob={self._fmt(summary.get('seq_max_prob'), 4)} "
@@ -930,6 +969,18 @@ class AbFlowTrainer(Trainer):
             f"unique_MAP={self._fmt(summary.get('seq_unique_map_classes'), 1)} "
             f"proposal_AAR={self._fmt(summary.get('proposal_aar'), 4)} "
             f"pred_vs_proposal={self._fmt(summary.get('pred_vs_proposal_aar'), 4)}"
+        )
+        print(
+            "[SequencePathAudit:Validation] "
+            f"epoch={self.epoch} "
+            f"exact={self._fmt(summary.get('sequence_path_contract_exact'), 0)} "
+            f"path_design={self._fmt(summary.get('sequence_path_participation_rate'), 4)} "
+            f"external_native={self._fmt(summary.get('sequence_external_native_context_rate'), 4)} "
+            f"noisy_branch={self._fmt(summary.get('sequence_noisy_branch_rate'), 4)} "
+            f"clean_branch={self._fmt(summary.get('sequence_clean_branch_rate'), 4)} "
+            f"state_native={self._fmt(summary.get('sequence_state_native_fraction'), 4)} "
+            f"loss_design={self._fmt(summary.get('sequence_loss_coverage_design'), 4)} "
+            f"loss_on_noisy={self._fmt(summary.get('sequence_loss_on_noisy_precision'), 4)}"
         )
         print(
             "[SequenceRoundAudit] "
@@ -1028,6 +1079,7 @@ class AbFlowTrainer(Trainer):
             f"base_w={self._fmt(summary.get('mf_base_adapter_weight_rms'), 6)} "
             f"seq_w={self._fmt(summary.get('mf_seq_adapter_weight_rms'), 6)} "
             f"disto={self._fmt(summary.get('mf_distogram_loss'), 5)} "
+            f"disto_live={self._fmt(summary.get('mf_distogram_pair_live_contract'), 0)} "
             f"slddt={self._fmt(summary.get('mf_smooth_lddt_loss'), 5)} "
             f"slddt_intra={self._fmt(summary.get('mf_smooth_lddt_intra_loss'), 5)} "
             f"slddt_scaf={self._fmt(summary.get('mf_smooth_lddt_scaffold_loss'), 5)} "
@@ -1064,6 +1116,7 @@ class AbFlowTrainer(Trainer):
             f"|gD|={self._fmte(g('grad_probe_norm_distogram'), 3)} "
             f"|gL|={self._fmte(g('grad_probe_norm_smooth_lddt'), 3)} "
             f"cos(T,S)={self._fmt(g('grad_probe_cos_endpoint_seq'), 3)} "
+            f"cos(S,Struct)={self._fmt(g('grad_probe_cos_seq_structure'), 3)} "
             f"cos(T,D)={self._fmt(g('grad_probe_cos_endpoint_distogram'), 3)} "
             f"cos(S,D)={self._fmt(g('grad_probe_cos_seq_distogram'), 3)} "
             f"cos(Struct,D)={self._fmt(g('grad_probe_cos_structure_distogram'), 3)} "
@@ -1296,8 +1349,25 @@ class AbFlowTrainer(Trainer):
                 f"best_DockQ={self._fmt(row['best_test_DockQ'], 5)}"
             )
 
+    def _requires_live_pair_gradient_contract(self):
+        raw_model = self.model.module if hasattr(self.model, "module") else self.model
+        return bool(
+            getattr(raw_model, "mf_terminal_live_pair_aux", False)
+            and getattr(raw_model, "mf_repr_distogram", False)
+            and abs(float(getattr(raw_model, "loss_distogram_weight", 0.0))) > 0.0
+        )
+
     def _should_probe_grad(self, val):
-        # interval=0 means once per actual train epoch, not on batch 0.
+        # Replacement R13 gets one immediate first-batch connectivity probe.
+        # After it passes, interval=0 returns to the historical once-per-epoch
+        # authority audit used by R11/R12/R13.
+        if (
+            (not val)
+            and self._grad_diag_enabled
+            and self._requires_live_pair_gradient_contract()
+            and not self._live_pair_gradient_contract_verified
+        ):
+            return True
         step = int(self.global_step)
         return (
             (not val)
@@ -1311,7 +1381,8 @@ class AbFlowTrainer(Trainer):
         # Validation always captures the model-side diagnostics needed for the
         # epoch mechanism audit.  Training captures them only for the periodic
         # gradient-authority probe.  No per-step diagnostic files are written.
-        capture_diagnostics = bool(val) or self._should_probe_grad(val)
+        probe_grad_now = self._should_probe_grad(val)
+        capture_diagnostics = bool(val) or probe_grad_now
         raw_model._diagnostic_capture = bool(capture_diagnostics)
         raw_model._diagnostic_validation_mode = bool(val and capture_diagnostics)
 
@@ -1388,7 +1459,7 @@ class AbFlowTrainer(Trainer):
                 )
                 self._train_loss_outlier_logged_epoch = int(self.epoch)
 
-        if self._should_probe_grad(val) and hasattr(raw_model, "compute_gradient_conflict_diagnostics"):
+        if probe_grad_now and hasattr(raw_model, "compute_gradient_conflict_diagnostics"):
             raw_model.compute_gradient_conflict_diagnostics()
             grad_error = str(getattr(raw_model, "_last_gradient_diagnostic_error", "") or "")
             if grad_error and self._diag_main_rank:
@@ -1398,6 +1469,48 @@ class AbFlowTrainer(Trainer):
                 )
         else:
             raw_model.last_gradient_diagnostics = {}
+
+        # V170 fail-fast scientific contract. ``grad_probe_norm_distogram`` is
+        # the norm of the *weighted* distogram objective differentiated with
+        # respect to the final-round shared activation captured before the MF
+        # representation branch. Therefore PASS means the intended auxiliary is
+        # not merely training its own head: it reaches the generator path.
+        if (
+            probe_grad_now
+            and self._requires_live_pair_gradient_contract()
+            and not self._live_pair_gradient_contract_verified
+        ):
+            grad_diag = getattr(raw_model, "last_gradient_diagnostics", None) or {}
+            gd_value = grad_diag.get("grad_probe_norm_distogram")
+            gd_scalar = self._scalar(gd_value)
+            local_ok = bool(
+                gd_scalar is not None
+                and isfinite(float(gd_scalar))
+                and float(gd_scalar) > 1.0e-12
+            )
+            # All DDP ranks must observe a live path. This avoids a rank-specific
+            # dynamic-graph bug passing on rank0 and hanging later in backward.
+            if torch.is_tensor(loss):
+                ok_tensor = loss.detach().new_tensor(1 if local_ok else 0, dtype=torch.int32)
+            else:
+                ok_tensor = torch.tensor(1 if local_ok else 0, dtype=torch.int32)
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN)
+            global_ok = bool(int(ok_tensor.detach().cpu().item()) == 1)
+            if not global_ok:
+                raise RuntimeError(
+                    "R05MF_LIVEPAIR_DISTOGRAM_V170 contract failed: weighted "
+                    "distogram CE has no non-zero gradient to the shared generator "
+                    "activation. Refusing to continue an invalid R13 run."
+                )
+            self._live_pair_gradient_contract_verified = True
+            if self._diag_main_rank:
+                print(
+                    "[LivePairGradientContract] "
+                    f"epoch={self.epoch} step={self.global_step} PASS "
+                    f"|gD_shared|={self._fmte(gd_scalar, 6)} "
+                    "carry=detached terminal_pair=live no_cross_round_BPTT=1"
+                )
 
         log_type = 'Validation' if val else 'Train'
         self.log(f'Overall/Loss/{log_type}', loss, batch_idx, val)
@@ -1427,7 +1540,28 @@ class AbFlowTrainer(Trainer):
         grad_diagnostics = getattr(raw_model, "last_gradient_diagnostics", None) or {}
         for name, value in grad_diagnostics.items():
             self.log(f"GradientDiag/{name}/{log_type}", value, batch_idx, val)
-        if self._should_probe_grad(val):
+        if probe_grad_now:
+            if (not val) and self._diag_main_rank:
+                def _ad(name):
+                    return self._scalar(abflow_diagnostics.get(name))
+                print(
+                    "[SequencePathAudit:Train] "
+                    f"epoch={self.epoch} step={self.global_step} "
+                    f"configured_context={self._fmt(batch.get('context_ratio'), 4)} "
+                    f"exact={self._fmt(_ad('sequence_path_contract_exact'), 0)} "
+                    f"path_design={self._fmt(_ad('sequence_path_participation_rate'), 4)} "
+                    f"external_native={self._fmt(_ad('sequence_external_native_context_rate'), 4)} "
+                    f"noisy_branch={self._fmt(_ad('sequence_noisy_branch_rate'), 4)} "
+                    f"clean_branch={self._fmt(_ad('sequence_clean_branch_rate'), 4)} "
+                    f"state_native={self._fmt(_ad('sequence_state_native_fraction'), 4)} "
+                    f"loss_design={self._fmt(_ad('sequence_loss_coverage_design'), 4)} "
+                    f"loss_on_noisy={self._fmt(_ad('sequence_loss_on_noisy_precision'), 4)}"
+                )
+            module_diag = getattr(raw_model, 'last_r05_module_diagnostics', {})
+            if module_diag:
+                print('[R05ModuleAudit:Train] epoch='+str(self.epoch)+' '+
+                      ' '.join(k+'='+self._fmt(self._scalar(v), 5)
+                               for k,v in sorted(module_diag.items())))
             self._print_loss_authority(grad_diagnostics)
             # autograd.grad creates temporary per-objective gradient tensors.
             # They are observational only; release their cached CUDA blocks once

@@ -1,6 +1,14 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
-# R05MF_AUTHORITY_LADDER_V169: three-run causal ladder; numerical authority operator unchanged from v168.
+# R05MF_AUTHORITY_LADDER_V169
+# R05MF_LIVEPAIR_DISTOGRAM_V170: terminal live-pair auxiliary state is separated
+# R05MF_CAUSAL_MODULES_V175
+# R05MF_ORTHOGONAL_R05_ABLATION_V172
+# R05MF_SEQUENCE_PATH_AUTHORITY_V171: exact categorical sequence bridge + path-noisy CE;
+# removes the external native-context curriculum from the formal R05×MF branch.
+# from detached cross-round carry; distogram-head initialization is RNG-isolated.
+# This restores the intended z_R -> distogram gradient without enabling cross-round BPTT.
+# The v168 parent-authority operator and v169 R11/R12 scientific paths are unchanged.
 import math, time, os
 from contextlib import nullcontext
 from tqdm import tqdm
@@ -340,6 +348,84 @@ class _TriangleAttention(nn.Module):
         return self._row_attention(zt).transpose(0, 1)
 
 
+class R05GeometryPair(nn.Module):
+    """V173: CA-distance/role pair representation -> existing R05 edge engine.
+
+    This is an AF2-inspired triangle-multiplication adaptation, not MFDesign
+    parity. Only inference-available current CA geometry and design/context roles
+    enter. The complete small pair matrices are rebuilt each R05 round; there is
+    no learned recurrent carry, direct single injection or sequence classifier.
+    Coordinates are in the existing R05 /10 frame; RBF centers use that frame.
+    """
+    def __init__(self, pair_dim=64):
+        super().__init__()
+        self.pair_dim = int(pair_dim)
+        self.register_buffer('centers', torch.linspace(0.0, 3.0, 16))
+        self.input = nn.Sequential(nn.Linear(19, self.pair_dim), nn.SiLU(),
+                                   nn.Linear(self.pair_dim, self.pair_dim))
+        self.outgoing = _TriangleMultiplication(self.pair_dim, self.pair_dim, True)
+        self.incoming = _TriangleMultiplication(self.pair_dim, self.pair_dim, False)
+        self.transition = nn.Sequential(nn.LayerNorm(self.pair_dim),
+            nn.Linear(self.pair_dim, 2*self.pair_dim), nn.SiLU(),
+            nn.Linear(2*self.pair_dim, self.pair_dim))
+        nn.init.zeros_(self.transition[-1].weight)
+        nn.init.zeros_(self.transition[-1].bias)
+
+    def forward(self, local_X, local_is_ab, local_batch_id, pair_edges):
+        # Deliberately no dropout: enabling this module does not consume runtime
+        # random draws. The existing EGNN output projections start at zero.
+        row, col = pair_edges
+        ca = local_X.detach()[:, 1].float()
+        distance = torch.linalg.norm(ca[row] - ca[col], dim=-1)
+        rbf = torch.exp(-((distance[:, None] - self.centers.float()) / 0.2)**2)
+        roles = torch.stack([local_is_ab[row], local_is_ab[col], row == col], -1)
+        with torch.cuda.amp.autocast(enabled=False):
+            z = self.input(torch.cat([rbf, roles.float()], -1))
+            parts, tri_terms = [], []
+            for gid in torch.unique(local_batch_id[row]):
+                select = local_batch_id[row] == gid
+                q = z[select]
+                n = math.isqrt(int(q.shape[0]))
+                if n*n != q.shape[0]:
+                    raise RuntimeError('R22 needs complete ordered pair matrices')
+                matrix = q.reshape(n, n, self.pair_dim)
+                delta_out = self.outgoing(matrix)
+                matrix = matrix + delta_out
+                delta_in = self.incoming(matrix)
+                matrix = matrix + delta_in
+                matrix = matrix + self.transition(matrix)
+                parts.append(matrix.reshape(-1, self.pair_dim))
+                tri_terms.append((delta_out.square().mean()+delta_in.square().mean()).sqrt())
+            # _build_bounded_mf_pair_edges returns graphs in ascending id order.
+            pair = torch.cat(parts, 0) if parts else z
+        diag = {'mf_geom_pair_rms': pair.detach().square().mean().sqrt() if pair.numel() else ca.new_tensor(0.),
+                'mf_geom_triangle_rms': torch.stack(tri_terms).detach().mean() if tri_terms else ca.new_tensor(0.),
+                'mf_geom_pair_count': ca.new_tensor(float(row.numel()))}
+        return pair, diag
+
+    @staticmethod
+    def gather(pair_edges, pair, query, n_local):
+        """Return [pair features, presence]. Missing pairs stay absent after LN.
+
+        Presence is essential: LayerNorm's learned bias can turn an all-zero
+        missing feature into a nonzero residual if absence is not carried.
+        """
+        r, c = pair_edges
+        qr, qc = query
+        codes = r*n_local+c
+        order = torch.argsort(codes)
+        sorted_codes = codes[order]
+        query_codes = qr*n_local+qc
+        result = pair.new_zeros((qr.numel(), pair.shape[-1]+1))
+        if codes.numel():
+            pos = torch.searchsorted(sorted_codes, query_codes)
+            safe = pos.clamp(max=codes.numel()-1)
+            hit = (pos < codes.numel()) & (sorted_codes[safe] == query_codes)
+            result[hit, :-1] = pair[order[safe[hit]]]
+            result[hit, -1] = 1.0
+        return result
+
+
 class MFRepresentationEnrichment(nn.Module):
     """MFDesign-style single/pair representation graft for the R05 parent.
 
@@ -359,7 +445,7 @@ class MFRepresentationEnrichment(nn.Module):
         single_dim=128, pair_dim=64, num_blocks=2, num_heads=4,
         atom_s=128, atom_depth=3, atom_heads=4, rbf_bins=16, time_dim=16,
         coordinate_scale=0.1, enable_distogram=False, distogram_bins=64,
-        distogram_min=2.0, distogram_max=22.0,
+        distogram_min=2.0, distogram_max=22.0, distogram_head_seed=13003,
         relpos_dim=32, opm_dim=64, enable_allatom_pair=True,
         allatom_chunk=512, detach_state_carry=True, triangle_heads=4,
         triangle_hidden=128, triangle_checkpoint=True,
@@ -385,6 +471,7 @@ class MFRepresentationEnrichment(nn.Module):
         self.distogram_bins = int(distogram_bins)
         self.distogram_min = float(distogram_min)
         self.distogram_max = float(distogram_max)
+        self.distogram_head_seed = int(distogram_head_seed)
         self.relpos_dim = int(relpos_dim)
         self.opm_dim = int(opm_dim)
         self.enable_allatom_pair = bool(enable_allatom_pair)
@@ -575,9 +662,17 @@ class MFRepresentationEnrichment(nn.Module):
 
         if self.enable_distogram:
             self.distogram_norm = nn.LayerNorm(self.pair_dim)
-            self.distogram_head = nn.Linear(
-                self.pair_dim, self.distogram_bins
-            )
+            # V170 causal-isolation contract: adding an auxiliary head must not
+            # advance the global CPU RNG stream and thereby change subsequent
+            # generator initialization or training-time random draws. The head
+            # receives a private fixed initialization stream; fork_rng restores
+            # the caller RNG state exactly on exit. This seed is an experiment
+            # identity constant, not a tuned scientific hyperparameter.
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(self.distogram_head_seed)
+                self.distogram_head = nn.Linear(
+                    self.pair_dim, self.distogram_bins
+                )
         else:
             self.distogram_norm = None
             self.distogram_head = None
@@ -1063,6 +1158,7 @@ class MFRepresentationEnrichment(nn.Module):
         pred_X, true_X, valid_atom_mask, design_residue_mask, batch_id,
         is_antigen_mask=None, cutoff=15.0,
         intra_weight=1.0, scaffold_weight=1.0, antigen_weight=1.0,
+        metric="smooth_lddt",
     ):
         """Design-region factored smooth-lDDT for H3, 6CDR and related tasks.
 
@@ -1081,6 +1177,10 @@ class MFRepresentationEnrichment(nn.Module):
         design x context distance matrices are constructed, avoiding O(N_context^2)
         work as the design region grows from H3 to all six CDRs.
 
+        V173 metric="pseudo_huber" keeps this relation universe but uses
+        sqrt(1+e^2)-1 with e=distance_error/(1 Angstrom). It has zero perfect
+        floor and a non-exponentially-saturating derivative. It is NOT lDDT.
+
         ``design_residue_mask`` is the task contract.  For H3 it is the H3 mask;
         for 6CDR it can contain H1/H2/H3/L1/L2/L3 simultaneously without changing
         this loss implementation.  Coordinates must be physical Angstrom values.
@@ -1096,6 +1196,8 @@ class MFRepresentationEnrichment(nn.Module):
         if is_antigen_mask is None:
             is_antigen_mask = torch.zeros_like(design_residue_mask, dtype=torch.bool)
 
+        if metric not in {"smooth_lddt", "pseudo_huber"}:
+            raise ValueError('Unknown relation metric: '+str(metric))
         cutoff = float(cutoff)
         relation_weights = {
             "intra": float(intra_weight),
@@ -1106,6 +1208,13 @@ class MFRepresentationEnrichment(nn.Module):
         def _smooth_loss(delta, mask):
             if not bool(mask.any()):
                 return None, 0
+            if metric == "pseudo_huber":
+                # e = distance error / 1 Angstrom. Numerically stable form of
+                # sqrt(1+e^2)-1; derivative e/sqrt(1+e^2) is bounded but does not
+                # exponentially vanish on a badly misplaced design.
+                e = delta[mask].float()
+                robust = e.square() / (torch.sqrt(1.0 + e.square()) + 1.0)
+                return robust.mean(), int(mask.sum().item())
             score = (
                 torch.sigmoid(0.5 - delta)
                 + torch.sigmoid(1.0 - delta)
@@ -1201,13 +1310,13 @@ class MFRepresentationEnrichment(nn.Module):
             vals = relation_losses[name]
             return torch.stack(vals).mean().to(pred_X.dtype) if vals else zero.detach()
 
-        if graph_losses:
+        if graph_losses and metric == "smooth_lddt":
             thresholds = pred_X.detach().new_tensor([0.5, 1.0, 2.0, 4.0])
             perfect_floor = 1.0 - torch.sigmoid(thresholds).mean()
             excess = (total.detach().float() - perfect_floor.float()).clamp_min(0.0).to(pred_X.dtype)
         else:
             perfect_floor = zero.detach()
-            excess = zero.detach()
+            excess = total.detach() if metric == "pseudo_huber" else zero.detach()
         diagnostics = {
             "intra": _diag_mean("intra"),
             "scaffold": _diag_mean("scaffold"),
@@ -1312,10 +1421,10 @@ class AbFlowModel(nn.Module):
         #   context   : time-condition context/global/local-context messages only
         #   all       : interface scope + context scope
         #
-        # The pair-time encoder keeps all original GCL parameter shapes and adds
-        # only zero-initialized channel-wise time scales.  This makes the initial
-        # function exactly the base AMEncoder and avoids changing the RNG stream
-        # for later model parameters.
+        # V175 Pair-Time follows supplied AbX semantics: sinusoidal t is an
+        # explicit residue-pair representation feature. The new projection is
+        # zero-start and same-layer coordinate messages remain the base R05 ones,
+        # so enabling it cannot act as a hand-written time-dependent force.
         pair_scope = _env_str("ABFLOW_PAIR_TIME_SCOPE", "off").lower()
         # Backward compatibility with the previous boolean Stage-2 prototype.
         if (
@@ -2213,6 +2322,51 @@ class AbFlowModel(nn.Module):
                 "ABFLOW_SEQUENCE_CONTEXT_MODE must be legacy, loss_only or off."
             )
 
+        # V171 sequence state/objective contract.  Historical runs keep the
+        # legacy external curriculum.  Formal exact-bridge runs remove that
+        # independent native-context Bernoulli mask and let the categorical
+        # path itself be the sole authority over which target tokens are visible.
+        # The denoising CE is then applied only to residues that actually took
+        # the source/noisy branch of q_t, mirroring masked/absorbing denoising
+        # semantics without changing the R05 categorical sampler.
+        self.sequence_path_contract = _env_str(
+            "ABFLOW_SEQUENCE_PATH_CONTRACT", "legacy_context"
+        ).lower()
+        if self.sequence_path_contract not in {
+            "legacy_context", "exact_categorical_bridge"
+        }:
+            raise ValueError(
+                "ABFLOW_SEQUENCE_PATH_CONTRACT must be legacy_context or "
+                "exact_categorical_bridge."
+            )
+        self.sequence_loss_scope = _env_str(
+            "ABFLOW_SEQUENCE_LOSS_SCOPE", "context_mask"
+        ).lower()
+        if self.sequence_loss_scope not in {
+            "context_mask", "design_all", "path_noisy"
+        }:
+            raise ValueError(
+                "ABFLOW_SEQUENCE_LOSS_SCOPE must be context_mask, design_all "
+                "or path_noisy."
+            )
+        if self.sequence_path_contract == "exact_categorical_bridge":
+            if not self.scorefm_state_path:
+                raise ValueError(
+                    "V171 exact_categorical_bridge requires ABFLOW_SCOREFM_STATE_PATH=on."
+                )
+            if self.sequence_context_mode != "off":
+                raise ValueError(
+                    "V171 exact_categorical_bridge requires "
+                    "ABFLOW_SEQUENCE_CONTEXT_MODE=off; an independent native "
+                    "context curriculum would alter q_t itself."
+                )
+            if self.sequence_loss_scope != "path_noisy":
+                raise ValueError(
+                    "V171 exact_categorical_bridge formal contract requires "
+                    "ABFLOW_SEQUENCE_LOSS_SCOPE=path_noisy so sequence loss "
+                    "authority is defined by the sampled path-noise event."
+                )
+
         # The bridge Euler/CTMC step already reaches the terminal state.  The
         # old sampler queried the network once more at exactly t=1, a boundary
         # never sampled during continuous-time training, and replaced the
@@ -2453,13 +2607,29 @@ class AbFlowModel(nn.Module):
         self.sample_authority_diagnostics = _env_flag(
             "ABFLOW_MF_SAMPLE_AUTHORITY_DIAGNOSTICS", False
         )
+        # V170 separates two mathematical states that v169 accidentally
+        # conflated under one ``pair`` key:
+        #   pair_carry = stopgrad(z_r), used only as next-round recurrent state;
+        #   pair_live  = z_R, final differentiable state for terminal auxiliaries.
+        # Thus the auxiliary receives one final-round gradient path without
+        # re-introducing full backpropagation through the three R05 rounds.
+        self.mf_terminal_live_pair_aux = _env_flag(
+            "ABFLOW_MF_TERMINAL_LIVE_PAIR_AUX", False
+        )
+        self.mf_distogram_head_seed = _env_int(
+            "ABFLOW_MF_DISTOGRAM_HEAD_SEED", 13003
+        )
         self.mf_distogram_bins = _env_int("ABFLOW_MF_DISTOGRAM_BINS", 64)
         self.mf_distogram_min = _env_float("ABFLOW_MF_DISTOGRAM_MIN", 2.0)
         self.mf_distogram_max = _env_float("ABFLOW_MF_DISTOGRAM_MAX", 22.0)
 
-        if (self.mf_repr_distogram or self.mf_smooth_lddt) and not self.mf_repr_core:
+        # V172 causal-ablation cleanup: distogram is a representation-head loss
+        # and therefore requires the MF pair state, but design-region smooth-lDDT
+        # is a coordinate objective.  It depends only on pred_X/true_X/task masks
+        # and must remain independently testable on the R05 parent.
+        if self.mf_repr_distogram and not self.mf_repr_core:
             raise ValueError(
-                "MF distogram/smooth-lDDT require ABFLOW_MF_REPR_CORE=on."
+                "MF distogram requires ABFLOW_MF_REPR_CORE=on."
             )
         if _env_flag("ABFLOW_MF_CLEAN_SC", False):
             raise ValueError(
@@ -2497,6 +2667,15 @@ class AbFlowModel(nn.Module):
             raise ValueError(
                 "ABFLOW_LOSS_DISTOGRAM_WEIGHT is non-zero but ABFLOW_MF_DISTOGRAM is off."
             )
+        if self.loss_distogram_weight != 0.0 and not self.mf_terminal_live_pair_aux:
+            raise ValueError(
+                "V170 distogram training requires ABFLOW_MF_TERMINAL_LIVE_PAIR_AUX=on. "
+                "A detached cross-round carry is not a valid terminal supervision state."
+            )
+        if self.mf_terminal_live_pair_aux and not self.mf_repr_core:
+            raise ValueError(
+                "ABFLOW_MF_TERMINAL_LIVE_PAIR_AUX requires ABFLOW_MF_REPR_CORE=on."
+            )
         if self.loss_smooth_lddt_weight != 0.0 and not self.mf_smooth_lddt:
             raise ValueError(
                 "ABFLOW_LOSS_SMOOTH_LDDT_WEIGHT is non-zero but ABFLOW_MF_SMOOTH_LDDT is off."
@@ -2521,6 +2700,7 @@ class AbFlowModel(nn.Module):
                 distogram_bins=self.mf_distogram_bins,
                 distogram_min=self.mf_distogram_min,
                 distogram_max=self.mf_distogram_max,
+                distogram_head_seed=self.mf_distogram_head_seed,
                 relpos_dim=self.mf_relpos_dim,
                 opm_dim=self.mf_opm_dim,
                 enable_allatom_pair=self.mf_allatom_pair,
@@ -2552,7 +2732,38 @@ class AbFlowModel(nn.Module):
         self._last_mf_repr_state = {}
         self._sample_authority_records = []
         self._last_mf_repr_diagnostics = {}
+        self.r05_endpoint_relation = _env_flag("ABFLOW_R05_ENDPOINT_RELATION", False)
+        self.r05_geom_pair = _env_flag("ABFLOW_R05_GEOM_PAIR", False)
+        self.r05_geometry_pair = None
+        if getattr(self, 'r05_endpoint_relation', False):
+            if not self.mf_smooth_lddt or self.mf_repr_core:
+                raise ValueError('R21 requires relation objective on and MF core off')
+            if self.scorefm_loss_mode != 'f01_r3_endpoint_canonical_hybrid':
+                raise ValueError('R21 endpoint decoder requires U02 hybrid carrier')
+        if getattr(self, 'r05_geom_pair', False):
+            if self.mf_repr_core or self.pair_time_conditioning:
+                raise ValueError('R22 geometric pairs cannot be mixed with MF core/Pair-Time')
+            # Isolate new initialization from parent RNG. fork_rng restores the
+            # CPU stream; no torch.manual_seed() call changes any CUDA stream.
+            with torch.random.fork_rng(devices=[]):
+                self.r05_geometry_pair = R05GeometryPair(64)
+            self.gnn.enable_pair_representation(64, parent_authority=False)
+        self.last_r05_module_diagnostics = {}
 
+
+    @staticmethod
+    def _r05_decode_endpoint(carrier, x_t, x0, t_int, threshold=0.20):
+        """U02 piecewise chart inversion, in raw Angstrom coordinates.
+
+        t<threshold: Y is the clean endpoint; t>=threshold: Y is canonical.
+        d(endpoint)/dY is I or 2I, never 1/t. The denominator is evaluated with
+        threshold clamping also in the inactive branch to avoid NaN at t=0.
+        """
+        with torch.cuda.amp.autocast(enabled=False):
+            t = t_int.float()
+            y = carrier.float()
+            canonical = 2.0*y - (x_t.float()-(1.0-t)*x0.float())/t.clamp_min(threshold)
+            return torch.where(t >= threshold, canonical, y)
 
     @staticmethod
     def _parent_anchored_residual(parent, residual, *, center_last_dim=False, eps=1.0e-8):
@@ -2708,7 +2919,8 @@ class AbFlowModel(nn.Module):
 
     @torch.no_grad()
     def _sample_categorical_path(self, clean_S, base_S, t_graph,
-                                 interface_batch_id, corrupt_mask=None):
+                                 interface_batch_id, corrupt_mask=None,
+                                 return_noisy_mask=False):
         """Sample the linear categorical bridge q_t(S_t | S_1, S_0).
 
         Conditional on a source/target pair, each residue is at the target token
@@ -2742,11 +2954,20 @@ class AbFlowModel(nn.Module):
             )
 
         keep_clean = uniforms < keep_prob.clamp(0.0, 1.0)
+        noisy_branch = ~keep_clean
         sampled = torch.where(keep_clean, clean_S, base_S).long()
-        if corrupt_mask is None:
-            return sampled
-        corrupt_mask = corrupt_mask.to(device=clean_S.device, dtype=torch.bool)
-        return torch.where(corrupt_mask, sampled, clean_S).long()
+        if corrupt_mask is not None:
+            corrupt_mask = corrupt_mask.to(device=clean_S.device, dtype=torch.bool)
+            sampled = torch.where(corrupt_mask, sampled, clean_S).long()
+            # Residues excluded by a historical context mask are forcibly clean
+            # and therefore must never be labeled as a genuine path-noise event.
+            noisy_branch = noisy_branch & corrupt_mask
+        if return_noisy_mask:
+            # IMPORTANT: this mask records the sampled BRANCH, not token inequality.
+            # A proposal amino acid may coincidentally equal the native amino acid;
+            # using sampled != clean would silently mislabel such denoising states.
+            return sampled, noisy_branch
+        return sampled
 
     def align_epi_ab(self, local_inter_edges, local_is_ab):
         """Orient every cross-interface edge as antigen -> antibody.
@@ -4139,6 +4360,27 @@ class AbFlowModel(nn.Module):
                         .pow(2).mean() + self.scorefm_eps
                     ).to(H_0.dtype)
 
+        if getattr(self, 'r05_geom_pair', False):
+            if not bool(self.batch_constants.get('mf_pair_edges_initialized', False)):
+                self.batch_constants['mf_pair_edges'] = self._build_bounded_mf_pair_edges(
+                    local_X, local_is_ab, local_batch_id, mf_proposal_interface_X)
+                self.batch_constants['mf_pair_edges_initialized'] = True
+            pair_edges = self.batch_constants['mf_pair_edges']
+            pair, pair_diag = self.r05_geometry_pair(
+                local_X, local_is_ab, local_batch_id, pair_edges)
+            if diagnostics_active and int(round_idx) == int(self.round)-1:
+                self._r05_live_pair_probe = pair
+            n_local = int(local_X.shape[0])
+            mf_local_edge_attr = self.r05_geometry_pair.gather(
+                pair_edges, pair, local_edges, n_local)
+            mf_surf_edge_attr = self.r05_geometry_pair.gather(
+                pair_edges, pair, aligned_local_inter_edges, n_local)
+            if diagnostics_active:
+                self._last_condition_diagnostics.update(pair_diag)
+                self._last_condition_diagnostics['mf_geom_edge_coverage'] = (
+                    mf_local_edge_attr[:, -1].detach().mean()
+                    if mf_local_edge_attr.numel() else H_0.new_tensor(0.))
+
         # Capture the final-round shared activation only on diagnostic probe
         # steps. Sequence logits and coordinate outputs both depend on H_0.
         if (
@@ -4162,7 +4404,7 @@ class AbFlowModel(nn.Module):
 
         # message passing
         # sme_start = time.time()
-        if self.mf_repr_core:
+        if self.mf_repr_core or getattr(self, 'r05_geom_pair', False):
             H, pred_X, pred_local_X = self.gnn(
                 H_0, X, ctx_edges, local_mask, local_X, surf, local_edges,
                 paratope_mask, local_is_ab, aligned_local_inter_edges, epi_index,
@@ -4187,7 +4429,7 @@ class AbFlowModel(nn.Module):
             )
         # self.timing_stats['sme_encoding'] += time.time() - sme_start
 
-        if self.mf_repr_core and diagnostics_active and hasattr(
+        if (self.mf_repr_core or getattr(self, 'r05_geom_pair', False)) and diagnostics_active and hasattr(
             self.gnn, 'pair_authority_diagnostics'
         ):
             with torch.no_grad():
@@ -4195,6 +4437,15 @@ class AbFlowModel(nn.Module):
                     self._last_condition_diagnostics[
                         'mf_edge_' + _name
                     ] = _value.detach().to(H_0.dtype)
+
+        if self.pair_time_conditioning and diagnostics_active and hasattr(
+            self.gnn, 'pair_time_diagnostics'
+        ):
+            with torch.no_grad():
+                for _name, _value in self.gnn.pair_time_diagnostics().items():
+                    self._last_condition_diagnostics['pair_time_' + _name] = (
+                        _value.detach().to(H_0.dtype)
+                    )
 
         interface_X = pred_local_X[local_is_ab]
 
@@ -7291,6 +7542,10 @@ class AbFlowModel(nn.Module):
         # and there is no nested recycle loop or derived previous-clean summary.
         mf_previous_single = None
         mf_previous_pair = None
+        # Final-round differentiable representation is tracked independently of
+        # the detached state carried between physical R05 rounds.
+        mf_terminal_single_live = None
+        mf_terminal_pair_live = None
         diagnostics_active = bool(
             self.condition_diagnostics_enabled
             and getattr(self, "_diagnostic_capture", False)
@@ -7349,6 +7604,12 @@ class AbFlowModel(nn.Module):
 
             memory_H = H
             if self.mf_repr_core:
+                # V170: capture the terminal live s/z *before* detaching the
+                # recurrent carry. Earlier round s/z states are not retained live.
+                if round_idx == self.round - 1:
+                    mf_terminal_single_live = mf_single_out
+                    mf_terminal_pair_live = mf_pair_out
+
                 # Detached representation-state carry: s/z are genuine learned state,
                 # not a second backprop-through-time authority across R05 rounds.
                 # The R05 coordinate/hidden recurrence itself is left untouched.
@@ -7398,9 +7659,17 @@ class AbFlowModel(nn.Module):
             self._latest_condition_diagnostics = {}
 
         if self.mf_repr_core:
+            if mf_terminal_single_live is None or mf_terminal_pair_live is None:
+                raise RuntimeError(
+                    "MF representation core finished without a final live s/z state."
+                )
             self._last_mf_repr_state = {
-                'single': mf_previous_single,
-                'pair': mf_previous_pair,
+                # Differentiable terminal state for terminal auxiliary objectives.
+                'single_live': mf_terminal_single_live,
+                'pair_live': mf_terminal_pair_live,
+                # Recurrent carry; detached under the formal no-BPTT contract.
+                'single_carry': mf_previous_single,
+                'pair_carry': mf_previous_pair,
                 'pair_edges': self.batch_constants['mf_pair_edges'],
                 'local_mask': self.batch_constants['local_mask'],
             }
@@ -7679,6 +7948,7 @@ class AbFlowModel(nn.Module):
             ("endpoint", "satc"),
             ("seq", "satc"),
             ("endpoint", "seq"),
+            ("seq", "structure"),
             ("structure", "satc"),
             ("endpoint", "distogram"),
             ("seq", "distogram"),
@@ -7694,6 +7964,19 @@ class AbFlowModel(nn.Module):
                     torch.dot(ga, gb)
                     / (torch.linalg.norm(ga) * torch.linalg.norm(gb) + self.scorefm_eps)
                 )
+        pair_probe = getattr(self, '_r05_live_pair_probe', None)
+        if getattr(self, 'r05_geom_pair', False) and pair_probe is not None and pair_probe.requires_grad:
+            with torch.cuda.amp.autocast(enabled=False):
+                for name in ('endpoint', 'seq', 'structure'):
+                    value = terms.get(name)
+                    if value is not None and value.requires_grad:
+                        grad = torch.autograd.grad(value.float(), pair_probe,
+                            retain_graph=True, allow_unused=True)[0]
+                        if grad is not None:
+                            norm = torch.linalg.norm(grad.detach().float())
+                            out['grad_r05_pair_'+name] = norm
+                            self.last_r05_module_diagnostics['grad_pair_'+name] = norm
+            self._r05_live_pair_probe = None
         self.last_gradient_diagnostics = {k: v.detach() for k, v in out.items()}
         return self.last_gradient_diagnostics
 
@@ -7849,6 +8132,7 @@ class AbFlowModel(nn.Module):
         :param context_ratio: float, rate of context provided in masked sequence, should be [0, 1) and anneal to 0 in training, probability of keeping ground-truth sequence context among originally masked positions.
         '''
         # import ipdb; ipdb.set_trace()
+        self._r05_live_pair_probe = None
         # Do not retain a shared activation from a previous batch.
         self._diagnostic_probe_tensor = None
         self._last_gradient_diagnostic_error = ""
@@ -7875,9 +8159,11 @@ class AbFlowModel(nn.Module):
         #   The complete H3 categorical state follows q_t for every designed
         #   residue, while CE may be subsampled for curriculum purposes.
         # off:
-        #   Every designed residue follows the same train-time path used at
-        #   inference and every residue is supervised.  This is the formal v51
-        #   setting because hard/native context leakage is amplified by DUAL_SEQ.
+        #   Every designed residue is included in the sampled categorical path,
+        #   CE mask and soft-sequence recurrence mask. Whether S_t is actually
+        #   consumed still depends on the separate sequence-state input switch.
+        #   In R05 PCS-RC with DUAL_SEQUENCE_STATE=off, valid proposal tokens
+        #   overwrite global sequence context and S_t has no explicit input path.
         design_smask = smask.clone()
         sequence_loss_mask = design_smask.clone()
         if self.sequence_context_mode == "legacy":
@@ -7904,6 +8190,10 @@ class AbFlowModel(nn.Module):
             smask if self.sequence_context_mode == "legacy"
             else design_smask
         )
+        # Full-residue mask populated after S_t is sampled.  It is intentionally
+        # separate from token equality because source and native amino acids can
+        # coincide while the state still came from the noisy/source branch.
+        sequence_noisy_branch_mask = torch.zeros_like(design_smask, dtype=torch.bool)
 
         gt_interface_X = true_X[paratope_mask]
         batch_size = int(self.batch_constants['batch_size'].item()) if torch.is_tensor(self.batch_constants['batch_size']) else int(self.batch_constants['batch_size'])
@@ -8244,10 +8534,23 @@ class AbFlowModel(nn.Module):
                 Xt = mu_t
 
             if not self.struct_only:
-                St = self._sample_categorical_path(
-                    true_S[paratope_mask], interface_S, t_graph, interface_batch_id,
-                    corrupt_mask=sequence_path_mask[paratope_mask],
-                )
+                if self.sequence_loss_scope == "path_noisy":
+                    St, noisy_branch_int = self._sample_categorical_path(
+                        true_S[paratope_mask], interface_S, t_graph, interface_batch_id,
+                        corrupt_mask=sequence_path_mask[paratope_mask],
+                        return_noisy_mask=True,
+                    )
+                    sequence_noisy_branch_mask[paratope_mask] = noisy_branch_int
+                    sequence_loss_mask = design_smask & sequence_noisy_branch_mask
+                else:
+                    St, noisy_branch_int = self._sample_categorical_path(
+                        true_S[paratope_mask], interface_S, t_graph, interface_batch_id,
+                        corrupt_mask=sequence_path_mask[paratope_mask],
+                        return_noisy_mask=True,
+                    )
+                    sequence_noisy_branch_mask[paratope_mask] = noisy_branch_int
+                    if self.sequence_loss_scope == "design_all":
+                        sequence_loss_mask = design_smask
                 sequence_state_for_model = St
             else:
                 St = interface_S
@@ -8399,6 +8702,35 @@ class AbFlowModel(nn.Module):
                     )
                     total = total + mask.sum()
             snll = snll / total.clamp_min(1.0)
+
+        self.last_r05_module_diagnostics = {}
+        if bool(getattr(self, "_diagnostic_capture", False)) or not self.training:
+            with torch.no_grad():
+                d = self.last_r05_module_diagnostics
+                denom = design_smask.float().sum().clamp_min(1.)
+                d['seq_loss_design_coverage'] = sequence_loss_mask.float().sum()/denom
+                d['seq_recycle_design_coverage'] = smask.float().sum()/denom
+                d['explicit_st_consumed'] = X.new_tensor(float(
+                    self.dual_sequence_state or not self.abflow_recurrent_proposal_context))
+                d['endpoint_relation_on'] = X.new_tensor(float(getattr(self, 'r05_endpoint_relation', False)))
+                d['geom_pair_on'] = X.new_tensor(float(getattr(self, 'r05_geom_pair', False)))
+                d['pair_time_on'] = X.new_tensor(float(getattr(self, 'pair_time_conditioning', False)))
+                logits = r_pred_S_logits[-1][0] if not self.struct_only else None
+                for b in range(5):
+                    tb = t_graph.reshape(-1)
+                    if tb.numel() == 1:
+                        tb = tb.expand(batch_size)
+                    mask = design_smask & (tb[batch_id] >= b/5.) & (tb[batch_id] < (b+1)/5.)
+                    d['seq_bin%d_count'%b] = mask.float().sum()
+                    if logits is not None and mask.any():
+                        d['seq_bin%d_ce'%b] = F.cross_entropy(logits[mask].float(), true_S[mask])
+                        d['seq_bin%d_aar'%b] = (logits[mask].argmax(-1)==true_S[mask]).float().mean()
+                        d['seq_bin%d_ce_sum'%b] = d['seq_bin%d_ce'%b]*d['seq_bin%d_count'%b]
+                        d['seq_bin%d_correct'%b] = d['seq_bin%d_aar'%b]*d['seq_bin%d_count'%b]
+                for key, value in self._latest_condition_diagnostics.items():
+                    if (key.startswith('mf_geom_') or key.startswith('mf_edge_')
+                            or key.startswith('pair_time_')):
+                        d[key] = value.detach()
 
         # structure loss
         #
@@ -8607,17 +8939,38 @@ class AbFlowModel(nn.Module):
         # universe, with mean CE normalization so its configured weight is not
         # sequence-length dependent.
         mf_distogram_loss = X.new_tensor(0.0)
+        mf_distogram_pair_live_contract = X.detach().new_tensor(0.0)
         if self.mf_repr_distogram:
             mf_state = self._last_mf_repr_state
-            if not mf_state or mf_state.get('pair') is None:
+            pair_live = None if not mf_state else mf_state.get('pair_live')
+            pair_carry = None if not mf_state else mf_state.get('pair_carry')
+            if pair_live is None:
                 raise RuntimeError(
-                    "MF distogram is enabled but no final pair state was produced."
+                    "MF distogram is enabled but no final live pair state was produced."
                 )
+            # Fail on the exact v169 bug on the first training forward instead of
+            # silently training only the auxiliary head. The terminal z_R must be
+            # live; the recurrent carry must remain detached when no-BPTT is on.
+            if self.training and self.loss_distogram_weight != 0.0:
+                if not pair_live.requires_grad:
+                    raise RuntimeError(
+                        "V170 live-pair contract failed: final z_R is detached before "
+                        "distogram supervision."
+                    )
+                if (
+                    self.mf_detach_state_carry and pair_carry is not None
+                    and pair_carry.requires_grad
+                ):
+                    raise RuntimeError(
+                        "V170 carry contract failed: pair_carry unexpectedly requires grad; "
+                        "this would enable cross-round BPTT."
+                    )
+            mf_distogram_pair_live_contract = X.detach().new_tensor(1.0)
             true_local_X = true_X[mf_state['local_mask']]
             mf_distogram_loss, _ = self.mf_repr.distogram_loss(
                 true_local_X=true_local_X,
                 pair_edges=mf_state['pair_edges'],
-                pair_state=mf_state['pair'],
+                pair_state=pair_live,
             )
 
         # 4. MF/Boltz-inspired design-region factored smooth-lDDT auxiliary.
@@ -8636,9 +8989,26 @@ class AbFlowModel(nn.Module):
                 self.aa_feature._construct_atom_pos(true_S)
                 != self.aa_feature.atom_pos_pad_idx
             )
+            # The metric is intentionally invoked as a stateless coordinate
+            # objective rather than through ``self.mf_repr``.  This is the key
+            # V172 decoupling that makes R05 + design-lDDT a true one-factor
+            # ablation instead of silently requiring the closed MF trunk.
+            relation_pred_X = pred_X
+            relation_metric = "smooth_lddt"
+            if getattr(self, 'r05_endpoint_relation', False):
+                # Global pred_X is an antibody-shape branch. Its free placement
+                # is not the generated shadow endpoint. Decode the final shadow
+                # carrier, attach ONLY the design to fixed native context, then
+                # supervise inter-residue distances. No GT is used in decoding.
+                endpoint = self._r05_decode_endpoint(
+                    r_interface_X[-1], Xt, interface_X, t_int, self.f01_hybrid_t_min)
+                relation_pred_X = true_X.detach().float().clone()
+                relation_pred_X[paratope_mask] = endpoint
+                relation_metric = "pseudo_huber"
+                valid_atom_mask = valid_atom_mask & xloss_mask.bool()
             mf_smooth_lddt_loss, mf_smooth_lddt_diag = (
-                self.mf_repr.design_region_smooth_lddt_loss(
-                    pred_X=pred_X, true_X=true_X,
+                MFRepresentationEnrichment.design_region_smooth_lddt_loss(
+                    pred_X=relation_pred_X, true_X=true_X,
                     valid_atom_mask=valid_atom_mask,
                     design_residue_mask=paratope_mask,
                     batch_id=batch_id,
@@ -8647,8 +9017,21 @@ class AbFlowModel(nn.Module):
                     intra_weight=self.mf_smooth_lddt_intra_weight,
                     scaffold_weight=self.mf_smooth_lddt_scaffold_weight,
                     antigen_weight=self.mf_smooth_lddt_antigen_weight,
+                    metric=relation_metric,
                 )
             )
+
+        if getattr(self, 'r05_endpoint_relation', False):
+            with torch.no_grad():
+                self.last_r05_module_diagnostics.update({
+                    'endpoint_ca_raw_rms': (endpoint[:,1]-gt_interface_X[:,1]).square().sum(-1).mean().sqrt(),
+                    'relation_intra': mf_smooth_lddt_diag['intra'],
+                    'relation_scaffold': mf_smooth_lddt_diag['scaffold'],
+                    'relation_antigen': mf_smooth_lddt_diag['antigen'],
+                    'relation_loss': mf_smooth_lddt_loss.detach(),
+                })
+        for key, value in self.last_r05_module_diagnostics.items():
+            scorefm_details['r05v173_'+key] = value.detach()
 
         scorefm_details["mf_repr_core_enabled"] = X.detach().new_tensor(
             1.0 if self.mf_repr_core else 0.0
@@ -8663,6 +9046,12 @@ class AbFlowModel(nn.Module):
             1.0 if self.mf_smooth_lddt else 0.0
         )
         scorefm_details["mf_distogram_loss"] = mf_distogram_loss.detach()
+        scorefm_details["mf_distogram_pair_live_contract"] = (
+            mf_distogram_pair_live_contract
+        )
+        scorefm_details["mf_terminal_live_pair_aux"] = X.detach().new_tensor(
+            1.0 if self.mf_terminal_live_pair_aux else 0.0
+        )
         scorefm_details["mf_smooth_lddt_loss"] = mf_smooth_lddt_loss.detach()
         scorefm_details["mf_smooth_lddt_intra_loss"] = mf_smooth_lddt_diag['intra'].detach()
         scorefm_details["mf_smooth_lddt_scaffold_loss"] = mf_smooth_lddt_diag['scaffold'].detach()
@@ -8679,8 +9068,10 @@ class AbFlowModel(nn.Module):
             float(self.loss_smooth_lddt_weight)
         )
         if self.mf_repr_core and self._last_mf_repr_state:
-            _single = self._last_mf_repr_state.get('single')
-            _pair = self._last_mf_repr_state.get('pair')
+            # Logging uses detached views of the final live state; diagnostics do
+            # not become an additional gradient authority.
+            _single = self._last_mf_repr_state.get('single_live')
+            _pair = self._last_mf_repr_state.get('pair_live')
             if _single is not None and _single.numel():
                 scorefm_details["mf_single_rms"] = torch.sqrt(
                     _single.detach().float().pow(2).mean() + self.scorefm_eps
@@ -8702,8 +9093,9 @@ class AbFlowModel(nn.Module):
             pdev_loss, prmsd_loss = None, None
 
         # Comprehensive loss with one centralized, explicit hierarchy.
-        # Defaults are exactly the historical R05 coefficients.  R09/R10 add
-        # only the mean-normalized distogram auxiliary at the configured weight.
+        # Defaults are exactly the historical R05 coefficients. V170 keeps the
+        # R12 parent objective unchanged and, only for the replacement R13, adds
+        # mean-normalized distogram CE on the final differentiable z_R state.
         edge_loss_tensor = (
             ed_loss if torch.is_tensor(ed_loss) else interface_loss * 0.0
         )
@@ -8985,6 +9377,14 @@ class AbFlowModel(nn.Module):
                     1.0 if self.sequence_context_mode == "off" else 0.0,
                     device=X.device,
                 ),
+                "sequence_path_contract_exact": torch.as_tensor(
+                    1.0 if self.sequence_path_contract == "exact_categorical_bridge" else 0.0,
+                    device=X.device,
+                ),
+                "sequence_loss_scope_path_noisy": torch.as_tensor(
+                    1.0 if self.sequence_loss_scope == "path_noisy" else 0.0,
+                    device=X.device,
+                ),
                 "final_readout_integrated_endpoint": torch.as_tensor(
                     1.0 if self.final_readout_mode == "integrated_endpoint"
                     else 0.0,
@@ -8996,6 +9396,37 @@ class AbFlowModel(nn.Module):
                 ),
                 "sequence_path_mask_rate": sequence_path_mask.float().mean(),
                 "sequence_loss_mask_rate": sequence_loss_mask.float().mean(),
+                "sequence_design_mask_rate": design_smask.float().mean(),
+                "sequence_path_participation_rate": (
+                    (sequence_path_mask & design_smask).float().sum()
+                    / design_smask.float().sum().clamp_min(1.0)
+                ),
+                "sequence_loss_coverage_design": (
+                    sequence_loss_mask.float().sum()
+                    / design_smask.float().sum().clamp_min(1.0)
+                ),
+                "sequence_external_native_context_rate": (
+                    (design_smask & (~sequence_path_mask)).float().sum()
+                    / design_smask.float().sum().clamp_min(1.0)
+                ),
+                "sequence_noisy_branch_rate": (
+                    sequence_noisy_branch_mask.float().sum()
+                    / design_smask.float().sum().clamp_min(1.0)
+                ),
+                "sequence_clean_branch_rate": (
+                    ((design_smask & (~sequence_noisy_branch_mask)).float().sum())
+                    / design_smask.float().sum().clamp_min(1.0)
+                ),
+                "sequence_loss_on_noisy_precision": (
+                    (sequence_loss_mask & sequence_noisy_branch_mask).float().sum()
+                    / sequence_loss_mask.float().sum().clamp_min(1.0)
+                ),
+                "sequence_state_native_fraction": (
+                    ((St == true_S[paratope_mask])
+                     & design_smask[paratope_mask]).float().sum()
+                    / design_smask[paratope_mask].float().sum().clamp_min(1.0)
+                    if (St is not None and not self.struct_only) else X.new_tensor(0.0)
+                ),
                 "t_mean": t_graph.detach().float().mean(),
                 "t_min": t_graph.detach().float().min(),
                 "t_max": t_graph.detach().float().max(),

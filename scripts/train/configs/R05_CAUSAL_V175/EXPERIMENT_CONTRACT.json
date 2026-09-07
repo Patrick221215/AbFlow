@@ -1,0 +1,86 @@
+{
+  "version": "v175",
+  "parent": "R05_PCS_RC_LC_R1_ABX_FF_FIXEDG_RESIDUE_U02_SCOREFLOW",
+  "objective": "maximize R05 co-design metrics without altering its Score-Flow physics",
+  "frozen": {
+    "source": "PCS-RC",
+    "noise_support": "residue-R3",
+    "carrier": "U02 endpoint/canonical hybrid",
+    "sampler": "f01_canonical_carrier",
+    "sequence_context": "legacy",
+    "rounds": 3,
+    "batch": 56,
+    "max_epoch": 200,
+    "ema": 0.999,
+    "epoch_protocol": "Train->Validation->Test",
+    "valgen": "forbidden/not implemented"
+  },
+  "experiments": {
+    "R23_R05_ABX_PAIR_TIME_U02": {
+      "module": "AbX-style sinusoidal residue-pair time semantic conditioning",
+      "primary_metrics": [
+        "AAR",
+        "CAAR",
+        "DockQ"
+      ],
+      "guardrails": [
+        "H3raw",
+        "TM",
+        "lDDT"
+      ],
+      "mechanism_logs": [
+        "pair_time_enabled_fraction",
+        "pair_time_time_mean",
+        "pair_time_base_rms",
+        "pair_time_residual_rms",
+        "pair_time_residual_to_base",
+        "pair_time_weight_rms"
+      ]
+    },
+    "R24_R05_ENDPOINT_RELATION_U02": {
+      "module": "U02 carrier -> clean endpoint -> invariant pseudo-Huber relation supervision",
+      "primary_metrics": [
+        "lDDT",
+        "TM",
+        "DockQ",
+        "H3aligned"
+      ],
+      "guardrails": [
+        "H3raw",
+        "AAR",
+        "CAAR"
+      ],
+      "mechanism_logs": [
+        "endpoint_ca_raw_rms",
+        "relation_intra",
+        "relation_scaffold",
+        "relation_antigen",
+        "relation_loss",
+        "GradientDiag/*smooth_lddt*"
+      ]
+    },
+    "R25_R05_GEOMETRY_PAIR_U02": {
+      "module": "current-CA pair state + triangle multiplication -> existing EGNN edge residual",
+      "primary_metrics": [
+        "DockQ",
+        "AAR",
+        "CAAR",
+        "lDDT"
+      ],
+      "guardrails": [
+        "H3raw"
+      ],
+      "mechanism_logs": [
+        "mf_geom_pair_rms",
+        "mf_geom_triangle_rms",
+        "mf_geom_pair_count",
+        "mf_geom_edge_coverage",
+        "mf_edge_raw_ratio",
+        "mf_edge_applied_ratio",
+        "grad_pair_endpoint",
+        "grad_pair_seq",
+        "grad_pair_structure"
+      ]
+    }
+  }
+}
