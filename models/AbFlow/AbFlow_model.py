@@ -2,7 +2,8 @@
 # -*- coding:utf-8 -*-
 # R05MF_AUTHORITY_LADDER_V169
 # R05MF_LIVEPAIR_DISTOGRAM_V170: terminal live-pair auxiliary state is separated
-# R05MF_CAUSAL_MODULES_V175
+# R05MF_CAUSAL_MODULES_V177_DIRECT_R05
+# R05MF_GEOM_CALIBRATION_V179: live direct-R05 pair distogram + U02 flow-equivalence diagnostics.
 # R05MF_ORTHOGONAL_R05_ABLATION_V172
 # R05MF_SEQUENCE_PATH_AUTHORITY_V171: exact categorical sequence bridge + path-noisy CE;
 # removes the external native-context curriculum from the formal R05×MF branch.
@@ -349,59 +350,285 @@ class _TriangleAttention(nn.Module):
 
 
 class R05GeometryPair(nn.Module):
-    """V173: CA-distance/role pair representation -> existing R05 edge engine.
+    """Direct-R05 dense CA geometry-pair module with one triangle operator.
 
-    This is an AF2-inspired triangle-multiplication adaptation, not MFDesign
-    parity. Only inference-available current CA geometry and design/context roles
-    enter. The complete small pair matrices are rebuilt each R05 round; there is
-    no learned recurrent carry, direct single injection or sequence classifier.
-    Coordinates are in the existing R05 /10 frame; RBF centers use that frame.
+    Formal v177 experiments are siblings of R05, not a ladder:
+      * R24: pair state + AF2 Triangle Attention (starting + ending node) only.
+      * R25: pair state + AF2 Triangle Multiplication (outgoing + incoming) only.
+
+    Both reuse the same minimal pair input, pair transition and zero-start EGNN
+    adapter.  There is no extra loss and no change to the R05/U02 path/sampler.
+    The active triangle operator also has a zero-start output projection, so the
+    added branch is functionally neutral at initialization and must earn authority
+    from the original R05 objectives.
     """
-    def __init__(self, pair_dim=64):
+    def __init__(self, pair_dim=64, triangle_mode='multiplication', triangle_heads=4,
+                 enable_distogram=False, distogram_bins=64,
+                 distogram_min=2.0, distogram_max=22.0,
+                 distogram_head_seed=13003):
         super().__init__()
         self.pair_dim = int(pair_dim)
+        self.triangle_mode = str(triangle_mode).strip().lower()
+        self.enable_distogram = bool(enable_distogram)
+        self.distogram_bins = int(distogram_bins)
+        self.distogram_min = float(distogram_min)
+        self.distogram_max = float(distogram_max)
+        self.distogram_head_seed = int(distogram_head_seed)
+        if self.triangle_mode not in {'multiplication', 'attention'}:
+            raise ValueError(
+                'R05GeometryPair triangle_mode must be multiplication or attention, got %r'
+                % self.triangle_mode
+            )
+        self.use_multiplication = self.triangle_mode == 'multiplication'
+        self.use_attention = self.triangle_mode == 'attention'
+        self.triangle_heads = int(triangle_heads)
         self.register_buffer('centers', torch.linspace(0.0, 3.0, 16))
-        self.input = nn.Sequential(nn.Linear(19, self.pair_dim), nn.SiLU(),
-                                   nn.Linear(self.pair_dim, self.pair_dim))
-        self.outgoing = _TriangleMultiplication(self.pair_dim, self.pair_dim, True)
-        self.incoming = _TriangleMultiplication(self.pair_dim, self.pair_dim, False)
-        self.transition = nn.Sequential(nn.LayerNorm(self.pair_dim),
-            nn.Linear(self.pair_dim, 2*self.pair_dim), nn.SiLU(),
-            nn.Linear(2*self.pair_dim, self.pair_dim))
+
+        # Minimal R05-local pair state: CA distance RBF + pair roles.
+        self.input = nn.Sequential(
+            nn.Linear(19, self.pair_dim), nn.SiLU(),
+            nn.Linear(self.pair_dim, self.pair_dim)
+        )
+
+        # Only ONE higher-order triangle operator is instantiated in a formal run.
+        # This is the critical v177 correction: R24 is NOT a child of R25.
+        if self.use_multiplication:
+            self.outgoing = _TriangleMultiplication(
+                self.pair_dim, self.pair_dim, True
+            )
+            self.incoming = _TriangleMultiplication(
+                self.pair_dim, self.pair_dim, False
+            )
+        else:
+            self.outgoing = None
+            self.incoming = None
+
+        if self.use_attention:
+            self.attention_start = _TriangleAttention(
+                self.pair_dim, self.triangle_heads, starting=True
+            )
+            self.attention_end = _TriangleAttention(
+                self.pair_dim, self.triangle_heads, starting=False
+            )
+        else:
+            self.attention_start = None
+            self.attention_end = None
+
+        # Shared pair transition.  Its final projection is zero-start, as is the
+        # downstream EGNN pair adapter, so the new direct-R05 branch starts neutral.
+        self.transition = nn.Sequential(
+            nn.LayerNorm(self.pair_dim),
+            nn.Linear(self.pair_dim, 2 * self.pair_dim), nn.SiLU(),
+            nn.Linear(2 * self.pair_dim, self.pair_dim)
+        )
         nn.init.zeros_(self.transition[-1].weight)
         nn.init.zeros_(self.transition[-1].bias)
 
+        # V179: optional *representation-calibration* head.  This does not decode
+        # coordinates and therefore does not create a second structural authority.
+        # It asks the same live z_ij that conditions the R05 EGNN to retain native
+        # H3--H3 / H3--antigen distance information.  Initialization uses a private
+        # CPU RNG stream so enabling the head cannot perturb the generator RNG.
+        if self.enable_distogram:
+            self.distogram_norm = nn.LayerNorm(self.pair_dim)
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(self.distogram_head_seed)
+                self.distogram_head = nn.Linear(self.pair_dim, self.distogram_bins)
+        else:
+            self.distogram_norm = None
+            self.distogram_head = None
+
     def forward(self, local_X, local_is_ab, local_batch_id, pair_edges):
-        # Deliberately no dropout: enabling this module does not consume runtime
-        # random draws. The existing EGNN output projections start at zero.
         row, col = pair_edges
         ca = local_X.detach()[:, 1].float()
         distance = torch.linalg.norm(ca[row] - ca[col], dim=-1)
-        rbf = torch.exp(-((distance[:, None] - self.centers.float()) / 0.2)**2)
+        rbf = torch.exp(-((distance[:, None] - self.centers.float()) / 0.2) ** 2)
         roles = torch.stack([local_is_ab[row], local_is_ab[col], row == col], -1)
+
         with torch.cuda.amp.autocast(enabled=False):
             z = self.input(torch.cat([rbf, roles.float()], -1))
-            parts, tri_terms = [], []
+            parts = []
+            mul_terms, attn_terms, transition_terms, total_terms = [], [], [], []
+            attn_start_terms, attn_end_terms = [], []
+
             for gid in torch.unique(local_batch_id[row]):
                 select = local_batch_id[row] == gid
                 q = z[select]
                 n = math.isqrt(int(q.shape[0]))
-                if n*n != q.shape[0]:
-                    raise RuntimeError('R22 needs complete ordered pair matrices')
-                matrix = q.reshape(n, n, self.pair_dim)
-                delta_out = self.outgoing(matrix)
-                matrix = matrix + delta_out
-                delta_in = self.incoming(matrix)
-                matrix = matrix + delta_in
-                matrix = matrix + self.transition(matrix)
+                if n * n != q.shape[0]:
+                    raise RuntimeError(
+                        'R05 geometry pair needs complete ordered pair matrices'
+                    )
+                matrix0 = q.reshape(n, n, self.pair_dim)
+                matrix = matrix0
+                zero = matrix.new_tensor(0.0)
+
+                if self.use_multiplication:
+                    delta_out = self.outgoing(matrix)
+                    matrix = matrix + delta_out
+                    delta_in = self.incoming(matrix)
+                    matrix = matrix + delta_in
+                    mul_terms.append(
+                        (delta_out.square().mean() + delta_in.square().mean()).sqrt()
+                    )
+                else:
+                    mul_terms.append(zero)
+
+                if self.use_attention:
+                    delta_start = self.attention_start(matrix)
+                    matrix = matrix + delta_start
+                    delta_end = self.attention_end(matrix)
+                    matrix = matrix + delta_end
+                    attn_start_terms.append(delta_start.square().mean().sqrt())
+                    attn_end_terms.append(delta_end.square().mean().sqrt())
+                    attn_terms.append(
+                        (delta_start.square().mean() + delta_end.square().mean()).sqrt()
+                    )
+                else:
+                    attn_start_terms.append(zero)
+                    attn_end_terms.append(zero)
+                    attn_terms.append(zero)
+
+                delta_transition = self.transition(matrix)
+                matrix = matrix + delta_transition
+                transition_terms.append(delta_transition.square().mean().sqrt())
+                total_terms.append((matrix - matrix0).square().mean().sqrt())
                 parts.append(matrix.reshape(-1, self.pair_dim))
-                tri_terms.append((delta_out.square().mean()+delta_in.square().mean()).sqrt())
-            # _build_bounded_mf_pair_edges returns graphs in ascending id order.
+
             pair = torch.cat(parts, 0) if parts else z
-        diag = {'mf_geom_pair_rms': pair.detach().square().mean().sqrt() if pair.numel() else ca.new_tensor(0.),
-                'mf_geom_triangle_rms': torch.stack(tri_terms).detach().mean() if tri_terms else ca.new_tensor(0.),
-                'mf_geom_pair_count': ca.new_tensor(float(row.numel()))}
+
+        zero = ca.new_tensor(0.0)
+        mul_rms = torch.stack(mul_terms).detach().mean() if mul_terms else zero
+        attn_rms = torch.stack(attn_terms).detach().mean() if attn_terms else zero
+        trans_rms = (
+            torch.stack(transition_terms).detach().mean() if transition_terms else zero
+        )
+        total_rms = torch.stack(total_terms).detach().mean() if total_terms else zero
+        start_rms = (
+            torch.stack(attn_start_terms).detach().mean() if attn_start_terms else zero
+        )
+        end_rms = (
+            torch.stack(attn_end_terms).detach().mean() if attn_end_terms else zero
+        )
+        operator_rms = attn_rms if self.use_attention else mul_rms
+
+        diag = {
+            'mf_geom_pair_rms': (
+                pair.detach().square().mean().sqrt() if pair.numel() else zero
+            ),
+            # Backward-compatible R25 key remains multiplication-only.
+            'mf_geom_triangle_rms': mul_rms,
+            'mf_geom_triangle_mul_rms': mul_rms,
+            'mf_geom_triangle_attn_rms': attn_rms,
+            'mf_geom_triangle_attn_start_rms': start_rms,
+            'mf_geom_triangle_attn_end_rms': end_rms,
+            'mf_geom_triangle_operator_rms': operator_rms,
+            'mf_geom_transition_rms': trans_rms,
+            'mf_geom_total_update_rms': total_rms,
+            'mf_geom_triangle_multiplication_enabled': ca.new_tensor(
+                1.0 if self.use_multiplication else 0.0
+            ),
+            'mf_geom_triangle_attention_enabled': ca.new_tensor(
+                1.0 if self.use_attention else 0.0
+            ),
+            'mf_geom_pair_count': ca.new_tensor(float(row.numel())),
+        }
         return pair, diag
+
+    @staticmethod
+    def _gather_directed_features(pair_edges, features, query, n_local):
+        """Exact lookup of directed pair features without inventing missing pairs."""
+        r, c = pair_edges
+        qr, qc = query
+        codes = r * n_local + c
+        order = torch.argsort(codes)
+        sorted_codes = codes[order]
+        query_codes = qr * n_local + qc
+        result = features.new_zeros((qr.numel(), features.shape[-1]))
+        if codes.numel():
+            pos = torch.searchsorted(sorted_codes, query_codes)
+            safe = pos.clamp(max=codes.numel() - 1)
+            hit = (pos < codes.numel()) & (sorted_codes[safe] == query_codes)
+            result[hit] = features[order[safe[hit]]]
+        return result
+
+    def distogram_loss(self, true_local_X, pair_edges, pair_state, local_is_ab):
+        """Native-distance calibration for the *live* direct-R05 pair state.
+
+        Only non-self pairs touching the designed antibody/paratope are supervised:
+        H3--H3 and H3--antigen.  Antigen--antigen pairs are deliberately excluded,
+        because their native geometry is already observed context and would dominate
+        the auxiliary with an easy task unrelated to generation.
+        """
+        if not self.enable_distogram:
+            z = pair_state.sum() * 0.0
+            return z, {
+                'loss': z.detach(), 'accuracy': z.detach(), 'mae_A': z.detach(),
+                'pairs': z.detach(), 'intra_pairs': z.detach(),
+                'antigen_pairs': z.detach(),
+            }
+        if pair_edges.numel() == 0:
+            z = pair_state.sum() * 0.0
+            return z, {
+                'loss': z.detach(), 'accuracy': z.detach(), 'mae_A': z.detach(),
+                'pairs': z.detach(), 'intra_pairs': z.detach(),
+                'antigen_pairs': z.detach(),
+            }
+        row, col = pair_edges
+        n_local = int(true_local_X.shape[0])
+        with torch.cuda.amp.autocast(enabled=False):
+            logits_directed = self.distogram_head(
+                self.distogram_norm(pair_state.float())
+            )
+            reverse_edges = torch.stack([col, row], dim=0)
+            logits_reverse = self._gather_directed_features(
+                pair_edges, logits_directed, reverse_edges, n_local
+            )
+            logits = 0.5 * (logits_directed + logits_reverse)
+
+            ca_idx = 1 if true_local_X.shape[1] > 1 else 0
+            ca = true_local_X[:, ca_idx].float()
+            dist = torch.linalg.norm(ca[row] - ca[col], dim=-1)
+            boundaries = torch.linspace(
+                self.distogram_min, self.distogram_max,
+                self.distogram_bins - 1, device=dist.device, dtype=dist.dtype
+            )
+            target = torch.bucketize(dist.detach(), boundaries).long()
+            non_diag = row != col
+            design_pair = (local_is_ab[row] | local_is_ab[col]) & non_diag
+            intra = local_is_ab[row] & local_is_ab[col] & non_diag
+            antigen = (local_is_ab[row] ^ local_is_ab[col]) & non_diag
+            if bool(design_pair.any()):
+                loss = F.cross_entropy(
+                    logits[design_pair], target[design_pair], reduction='mean'
+                )
+                pred_bin = logits[design_pair].argmax(dim=-1)
+                acc = (pred_bin == target[design_pair]).float().mean()
+                # Diagnostic expected distance only. Extreme buckets are represented
+                # by the configured min/max; this never enters the training loss.
+                centers = torch.linspace(
+                    self.distogram_min, self.distogram_max, self.distogram_bins,
+                    device=dist.device, dtype=dist.dtype
+                )
+                expected = (
+                    torch.softmax(logits[design_pair], dim=-1) * centers[None]
+                ).sum(dim=-1)
+                mae = (expected - dist[design_pair]).abs().mean()
+            else:
+                loss = logits.sum() * 0.0
+                acc = loss.detach()
+                mae = loss.detach()
+
+        diag = {
+            'loss': loss.detach(),
+            'accuracy': acc.detach(),
+            'mae_A': mae.detach(),
+            'pairs': loss.detach().new_tensor(float(design_pair.sum().item())),
+            'intra_pairs': loss.detach().new_tensor(float(intra.sum().item())),
+            'antigen_pairs': loss.detach().new_tensor(float(antigen.sum().item())),
+        }
+        return loss, diag
+
 
     @staticmethod
     def gather(pair_edges, pair, query, n_local):
@@ -2734,6 +2961,35 @@ class AbFlowModel(nn.Module):
         self._last_mf_repr_diagnostics = {}
         self.r05_endpoint_relation = _env_flag("ABFLOW_R05_ENDPOINT_RELATION", False)
         self.r05_geom_pair = _env_flag("ABFLOW_R05_GEOM_PAIR", False)
+        self.r05_geom_triangle_mode = os.environ.get(
+            "ABFLOW_R05_GEOM_TRIANGLE_MODE", "multiplication"
+        ).strip().lower()
+        if self.r05_geom_pair and self.r05_geom_triangle_mode not in {
+                "multiplication", "attention"}:
+            raise ValueError(
+                "ABFLOW_R05_GEOM_TRIANGLE_MODE must be multiplication or attention"
+            )
+        self.r05_geom_triangle_attention = bool(
+            self.r05_geom_pair and self.r05_geom_triangle_mode == "attention"
+        )
+        self.r05_geom_triangle_multiplication = bool(
+            self.r05_geom_pair and self.r05_geom_triangle_mode == "multiplication"
+        )
+        # V179 direct-R05 pair calibration.  Separate from MFRepresentationEnrichment
+        # distogram so R26 can be a lightweight R25-successor without enabling MF core.
+        self.r05_geom_distogram = _env_flag("ABFLOW_R05_GEOM_DISTOGRAM", False)
+        self.loss_r05_geom_distogram_weight = _env_float(
+            "ABFLOW_LOSS_R05_GEOM_DISTOGRAM_WEIGHT", 0.0
+        )
+        if self.r05_geom_distogram and not self.r05_geom_pair:
+            raise ValueError(
+                "ABFLOW_R05_GEOM_DISTOGRAM requires ABFLOW_R05_GEOM_PAIR=on."
+            )
+        if self.loss_r05_geom_distogram_weight != 0.0 and not self.r05_geom_distogram:
+            raise ValueError(
+                "ABFLOW_LOSS_R05_GEOM_DISTOGRAM_WEIGHT is non-zero but "
+                "ABFLOW_R05_GEOM_DISTOGRAM is off."
+            )
         self.r05_geometry_pair = None
         if getattr(self, 'r05_endpoint_relation', False):
             if not self.mf_smooth_lddt or self.mf_repr_core:
@@ -2746,7 +3002,16 @@ class AbFlowModel(nn.Module):
             # Isolate new initialization from parent RNG. fork_rng restores the
             # CPU stream; no torch.manual_seed() call changes any CUDA stream.
             with torch.random.fork_rng(devices=[]):
-                self.r05_geometry_pair = R05GeometryPair(64)
+                self.r05_geometry_pair = R05GeometryPair(
+                    64,
+                    triangle_mode=self.r05_geom_triangle_mode,
+                    triangle_heads=self.mf_triangle_heads,
+                    enable_distogram=self.r05_geom_distogram,
+                    distogram_bins=self.mf_distogram_bins,
+                    distogram_min=self.mf_distogram_min,
+                    distogram_max=self.mf_distogram_max,
+                    distogram_head_seed=self.mf_distogram_head_seed,
+                )
             self.gnn.enable_pair_representation(64, parent_authority=False)
         self.last_r05_module_diagnostics = {}
 
@@ -4368,8 +4633,18 @@ class AbFlowModel(nn.Module):
             pair_edges = self.batch_constants['mf_pair_edges']
             pair, pair_diag = self.r05_geometry_pair(
                 local_X, local_is_ab, local_batch_id, pair_edges)
-            if diagnostics_active and int(round_idx) == int(self.round)-1:
-                self._r05_live_pair_probe = pair
+            if int(round_idx) == int(self.round)-1:
+                if diagnostics_active:
+                    self._r05_live_pair_probe = pair
+                if getattr(self, 'r05_geom_distogram', False):
+                    # Keep exactly one differentiable terminal z_R.  This is not a
+                    # recurrent carry and therefore does not introduce cross-round BPTT.
+                    self._r05_geom_pair_live = {
+                        'pair': pair,
+                        'pair_edges': pair_edges,
+                        'local_is_ab': local_is_ab,
+                        'local_mask': local_mask,
+                    }
             n_local = int(local_X.shape[0])
             mf_local_edge_attr = self.r05_geometry_pair.gather(
                 pair_edges, pair, local_edges, n_local)
@@ -6605,6 +6880,48 @@ class AbFlowModel(nn.Module):
             # Diagnostics must never change training behavior.
             tbin_details = {}
 
+        # V179 observational U02 flow-equivalence diagnostic.  R05 does not add
+        # a second velocity loss: the carrier already parameterizes the same field,
+        # Y = Xt + (1-t)u.  We log the implied velocity error to decide empirically
+        # whether late-time flow inconsistency is actually correlated with failures.
+        flow_equiv_details = {}
+        if (
+            self.scorefm_loss_mode == "f01_r3_endpoint_canonical_hybrid"
+            and structured_endpoint_target is not None
+        ):
+            try:
+                t_like = torch.as_tensor(
+                    t, device=pred_clean_X.device, dtype=pred_clean_X.dtype
+                )
+                while t_like.dim() < pred_clean_X.dim():
+                    t_like = t_like.unsqueeze(-1)
+                denom = (1.0 - t_like).clamp_min(5.0e-2)
+                u_err = (pred_clean_X - primary_target) / denom
+                u_pg, u_valid = self._masked_residue_mse_per_graph(
+                    u_err, atom_mask, interface_batch_id
+                )
+                valid_u = u_valid & endpoint_valid
+                u_rms = (
+                    torch.sqrt(u_pg[valid_u].mean().clamp_min(0.0))
+                    if bool(valid_u.any()) else endpoint_loss.detach() * 0.0
+                )
+                flow_equiv_details = {
+                    'scorefm_u02_implied_velocity_error_rms': u_rms.detach(),
+                    'scorefm_u02_flow_aux_train_weight': endpoint_loss.detach().new_tensor(0.0),
+                    'scorefm_u02_velocity_denom_floor': endpoint_loss.detach().new_tensor(0.05),
+                }
+                # Same five bins as the carrier objective; diagnostic only.
+                for _bi, (_lo, _hi) in enumerate(
+                    [(0.0,0.2),(0.2,0.4),(0.4,0.6),(0.6,0.8),(0.8,1.0001)]
+                ):
+                    _m = valid_u & (t_graph_diag >= _lo) & (t_graph_diag < _hi)
+                    flow_equiv_details[f'scorefm_u02_tbin_{_bi}_velocity_error_rms'] = (
+                        torch.sqrt(u_pg[_m].mean().clamp_min(0.0)).detach()
+                        if bool(_m.any()) else endpoint_loss.detach() * 0.0
+                    )
+            except Exception:
+                flow_equiv_details = {}
+
         zero = endpoint_loss.detach() * 0.0
         # Keep differentiable objective components only until the trainer's
         # optional gradient-conflict probe has run.
@@ -6744,6 +7061,7 @@ class AbFlowModel(nn.Module):
             details.update(tbin_details)
             details.update(boundary_details)
             details.update(support_geometry_details)
+            details.update(flow_equiv_details)
             return endpoint_loss, details
 
         if self.scorefm_loss_mode in {
@@ -7967,7 +8285,7 @@ class AbFlowModel(nn.Module):
         pair_probe = getattr(self, '_r05_live_pair_probe', None)
         if getattr(self, 'r05_geom_pair', False) and pair_probe is not None and pair_probe.requires_grad:
             with torch.cuda.amp.autocast(enabled=False):
-                for name in ('endpoint', 'seq', 'structure'):
+                for name in ('endpoint', 'seq', 'structure', 'distogram'):
                     value = terms.get(name)
                     if value is not None and value.requires_grad:
                         grad = torch.autograd.grad(value.float(), pair_probe,
@@ -8133,6 +8451,7 @@ class AbFlowModel(nn.Module):
         '''
         # import ipdb; ipdb.set_trace()
         self._r05_live_pair_probe = None
+        self._r05_geom_pair_live = None
         # Do not retain a shared activation from a previous batch.
         self._diagnostic_probe_tensor = None
         self._last_gradient_diagnostic_error = ""
@@ -8714,6 +9033,18 @@ class AbFlowModel(nn.Module):
                     self.dual_sequence_state or not self.abflow_recurrent_proposal_context))
                 d['endpoint_relation_on'] = X.new_tensor(float(getattr(self, 'r05_endpoint_relation', False)))
                 d['geom_pair_on'] = X.new_tensor(float(getattr(self, 'r05_geom_pair', False)))
+                d['geom_triangle_attention_on'] = X.new_tensor(
+                    float(getattr(self, 'r05_geom_triangle_attention', False))
+                )
+                d['geom_triangle_multiplication_on'] = X.new_tensor(
+                    float(getattr(self, 'r05_geom_triangle_multiplication', False))
+                )
+                d['geom_distogram_on'] = X.new_tensor(
+                    float(getattr(self, 'r05_geom_distogram', False))
+                )
+                d['geom_distogram_weight'] = X.new_tensor(
+                    float(getattr(self, 'loss_r05_geom_distogram_weight', 0.0))
+                )
                 d['pair_time_on'] = X.new_tensor(float(getattr(self, 'pair_time_conditioning', False)))
                 logits = r_pred_S_logits[-1][0] if not self.struct_only else None
                 for b in range(5):
@@ -8933,7 +9264,51 @@ class AbFlowModel(nn.Module):
             ed_loss = 0
         dock_loss = interface_loss + ed_loss
 
-        # 3. MFDesign-style persistent-pair distogram auxiliary.
+        # 3. V179 direct-R05 geometry-pair calibration.
+        # R25 already sends z_ij to BOTH local node and coordinate EGNN updates.
+        # The missing contract is not a structural route; it is explicit native
+        # geometric calibration of the same live pair state.  This auxiliary is
+        # therefore placed on z_R itself, with no second coordinate decoder.
+        r05_geom_distogram_loss = X.new_tensor(0.0)
+        r05_geom_distogram_pair_live_contract = X.detach().new_tensor(0.0)
+        r05_geom_distogram_diag = {
+            'loss': X.new_tensor(0.0), 'accuracy': X.new_tensor(0.0),
+            'mae_A': X.new_tensor(0.0), 'pairs': X.new_tensor(0.0),
+            'intra_pairs': X.new_tensor(0.0), 'antigen_pairs': X.new_tensor(0.0),
+        }
+        if getattr(self, 'r05_geom_distogram', False):
+            state = getattr(self, '_r05_geom_pair_live', None)
+            if not state:
+                raise RuntimeError(
+                    'R05 geometry distogram is enabled but no final live pair state was produced.'
+                )
+            pair_live = state['pair']
+            if self.training and self.loss_r05_geom_distogram_weight != 0.0:
+                if not pair_live.requires_grad:
+                    raise RuntimeError(
+                        'V179 direct-R05 distogram contract failed: final z_R is detached.'
+                    )
+            r05_geom_distogram_pair_live_contract = X.detach().new_tensor(1.0)
+            true_local_X = true_X[state['local_mask']]
+            r05_geom_distogram_loss, r05_geom_distogram_diag = (
+                self.r05_geometry_pair.distogram_loss(
+                    true_local_X=true_local_X,
+                    pair_edges=state['pair_edges'],
+                    pair_state=pair_live,
+                    local_is_ab=state['local_is_ab'],
+                )
+            )
+            self.last_r05_module_diagnostics.update({
+                'geom_distogram_loss': r05_geom_distogram_diag['loss'],
+                'geom_distogram_acc': r05_geom_distogram_diag['accuracy'],
+                'geom_distogram_mae_A': r05_geom_distogram_diag['mae_A'],
+                'geom_distogram_pairs': r05_geom_distogram_diag['pairs'],
+                'geom_distogram_intra_pairs': r05_geom_distogram_diag['intra_pairs'],
+                'geom_distogram_antigen_pairs': r05_geom_distogram_diag['antigen_pairs'],
+                'geom_distogram_live_contract': r05_geom_distogram_pair_live_contract,
+            })
+
+        # 4. MFDesign-style persistent-pair distogram auxiliary.
         # This supervises z_ij, not a second coordinate decoder.  The target is
         # native CA--CA distance over the same stable H3--antigen/H3--H3 pair
         # universe, with mean CE normalization so its configured weight is not
@@ -8973,7 +9348,7 @@ class AbFlowModel(nn.Module):
                 pair_state=pair_live,
             )
 
-        # 4. MF/Boltz-inspired design-region factored smooth-lDDT auxiliary.
+        # 5. MF/Boltz-inspired design-region factored smooth-lDDT auxiliary.
         # The donor metric is retained, but the task pair universe is generalized
         # to the supplied design mask and balanced across design--design,
         # design--fixed-scaffold and design--antigen relations.
@@ -9032,6 +9407,22 @@ class AbFlowModel(nn.Module):
                 })
         for key, value in self.last_r05_module_diagnostics.items():
             scorefm_details['r05v173_'+key] = value.detach()
+
+        scorefm_details['r05_geom_distogram_enabled'] = X.detach().new_tensor(
+            1.0 if getattr(self, 'r05_geom_distogram', False) else 0.0
+        )
+        scorefm_details['r05_geom_distogram_loss'] = r05_geom_distogram_loss.detach()
+        scorefm_details['r05_geom_distogram_weight'] = X.detach().new_tensor(
+            float(getattr(self, 'loss_r05_geom_distogram_weight', 0.0))
+        )
+        scorefm_details['r05_geom_distogram_pair_live_contract'] = (
+            r05_geom_distogram_pair_live_contract
+        )
+        scorefm_details['r05_geom_distogram_accuracy'] = r05_geom_distogram_diag['accuracy'].detach()
+        scorefm_details['r05_geom_distogram_mae_A'] = r05_geom_distogram_diag['mae_A'].detach()
+        scorefm_details['r05_geom_distogram_pairs'] = r05_geom_distogram_diag['pairs'].detach()
+        scorefm_details['r05_geom_distogram_intra_pairs'] = r05_geom_distogram_diag['intra_pairs'].detach()
+        scorefm_details['r05_geom_distogram_antigen_pairs'] = r05_geom_distogram_diag['antigen_pairs'].detach()
 
         scorefm_details["mf_repr_core_enabled"] = X.detach().new_tensor(
             1.0 if self.mf_repr_core else 0.0
@@ -9105,6 +9496,7 @@ class AbFlowModel(nn.Module):
             + self.loss_interface_weight * interface_loss
             + self.loss_edge_weight * edge_loss_tensor
             + self.loss_distogram_weight * mf_distogram_loss
+            + self.loss_r05_geom_distogram_weight * r05_geom_distogram_loss
             + self.loss_smooth_lddt_weight * mf_smooth_lddt_loss
             + (0 if pdev_loss is None else pdev_loss)
         )
@@ -9118,7 +9510,10 @@ class AbFlowModel(nn.Module):
                 self, "_last_satc_objective_tensor", interface_loss * 0.0
             ),
             "edge": self.loss_edge_weight * edge_loss_tensor,
-            "distogram": self.loss_distogram_weight * mf_distogram_loss,
+            "distogram": (
+                self.loss_distogram_weight * mf_distogram_loss
+                + self.loss_r05_geom_distogram_weight * r05_geom_distogram_loss
+            ),
             "smooth_lddt": self.loss_smooth_lddt_weight * mf_smooth_lddt_loss,
         }
 
