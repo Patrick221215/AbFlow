@@ -13,9 +13,10 @@ set -euo pipefail
 
 CODE_DIR=$(realpath "$(dirname "$0")/../..")
 NUM_WORKERS="${ABFLOW_EPOCH_TEST_METRIC_WORKERS:-${NUM_WORKERS:-8}}"
-BATCH_SIZE="${ABFLOW_EPOCH_TEST_BATCH_SIZE:-${BATCH_SIZE:-20}}"
+BATCH_SIZE="${ABFLOW_EPOCH_TEST_BATCH_SIZE:-${BATCH_SIZE:-16}}"
 N_STEPS="${ABFLOW_EPOCH_TEST_N_STEPS:-${N_STEPS:-10}}"
 BASE_SEED="${ABFLOW_EPOCH_TEST_BASE_SEED:-2023}"
+TEST_CDR="${ABFLOW_EPOCH_TEST_CDR:-H3}"
 SHOW_SAMPLE_PROGRESS="${ABFLOW_EPOCH_TEST_SHOW_SAMPLE_PROGRESS:-${SHOW_SAMPLE_PROGRESS:-1}}"
 KEEP_STRUCTURES="${ABFLOW_EPOCH_TEST_KEEP_STRUCTURES:-on}"
 GPU="${GPU:-0}"
@@ -76,6 +77,7 @@ if [[ "$TASK" == "rabd" ]]; then
     --n_steps "$N_STEPS"
     --base_seed "$BASE_SEED"
     --metric_workers "$NUM_WORKERS"
+    --cdr "$TEST_CDR"
   )
 
   case "${SHOW_SAMPLE_PROGRESS,,}" in
@@ -89,7 +91,7 @@ if [[ "$TASK" == "rabd" ]]; then
   echo "[FormalTest] checkpoint=$CKPT"
   echo "[FormalTest] GPUs=$GPU world_size=$NPROC"
   echo "[FormalTest] test_set=$TEST_SET"
-  echo "[FormalTest] logical_batch_size=$BATCH_SIZE n_steps=$N_STEPS base_seed=$BASE_SEED"
+  echo "[FormalTest] logical_batch_size=$BATCH_SIZE n_steps=$N_STEPS base_seed=$BASE_SEED cdr=$TEST_CDR"
   echo "[FormalTest] save_dir=$SAVE_DIR"
 
   cd "$CODE_DIR"

@@ -202,6 +202,122 @@ class Trainer:
         module_to_save = self.model.module if self.local_rank == 0 else self.model
         torch.save(module_to_save, save_path)
 
+    def _runtime_guard_steps(self):
+        return max(0, int(os.environ.get("ABFLOW_GRAD_FINITE_GUARD_STEPS", "8") or 0))
+
+    def _autograd_anomaly_steps(self):
+        # Diagnostic-only.  The first full forward+backward can be wrapped in PyTorch's
+        # anomaly detector so the first autograd Function returning NaN is
+        # reported with its forward traceback.  No optimizer/loss/model math is
+        # changed, and the default is zero outside the V196 diagnostic configs.
+        return max(0, int(os.environ.get("ABFLOW_AUTOGRAD_ANOMALY_STEPS", "0") or 0))
+
+    def _backward_with_optional_anomaly(self, loss):
+        # V197: anomaly mode is enabled before the forward in _train_epoch so
+        # PyTorch can report the forward call site of the first bad backward op.
+        loss.backward()
+
+    def _train_memory_log(self, stage, device):
+        """Early-step CUDA memory audit; diagnostic only, no training semantics."""
+        if (
+            not torch.cuda.is_available()
+            or int(self.global_step) >= self._runtime_guard_steps()
+            or not self._is_main_proc()
+        ):
+            return
+        dev = torch.device(device) if not isinstance(device, torch.device) else device
+        alloc = torch.cuda.memory_allocated(dev) / (1024 ** 3)
+        reserved = torch.cuda.memory_reserved(dev) / (1024 ** 3)
+        peak_alloc = torch.cuda.max_memory_allocated(dev) / (1024 ** 3)
+        peak_reserved = torch.cuda.max_memory_reserved(dev) / (1024 ** 3)
+        print_log(
+            f"[TrainMemory] epoch={self.epoch} step={self.global_step} stage={stage} "
+            f"alloc={alloc:.3f}GiB reserved={reserved:.3f}GiB "
+            f"peak_alloc={peak_alloc:.3f}GiB peak_reserved={peak_reserved:.3f}GiB"
+        )
+
+    def _nonfinite_grad_summary(self, limit=24):
+        """Failure-only forensic summary; never repairs or masks gradients."""
+        from collections import Counter
+        bad, groups = [], Counter()
+        nan_elems = inf_elems = 0
+        for name, param in self.model.named_parameters():
+            grad = param.grad
+            if grad is None:
+                continue
+            finite = torch.isfinite(grad)
+            if bool(finite.all().detach().cpu().item()):
+                continue
+            bad.append(name)
+            groups['.'.join(name.split('.')[:3])] += 1
+            nan_elems += int(torch.isnan(grad).sum().detach().cpu().item())
+            inf_elems += int(torch.isinf(grad).sum().detach().cpu().item())
+        print_log(
+            f"[NonFiniteGradSummary] epoch={self.epoch} step={self.global_step} "
+            f"rank={self.local_rank} bad_params={len(bad)} nan_elems={nan_elems} "
+            f"inf_elems={inf_elems} groups={groups.most_common(12)} "
+            f"params={bad[:limit]}"
+        )
+        return bad
+
+    def _checked_clip_grad_norm(self):
+        """Parent grad clipping + fail-fast before a NaN norm can poison all grads."""
+        max_norm = self.config.grad_clip
+        if max_norm is None:
+            return None
+        try:
+            total_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), max_norm, error_if_nonfinite=True
+            )
+        except TypeError:
+            # torch versions without error_if_nonfinite: localize first, then clip.
+            bad = [
+                name for name, param in self.model.named_parameters()
+                if param.grad is not None
+                and not bool(torch.isfinite(param.grad).all().detach().cpu().item())
+            ][:16]
+            if bad:
+                print_log(
+                    f"[NonFiniteGrad] epoch={self.epoch} step={self.global_step} "
+                    f"rank={self.local_rank} params={bad}"
+                )
+                raise FloatingPointError("non-finite gradient before optimizer.step")
+            total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
+        except RuntimeError as exc:
+            bad = self._nonfinite_grad_summary(limit=24)
+            print_log(
+                f"[NonFiniteGrad] epoch={self.epoch} step={self.global_step} "
+                f"rank={self.local_rank} params={bad[:16] or ['<unable-to-localize>']}"
+            )
+            raise FloatingPointError("non-finite gradient before optimizer.step") from exc
+
+        if self._is_main_proc() and int(self.global_step) < self._runtime_guard_steps():
+            print_log(
+                f"[GradFinite] epoch={self.epoch} step={self.global_step} "
+                f"preclip_total_norm={float(total_norm.detach().cpu().item()):.6g} "
+                f"clip={float(max_norm):.6g}"
+            )
+        return total_norm
+
+    def _check_parameters_finite_after_step(self):
+        """Early-step optimizer guard; healthy path performs one host sync."""
+        if int(self.global_step) >= self._runtime_guard_steps():
+            return
+        named = [(name, p) for name, p in self.model.named_parameters() if p.requires_grad]
+        if not named:
+            return
+        flags = torch.stack([torch.isfinite(param.detach()).all() for _, param in named])
+        if not bool(flags.all().detach().cpu().item()):
+            bad_mask = (~flags).detach().cpu().tolist()
+            bad = [name for (name, _), is_bad in zip(named, bad_mask) if is_bad][:16]
+            print_log(
+                f"[NonFiniteParamAfterStep] epoch={self.epoch} step={self.global_step} "
+                f"rank={self.local_rank} params={bad}"
+            )
+            raise FloatingPointError("optimizer produced non-finite parameters")
+        if self._is_main_proc():
+            print_log(f"[ParamFinite] epoch={self.epoch} step={self.global_step} status=PASS")
+
     def _train_epoch(self, device):
         # import ipdb; ipdb.set_trace()
         if self.train_loader.sampler is not None and self.local_rank != -1:
@@ -218,27 +334,52 @@ class Trainer:
             batch = self.to_device(batch, device)
 
             self.optimizer.zero_grad(set_to_none=True)
+            if (
+                torch.cuda.is_available()
+                and int(self.global_step) < self._runtime_guard_steps()
+            ):
+                torch.cuda.reset_peak_memory_stats(device)
 
-            with self._amp_autocast(device):
-                loss = self.train_step(batch, self.global_step)
+            anomaly_on = int(self.global_step) < self._autograd_anomaly_steps()
+            if anomaly_on:
+                print_log(
+                    f"[AutogradAnomaly] epoch={self.epoch} step={self.global_step} "
+                    f"rank={self.local_rank} status=ON scope=forward+backward detect_nan=1"
+                )
+                torch.autograd.set_detect_anomaly(True)
+            try:
+                with self._amp_autocast(device):
+                    loss = self.train_step(batch, self.global_step)
 
-            if self.grad_scaler is not None:
-                self.grad_scaler.scale(loss).backward()
-                if self.config.grad_clip is not None:
-                    self.grad_scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.config.grad_clip
+                if not bool(torch.isfinite(loss.detach()).all().cpu().item()):
+                    print_log(
+                        f"[NonFiniteLoss] epoch={self.epoch} step={self.global_step} "
+                        f"rank={self.local_rank} loss={loss.detach()}"
                     )
-                self.grad_scaler.step(self.optimizer)
-                self.grad_scaler.update()
-            else:
-                loss.backward()
-                if self.config.grad_clip is not None:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.config.grad_clip
-                    )
-                self.optimizer.step()
+                    raise FloatingPointError("non-finite training loss before backward")
+                self._train_memory_log("after_forward", device)
 
+                if self.grad_scaler is not None:
+                    scaled_loss = self.grad_scaler.scale(loss)
+                    self._backward_with_optional_anomaly(scaled_loss)
+                    if self.config.grad_clip is not None:
+                        self.grad_scaler.unscale_(self.optimizer)
+                        self._checked_clip_grad_norm()
+                    self._train_memory_log("after_backward", device)
+                    self.grad_scaler.step(self.optimizer)
+                    self.grad_scaler.update()
+                else:
+                    self._backward_with_optional_anomaly(loss)
+                    if self.config.grad_clip is not None:
+                        self._checked_clip_grad_norm()
+                    self._train_memory_log("after_backward", device)
+                    self.optimizer.step()
+            finally:
+                if anomaly_on:
+                    torch.autograd.set_detect_anomaly(False)
+
+            self._check_parameters_finite_after_step()
+            self._train_memory_log("after_optimizer", device)
             after_optimizer_step(self)
 
             if self._should_log_step(self.global_step) and hasattr(t_iter, 'set_postfix'):
@@ -400,29 +541,40 @@ class Trainer:
                     return False
                 raise ValueError(f'{name} must be on/off, got {raw!r}')
 
-            # R08-R10 use a genuinely dynamic parameter-use graph: the triangle
-            # representation is routed through local pair -> dynamic EGNN edges,
-            # while representation recycle is detached.  Therefore static_graph
-            # is not a valid DDP contract for these runs.  On torch 1.11, re-entrant
-            # activation checkpointing of the same shared triangle parameters also
-            # conflicts with normal DDP reduction.  The formal runtime is therefore:
-            #   triangle checkpoint OFF, static graph OFF, find_unused ON.
-            # Historical R05 runs keep their original false/false behavior because
-            # the launcher does not enable ABFLOW_DDP_FIND_UNUSED_PARAMETERS for them.
+            # V193 formal R05+AbX runtime contract (PyTorch 1.11):
+            # - the same AbX Seqformer block is activation-checkpointed once in
+            #   each of the three R05 physical recurrence rounds;
+            # - the same parameter set must therefore participate every round;
+            # - empty surface-edge batches are handled inside MS_E_GCL with an
+            #   exact zero-message identity that still yields zero (not None)
+            #   gradients for the surf_gcl parameters.
+            # Under this contract repeated re-entrant checkpointing is run with
+            # DDP static_graph=True and find_unused_parameters=False.
             find_unused = _env_bool('ABFLOW_DDP_FIND_UNUSED_PARAMETERS', False)
             static_graph = _env_bool('ABFLOW_DDP_STATIC_GRAPH', False)
             triangle_ckpt = _env_bool('ABFLOW_MF_TRIANGLE_CHECKPOINT', False)
+            abx_ckpt = _env_bool('ABFLOW_ABX_ACTIVATION_CHECKPOINT', False)
 
             if static_graph and find_unused:
                 raise RuntimeError(
-                    'ABFLOW_DDP_STATIC_GRAPH=on is incompatible with the formal '
-                    'R08-R10 dynamic-used-parameter contract. Set static_graph=off.'
+                    'ABFLOW_DDP_STATIC_GRAPH=on must use '
+                    'ABFLOW_DDP_FIND_UNUSED_PARAMETERS=off.'
                 )
             if triangle_ckpt and find_unused:
                 raise RuntimeError(
                     'PyTorch 1.11 DDP cannot safely combine shared re-entrant triangle '
-                    'checkpointing with the dynamic R08-R10 graph. Set '
-                    'ABFLOW_MF_TRIANGLE_CHECKPOINT=off.'
+                    'checkpointing with find_unused_parameters=True.'
+                )
+            if abx_ckpt and find_unused:
+                raise RuntimeError(
+                    'ABFLOW_ABX_ACTIVATION_CHECKPOINT=on must use '
+                    'ABFLOW_DDP_FIND_UNUSED_PARAMETERS=off in the V193 runtime.'
+                )
+            if abx_ckpt and not static_graph:
+                raise RuntimeError(
+                    'ABFLOW_ABX_ACTIVATION_CHECKPOINT=on requires '
+                    'ABFLOW_DDP_STATIC_GRAPH=on under PyTorch 1.11 because the '
+                    'shared AbX block is checkpointed in all three R05 rounds.'
                 )
 
             self.model = torch.nn.parallel.DistributedDataParallel(
@@ -446,7 +598,8 @@ class Trainer:
                     '[DDPGraphContract] '
                     f'find_unused_parameters={str(find_unused).lower()} '
                     f'static_graph={str(static_graph).lower()} '
-                    f'triangle_checkpoint={str(triangle_ckpt).lower()}'
+                    f'triangle_checkpoint={str(triangle_ckpt).lower()} ' +
+                    f'abx_checkpoint={str(abx_ckpt).lower()}'
                 )
         else:
             print_log(f'training on {device_ids}')

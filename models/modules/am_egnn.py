@@ -472,7 +472,25 @@ class MS_E_GCL(nn.Module):
         channel_weights: [bs * n_node, n_channel]
         '''
         row, col = edge_index
-        # print('row, col : ', row, col)
+        # Empty aligned surface edges are a valid no-message case (especially
+        # with local batch=1).  Do not fabricate geometry and do not bypass this
+        # module in AMEncoder: return an exact identity value while attaching a
+        # zero-valued dependency to every trainable parameter.  Consequently
+        # each parameter receives a zero tensor gradient rather than grad=None,
+        # which is compatible with DDP find_unused_parameters=False and the
+        # repeated-checkpoint static graph used by the AbX/R05 integration.
+        if row.numel() == 0 or epi_index is None or epi_index.numel() == 0:
+            zero_anchor = None
+            for param in self.parameters():
+                if param.requires_grad:
+                    term = param.reshape(-1)[0] * 0.0
+                    zero_anchor = term if zero_anchor is None else zero_anchor + term
+            if zero_anchor is None:
+                return h, coord
+            return (
+                h + zero_anchor.to(device=h.device, dtype=h.dtype),
+                coord + zero_anchor.to(device=coord.device, dtype=coord.dtype),
+            )
 
         radial, abX = coord_SR(edge_index, epi_index, coord, surf_verts, channel_attr, self.scale_linear, self.radial_linear)
         # radial, coord_diff = coord2radial(edge_index, coord, channel_attr, channel_weights, self.radial_linear)

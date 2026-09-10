@@ -1,21 +1,20 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
+# V185_STABLE_TRAINER_MINIMAL_ABX_DIAGNOSTICS
 # R05MF_AUTHORITY_LADDER_V169: three-run causal ladder; diagnostics/protocol unchanged from v168.
 # R05MF_LIVEPAIR_DISTOGRAM_V170: first-batch end-to-end gradient contract for
 # R05MF_SEQUENCE_PATH_AUTHORITY_V171: audits exact categorical path and path-noisy CE.
 # the replacement R13; aborts if weighted distogram CE does not reach the shared
 # pre-MF generator activation.
-"""AbFlow trainer with low-overhead, machine-readable diagnostics.
+# V203_FORMAL_TRAIN_VAL_TEST_EVERY_EPOCH
+# Fixed project protocol: every epoch executes Train -> Val -> formal EMA Test generation.
+# Test failures are fail-fast and may never be silently converted into NaN summaries.
+"""AbFlow trainer: stable v163 training/validation behavior with minimal V185 diagnostics.
 
-The TensorBoard logging behavior is preserved.  Main-rank JSONL/latest files are
-added so each epoch can be inspected without opening TensorBoard or evaluating
-all test checkpoints.  Periodic gradient-conflict probes are observational only.
-
-R05MF_DIAGNOSTIC_V167 is a diagnostics-only overlay.  It preserves the formal
-R05MF_PARENT_AUTHORITY_V168 adds observational Test-trajectory logging for the
-new parent-anchored authority experiment while preserving Train->Val->Test.
-Train -> Validation -> Test epoch order, checkpoint rule, sampler, RNG, losses,
-optimizer and scheduler.
+V185 deliberately restores the previously stable trainer instead of using the
+heavily trimmed V182-V184 trainer. Optimizer/scheduler/DDP-validation/EMA/checkpoint
+semantics are preserved. Only observational logging is adapted to the new
+AbX-native single/pair/time representation and auxiliary loss names.
 """
 from math import cos, pi, log, exp, isfinite
 import csv
@@ -45,6 +44,9 @@ def _env_flag(name, default=False):
         return bool(default)
     return value in {"1", "true", "yes", "y", "on"}
 
+
+
+V207_EXPLICIT_EPOCH_TEST_CDR_CONTRACT = True
 
 class _ExactDistributedValidationBatchSampler(Sampler):
     """Shard *logical validation batches* across ranks without padding.
@@ -140,6 +142,14 @@ class AbFlowTrainer(Trainer):
         self._grad_diag_enabled = _env_flag(
             "ABFLOW_GRAD_CONFLICT_DIAGNOSTICS", False
         )
+        # V185: diagnostics-only cadence. First few steps verify the new
+        # representation/time/edge routing without changing optimization.
+        self._science_log_first_steps = max(0, _env_int(
+            "ABFLOW_SCI_LOG_FIRST_STEPS", 8
+        ))
+        self._science_log_interval = max(1, _env_int(
+            "ABFLOW_SCI_LOG_INTERVAL", int(getattr(config, "log_interval", 20))
+        ))
 
         # Epoch-0 R08/R10 summaries exposed rare ~1e5-1e6 structure-loss means
         # that were invisible in rank-0 tqdm.  Record the first true per-rank
@@ -222,18 +232,72 @@ class AbFlowTrainer(Trainer):
         self._epoch_test_project_root = str(os.environ.get(
             "ABFLOW_PROJECT_ROOT", os.getcwd()
         ) or os.getcwd()).strip()
+        # V207: formal Test task identity is explicit evaluation state.
+        # Do NOT infer it from raw_model.cdr_type because old/current checkpoints
+        # can legitimately carry None even when the experiment itself is H3-only.
+        epoch_test_cdr_raw = str(os.environ.get("ABFLOW_EPOCH_TEST_CDR", "H3") or "H3").strip()
+        self._epoch_test_cdr = [x.strip().upper() for x in epoch_test_cdr_raw.split(",") if x.strip()]
+        if self._epoch_test_cdr != ["H3"]:
+            raise RuntimeError(
+                "V207 formal RAbD Test requires ABFLOW_EPOCH_TEST_CDR=H3; "
+                f"got {self._epoch_test_cdr!r}."
+            )
         self._epoch_test_dataset = None
         self._epoch_test_root = os.path.join(self.config.save_dir, "epoch_test")
 
+        # V203 fixed project protocol: Test is a mandatory third phase of every epoch.
+        # The launcher also validates this contract before torchrun; keeping the
+        # trainer-side assertion prevents a direct train.py invocation from silently
+        # producing NaN test columns.
+        if not self._epoch_test_enabled:
+            raise RuntimeError(
+                "V203 formal protocol requires ABFLOW_EPOCH_TEST=on: "
+                "every epoch must execute Train -> Val -> formal Test generation."
+            )
+        if int(self._epoch_test_interval) != 1:
+            raise RuntimeError(
+                "V203 formal protocol requires ABFLOW_EPOCH_TEST_INTERVAL=1, "
+                f"got {self._epoch_test_interval}."
+            )
+        if int(self._epoch_test_n_steps) != 10:
+            raise RuntimeError(
+                "V203 formal protocol requires 10-step generation, "
+                f"got ABFLOW_EPOCH_TEST_N_STEPS={self._epoch_test_n_steps}."
+            )
+        if not self._epoch_test_fail_fast:
+            raise RuntimeError(
+                "V203 formal protocol requires ABFLOW_EPOCH_TEST_FAIL_FAST=on; "
+                "formal Test errors must never be converted into NaN and ignored."
+            )
+        if not self._epoch_test_json:
+            raise RuntimeError(
+                "V203 formal protocol requires ABFLOW_EPOCH_TEST_JSON."
+            )
         if self._diag_main_rank:
             print(
+                "[V203TrainValTestContract] "
+                f"epoch_test=on interval={self._epoch_test_interval} "
+                f"json={self._epoch_test_json} pep={self._epoch_test_pep or '<auto:test.pkl>'} "
+                f"surf={self._epoch_test_surf or '<auto:test_surf.pkl>'} "
+                f"batch={self._epoch_test_batch_size} n_steps={self._epoch_test_n_steps} "
+                f"seed={self._epoch_test_base_seed} cdr={self._epoch_test_cdr} fail_fast=on"
+            )
+
+        if self._diag_main_rank:
+            raw_model = model.module if hasattr(model, "module") else model
+            print(
                 "[LossContract] "
-                f"sequence={getattr(model, 'loss_sequence_weight', float('nan')):.4g} "
-                f"structure={getattr(model, 'loss_structure_weight', float('nan')):.4g} "
-                f"interface={getattr(model, 'loss_interface_weight', float('nan')):.4g} "
-                f"edge={getattr(model, 'loss_edge_weight', float('nan')):.4g} "
-                f"distogram={getattr(model, 'loss_distogram_weight', float('nan')):.4g} "
-                "authority=R05_parent_plus_optional_pair_aux"
+                f"sequence={getattr(raw_model, 'seq_ce_weight', 1.0):.4g} "
+                f"structure=1 interface=1 edge=1 "
+                f"distogram={getattr(raw_model, 'loss_distogram_weight', 0.0):.4g} "
+                f"smooth_lddt={getattr(raw_model, 'loss_smooth_lddt_weight', 0.0):.4g}"
+            )
+            print(
+                "[R05AbXContract] "
+                f"R05_time={int(bool(getattr(raw_model, 'scorefm_time_embed', False)))} "
+                f"AbX_time={int(bool(getattr(getattr(raw_model, 'abx_repr', None), 'trunk', None) and getattr(raw_model.abx_repr.trunk, 'use_abx_time', False)))} "
+                f"AbX_recycling={int(bool(getattr(getattr(raw_model, 'abx_repr', None), 'trunk', None) and (getattr(raw_model.abx_repr.trunk, 'recycle_features', False) or getattr(raw_model.abx_repr.trunk, 'recycle_pos', False))))} "
+                "single=R05_dynamic+AbX pair=native_edge_attr recurrence=R05x3"
             )
 
 
@@ -361,13 +425,13 @@ class AbFlowTrainer(Trainer):
             self._epoch_test_json,
             pep_file=pep_file,
             surf_file=surf_file,
-            cdr=raw_model.cdr_type,
+            cdr=self._epoch_test_cdr,
         )
         if self._is_main_proc():
             print(
                 "[EpochTest] dataset loaded: "
                 f"n={len(self._epoch_test_dataset)} json={self._epoch_test_json} "
-                f"pep={pep_file} surf={surf_file}"
+                f"pep={pep_file} surf={surf_file} cdr={self._epoch_test_cdr}"
             )
         return self._epoch_test_dataset
 
@@ -420,13 +484,16 @@ class AbFlowTrainer(Trainer):
                     n_steps=self._epoch_test_n_steps,
                     base_seed=self._epoch_test_base_seed,
                     show_sample_progress=self._epoch_test_show_sample_progress,
+                    cdr_type=self._epoch_test_cdr,
                 )
                 metrics = run_cal_metrics_rank0(
                     summary_file=generation.summary_file,
                     save_dir=epoch_dir,
                     project_root=self._epoch_test_project_root,
                     num_workers=self._epoch_test_metric_workers,
+                    cdr_type=self._epoch_test_cdr,
                 )
+                self._validate_formal_epoch_test_metrics(metrics, device)
                 if (
                     bool(getattr(raw_model, 'sample_authority_diagnostics', False))
                     and hasattr(raw_model, 'consume_sample_authority_diagnostics')
@@ -475,6 +542,55 @@ class AbFlowTrainer(Trainer):
                 torch.cuda.empty_cache()
 
         return metrics
+
+    def _validate_formal_epoch_test_metrics(self, metrics, device):
+        """Fail-fast if the formal Test phase did not return the seven core metrics."""
+        required = (
+            "AAR_mean", "CAAR_mean", "RMSDCA_CDRH3_mean",
+            "RMSDCA_CDRH3_aligned_mean", "TMscore_mean",
+            "LDDT_mean", "DockQ_mean",
+        )
+        local_ok = True
+        local_message = ""
+        if self._is_main_proc():
+            missing = [k for k in required if k not in metrics]
+            nonfinite = []
+            if not missing:
+                for key in required:
+                    try:
+                        value = float(metrics[key])
+                    except Exception:
+                        nonfinite.append(key)
+                        continue
+                    if not isfinite(value):
+                        nonfinite.append(key)
+            if missing or nonfinite:
+                local_ok = False
+                local_message = (
+                    f"formal Test metrics invalid: missing={missing} nonfinite={nonfinite}; "
+                    f"available={sorted(metrics.keys()) if isinstance(metrics, dict) else type(metrics)}"
+                )
+
+        status = torch.tensor(1 if local_ok else 0, dtype=torch.int32, device=device)
+        if dist.is_available() and dist.is_initialized():
+            dist.broadcast(status, src=0)
+        if int(status.item()) != 1:
+            if self._is_main_proc() and local_message:
+                print(f"[FormalEpochTestFAIL] epoch={self.epoch} {local_message}")
+            raise RuntimeError(local_message or "formal Test metric validation failed on rank0")
+
+        if self._is_main_proc():
+            print(
+                "[FormalEpochTestPASS] "
+                f"epoch={self.epoch} "
+                f"AAR={float(metrics['AAR_mean']):.5f} "
+                f"CAAR={float(metrics['CAAR_mean']):.5f} "
+                f"H3raw={float(metrics['RMSDCA_CDRH3_mean']):.5f}A "
+                f"H3aligned={float(metrics['RMSDCA_CDRH3_aligned_mean']):.5f}A "
+                f"TM={float(metrics['TMscore_mean']):.5f} "
+                f"lDDT={float(metrics['LDDT_mean']):.5f} "
+                f"DockQ={float(metrics['DockQ_mean']):.5f}"
+            )
 
     def _print_epoch_test_authority_trace(self, local_records):
         """Aggregate model.sample authority diagnostics across Test ranks.
@@ -648,18 +764,20 @@ class AbFlowTrainer(Trainer):
             self._print_validation_audits(validation_summary)
         self.writer_buffer = {}
 
-        # Third epoch phase: real EMA rollout Test.  It is observation-only.
-        test_metrics = {}
-        if self._epoch_test_should_run():
-            try:
-                test_metrics = self._run_epoch_test(device) or {}
-            except Exception as exc:
-                message = f"{type(exc).__name__}: {exc}"
-                self._write_epoch_test_error(message)
-                if self._is_main_proc():
-                    print(f"[EpochTest][ERROR] {message}")
-                if self._epoch_test_fail_fast:
-                    raise
+        # V203 fixed third phase: every epoch performs formal EMA rollout Test.
+        # There is deliberately no silent skip path and no NaN fallback.
+        if not self._epoch_test_should_run():
+            raise RuntimeError(
+                f"V203 formal Test was unexpectedly disabled/skipped at epoch={self.epoch}."
+            )
+        try:
+            test_metrics = self._run_epoch_test(device) or {}
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            self._write_epoch_test_error(message)
+            if self._is_main_proc():
+                print(f"[EpochTest][ERROR] {message}")
+            raise
         self._last_epoch_test_metrics = dict(test_metrics)
         self._finalize_epoch_summary(
             train_summary=train_summary,
@@ -792,6 +910,32 @@ class AbFlowTrainer(Trainer):
             "mf_smooth_lddt_antigen_pairs": m("DTM/mf_smooth_lddt_antigen_pairs/Validation"),
             "mf_smooth_lddt_perfect_floor": m("DTM/mf_smooth_lddt_perfect_floor/Validation"),
             "mf_smooth_lddt_excess": m("DTM/mf_smooth_lddt_excess/Validation"),
+            # V185 native-AbX aliases.  Old MF keys above are retained only so
+            # this trainer remains backwards-compatible with historical logs.
+            "abx_distogram_loss": m("DTM/abx_distogram_loss/Validation"),
+            "abx_smooth_lddt_loss": m("DTM/abx_smooth_lddt_loss/Validation"),
+            "abx_smooth_lddt_intra_loss": m("DTM/abx_smooth_lddt_intra_loss/Validation"),
+            "abx_smooth_lddt_scaffold_loss": m("DTM/abx_smooth_lddt_scaffold_loss/Validation"),
+            "abx_smooth_lddt_antigen_loss": m("DTM/abx_smooth_lddt_antigen_loss/Validation"),
+            "abx_smooth_lddt_intra_pairs": m("DTM/abx_smooth_lddt_intra_pairs/Validation"),
+            "abx_smooth_lddt_scaffold_pairs": m("DTM/abx_smooth_lddt_scaffold_pairs/Validation"),
+            "abx_smooth_lddt_antigen_pairs": m("DTM/abx_smooth_lddt_antigen_pairs/Validation"),
+            "abx_single_rms": m("DTM/abx_single_rms/Validation"),
+            "abx_pair_rms": m("DTM/abx_pair_rms/Validation"),
+            "abx_token_count": m("DTM/abx_token_count/Validation"),
+            "abx_pair_count": m("DTM/abx_pair_count/Validation"),
+            "abx_design_embedding_mask_rate": m("DTM/abx_design_embedding_mask_rate/Validation"),
+            "r05_parent_static_bio_rms": m("AbFlowDiag/r05_parent_static_bio_rms/Validation"),
+            "r05_parent_dynamic_bio_rms": m("AbFlowDiag/r05_parent_dynamic_bio_rms/Validation"),
+            "abx_single_bio_rms": m("AbFlowDiag/abx_single_bio_rms/Validation"),
+            "r05_time_embed_on": m("AbFlowDiag/r05_time_embed_on/Validation"),
+            "abx_time_embed_on": m("AbFlowDiag/abx_time_embed_on/Validation"),
+            "abx_ctx_edge_attr_rms": m("AbFlowDiag/abx_ctx_edge_attr_rms/Validation"),
+            "abx_inter_edge_attr_rms": m("AbFlowDiag/abx_inter_edge_attr_rms/Validation"),
+            "abx_surf_edge_attr_rms": m("AbFlowDiag/abx_surf_edge_attr_rms/Validation"),
+            "abx_ctx_edge_count": m("AbFlowDiag/abx_ctx_edge_count/Validation"),
+            "abx_inter_edge_count": m("AbFlowDiag/abx_inter_edge_count/Validation"),
+            "abx_surf_edge_count": m("AbFlowDiag/abx_surf_edge_count/Validation"),
             "h3ca_raw_r0": m("AbFlowDiag/val_proxy_round0_h3_ca_rmsd/Validation"),
             "h3ca_raw_r1": m("AbFlowDiag/val_proxy_round1_h3_ca_rmsd/Validation"),
             "h3ca_raw_r2": m("AbFlowDiag/val_proxy_round2_h3_ca_rmsd/Validation"),
@@ -1001,53 +1145,6 @@ class AbFlowTrainer(Trainer):
             f"{self._fmt(summary.get('round2_seq_top1_margin'), 4)})"
         )
         print(
-            "[SequenceAuthority] "
-            f"epoch={self.epoch} "
-            f"parent_logit_rms=({self._fmt(summary.get('round0_mf_seq_parent_logit_rms'), 5)},"
-            f"{self._fmt(summary.get('round1_mf_seq_parent_logit_rms'), 5)},"
-            f"{self._fmt(summary.get('round2_mf_seq_parent_logit_rms'), 5)}) "
-            f"modern_to_parent=({self._fmt(summary.get('round0_mf_seq_residual_to_parent_ratio'), 5)},"
-            f"{self._fmt(summary.get('round1_mf_seq_residual_to_parent_ratio'), 5)},"
-            f"{self._fmt(summary.get('round2_mf_seq_residual_to_parent_ratio'), 5)}) "
-            f"cos=({self._fmt(summary.get('round0_mf_seq_parent_residual_cos'), 4)},"
-            f"{self._fmt(summary.get('round1_mf_seq_parent_residual_cos'), 4)},"
-            f"{self._fmt(summary.get('round2_mf_seq_parent_residual_cos'), 4)}) "
-            f"map_change=({self._fmt(summary.get('round0_mf_seq_parent_to_final_map_change_rate'), 4)},"
-            f"{self._fmt(summary.get('round1_mf_seq_parent_to_final_map_change_rate'), 4)},"
-            f"{self._fmt(summary.get('round2_mf_seq_parent_to_final_map_change_rate'), 4)})"
-        )
-        print(
-            "[ParentAuthorityAudit] "
-            f"epoch={self.epoch} "
-            f"seq_raw=({self._fmt(summary.get('round0_mf_seq_raw_residual_to_parent_ratio'), 4)},"
-            f"{self._fmt(summary.get('round1_mf_seq_raw_residual_to_parent_ratio'), 4)},"
-            f"{self._fmt(summary.get('round2_mf_seq_raw_residual_to_parent_ratio'), 4)}) "
-            f"seq_applied=({self._fmt(summary.get('round0_mf_seq_residual_to_parent_ratio'), 4)},"
-            f"{self._fmt(summary.get('round1_mf_seq_residual_to_parent_ratio'), 4)},"
-            f"{self._fmt(summary.get('round2_mf_seq_residual_to_parent_ratio'), 4)}) "
-            f"seq_clip=({self._fmt(summary.get('round0_mf_seq_authority_clip_fraction'), 4)},"
-            f"{self._fmt(summary.get('round1_mf_seq_authority_clip_fraction'), 4)},"
-            f"{self._fmt(summary.get('round2_mf_seq_authority_clip_fraction'), 4)}) "
-            f"base_raw=({self._fmt(summary.get('round0_mf_base_raw_to_parent_ratio'), 4)},"
-            f"{self._fmt(summary.get('round1_mf_base_raw_to_parent_ratio'), 4)},"
-            f"{self._fmt(summary.get('round2_mf_base_raw_to_parent_ratio'), 4)}) "
-            f"base_applied=({self._fmt(summary.get('round0_mf_base_applied_to_parent_ratio'), 4)},"
-            f"{self._fmt(summary.get('round1_mf_base_applied_to_parent_ratio'), 4)},"
-            f"{self._fmt(summary.get('round2_mf_base_applied_to_parent_ratio'), 4)}) "
-            f"base_clip=({self._fmt(summary.get('round0_mf_base_authority_clip_fraction'), 4)},"
-            f"{self._fmt(summary.get('round1_mf_base_authority_clip_fraction'), 4)},"
-            f"{self._fmt(summary.get('round2_mf_base_authority_clip_fraction'), 4)}) "
-            f"edge_raw=({self._fmt(summary.get('round0_mf_edge_raw_ratio'), 4)},"
-            f"{self._fmt(summary.get('round1_mf_edge_raw_ratio'), 4)},"
-            f"{self._fmt(summary.get('round2_mf_edge_raw_ratio'), 4)}) "
-            f"edge_applied=({self._fmt(summary.get('round0_mf_edge_applied_ratio'), 4)},"
-            f"{self._fmt(summary.get('round1_mf_edge_applied_ratio'), 4)},"
-            f"{self._fmt(summary.get('round2_mf_edge_applied_ratio'), 4)}) "
-            f"edge_clip=({self._fmt(summary.get('round0_mf_edge_clip_fraction'), 4)},"
-            f"{self._fmt(summary.get('round1_mf_edge_clip_fraction'), 4)},"
-            f"{self._fmt(summary.get('round2_mf_edge_clip_fraction'), 4)})"
-        )
-        print(
             "[SequenceProposalAudit] "
             f"epoch={self.epoch} proposal_AAR={self._fmt(summary.get('proposal_aar'), 4)} "
             f"pred_eq_proposal={self._fmt(summary.get('pred_vs_proposal_aar'), 4)} "
@@ -1057,38 +1154,39 @@ class AbFlowTrainer(Trainer):
             f"damage_correct={self._fmt(summary.get('proposal_damage_rate'), 4)}"
         )
         print(
-            "[MFRepresentationAudit] "
+            "[R05AbXRepresentationAudit] "
             f"epoch={self.epoch} "
-            f"single_rms={self._fmt(summary.get('mf_single_rms'), 5)} "
-            f"pair_rms={self._fmt(summary.get('mf_pair_rms'), 5)} "
-            f"pairs={self._fmt(summary.get('mf_pair_count'), 1)} "
-            f"pairs_graph_mean={self._fmt(summary.get('mf_pair_count_graph_mean'), 1)} "
-            f"pairs_graph_max={self._fmt(summary.get('mf_pair_count_graph_max'), 1)} "
-            f"tokens_graph_mean={self._fmt(summary.get('mf_local_token_count_graph_mean'), 2)} "
-            f"tokens_graph_max={self._fmt(summary.get('mf_local_token_count_graph_max'), 2)} "
-            f"atom_pair={self._fmt(summary.get('mf_allatom_pair_rbf_rms'), 5)} "
-            f"opm={self._fmt(summary.get('mf_opm_update_rms'), 6)} "
-            f"triangle={self._fmt(summary.get('mf_triangle_update_rms'), 6)} "
-            f"pair_atom={self._fmt(summary.get('mf_pair_atom_update_rms'), 6)} "
-            f"pair_atom_res={self._fmt(summary.get('mf_pair_atom_residual_rms'), 6)} "
-            f"pair_atom_w={self._fmt(summary.get('mf_pair_atom_adapter_weight_rms'), 6)} "
-            f"base_res={self._fmt(summary.get('mf_base_residual_rms'), 6)} "
-            f"seq_res={self._fmt(summary.get('mf_seq_residual_rms'), 6)} "
-            f"single_delta={self._fmt(summary.get('mf_single_round_delta_rms'), 6)} "
-            f"pair_delta={self._fmt(summary.get('mf_pair_round_delta_rms'), 6)} "
-            f"base_w={self._fmt(summary.get('mf_base_adapter_weight_rms'), 6)} "
-            f"seq_w={self._fmt(summary.get('mf_seq_adapter_weight_rms'), 6)} "
-            f"disto={self._fmt(summary.get('mf_distogram_loss'), 5)} "
-            f"disto_live={self._fmt(summary.get('mf_distogram_pair_live_contract'), 0)} "
-            f"slddt={self._fmt(summary.get('mf_smooth_lddt_loss'), 5)} "
-            f"slddt_intra={self._fmt(summary.get('mf_smooth_lddt_intra_loss'), 5)} "
-            f"slddt_scaf={self._fmt(summary.get('mf_smooth_lddt_scaffold_loss'), 5)} "
-            f"slddt_ag={self._fmt(summary.get('mf_smooth_lddt_antigen_loss'), 5)} "
-            f"slddt_pairs=({self._fmt(summary.get('mf_smooth_lddt_intra_pairs'), 0)},"
-            f"{self._fmt(summary.get('mf_smooth_lddt_scaffold_pairs'), 0)},"
-            f"{self._fmt(summary.get('mf_smooth_lddt_antigen_pairs'), 0)}) "
-            f"slddt_floor={self._fmt(summary.get('mf_smooth_lddt_perfect_floor'), 5)} "
-            f"slddt_excess={self._fmt(summary.get('mf_smooth_lddt_excess'), 5)}"
+            f"single_rms={self._fmt(summary.get('abx_single_rms'), 5)} "
+            f"pair_rms={self._fmt(summary.get('abx_pair_rms'), 5)} "
+            f"tokens={self._fmt(summary.get('abx_token_count'), 1)} "
+            f"pairs={self._fmt(summary.get('abx_pair_count'), 1)} "
+            f"design_mask={self._fmt(summary.get('abx_design_embedding_mask_rate'), 4)} "
+            f"parent_static={self._fmt(summary.get('r05_parent_static_bio_rms'), 5)} "
+            f"parent_dynamic={self._fmt(summary.get('r05_parent_dynamic_bio_rms'), 5)} "
+            f"abx_single_bio={self._fmt(summary.get('abx_single_bio_rms'), 5)} "
+            f"time=R05:{self._fmt(summary.get('r05_time_embed_on'), 0)}/AbX:{self._fmt(summary.get('abx_time_embed_on'), 0)}"
+        )
+        print(
+            "[R05AbXEdgeAudit] "
+            f"epoch={self.epoch} "
+            f"ctx_rms={self._fmt(summary.get('abx_ctx_edge_attr_rms'), 5)} "
+            f"inter_rms={self._fmt(summary.get('abx_inter_edge_attr_rms'), 5)} "
+            f"surf_rms={self._fmt(summary.get('abx_surf_edge_attr_rms'), 5)} "
+            f"counts=({self._fmt(summary.get('abx_ctx_edge_count'), 0)},"
+            f"{self._fmt(summary.get('abx_inter_edge_count'), 0)},"
+            f"{self._fmt(summary.get('abx_surf_edge_count'), 0)})"
+        )
+        print(
+            "[R05AbXAuxAudit] "
+            f"epoch={self.epoch} "
+            f"disto={self._fmt(summary.get('abx_distogram_loss'), 5)} "
+            f"lddt={self._fmt(summary.get('abx_smooth_lddt_loss'), 5)} "
+            f"lddt_intra={self._fmt(summary.get('abx_smooth_lddt_intra_loss'), 5)} "
+            f"lddt_scaffold={self._fmt(summary.get('abx_smooth_lddt_scaffold_loss'), 5)} "
+            f"lddt_antigen={self._fmt(summary.get('abx_smooth_lddt_antigen_loss'), 5)} "
+            f"pairs=({self._fmt(summary.get('abx_smooth_lddt_intra_pairs'), 0)},"
+            f"{self._fmt(summary.get('abx_smooth_lddt_scaffold_pairs'), 0)},"
+            f"{self._fmt(summary.get('abx_smooth_lddt_antigen_pairs'), 0)})"
         )
         bins = []
         for bidx in range(5):
@@ -1291,8 +1389,8 @@ class AbFlowTrainer(Trainer):
             "val_structure": validation_summary.get("loss_structure", float("nan")),
             "val_interface": validation_summary.get("loss_interface", float("nan")),
             "val_edge": validation_summary.get("loss_edge", float("nan")),
-            "val_distogram": validation_summary.get("mf_distogram_loss", float("nan")),
-            "val_smooth_lddt": validation_summary.get("mf_smooth_lddt_loss", float("nan")),
+            "val_distogram": validation_summary.get("abx_distogram_loss", validation_summary.get("mf_distogram_loss", float("nan"))),
+            "val_smooth_lddt": validation_summary.get("abx_smooth_lddt_loss", validation_summary.get("mf_smooth_lddt_loss", float("nan"))),
         }
         for key, value in current_test.items():
             row[f"test_{key}"] = value
@@ -1382,7 +1480,8 @@ class AbFlowTrainer(Trainer):
         # epoch mechanism audit.  Training captures them only for the periodic
         # gradient-authority probe.  No per-step diagnostic files are written.
         probe_grad_now = self._should_probe_grad(val)
-        capture_diagnostics = bool(val) or probe_grad_now
+        first_step_diag = (not val) and int(self.global_step) < self._science_log_first_steps
+        capture_diagnostics = bool(val) or probe_grad_now or first_step_diag
         raw_model._diagnostic_capture = bool(capture_diagnostics)
         raw_model._diagnostic_validation_mode = bool(val and capture_diagnostics)
 
@@ -1540,6 +1639,33 @@ class AbFlowTrainer(Trainer):
         grad_diagnostics = getattr(raw_model, "last_gradient_diagnostics", None) or {}
         for name, value in grad_diagnostics.items():
             self.log(f"GradientDiag/{name}/{log_type}", value, batch_idx, val)
+
+        if not val and (
+            int(self.global_step) < self._science_log_first_steps
+            or int(self.global_step) % self._science_log_interval == 0
+        ) and self._diag_main_rank:
+            def _sf(name):
+                return self._scalar(scorefm_losses.get(name))
+            def _ad(name):
+                return self._scalar(abflow_diagnostics.get(name))
+            print(
+                "[R05AbXStep] "
+                f"epoch={self.epoch} step={self.global_step} "
+                f"loss={self._fmt(self._scalar(loss), 5)} "
+                f"seq={self._fmt(self._scalar(snll), 5)} "
+                f"struct={self._fmt(self._scalar(struct_loss), 5)} "
+                f"interface={self._fmt(self._scalar(interface_loss), 5)} "
+                f"edge={self._fmt(self._scalar(ed_loss), 5)} "
+                f"disto={self._fmt(_sf('abx_distogram_loss'), 5)} "
+                f"lddt={self._fmt(_sf('abx_smooth_lddt_loss'), 5)} "
+                f"t=({self._fmt(_ad('t_min'), 3)},{self._fmt(_ad('t_mean'), 3)},{self._fmt(_ad('t_max'), 3)}) "
+                f"s={self._fmt(_sf('abx_single_rms'), 4)} "
+                f"z={self._fmt(_sf('abx_pair_rms'), 4)} "
+                f"edge_z=({self._fmt(_ad('abx_ctx_edge_attr_rms'), 4)},"
+                f"{self._fmt(_ad('abx_inter_edge_attr_rms'), 4)},"
+                f"{self._fmt(_ad('abx_surf_edge_attr_rms'), 4)}) "
+                f"mask={self._fmt(_sf('abx_design_embedding_mask_rate'), 3)}"
+            )
         if probe_grad_now:
             if (not val) and self._diag_main_rank:
                 def _ad(name):
@@ -1592,9 +1718,9 @@ class AbFlowTrainer(Trainer):
             self._accumulate_train_component("interface", interface_loss)
             self._accumulate_train_component("edge", ed_loss)
             self._accumulate_train_component(
-                "distogram", scorefm_losses.get("mf_distogram_loss")
+                "distogram", scorefm_losses.get("abx_distogram_loss", scorefm_losses.get("mf_distogram_loss"))
             )
             self._accumulate_train_component(
-                "smooth_lddt", scorefm_losses.get("mf_smooth_lddt_loss")
+                "smooth_lddt", scorefm_losses.get("abx_smooth_lddt_loss", scorefm_losses.get("mf_smooth_lddt_loss"))
             )
         return loss

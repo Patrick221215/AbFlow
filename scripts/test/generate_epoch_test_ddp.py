@@ -27,6 +27,7 @@ from utils.epoch_test import (
     run_cal_metrics_rank0,
     cleanup_structures,
     dist_info,
+    normalize_test_cdr,
 )
 
 
@@ -42,6 +43,7 @@ def parse_args():
     p.add_argument("--n_steps", type=int, default=10)
     p.add_argument("--base_seed", type=int, default=2023)
     p.add_argument("--metric_workers", type=int, default=8)
+    p.add_argument("--cdr", default=os.environ.get("ABFLOW_EPOCH_TEST_CDR", "H3"))
     p.add_argument("--show_sample_progress", action="store_true")
     p.add_argument("--delete_structures_after_metrics", action="store_true")
     return p.parse_args()
@@ -98,11 +100,14 @@ def main():
         model.to(device)
         model.eval()
 
+        formal_cdr = normalize_test_cdr(args.cdr)
+        if rank == 0:
+            print(f"[V207StandaloneTestContract] cdr={formal_cdr}")
         test_set = E2EDataset(
             args.test_set,
             pep_file=args.pep_file,
             surf_file=args.surf_file,
-            cdr=model.cdr_type,
+            cdr=formal_cdr,
         )
 
         generation = generate_distributed(
@@ -114,12 +119,14 @@ def main():
             n_steps=args.n_steps,
             base_seed=args.base_seed,
             show_sample_progress=args.show_sample_progress,
+            cdr_type=formal_cdr,
         )
         metrics = run_cal_metrics_rank0(
             summary_file=generation.summary_file,
             save_dir=args.save_dir,
             project_root=str(PROJECT_ROOT),
             num_workers=args.metric_workers,
+            cdr_type=formal_cdr,
         )
 
         if rank == 0:

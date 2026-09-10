@@ -39,6 +39,8 @@ from data.dataset import E2EDataset
 from data.pdb_utils import VOCAB, Residue, Peptide, Protein, AgAbComplex
 
 
+V207_EXPLICIT_EPOCH_TEST_CDR_CONTRACT = True
+
 METRIC_NAMES = [
     "AAR H3",
     "CAAR H3",
@@ -233,6 +235,20 @@ def _split_graph_outputs(batch: dict, X: torch.Tensor, S: torch.Tensor):
     return X_list, S_list
 
 
+def normalize_test_cdr(cdr_type) -> List[str]:
+    """Normalize the formal evaluation CDR identity without consulting model state."""
+    if cdr_type is None:
+        raw = str(os.environ.get("ABFLOW_EPOCH_TEST_CDR", "H3") or "H3")
+        values = [x.strip().upper() for x in raw.split(",") if x.strip()]
+    elif isinstance(cdr_type, str):
+        values = [x.strip().upper() for x in cdr_type.split(",") if x.strip()]
+    else:
+        values = [str(x).strip().upper() for x in cdr_type if str(x).strip()]
+    if values != ["H3"]:
+        raise RuntimeError(f"Formal RAbD Test requires cdr=['H3']; got {values!r}")
+    return values
+
+
 @dataclass
 class GenerationResult:
     summary_file: Optional[str]
@@ -251,9 +267,11 @@ def generate_distributed(
     n_steps: int = 10,
     base_seed: int = 2023,
     show_sample_progress: bool = False,
+    cdr_type=None,
 ) -> GenerationResult:
     """Generate the full test set exactly once across the current DDP world."""
     rank, world_size = dist_info()
+    formal_cdr = normalize_test_cdr(cdr_type)
     save_dir = os.path.abspath(save_dir)
     rank_dir = os.path.join(save_dir, f"rank_{rank:02d}")
     os.makedirs(rank_dir, exist_ok=True)
@@ -307,7 +325,7 @@ def generate_distributed(
                         "H": cplx.heavy_chain,
                         "L": cplx.light_chain,
                         "A": cplx.antigen.get_chain_names(),
-                        "cdr_type": model.cdr_type,
+                        "cdr_type": formal_cdr,
                         "pdb": pdb_id,
                         "pmetric": None,
                     }
@@ -359,6 +377,7 @@ def generate_distributed(
             "n_steps": int(n_steps),
             "n_items": int(len(dataset)),
             "world_size": int(world_size),
+            "cdr_type": formal_cdr,
             "logical_batches": logical_batches(len(dataset), batch_size),
         }
         with open(os.path.join(save_dir, "test_protocol.json"), "w", encoding="utf-8") as f:
@@ -373,12 +392,38 @@ def generate_distributed(
     )
 
 
+def validate_summary_contract(summary_file: str, expected_cdr=None) -> int:
+    """Cheap fail-fast validation before launching the external metric program."""
+    expected = normalize_test_cdr(expected_cdr)
+    records = []
+    with open(summary_file, "r", encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            for key in ("mod_pdb", "ref_pdb", "H", "L", "A", "cdr_type", "pdb"):
+                if key not in item:
+                    raise RuntimeError(f"summary.json line {lineno} missing key {key!r}")
+            if normalize_test_cdr(item.get("cdr_type")) != expected:
+                raise RuntimeError(
+                    f"summary.json line {lineno} cdr_type={item.get('cdr_type')!r}; expected {expected!r}"
+                )
+            for key in ("mod_pdb", "ref_pdb"):
+                if not os.path.isfile(item[key]):
+                    raise FileNotFoundError(f"summary.json line {lineno} missing file: {item[key]}")
+            records.append(item)
+    if not records:
+        raise RuntimeError("summary.json contains zero generated complexes")
+    return len(records)
+
+
 def run_cal_metrics_rank0(
     *,
     summary_file: Optional[str],
     save_dir: str,
     project_root: str,
     num_workers: int = 8,
+    cdr_type=None,
 ) -> Dict[str, float]:
     """Run the project's original cal_metrics.py on rank 0 and parse output."""
     rank, world_size = dist_info()
@@ -393,28 +438,49 @@ def run_cal_metrics_rank0(
             if not os.path.isfile(cal_metrics):
                 raise FileNotFoundError(f"cal_metrics.py not found: {cal_metrics}")
 
+            n_records = validate_summary_contract(summary_file, expected_cdr=cdr_type)
             env = os.environ.copy()
             env["OPENMM_CPU_THREADS"] = "1"
-            cmd = [
-                sys.executable,
-                cal_metrics,
-                "--test_set",
-                os.path.abspath(summary_file),
-                "--num_workers",
-                str(int(num_workers)),
-            ]
-            proc = subprocess.run(
-                cmd,
-                cwd=os.path.abspath(project_root),
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
+
+            def _run_metric_process(workers: int):
+                cmd = [
+                    sys.executable, cal_metrics,
+                    "--test_set", os.path.abspath(summary_file),
+                    "--num_workers", str(int(workers)),
+                ]
+                return subprocess.run(
+                    cmd, cwd=os.path.abspath(project_root), env=env,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                )
+
+            requested_workers = max(1, int(num_workers))
+            proc = _run_metric_process(requested_workers)
             log_text = proc.stdout or ""
             log_path = os.path.join(save_dir, "cal_metrics.log")
             with open(log_path, "w", encoding="utf-8") as f:
+                f.write(
+                    f"[V207MetricContract] records={n_records} cdr={normalize_test_cdr(cdr_type)} "
+                    f"workers={requested_workers}\n"
+                )
                 f.write(log_text)
+
+            # Same scientific evaluator, execution-only fallback. Some metric stacks
+            # fail under multiprocessing/OpenMM yet are deterministic with one worker.
+            if int(proc.returncode) != 0 and requested_workers != 1:
+                retry = _run_metric_process(1)
+                retry_text = retry.stdout or ""
+                retry_path = os.path.join(save_dir, "cal_metrics_retry_worker1.log")
+                with open(retry_path, "w", encoding="utf-8") as f:
+                    f.write(retry_text)
+                if int(retry.returncode) == 0:
+                    proc, log_text, log_path = retry, retry_text, retry_path
+                else:
+                    tail0 = "\n".join(log_text.splitlines()[-40:])
+                    tail1 = "\n".join(retry_text.splitlines()[-40:])
+                    raise RuntimeError(
+                        "cal_metrics.py failed with requested workers and worker=1. "
+                        f"requested_tail=\n{tail0}\nworker1_tail=\n{tail1}"
+                    )
 
             metrics = parse_cal_metrics_output(log_text)
             result = {
@@ -422,6 +488,8 @@ def run_cal_metrics_rank0(
                 "metrics": metrics,
                 "log": log_path,
                 "error": "",
+                "records": int(n_records),
+                "cdr_type": normalize_test_cdr(cdr_type),
             }
         except Exception as exc:
             result = {
