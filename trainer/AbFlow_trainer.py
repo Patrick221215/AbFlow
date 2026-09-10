@@ -1,11 +1,8 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
-# V185_STABLE_TRAINER_MINIMAL_ABX_DIAGNOSTICS
-# R05MF_AUTHORITY_LADDER_V169: three-run causal ladder; diagnostics/protocol unchanged from v168.
-# R05MF_LIVEPAIR_DISTOGRAM_V170: first-batch end-to-end gradient contract for
-# R05MF_SEQUENCE_PATH_AUTHORITY_V171: audits exact categorical path and path-noisy CE.
-# the replacement R13; aborts if weighted distogram CE does not reach the shared
-# pre-MF generator activation.
+# V207.1_GOLD_STANDARD: R28/R29/R30 causal ladder with donor-faithful
+# Distogram/smooth-lDDT objectives and a two-stage zero-init-aware pair-gradient
+# contract. Sequence-path, DDP, EMA and formal Train->Val->Test audits remain.
 # V203_FORMAL_TRAIN_VAL_TEST_EVERY_EPOCH
 # Fixed project protocol: every epoch executes Train -> Val -> formal EMA Test generation.
 # Test failures are fail-fast and may never be silently converted into NaN summaries.
@@ -44,9 +41,6 @@ def _env_flag(name, default=False):
         return bool(default)
     return value in {"1", "true", "yes", "y", "on"}
 
-
-
-V207_EXPLICIT_EPOCH_TEST_CDR_CONTRACT = True
 
 class _ExactDistributedValidationBatchSampler(Sampler):
     """Shard *logical validation batches* across ranks without padding.
@@ -135,10 +129,13 @@ class AbFlowTrainer(Trainer):
             if requested_grad_interval <= 0
             else max(1, requested_grad_interval)
         )
-        # V170: the replacement R13 is not allowed to burn even one full epoch
-        # with a silently detached distogram path. A one-time first-batch probe
-        # verifies weighted L_distogram -> shared pre-MF activation connectivity.
+        # V207.1 two-stage Distogram connectivity contract.  The donor head uses
+        # init='final' (exactly zero projection weights), so dL_D/dz is expected
+        # to be zero before the first optimizer update even though the head is
+        # learnable.  Admit that cold start once; the next batch must demonstrate
+        # a live weighted L_distogram -> shared pair-z gradient on every rank.
         self._live_pair_gradient_contract_verified = False
+        self._live_pair_gradient_cold_start_observed = False
         self._grad_diag_enabled = _env_flag(
             "ABFLOW_GRAD_CONFLICT_DIAGNOSTICS", False
         )
@@ -232,16 +229,6 @@ class AbFlowTrainer(Trainer):
         self._epoch_test_project_root = str(os.environ.get(
             "ABFLOW_PROJECT_ROOT", os.getcwd()
         ) or os.getcwd()).strip()
-        # V207: formal Test task identity is explicit evaluation state.
-        # Do NOT infer it from raw_model.cdr_type because old/current checkpoints
-        # can legitimately carry None even when the experiment itself is H3-only.
-        epoch_test_cdr_raw = str(os.environ.get("ABFLOW_EPOCH_TEST_CDR", "H3") or "H3").strip()
-        self._epoch_test_cdr = [x.strip().upper() for x in epoch_test_cdr_raw.split(",") if x.strip()]
-        if self._epoch_test_cdr != ["H3"]:
-            raise RuntimeError(
-                "V207 formal RAbD Test requires ABFLOW_EPOCH_TEST_CDR=H3; "
-                f"got {self._epoch_test_cdr!r}."
-            )
         self._epoch_test_dataset = None
         self._epoch_test_root = os.path.join(self.config.save_dir, "epoch_test")
 
@@ -280,15 +267,17 @@ class AbFlowTrainer(Trainer):
                 f"json={self._epoch_test_json} pep={self._epoch_test_pep or '<auto:test.pkl>'} "
                 f"surf={self._epoch_test_surf or '<auto:test_surf.pkl>'} "
                 f"batch={self._epoch_test_batch_size} n_steps={self._epoch_test_n_steps} "
-                f"seed={self._epoch_test_base_seed} cdr={self._epoch_test_cdr} fail_fast=on"
+                f"seed={self._epoch_test_base_seed} fail_fast=on"
             )
 
         if self._diag_main_rank:
             raw_model = model.module if hasattr(model, "module") else model
             print(
                 "[LossContract] "
-                f"sequence={getattr(raw_model, 'seq_ce_weight', 1.0):.4g} "
-                f"structure=1 interface=1 edge=1 "
+                f"sequence={getattr(raw_model, 'loss_sequence_weight', 1.0):.4g} "
+                f"structure={getattr(raw_model, 'loss_structure_weight', 1.0):.4g} "
+                f"interface={getattr(raw_model, 'loss_interface_weight', 1.0):.4g} "
+                f"edge={getattr(raw_model, 'loss_edge_weight', 1.0):.4g} "
                 f"distogram={getattr(raw_model, 'loss_distogram_weight', 0.0):.4g} "
                 f"smooth_lddt={getattr(raw_model, 'loss_smooth_lddt_weight', 0.0):.4g}"
             )
@@ -425,13 +414,13 @@ class AbFlowTrainer(Trainer):
             self._epoch_test_json,
             pep_file=pep_file,
             surf_file=surf_file,
-            cdr=self._epoch_test_cdr,
+            cdr=raw_model.cdr_type,
         )
         if self._is_main_proc():
             print(
                 "[EpochTest] dataset loaded: "
                 f"n={len(self._epoch_test_dataset)} json={self._epoch_test_json} "
-                f"pep={pep_file} surf={surf_file} cdr={self._epoch_test_cdr}"
+                f"pep={pep_file} surf={surf_file}"
             )
         return self._epoch_test_dataset
 
@@ -484,14 +473,12 @@ class AbFlowTrainer(Trainer):
                     n_steps=self._epoch_test_n_steps,
                     base_seed=self._epoch_test_base_seed,
                     show_sample_progress=self._epoch_test_show_sample_progress,
-                    cdr_type=self._epoch_test_cdr,
                 )
                 metrics = run_cal_metrics_rank0(
                     summary_file=generation.summary_file,
                     save_dir=epoch_dir,
                     project_root=self._epoch_test_project_root,
                     num_workers=self._epoch_test_metric_workers,
-                    cdr_type=self._epoch_test_cdr,
                 )
                 self._validate_formal_epoch_test_metrics(metrics, device)
                 if (
@@ -910,16 +897,8 @@ class AbFlowTrainer(Trainer):
             "mf_smooth_lddt_antigen_pairs": m("DTM/mf_smooth_lddt_antigen_pairs/Validation"),
             "mf_smooth_lddt_perfect_floor": m("DTM/mf_smooth_lddt_perfect_floor/Validation"),
             "mf_smooth_lddt_excess": m("DTM/mf_smooth_lddt_excess/Validation"),
-            # V185 native-AbX aliases.  Old MF keys above are retained only so
-            # this trainer remains backwards-compatible with historical logs.
+            # Native-AbX pair diagnostics; smooth-lDDT remains an MF/Boltz loss.
             "abx_distogram_loss": m("DTM/abx_distogram_loss/Validation"),
-            "abx_smooth_lddt_loss": m("DTM/abx_smooth_lddt_loss/Validation"),
-            "abx_smooth_lddt_intra_loss": m("DTM/abx_smooth_lddt_intra_loss/Validation"),
-            "abx_smooth_lddt_scaffold_loss": m("DTM/abx_smooth_lddt_scaffold_loss/Validation"),
-            "abx_smooth_lddt_antigen_loss": m("DTM/abx_smooth_lddt_antigen_loss/Validation"),
-            "abx_smooth_lddt_intra_pairs": m("DTM/abx_smooth_lddt_intra_pairs/Validation"),
-            "abx_smooth_lddt_scaffold_pairs": m("DTM/abx_smooth_lddt_scaffold_pairs/Validation"),
-            "abx_smooth_lddt_antigen_pairs": m("DTM/abx_smooth_lddt_antigen_pairs/Validation"),
             "abx_single_rms": m("DTM/abx_single_rms/Validation"),
             "abx_pair_rms": m("DTM/abx_pair_rms/Validation"),
             "abx_token_count": m("DTM/abx_token_count/Validation"),
@@ -1180,13 +1159,13 @@ class AbFlowTrainer(Trainer):
             "[R05AbXAuxAudit] "
             f"epoch={self.epoch} "
             f"disto={self._fmt(summary.get('abx_distogram_loss'), 5)} "
-            f"lddt={self._fmt(summary.get('abx_smooth_lddt_loss'), 5)} "
-            f"lddt_intra={self._fmt(summary.get('abx_smooth_lddt_intra_loss'), 5)} "
-            f"lddt_scaffold={self._fmt(summary.get('abx_smooth_lddt_scaffold_loss'), 5)} "
-            f"lddt_antigen={self._fmt(summary.get('abx_smooth_lddt_antigen_loss'), 5)} "
-            f"pairs=({self._fmt(summary.get('abx_smooth_lddt_intra_pairs'), 0)},"
-            f"{self._fmt(summary.get('abx_smooth_lddt_scaffold_pairs'), 0)},"
-            f"{self._fmt(summary.get('abx_smooth_lddt_antigen_pairs'), 0)})"
+            f"lddt={self._fmt(summary.get('mf_smooth_lddt_loss'), 5)} "
+            f"lddt_intra={self._fmt(summary.get('mf_smooth_lddt_intra_loss'), 5)} "
+            f"lddt_scaffold={self._fmt(summary.get('mf_smooth_lddt_scaffold_loss'), 5)} "
+            f"lddt_antigen={self._fmt(summary.get('mf_smooth_lddt_antigen_loss'), 5)} "
+            f"pairs=({self._fmt(summary.get('mf_smooth_lddt_intra_pairs'), 0)},"
+            f"{self._fmt(summary.get('mf_smooth_lddt_scaffold_pairs'), 0)},"
+            f"{self._fmt(summary.get('mf_smooth_lddt_antigen_pairs'), 0)})"
         )
         bins = []
         for bidx in range(5):
@@ -1266,6 +1245,25 @@ class AbFlowTrainer(Trainer):
             f"Struct:{weights['structure']:.4g},Edge:{weights['edge']:.4g},"
             f"D:{weights['distogram']:.4g},L:{weights['smooth_lddt']:.4g}"
         )
+        # Distogram and the generator share AbX z, not the later R05 H_0 probe.
+        # Ratios below are therefore mathematically comparable on one tensor.
+        gz_d = g("grad_pair_norm_distogram")
+        gz_t = g("grad_pair_norm_endpoint")
+        gz_s = g("grad_pair_norm_structure")
+        ratio_dt = None if gz_d is None or gz_t is None or abs(gz_t) <= 1e-20 else gz_d / gz_t
+        ratio_ds = None if gz_d is None or gz_s is None or abs(gz_s) <= 1e-20 else gz_d / gz_s
+        if any(v is not None for v in (gz_d, gz_t, gz_s)):
+            print(
+                "[PairLossAuthority] "
+                f"epoch={self.epoch} step={self.global_step} probe=z "
+                f"|gD|={self._fmte(gz_d, 3)} "
+                f"|gT|={self._fmte(gz_t, 3)} "
+                f"|gStruct|={self._fmte(gz_s, 3)} "
+                f"D/T={self._fmt(ratio_dt, 4)} "
+                f"D/Struct={self._fmt(ratio_ds, 4)} "
+                f"cos(D,T)={self._fmt(g('grad_pair_cos_distogram_endpoint'), 4)} "
+                f"cos(D,Struct)={self._fmt(g('grad_pair_cos_distogram_structure'), 4)}"
+            )
 
 
     def _accumulate_train_component(self, name, value):
@@ -1390,7 +1388,7 @@ class AbFlowTrainer(Trainer):
             "val_interface": validation_summary.get("loss_interface", float("nan")),
             "val_edge": validation_summary.get("loss_edge", float("nan")),
             "val_distogram": validation_summary.get("abx_distogram_loss", validation_summary.get("mf_distogram_loss", float("nan"))),
-            "val_smooth_lddt": validation_summary.get("abx_smooth_lddt_loss", validation_summary.get("mf_smooth_lddt_loss", float("nan"))),
+            "val_smooth_lddt": validation_summary.get("mf_smooth_lddt_loss", float("nan")),
         }
         for key, value in current_test.items():
             row[f"test_{key}"] = value
@@ -1450,15 +1448,14 @@ class AbFlowTrainer(Trainer):
     def _requires_live_pair_gradient_contract(self):
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
         return bool(
-            getattr(raw_model, "mf_terminal_live_pair_aux", False)
-            and getattr(raw_model, "mf_repr_distogram", False)
+            getattr(raw_model, "abx_native_repr", False)
+            and getattr(raw_model, "abx_distogram", False)
             and abs(float(getattr(raw_model, "loss_distogram_weight", 0.0))) > 0.0
         )
 
     def _should_probe_grad(self, val):
-        # Replacement R13 gets one immediate first-batch connectivity probe.
-        # After it passes, interval=0 returns to the historical once-per-epoch
-        # authority audit used by R11/R12/R13.
+        # R29 gets one immediate first-batch pair-z connectivity probe. After
+        # it passes, interval=0 returns to the once-per-epoch authority audit.
         if (
             (not val)
             and self._grad_diag_enabled
@@ -1569,46 +1566,112 @@ class AbFlowTrainer(Trainer):
         else:
             raw_model.last_gradient_diagnostics = {}
 
-        # V170 fail-fast scientific contract. ``grad_probe_norm_distogram`` is
-        # the norm of the *weighted* distogram objective differentiated with
-        # respect to the final-round shared activation captured before the MF
-        # representation branch. Therefore PASS means the intended auxiliary is
-        # not merely training its own head: it reaches the generator path.
+        # V207.1 two-stage fail-fast contract.
+        #
+        # AbX initializes the Distogram projection with init='final', i.e. W=0.
+        # Before the first optimizer update the chain rule therefore gives
+        #
+        #     dL_D/dz = W^T dL_D/dlogits = 0,
+        #
+        # which is a correct donor cold start, not a detached graph.  We admit
+        # exactly one such batch only when W=0, the CE is finite, and resolved
+        # supervision contains valid pairs.  Because the trainer updates W after
+        # this share_step returns, the next batch must have finite non-zero
+        # dL_D/dz on every DDP rank or the run is genuinely invalid.
         if (
             probe_grad_now
             and self._requires_live_pair_gradient_contract()
             and not self._live_pair_gradient_contract_verified
         ):
             grad_diag = getattr(raw_model, "last_gradient_diagnostics", None) or {}
-            gd_value = grad_diag.get("grad_probe_norm_distogram")
+            gd_value = grad_diag.get("grad_pair_norm_distogram")
             gd_scalar = self._scalar(gd_value)
-            local_ok = bool(
+            local_live = bool(
                 gd_scalar is not None
                 and isfinite(float(gd_scalar))
                 and float(gd_scalar) > 1.0e-12
             )
-            # All DDP ranks must observe a live path. This avoids a rank-specific
-            # dynamic-graph bug passing on rank0 and hanging later in backward.
+
+            scorefm_now = getattr(raw_model, "last_scorefm_losses", None) or {}
+            raw_disto = self._scalar(scorefm_now.get("disto_raw_loss"))
+            valid_pairs = self._scalar(scorefm_now.get("disto_valid_pairs_total"))
+            head = getattr(getattr(raw_model, "abx_repr", None), "distogram_head", None)
+            projection = getattr(head, "proj", None)
+            head_parameter_norm = None
+            if isinstance(projection, torch.nn.Module):
+                parameter_energy = [
+                    parameter.detach().float().square().sum()
+                    for parameter in projection.parameters()
+                ]
+                if parameter_energy:
+                    head_parameter_norm = float(
+                        torch.sqrt(torch.stack(parameter_energy).sum()).cpu().item()
+                    )
+            local_cold_start = bool(
+                not self._live_pair_gradient_cold_start_observed
+                and gd_scalar is not None
+                and isfinite(float(gd_scalar))
+                and abs(float(gd_scalar)) <= 1.0e-12
+                and head_parameter_norm is not None
+                and isfinite(float(head_parameter_norm))
+                and float(head_parameter_norm) <= 1.0e-12
+                and raw_disto is not None
+                and isfinite(float(raw_disto))
+                and valid_pairs is not None
+                and isfinite(float(valid_pairs))
+                and float(valid_pairs) > 0.0
+            )
+
+            # Every DDP rank must agree on either LIVE or the single permitted
+            # COLD_START state. Mixed rank states are a real contract failure.
             if torch.is_tensor(loss):
-                ok_tensor = loss.detach().new_tensor(1 if local_ok else 0, dtype=torch.int32)
-            else:
-                ok_tensor = torch.tensor(1 if local_ok else 0, dtype=torch.int32)
-            if dist.is_available() and dist.is_initialized():
-                dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN)
-            global_ok = bool(int(ok_tensor.detach().cpu().item()) == 1)
-            if not global_ok:
-                raise RuntimeError(
-                    "R05MF_LIVEPAIR_DISTOGRAM_V170 contract failed: weighted "
-                    "distogram CE has no non-zero gradient to the shared generator "
-                    "activation. Refusing to continue an invalid R13 run."
+                state_tensor = loss.detach().new_tensor(
+                    [1 if local_live else 0, 1 if local_cold_start else 0],
+                    dtype=torch.int32,
                 )
-            self._live_pair_gradient_contract_verified = True
-            if self._diag_main_rank:
-                print(
-                    "[LivePairGradientContract] "
-                    f"epoch={self.epoch} step={self.global_step} PASS "
-                    f"|gD_shared|={self._fmte(gd_scalar, 6)} "
-                    "carry=detached terminal_pair=live no_cross_round_BPTT=1"
+            else:
+                state_tensor = torch.tensor(
+                    [1 if local_live else 0, 1 if local_cold_start else 0],
+                    dtype=torch.int32,
+                )
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(state_tensor, op=dist.ReduceOp.MIN)
+            states = state_tensor.detach().cpu().tolist()
+            global_live = bool(int(states[0]) == 1)
+            global_cold_start = bool(int(states[1]) == 1)
+
+            if global_live:
+                self._live_pair_gradient_contract_verified = True
+                if self._diag_main_rank:
+                    print(
+                        "[LivePairGradientContract] "
+                        f"epoch={self.epoch} step={self.global_step} PASS "
+                        f"|gD_dz|={self._fmte(gd_scalar, 6)} "
+                        f"head_parameter_norm={self._fmte(head_parameter_norm, 6)} "
+                        "probe=shared_pair_z all_ranks=PASS"
+                    )
+            elif global_cold_start:
+                self._live_pair_gradient_cold_start_observed = True
+                if self._diag_main_rank:
+                    print(
+                        "[DistogramColdStartContract] "
+                        f"epoch={self.epoch} step={self.global_step} PASS "
+                        "donor_final_init=W0 expected_|dL_D/dz|=0 "
+                        f"|gD_dz|={self._fmte(gd_scalar, 6)} "
+                        f"head_parameter_norm={self._fmte(head_parameter_norm, 6)} "
+                        f"raw_loss={self._fmte(raw_disto, 6)} "
+                        f"valid_pairs={self._fmt(valid_pairs, 0)} "
+                        "next_batch_requires_live_pair_z=1"
+                    )
+            else:
+                raise RuntimeError(
+                    "V207.1_ABX_DISTOGRAM_TWO_STAGE contract failed: the run is "
+                    "neither a valid donor zero-initialized cold start nor a live "
+                    "weighted Distogram -> shared pair-z path. "
+                    f"step={self.global_step}, |gD_dz|={gd_scalar}, "
+                    f"head_parameter_norm={head_parameter_norm}, raw_loss={raw_disto}, "
+                    f"valid_pairs={valid_pairs}, "
+                    f"cold_start_seen={self._live_pair_gradient_cold_start_observed}."
                 )
 
         log_type = 'Validation' if val else 'Train'
@@ -1657,7 +1720,7 @@ class AbFlowTrainer(Trainer):
                 f"interface={self._fmt(self._scalar(interface_loss), 5)} "
                 f"edge={self._fmt(self._scalar(ed_loss), 5)} "
                 f"disto={self._fmt(_sf('abx_distogram_loss'), 5)} "
-                f"lddt={self._fmt(_sf('abx_smooth_lddt_loss'), 5)} "
+                f"lddt={self._fmt(_sf('mf_smooth_lddt_loss'), 5)} "
                 f"t=({self._fmt(_ad('t_min'), 3)},{self._fmt(_ad('t_mean'), 3)},{self._fmt(_ad('t_max'), 3)}) "
                 f"s={self._fmt(_sf('abx_single_rms'), 4)} "
                 f"z={self._fmt(_sf('abx_pair_rms'), 4)} "
@@ -1666,6 +1729,25 @@ class AbFlowTrainer(Trainer):
                 f"{self._fmt(_ad('abx_surf_edge_attr_rms'), 4)}) "
                 f"mask={self._fmt(_sf('abx_design_embedding_mask_rate'), 3)}"
             )
+            if bool(getattr(raw_model, "abx_distogram", False)):
+                print(
+                    "[DistoAudit] "
+                    f"epoch={self.epoch} step={self.global_step} "
+                    f"raw_loss={self._fmt(_sf('disto_raw_loss'), 6)} "
+                    f"weighted_loss={self._fmt(_sf('disto_weighted_loss'), 6)} "
+                    f"resolved_pseudo_beta_rate={self._fmt(_sf('disto_resolved_pseudo_beta_rate'), 4)} "
+                    f"resolved_atom_rate={self._fmt(_sf('disto_resolved_atom_rate'), 4)} "
+                    f"valid_pairs_total={self._fmt(_sf('disto_valid_pairs_total'), 0)} "
+                    f"pairs_DD={self._fmt(_sf('disto_design_design_pairs'), 0)} "
+                    f"pairs_DF={self._fmt(_sf('disto_design_framework_pairs'), 0)} "
+                    f"pairs_DA={self._fmt(_sf('disto_design_antigen_pairs'), 0)} "
+                    f"pairs_CC={self._fmt(_sf('disto_context_context_pairs'), 0)} "
+                    f"ce_DD={self._fmt(_sf('disto_ce_design_design'), 4)} "
+                    f"ce_DF={self._fmt(_sf('disto_ce_design_framework'), 4)} "
+                    f"ce_DA={self._fmt(_sf('disto_ce_design_antigen'), 4)} "
+                    f"ce_CC={self._fmt(_sf('disto_ce_context_context'), 4)} "
+                    f"contact_precision_8A_DA={self._fmt(_sf('disto_contact_precision_8A_design_antigen'), 4)}"
+                )
         if probe_grad_now:
             if (not val) and self._diag_main_rank:
                 def _ad(name):
@@ -1721,6 +1803,6 @@ class AbFlowTrainer(Trainer):
                 "distogram", scorefm_losses.get("abx_distogram_loss", scorefm_losses.get("mf_distogram_loss"))
             )
             self._accumulate_train_component(
-                "smooth_lddt", scorefm_losses.get("abx_smooth_lddt_loss", scorefm_losses.get("mf_smooth_lddt_loss"))
+                "smooth_lddt", scorefm_losses.get("mf_smooth_lddt_loss")
             )
         return loss
