@@ -1,6 +1,6 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
-# V208_JSON_AUTHORITY_R28_PARENT: R28 is R05+Pair; R29 is R28+Distogram;
+# V211_EVIDENCE_DRIVEN_R28_PARENT: R28 is R05+Pair; R29 is R28+Distogram;
 # R30 is R28+donor smooth-lDDT. Run settings, module switches and every loss
 # coefficient are read from the selected JSON. The V207.1 zero-init-aware
 # Distogram gradient contract is retained.
@@ -138,6 +138,9 @@ class AbFlowTrainer(Trainer):
         self._live_pair_gradient_contract_verified = False
         self._live_pair_gradient_cold_start_observed = False
         self._live_smooth_lddt_pair_gradient_contract_verified = False
+        self._live_smooth_lddt_pair_gradient_cold_start_observed = False
+        self._live_bridge_contract_verified = False
+        self._bridge_cold_start_observed = False
         self._grad_diag_enabled = _env_flag(
             "ABFLOW_GRAD_CONFLICT_DIAGNOSTICS", False
         )
@@ -274,10 +277,24 @@ class AbFlowTrainer(Trainer):
 
         if self._diag_main_rank:
             raw_model = model.module if hasattr(model, "module") else model
+            fingerprint_fn = getattr(
+                raw_model, "shared_initialization_fingerprint", None
+            )
+            if callable(fingerprint_fn):
+                fingerprint = fingerprint_fn()
+                print(
+                    "[V211SharedInitFingerprint] "
+                    f"sha256={fingerprint['sha256']} "
+                    f"parameter_tensors={fingerprint['parameter_tensors']} "
+                    f"parameter_elements={fingerprint['parameter_elements']} "
+                    f"excluded={fingerprint['excluded_prefix']}"
+                )
             print(
                 "[LossContract] "
-                f"sequence={getattr(raw_model, 'seq_ce_weight', 1.0):.4g} "
-                f"structure=1 interface=1 edge=1 "
+                f"sequence={getattr(raw_model, 'loss_sequence_weight', 1.0):.4g} "
+                f"structure={getattr(raw_model, 'loss_structure_weight', 1.0):.4g} "
+                f"interface={getattr(raw_model, 'loss_interface_weight', 1.0):.4g} "
+                f"edge={getattr(raw_model, 'loss_edge_weight', 1.0):.4g} "
                 f"distogram={getattr(raw_model, 'loss_distogram_weight', 0.0):.4g} "
                 f"smooth_lddt={getattr(raw_model, 'loss_smooth_lddt_weight', 0.0):.4g}"
             )
@@ -286,7 +303,8 @@ class AbFlowTrainer(Trainer):
                 f"R05_time={int(bool(getattr(raw_model, 'scorefm_time_embed', False)))} "
                 f"AbX_time={int(bool(getattr(getattr(raw_model, 'abx_repr', None), 'trunk', None) and getattr(raw_model.abx_repr.trunk, 'use_abx_time', False)))} "
                 f"AbX_recycling={int(bool(getattr(getattr(raw_model, 'abx_repr', None), 'trunk', None) and (getattr(raw_model.abx_repr.trunk, 'recycle_features', False) or getattr(raw_model.abx_repr.trunk, 'recycle_pos', False))))} "
-                "single=R05_dynamic+AbX pair=native_edge_attr recurrence=R05x3"
+                "single=R05_full+zero_start_AbX "
+                "pair=native_edge_zero_reparameterized recurrence=R05x3"
             )
 
 
@@ -895,10 +913,15 @@ class AbFlowTrainer(Trainer):
             "mf_smooth_lddt_intra_pairs": m("DTM/mf_smooth_lddt_intra_pairs/Validation"),
             "mf_smooth_lddt_scaffold_pairs": m("DTM/mf_smooth_lddt_scaffold_pairs/Validation"),
             "mf_smooth_lddt_antigen_pairs": m("DTM/mf_smooth_lddt_antigen_pairs/Validation"),
+            "mf_smooth_lddt_antigen_score": m("DTM/mf_smooth_lddt_antigen_score/Validation"),
+            "mf_smooth_lddt_fixed_context_pred_drift_rms": m("DTM/mf_smooth_lddt_fixed_context_pred_drift_rms/Validation"),
+            "mf_smooth_lddt_fixed_context_restored_rate": m("DTM/mf_smooth_lddt_fixed_context_restored_rate/Validation"),
             "mf_smooth_lddt_perfect_floor": m("DTM/mf_smooth_lddt_perfect_floor/Validation"),
             "mf_smooth_lddt_excess": m("DTM/mf_smooth_lddt_excess/Validation"),
             # Native-AbX pair diagnostics; smooth-lDDT remains an MF/Boltz loss.
             "abx_distogram_loss": m("DTM/abx_distogram_loss/Validation"),
+            "disto_all_pair_raw_loss": m("DTM/disto_all_pair_raw_loss/Validation"),
+            "disto_task_pair_fraction": m("DTM/disto_task_pair_fraction/Validation"),
             "abx_single_rms": m("DTM/abx_single_rms/Validation"),
             "abx_pair_rms": m("DTM/abx_pair_rms/Validation"),
             "abx_token_count": m("DTM/abx_token_count/Validation"),
@@ -915,6 +938,9 @@ class AbFlowTrainer(Trainer):
             "abx_ctx_edge_count": m("AbFlowDiag/abx_ctx_edge_count/Validation"),
             "abx_inter_edge_count": m("AbFlowDiag/abx_inter_edge_count/Validation"),
             "abx_surf_edge_count": m("AbFlowDiag/abx_surf_edge_count/Validation"),
+            "bridge_single_delta_to_base_ratio": m("AbFlowDiag/bridge_single_delta_to_base_ratio/Validation"),
+            "bridge_pair_delta_to_base_ratio_mean": m("AbFlowDiag/bridge_pair_delta_to_base_ratio_mean/Validation"),
+            "bridge_pair_delta_to_base_ratio_max": m("AbFlowDiag/bridge_pair_delta_to_base_ratio_max/Validation"),
             "h3ca_raw_r0": m("AbFlowDiag/val_proxy_round0_h3_ca_rmsd/Validation"),
             "h3ca_raw_r1": m("AbFlowDiag/val_proxy_round1_h3_ca_rmsd/Validation"),
             "h3ca_raw_r2": m("AbFlowDiag/val_proxy_round2_h3_ca_rmsd/Validation"),
@@ -1156,13 +1182,25 @@ class AbFlowTrainer(Trainer):
             f"{self._fmt(summary.get('abx_surf_edge_count'), 0)})"
         )
         print(
+            "[V211BridgeAuthorityAudit] "
+            f"epoch={self.epoch} "
+            f"single_delta_to_base={self._fmt(summary.get('bridge_single_delta_to_base_ratio'), 6)} "
+            f"pair_delta_to_base_mean={self._fmt(summary.get('bridge_pair_delta_to_base_ratio_mean'), 6)} "
+            f"pair_delta_to_base_max={self._fmt(summary.get('bridge_pair_delta_to_base_ratio_max'), 6)}"
+        )
+        print(
             "[R05AbXAuxAudit] "
             f"epoch={self.epoch} "
             f"disto={self._fmt(summary.get('abx_distogram_loss'), 5)} "
+            f"disto_all={self._fmt(summary.get('disto_all_pair_raw_loss'), 5)} "
+            f"task_pair_fraction={self._fmt(summary.get('disto_task_pair_fraction'), 4)} "
             f"lddt={self._fmt(summary.get('mf_smooth_lddt_loss'), 5)} "
             f"lddt_intra={self._fmt(summary.get('mf_smooth_lddt_intra_loss'), 5)} "
             f"lddt_scaffold={self._fmt(summary.get('mf_smooth_lddt_scaffold_loss'), 5)} "
             f"lddt_antigen={self._fmt(summary.get('mf_smooth_lddt_antigen_loss'), 5)} "
+            f"lddt_antigen_score={self._fmt(summary.get('mf_smooth_lddt_antigen_score'), 5)} "
+            f"fixed_context_drift_A={self._fmt(summary.get('mf_smooth_lddt_fixed_context_pred_drift_rms'), 5)} "
+            f"fixed_context_restored={self._fmt(summary.get('mf_smooth_lddt_fixed_context_restored_rate'), 4)} "
             f"pairs=({self._fmt(summary.get('mf_smooth_lddt_intra_pairs'), 0)},"
             f"{self._fmt(summary.get('mf_smooth_lddt_scaffold_pairs'), 0)},"
             f"{self._fmt(summary.get('mf_smooth_lddt_antigen_pairs'), 0)})"
@@ -1461,6 +1499,14 @@ class AbFlowTrainer(Trainer):
             and abs(float(getattr(raw_model, "loss_distogram_weight", 0.0))) > 0.0
         )
 
+    def _requires_live_bridge_contract(self):
+        raw_model = self.model.module if hasattr(self.model, "module") else self.model
+        return bool(
+            getattr(raw_model, "abx_native_repr", False)
+            and getattr(raw_model, "abx_bridge_mode", "")
+            == "zero_reparameterized"
+        )
+
     def _requires_live_smooth_lddt_pair_gradient_contract(self):
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
         return bool(
@@ -1590,7 +1636,7 @@ class AbFlowTrainer(Trainer):
         else:
             raw_model.last_gradient_diagnostics = {}
 
-        # V208 retains the V207.1 two-stage fail-fast Distogram contract.
+        # V211 retains the V207.1 two-stage fail-fast Distogram contract.
         #
         # AbX initializes the Distogram projection with init='final', i.e. W=0.
         # Before the first optimizer update the chain rule therefore gives
@@ -1689,7 +1735,7 @@ class AbFlowTrainer(Trainer):
                     )
             else:
                 raise RuntimeError(
-                    "V208_ABX_DISTOGRAM_TWO_STAGE contract failed: the run is "
+                    "V211_ABX_DISTOGRAM_TWO_STAGE contract failed: the run is "
                     "neither a valid donor zero-initialized cold start nor a live "
                     "weighted Distogram -> shared pair-z path. "
                     f"step={self.global_step}, |gD_dz|={gd_scalar}, "
@@ -1698,11 +1744,11 @@ class AbFlowTrainer(Trainer):
                     f"cold_start_seen={self._live_pair_gradient_cold_start_observed}."
                 )
 
-        # Unlike the zero-initialized Distogram projection, donor smooth-lDDT
-        # acts on final coordinates and should immediately reach the shared
-        # Pair state through native EGNN edge attributes. A finite raw loss is
-        # insufficient evidence: fail before the first expensive optimizer
-        # trajectory if the weighted auxiliary is detached from z.
+        # V211 uses an exact parent-preserving zero-start Pair adapter.  Thus
+        # smooth-lDDT is validly connected to final coordinates while dL/dz is
+        # mathematically zero on the first batch (W_z=0).  Admit this state once
+        # only; after the optimizer learns W_z, the next batch must prove a live
+        # weighted smooth-lDDT -> shared z path on every rank.
         if (
             probe_grad_now
             and self._requires_live_smooth_lddt_pair_gradient_contract()
@@ -1731,30 +1777,145 @@ class AbFlowTrainer(Trainer):
                 and isfinite(float(valid_pairs))
                 and float(valid_pairs) > 0.0
             )
+
+            pair_adapter_energy = []
+            for name, parameter in raw_model.named_parameters():
+                if name.endswith("edge_attr_linear.weight"):
+                    pair_adapter_energy.append(
+                        parameter.detach().float().square().sum()
+                    )
+            pair_adapter_norm = (
+                float(torch.sqrt(torch.stack(pair_adapter_energy).sum()).cpu().item())
+                if pair_adapter_energy else None
+            )
+            local_cold_start = bool(
+                not self._live_smooth_lddt_pair_gradient_cold_start_observed
+                and gl_scalar is not None
+                and isfinite(float(gl_scalar))
+                and abs(float(gl_scalar)) <= 1.0e-12
+                and pair_adapter_norm is not None
+                and isfinite(float(pair_adapter_norm))
+                and float(pair_adapter_norm) <= 1.0e-12
+                and raw_lddt is not None
+                and isfinite(float(raw_lddt))
+                and valid_pairs is not None
+                and isfinite(float(valid_pairs))
+                and float(valid_pairs) > 0.0
+            )
             state_tensor = loss.detach().new_tensor(
-                [1 if local_live else 0], dtype=torch.int32
+                [1 if local_live else 0, 1 if local_cold_start else 0],
+                dtype=torch.int32,
             ) if torch.is_tensor(loss) else torch.tensor(
-                [1 if local_live else 0], dtype=torch.int32
+                [1 if local_live else 0, 1 if local_cold_start else 0],
+                dtype=torch.int32,
             )
             if dist.is_available() and dist.is_initialized():
                 dist.all_reduce(state_tensor, op=dist.ReduceOp.MIN)
-            if int(state_tensor.detach().cpu().item()) != 1:
+            states = state_tensor.detach().cpu().tolist()
+            global_live = bool(int(states[0]) == 1)
+            global_cold_start = bool(int(states[1]) == 1)
+            if global_live:
+                self._live_smooth_lddt_pair_gradient_contract_verified = True
+                if self._diag_main_rank:
+                    print(
+                        "[LiveSmoothLDDTPairGradientContract] "
+                        f"epoch={self.epoch} step={self.global_step} PASS "
+                        f"|gL_dz|={self._fmte(gl_scalar, 6)} "
+                        f"pair_adapter_norm={self._fmte(pair_adapter_norm, 6)} "
+                        f"raw_loss={self._fmte(raw_lddt, 6)} "
+                        f"valid_pairs={self._fmt(valid_pairs, 0)} "
+                        "probe=shared_pair_z all_ranks=PASS"
+                    )
+            elif global_cold_start:
+                self._live_smooth_lddt_pair_gradient_cold_start_observed = True
+                if self._diag_main_rank:
+                    print(
+                        "[SmoothLDDTBridgeColdStartContract] "
+                        f"epoch={self.epoch} step={self.global_step} PASS "
+                        "parent_preserving_Wz0 expected_|dL/dz|=0 "
+                        f"|gL_dz|={self._fmte(gl_scalar, 6)} "
+                        f"pair_adapter_norm={self._fmte(pair_adapter_norm, 6)} "
+                        f"raw_loss={self._fmte(raw_lddt, 6)} "
+                        f"valid_pairs={self._fmt(valid_pairs, 0)} "
+                        "next_batch_requires_live_pair_z=1"
+                    )
+            else:
                 raise RuntimeError(
-                    "V208_MF_SMOOTH_LDDT_PAIR_Z contract failed: the weighted "
-                    "smooth-lDDT objective does not have a finite non-zero "
-                    "gradient on shared Pair z, or has no valid resolved design "
+                    "V211_MF_SMOOTH_LDDT_TWO_STAGE contract failed: the run is "
+                    "neither the single permitted zero-adapter cold start nor "
+                    "a live weighted smooth-lDDT -> shared Pair z path, or it "
+                    "has no valid resolved design "
                     f"pairs. step={self.global_step}, |gL_dz|={gl_scalar}, "
-                    f"raw_loss={raw_lddt}, valid_pairs={valid_pairs}."
+                    f"pair_adapter_norm={pair_adapter_norm}, "
+                    f"raw_loss={raw_lddt}, valid_pairs={valid_pairs}, "
+                    "cold_start_seen="
+                    f"{self._live_smooth_lddt_pair_gradient_cold_start_observed}."
                 )
-            self._live_smooth_lddt_pair_gradient_contract_verified = True
-            if self._diag_main_rank:
-                print(
-                    "[LiveSmoothLDDTPairGradientContract] "
-                    f"epoch={self.epoch} step={self.global_step} PASS "
-                    f"|gL_dz|={self._fmte(gl_scalar, 6)} "
-                    f"raw_loss={self._fmte(raw_lddt, 6)} "
-                    f"valid_pairs={self._fmt(valid_pairs, 0)} "
-                    "probe=shared_pair_z all_ranks=PASS"
+
+        # Common R28/R29/R30 bridge contract.  Step 0 must be the exact R05
+        # function (zero Single and Pair deltas); after one optimizer update,
+        # both donor routes must be measurably active.  This makes a detached or
+        # accidentally bypassed donor trunk fail before an expensive epoch.
+        if (
+            not val
+            and self._requires_live_bridge_contract()
+            and not self._live_bridge_contract_verified
+        ):
+            bridge_diag = getattr(raw_model, "last_abflow_diagnostics", None) or {}
+            single_ratio = self._scalar(
+                bridge_diag.get("bridge_single_delta_to_base_ratio")
+            )
+            pair_ratio = self._scalar(
+                bridge_diag.get("bridge_pair_delta_to_base_ratio_mean")
+            )
+            finite_ratios = bool(
+                single_ratio is not None and pair_ratio is not None
+                and isfinite(float(single_ratio)) and isfinite(float(pair_ratio))
+            )
+            local_cold = bool(
+                not self._bridge_cold_start_observed
+                and finite_ratios
+                and abs(float(single_ratio)) <= 1.0e-12
+                and abs(float(pair_ratio)) <= 1.0e-12
+            )
+            local_live = bool(
+                self._bridge_cold_start_observed
+                and finite_ratios
+                and float(single_ratio) > 1.0e-12
+                and float(pair_ratio) > 1.0e-12
+            )
+            states = loss.detach().new_tensor(
+                [1 if local_cold else 0, 1 if local_live else 0],
+                dtype=torch.int32,
+            )
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(states, op=dist.ReduceOp.MIN)
+            cold_all, live_all = [bool(int(v)) for v in states.cpu().tolist()]
+            if cold_all:
+                self._bridge_cold_start_observed = True
+                if self._diag_main_rank:
+                    print(
+                        "[V211BridgeColdStartPASS] "
+                        f"step={self.global_step} single_ratio={self._fmte(single_ratio, 3)} "
+                        f"pair_ratio={self._fmte(pair_ratio, 3)} "
+                        "parent_identity=exact next_batch_requires_live=1"
+                    )
+            elif live_all:
+                self._live_bridge_contract_verified = True
+                if self._diag_main_rank:
+                    print(
+                        "[V211BridgeLivePASS] "
+                        f"step={self.global_step} single_ratio={self._fmte(single_ratio, 3)} "
+                        f"pair_ratio={self._fmte(pair_ratio, 3)} all_ranks=PASS"
+                    )
+            else:
+                raise RuntimeError(
+                    "V211 Single/Pair bridge contract failed: expected exact "
+                    "zero deltas on the first batch and finite non-zero deltas "
+                    "on the next batch. "
+                    f"step={self.global_step}, single_ratio={single_ratio}, "
+                    f"pair_ratio={pair_ratio}, "
+                    f"cold_start_seen={self._bridge_cold_start_observed}."
                 )
 
         log_type = 'Validation' if val else 'Train'
@@ -1810,6 +1971,9 @@ class AbFlowTrainer(Trainer):
                 f"edge_z=({self._fmt(_ad('abx_ctx_edge_attr_rms'), 4)},"
                 f"{self._fmt(_ad('abx_inter_edge_attr_rms'), 4)},"
                 f"{self._fmt(_ad('abx_surf_edge_attr_rms'), 4)}) "
+                f"bridge_s={self._fmt(_ad('bridge_single_delta_to_base_ratio'), 6)} "
+                f"bridge_z_mean={self._fmt(_ad('bridge_pair_delta_to_base_ratio_mean'), 6)} "
+                f"bridge_z_max={self._fmt(_ad('bridge_pair_delta_to_base_ratio_max'), 6)} "
                 f"mask={self._fmt(_sf('abx_design_embedding_mask_rate'), 3)}"
             )
             if bool(getattr(raw_model, "abx_distogram", False)):
@@ -1817,10 +1981,14 @@ class AbFlowTrainer(Trainer):
                     "[DistoAudit] "
                     f"epoch={self.epoch} step={self.global_step} "
                     f"raw_loss={self._fmt(_sf('disto_raw_loss'), 6)} "
+                    f"all_pair_raw_loss={self._fmt(_sf('disto_all_pair_raw_loss'), 6)} "
                     f"weighted_loss={self._fmt(_sf('disto_weighted_loss'), 6)} "
+                    f"scope_design_anchored={self._fmt(_sf('disto_scope_design_anchored'), 0)} "
                     f"resolved_pseudo_beta_rate={self._fmt(_sf('disto_resolved_pseudo_beta_rate'), 4)} "
                     f"resolved_atom_rate={self._fmt(_sf('disto_resolved_atom_rate'), 4)} "
-                    f"valid_pairs_total={self._fmt(_sf('disto_valid_pairs_total'), 0)} "
+                    f"objective_pairs={self._fmt(_sf('disto_valid_pairs_total'), 0)} "
+                    f"donor_pairs={self._fmt(_sf('disto_donor_valid_pairs_total'), 0)} "
+                    f"task_pair_fraction={self._fmt(_sf('disto_task_pair_fraction'), 4)} "
                     f"pairs_DD={self._fmt(_sf('disto_design_design_pairs'), 0)} "
                     f"pairs_DF={self._fmt(_sf('disto_design_framework_pairs'), 0)} "
                     f"pairs_DA={self._fmt(_sf('disto_design_antigen_pairs'), 0)} "
@@ -1830,6 +1998,22 @@ class AbFlowTrainer(Trainer):
                     f"ce_DA={self._fmt(_sf('disto_ce_design_antigen'), 4)} "
                     f"ce_CC={self._fmt(_sf('disto_ce_context_context'), 4)} "
                     f"contact_precision_8A_DA={self._fmt(_sf('disto_contact_precision_8A_design_antigen'), 4)}"
+                )
+            if bool(getattr(raw_model, "mf_smooth_lddt", False)):
+                print(
+                    "[SmoothLDDTAudit] "
+                    f"epoch={self.epoch} step={self.global_step} "
+                    f"raw_loss={self._fmt(_sf('mf_smooth_lddt_loss'), 6)} "
+                    f"weighted_loss={self._fmt(_sf('mf_smooth_lddt_weighted_loss'), 6)} "
+                    f"loss_DD={self._fmt(_sf('mf_smooth_lddt_intra_loss'), 5)} "
+                    f"loss_DF={self._fmt(_sf('mf_smooth_lddt_scaffold_loss'), 5)} "
+                    f"loss_DA={self._fmt(_sf('mf_smooth_lddt_antigen_loss'), 5)} "
+                    f"score_DA={self._fmt(_sf('mf_smooth_lddt_antigen_score'), 5)} "
+                    f"pairs=({self._fmt(_sf('mf_smooth_lddt_intra_pairs'), 0)},"
+                    f"{self._fmt(_sf('mf_smooth_lddt_scaffold_pairs'), 0)},"
+                    f"{self._fmt(_sf('mf_smooth_lddt_antigen_pairs'), 0)}) "
+                    f"fixed_context_drift_A={self._fmt(_sf('mf_smooth_lddt_fixed_context_pred_drift_rms'), 5)} "
+                    f"fixed_context_restored_rate={self._fmt(_sf('mf_smooth_lddt_fixed_context_restored_rate'), 4)}"
                 )
         if probe_grad_now:
             if (not val) and self._diag_main_rank:

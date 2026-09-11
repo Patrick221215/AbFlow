@@ -173,13 +173,14 @@ else
 fi
 
 echo "============================================================"
-echo "[V208JSONAuthority] exp=$ABFLOW_EXP_ID"
-echo "[V208JSONAuthority] config=$CONFIG_PATH"
-echo "[V208JSONAuthority] GPUs=$ABFLOW_JSON_GPU_LIST world_size=$ABFLOW_JSON_WORLD_SIZE port=$ABFLOW_JSON_MASTER_PORT"
-echo "[V208JSONAuthority] save_dir=$ABFLOW_JSON_SAVE_DIR version=$RUN_VERSION force_scratch=$ABFLOW_JSON_FORCE_SCRATCH"
-echo "[V208JSONAuthority] pair=$ABFLOW_ABX_NATIVE_REPR distogram=$ABFLOW_ABX_DISTOGRAM smooth_lddt=$ABFLOW_MF_SMOOTH_LDDT"
-echo "[V208JSONAuthority] weights=seq:$ABFLOW_LOSS_SEQUENCE_WEIGHT,struct:$ABFLOW_LOSS_STRUCTURE_WEIGHT,interface:$ABFLOW_LOSS_INTERFACE_WEIGHT,edge:$ABFLOW_LOSS_EDGE_WEIGHT,disto:$ABFLOW_LOSS_DISTOGRAM_WEIGHT,lddt:$ABFLOW_LOSS_SMOOTH_LDDT_WEIGHT"
-echo "[V208JSONAuthority] JSON controls run, architecture, objective and loss coefficients"
+echo "[V211JSONAuthority] exp=$ABFLOW_EXP_ID"
+echo "[V211JSONAuthority] config=$CONFIG_PATH"
+echo "[V211JSONAuthority] GPUs=$ABFLOW_JSON_GPU_LIST world_size=$ABFLOW_JSON_WORLD_SIZE port=$ABFLOW_JSON_MASTER_PORT"
+echo "[V211JSONAuthority] save_dir=$ABFLOW_JSON_SAVE_DIR version=$RUN_VERSION force_scratch=$ABFLOW_JSON_FORCE_SCRATCH"
+echo "[V211JSONAuthority] pair=$ABFLOW_ABX_NATIVE_REPR bridge=$ABFLOW_ABX_BRIDGE_MODE distogram=$ABFLOW_ABX_DISTOGRAM disto_scope=$ABFLOW_DISTOGRAM_PAIR_SCOPE smooth_lddt=$ABFLOW_MF_SMOOTH_LDDT lddt_context=$ABFLOW_SMOOTH_LDDT_CONTEXT_MODE"
+echo "[V211JSONAuthority] RNG=abx_init:$ABFLOW_ABX_INIT_SEED,abx_forward_dropout:$ABFLOW_ABX_FORWARD_SEED"
+echo "[V211JSONAuthority] weights=seq:$ABFLOW_LOSS_SEQUENCE_WEIGHT,struct:$ABFLOW_LOSS_STRUCTURE_WEIGHT,interface:$ABFLOW_LOSS_INTERFACE_WEIGHT,edge:$ABFLOW_LOSS_EDGE_WEIGHT,disto:$ABFLOW_LOSS_DISTOGRAM_WEIGHT,lddt:$ABFLOW_LOSS_SMOOTH_LDDT_WEIGHT"
+echo "[V211JSONAuthority] JSON controls run, architecture, objective and loss coefficients"
 echo "============================================================"
 
 cd "$CODE_DIR"
