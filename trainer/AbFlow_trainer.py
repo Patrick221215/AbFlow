@@ -1,8 +1,9 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
-# V207.1_GOLD_STANDARD: R28/R29/R30 causal ladder with donor-faithful
-# Distogram/smooth-lDDT objectives and a two-stage zero-init-aware pair-gradient
-# contract. Sequence-path, DDP, EMA and formal Train->Val->Test audits remain.
+# V208_JSON_AUTHORITY_R28_PARENT: R28 is R05+Pair; R29 is R28+Distogram;
+# R30 is R28+donor smooth-lDDT. Run settings, module switches and every loss
+# coefficient are read from the selected JSON. The V207.1 zero-init-aware
+# Distogram gradient contract is retained.
 # V203_FORMAL_TRAIN_VAL_TEST_EVERY_EPOCH
 # Fixed project protocol: every epoch executes Train -> Val -> formal EMA Test generation.
 # Test failures are fail-fast and may never be silently converted into NaN summaries.
@@ -107,7 +108,7 @@ class AbFlowTrainer(Trainer):
         # Epoch-level scientific summaries.  These are observational only and
         # never participate in gradient computation or checkpoint selection.
         # We keep only the formal top-level objective components so the canonical
-        # epoch table stays compact and directly comparable across R08/R09/R10.
+        # epoch table stays compact and directly comparable across R28/R29/R30.
         self._train_component_names = (
             "loss", "seq", "structure", "interface", "edge",
             "distogram", "smooth_lddt"
@@ -136,6 +137,7 @@ class AbFlowTrainer(Trainer):
         # a live weighted L_distogram -> shared pair-z gradient on every rank.
         self._live_pair_gradient_contract_verified = False
         self._live_pair_gradient_cold_start_observed = False
+        self._live_smooth_lddt_pair_gradient_contract_verified = False
         self._grad_diag_enabled = _env_flag(
             "ABFLOW_GRAD_CONFLICT_DIAGNOSTICS", False
         )
@@ -148,7 +150,7 @@ class AbFlowTrainer(Trainer):
             "ABFLOW_SCI_LOG_INTERVAL", int(getattr(config, "log_interval", 20))
         ))
 
-        # Epoch-0 R08/R10 summaries exposed rare ~1e5-1e6 structure-loss means
+        # Earlier R28/R30 summaries exposed rare ~1e5-1e6 structure-loss means
         # that were invisible in rank-0 tqdm.  Record the first true per-rank
         # outlier in run_time.log instead of guessing whether this is aggregation
         # error or a real hard sample on another DDP rank.  Observational only.
@@ -274,10 +276,8 @@ class AbFlowTrainer(Trainer):
             raw_model = model.module if hasattr(model, "module") else model
             print(
                 "[LossContract] "
-                f"sequence={getattr(raw_model, 'loss_sequence_weight', 1.0):.4g} "
-                f"structure={getattr(raw_model, 'loss_structure_weight', 1.0):.4g} "
-                f"interface={getattr(raw_model, 'loss_interface_weight', 1.0):.4g} "
-                f"edge={getattr(raw_model, 'loss_edge_weight', 1.0):.4g} "
+                f"sequence={getattr(raw_model, 'seq_ce_weight', 1.0):.4g} "
+                f"structure=1 interface=1 edge=1 "
                 f"distogram={getattr(raw_model, 'loss_distogram_weight', 0.0):.4g} "
                 f"smooth_lddt={getattr(raw_model, 'loss_smooth_lddt_weight', 0.0):.4g}"
             )
@@ -1248,21 +1248,29 @@ class AbFlowTrainer(Trainer):
         # Distogram and the generator share AbX z, not the later R05 H_0 probe.
         # Ratios below are therefore mathematically comparable on one tensor.
         gz_d = g("grad_pair_norm_distogram")
+        gz_l = g("grad_pair_norm_smooth_lddt")
         gz_t = g("grad_pair_norm_endpoint")
         gz_s = g("grad_pair_norm_structure")
         ratio_dt = None if gz_d is None or gz_t is None or abs(gz_t) <= 1e-20 else gz_d / gz_t
         ratio_ds = None if gz_d is None or gz_s is None or abs(gz_s) <= 1e-20 else gz_d / gz_s
-        if any(v is not None for v in (gz_d, gz_t, gz_s)):
+        ratio_lt = None if gz_l is None or gz_t is None or abs(gz_t) <= 1e-20 else gz_l / gz_t
+        ratio_ls = None if gz_l is None or gz_s is None or abs(gz_s) <= 1e-20 else gz_l / gz_s
+        if any(v is not None for v in (gz_d, gz_l, gz_t, gz_s)):
             print(
                 "[PairLossAuthority] "
                 f"epoch={self.epoch} step={self.global_step} probe=z "
                 f"|gD|={self._fmte(gz_d, 3)} "
+                f"|gL|={self._fmte(gz_l, 3)} "
                 f"|gT|={self._fmte(gz_t, 3)} "
                 f"|gStruct|={self._fmte(gz_s, 3)} "
                 f"D/T={self._fmt(ratio_dt, 4)} "
                 f"D/Struct={self._fmt(ratio_ds, 4)} "
+                f"L/T={self._fmt(ratio_lt, 4)} "
+                f"L/Struct={self._fmt(ratio_ls, 4)} "
                 f"cos(D,T)={self._fmt(g('grad_pair_cos_distogram_endpoint'), 4)} "
-                f"cos(D,Struct)={self._fmt(g('grad_pair_cos_distogram_structure'), 4)}"
+                f"cos(D,Struct)={self._fmt(g('grad_pair_cos_distogram_structure'), 4)} "
+                f"cos(L,T)={self._fmt(g('grad_pair_cos_smooth_lddt_endpoint'), 4)} "
+                f"cos(L,Struct)={self._fmt(g('grad_pair_cos_smooth_lddt_structure'), 4)}"
             )
 
 
@@ -1453,14 +1461,30 @@ class AbFlowTrainer(Trainer):
             and abs(float(getattr(raw_model, "loss_distogram_weight", 0.0))) > 0.0
         )
 
+    def _requires_live_smooth_lddt_pair_gradient_contract(self):
+        raw_model = self.model.module if hasattr(self.model, "module") else self.model
+        return bool(
+            getattr(raw_model, "abx_native_repr", False)
+            and getattr(raw_model, "mf_smooth_lddt", False)
+            and abs(float(getattr(raw_model, "loss_smooth_lddt_weight", 0.0))) > 0.0
+        )
+
     def _should_probe_grad(self, val):
-        # R29 gets one immediate first-batch pair-z connectivity probe. After
-        # it passes, interval=0 returns to the once-per-epoch authority audit.
+        # R29/R30 get immediate pair-z connectivity probes. After the active
+        # auxiliary passes, interval=0 returns to once-per-epoch authority audit.
         if (
             (not val)
             and self._grad_diag_enabled
-            and self._requires_live_pair_gradient_contract()
-            and not self._live_pair_gradient_contract_verified
+            and (
+                (
+                    self._requires_live_pair_gradient_contract()
+                    and not self._live_pair_gradient_contract_verified
+                )
+                or (
+                    self._requires_live_smooth_lddt_pair_gradient_contract()
+                    and not self._live_smooth_lddt_pair_gradient_contract_verified
+                )
+            )
         ):
             return True
         step = int(self.global_step)
@@ -1566,7 +1590,7 @@ class AbFlowTrainer(Trainer):
         else:
             raw_model.last_gradient_diagnostics = {}
 
-        # V207.1 two-stage fail-fast contract.
+        # V208 retains the V207.1 two-stage fail-fast Distogram contract.
         #
         # AbX initializes the Distogram projection with init='final', i.e. W=0.
         # Before the first optimizer update the chain rule therefore gives
@@ -1665,13 +1689,72 @@ class AbFlowTrainer(Trainer):
                     )
             else:
                 raise RuntimeError(
-                    "V207.1_ABX_DISTOGRAM_TWO_STAGE contract failed: the run is "
+                    "V208_ABX_DISTOGRAM_TWO_STAGE contract failed: the run is "
                     "neither a valid donor zero-initialized cold start nor a live "
                     "weighted Distogram -> shared pair-z path. "
                     f"step={self.global_step}, |gD_dz|={gd_scalar}, "
                     f"head_parameter_norm={head_parameter_norm}, raw_loss={raw_disto}, "
                     f"valid_pairs={valid_pairs}, "
                     f"cold_start_seen={self._live_pair_gradient_cold_start_observed}."
+                )
+
+        # Unlike the zero-initialized Distogram projection, donor smooth-lDDT
+        # acts on final coordinates and should immediately reach the shared
+        # Pair state through native EGNN edge attributes. A finite raw loss is
+        # insufficient evidence: fail before the first expensive optimizer
+        # trajectory if the weighted auxiliary is detached from z.
+        if (
+            probe_grad_now
+            and self._requires_live_smooth_lddt_pair_gradient_contract()
+            and not self._live_smooth_lddt_pair_gradient_contract_verified
+        ):
+            grad_diag = getattr(raw_model, "last_gradient_diagnostics", None) or {}
+            gl_scalar = self._scalar(grad_diag.get("grad_pair_norm_smooth_lddt"))
+            scorefm_now = getattr(raw_model, "last_scorefm_losses", None) or {}
+            raw_lddt = self._scalar(scorefm_now.get("mf_smooth_lddt_loss"))
+            pair_counts = [
+                self._scalar(scorefm_now.get(f"mf_smooth_lddt_{name}_pairs"))
+                for name in ("intra", "scaffold", "antigen")
+            ]
+            valid_pairs = (
+                sum(float(value) for value in pair_counts if value is not None)
+                if any(value is not None for value in pair_counts)
+                else None
+            )
+            local_live = bool(
+                gl_scalar is not None
+                and isfinite(float(gl_scalar))
+                and float(gl_scalar) > 1.0e-12
+                and raw_lddt is not None
+                and isfinite(float(raw_lddt))
+                and valid_pairs is not None
+                and isfinite(float(valid_pairs))
+                and float(valid_pairs) > 0.0
+            )
+            state_tensor = loss.detach().new_tensor(
+                [1 if local_live else 0], dtype=torch.int32
+            ) if torch.is_tensor(loss) else torch.tensor(
+                [1 if local_live else 0], dtype=torch.int32
+            )
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(state_tensor, op=dist.ReduceOp.MIN)
+            if int(state_tensor.detach().cpu().item()) != 1:
+                raise RuntimeError(
+                    "V208_MF_SMOOTH_LDDT_PAIR_Z contract failed: the weighted "
+                    "smooth-lDDT objective does not have a finite non-zero "
+                    "gradient on shared Pair z, or has no valid resolved design "
+                    f"pairs. step={self.global_step}, |gL_dz|={gl_scalar}, "
+                    f"raw_loss={raw_lddt}, valid_pairs={valid_pairs}."
+                )
+            self._live_smooth_lddt_pair_gradient_contract_verified = True
+            if self._diag_main_rank:
+                print(
+                    "[LiveSmoothLDDTPairGradientContract] "
+                    f"epoch={self.epoch} step={self.global_step} PASS "
+                    f"|gL_dz|={self._fmte(gl_scalar, 6)} "
+                    f"raw_loss={self._fmte(raw_lddt, 6)} "
+                    f"valid_pairs={self._fmt(valid_pairs, 0)} "
+                    "probe=shared_pair_z all_ranks=PASS"
                 )
 
         log_type = 'Validation' if val else 'Train'

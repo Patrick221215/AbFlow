@@ -27,13 +27,13 @@ from utils.epoch_test import (
     run_cal_metrics_rank0,
     cleanup_structures,
     dist_info,
-    normalize_test_cdr,
+    resolve_eval_cdr_type,
 )
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="DDP EMA-checkpoint AbFlow test")
-    p.add_argument("--ckpt", required=True)
+    p.add_argument("--ckpt", default=None)
     p.add_argument("--test_set", required=True)
     p.add_argument("--save_dir", required=True)
     p.add_argument("--pep_file", default=None)
@@ -43,9 +43,21 @@ def parse_args():
     p.add_argument("--n_steps", type=int, default=10)
     p.add_argument("--base_seed", type=int, default=2023)
     p.add_argument("--metric_workers", type=int, default=8)
-    p.add_argument("--cdr", default=os.environ.get("ABFLOW_EPOCH_TEST_CDR", "H3"))
+    p.add_argument(
+        "--eval_cdr",
+        default=None,
+        help=(
+            "Optional explicit metric/design region (for example H3). Default: "
+            "model.cdr_type, then canonical model.paratope fallback."
+        ),
+    )
     p.add_argument("--show_sample_progress", action="store_true")
     p.add_argument("--delete_structures_after_metrics", action="store_true")
+    p.add_argument(
+        "--metrics_only",
+        action="store_true",
+        help="Reuse save_dir/summary.json and generated PDBs; skip model loading/sampling.",
+    )
     return p.parse_args()
 
 
@@ -95,19 +107,41 @@ def main():
     rank, world_size, device = init_distributed()
 
     try:
+        if args.metrics_only:
+            summary_file = (
+                os.path.join(os.path.abspath(args.save_dir), "summary.json")
+                if rank == 0 else None
+            )
+            metrics = run_cal_metrics_rank0(
+                summary_file=summary_file,
+                save_dir=args.save_dir,
+                project_root=str(PROJECT_ROOT),
+                num_workers=args.metric_workers,
+            )
+            if rank == 0:
+                print("[StandaloneEpochTest] mode=metrics_only")
+                print(f"[StandaloneEpochTest] world_size={world_size}")
+                print_legacy_metric_lines(metrics)
+            if args.delete_structures_after_metrics:
+                cleanup_structures(args.save_dir)
+            return
+
+        if args.eval_cdr:
+            os.environ["ABFLOW_EPOCH_TEST_CDR"] = str(args.eval_cdr)
+        if not args.ckpt:
+            raise ValueError("--ckpt is required unless --metrics_only is used.")
         model = load_model_compat(args.ckpt, map_location="cpu")
         model = ensure_model_runtime_compat(model)
         model.to(device)
         model.eval()
 
-        formal_cdr = normalize_test_cdr(args.cdr)
-        if rank == 0:
-            print(f"[V207StandaloneTestContract] cdr={formal_cdr}")
+        eval_cdr_type, eval_cdr_source = resolve_eval_cdr_type(model)
+
         test_set = E2EDataset(
             args.test_set,
             pep_file=args.pep_file,
             surf_file=args.surf_file,
-            cdr=formal_cdr,
+            cdr=eval_cdr_type,
         )
 
         generation = generate_distributed(
@@ -119,19 +153,21 @@ def main():
             n_steps=args.n_steps,
             base_seed=args.base_seed,
             show_sample_progress=args.show_sample_progress,
-            cdr_type=formal_cdr,
         )
         metrics = run_cal_metrics_rank0(
             summary_file=generation.summary_file,
             save_dir=args.save_dir,
             project_root=str(PROJECT_ROOT),
             num_workers=args.metric_workers,
-            cdr_type=formal_cdr,
         )
 
         if rank == 0:
-            print("[StandaloneEpochTest] protocol=logical_batch_seeded_v1")
+            print("[StandaloneEpochTest] protocol=logical_batch_seeded_v2")
             print(f"[StandaloneEpochTest] world_size={world_size}")
+            print(
+                "[StandaloneEpochTest] "
+                f"eval_cdr={eval_cdr_type} source={eval_cdr_source}"
+            )
             print_legacy_metric_lines(metrics)
 
         if args.delete_structures_after_metrics:

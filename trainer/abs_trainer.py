@@ -97,7 +97,7 @@ class Trainer:
             self.model_dir = ckpt_dir
             self.config.resume_checkpoint = resume_checkpoint
         else:
-            # Formal R08-R10 launchers set one explicit version for the whole
+            # The formal R28-R30 launcher sets one explicit version for the whole
             # torchrun job.  Without this, two DDP ranks can race in _get_version():
             # rank0 observes no directory and chooses version_0 while rank1 sees
             # the just-created version_0 and chooses version_1.

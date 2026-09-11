@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# AbFlow v103 formal Test entry.
+# AbFlow V207 formal Test entry (shared by in-Trainer and standalone testing).
 #
 # RAbD path:
 #   - one checkpoint / one model snapshot
@@ -12,32 +12,64 @@ set -euo pipefail
 # Other historical tasks keep the legacy single-process path below.
 
 CODE_DIR=$(realpath "$(dirname "$0")/../..")
-NUM_WORKERS="${ABFLOW_EPOCH_TEST_METRIC_WORKERS:-${NUM_WORKERS:-8}}"
-BATCH_SIZE="${ABFLOW_EPOCH_TEST_BATCH_SIZE:-${BATCH_SIZE:-16}}"
+NUM_WORKERS="${ABFLOW_EPOCH_TEST_METRIC_WORKERS:-${NUM_WORKERS:-4}}"
+BATCH_SIZE="${ABFLOW_EPOCH_TEST_BATCH_SIZE:-${BATCH_SIZE:-20}}"
 N_STEPS="${ABFLOW_EPOCH_TEST_N_STEPS:-${N_STEPS:-10}}"
 BASE_SEED="${ABFLOW_EPOCH_TEST_BASE_SEED:-2023}"
-TEST_CDR="${ABFLOW_EPOCH_TEST_CDR:-H3}"
+EVAL_CDR="${ABFLOW_EPOCH_TEST_CDR:-}"
 SHOW_SAMPLE_PROGRESS="${ABFLOW_EPOCH_TEST_SHOW_SAMPLE_PROGRESS:-${SHOW_SAMPLE_PROGRESS:-1}}"
 KEEP_STRUCTURES="${ABFLOW_EPOCH_TEST_KEEP_STRUCTURES:-on}"
+METRICS_ONLY="${ABFLOW_EPOCH_TEST_METRICS_ONLY:-off}"
 GPU="${GPU:-0}"
+PORT="${PORT:-29500}"
 
-CKPT="${1:-}"
-TEST_SET="${2:-}"
-SAVE_DIR="${3:-}"
-TASK="${4:-rabd}"
-SURF_FILE="${5:-}"
+MODE="generate"
+if [[ "${1:-}" == "metrics-only" ]]; then
+  MODE="metrics-only"
+  CKPT=""
+  TEST_SET="${2:-}"
+  SAVE_DIR="${3:-}"
+  TASK="${4:-rabd}"
+  SURF_FILE="${5:-}"
+  METRICS_ONLY="on"
+else
+  CKPT="${1:-}"
+  TEST_SET="${2:-}"
+  SAVE_DIR="${3:-}"
+  TASK="${4:-rabd}"
+  SURF_FILE="${5:-}"
+fi
 
-if [[ -z "$CKPT" || -z "$TEST_SET" ]]; then
+if [[ -z "$TEST_SET" || ( "$MODE" == "generate" && -z "$CKPT" ) ]]; then
   echo "Usage: GPU=2,3 bash $0 <checkpoint> <test set> [save_dir] [task] [surf_file]"
+  echo "       GPU=0 bash $0 metrics-only <test set> <existing_save_dir> [task] [surf_file]"
   echo "  task: rabd (formal DDP parity path), igfold, or custom path"
   exit 2
 fi
+if [[ "$MODE" == "metrics-only" && "$TASK" != "rabd" ]]; then
+  echo "[ERROR] metrics-only is supported only for the formal rabd path." >&2
+  exit 2
+fi
 
-CKPT=$(realpath "$CKPT")
+if [[ "$MODE" == "generate" ]]; then
+  [[ -f "$CKPT" ]] || { echo "[ERROR] checkpoint not found: $CKPT" >&2; exit 2; }
+fi
+[[ -f "$TEST_SET" ]] || { echo "[ERROR] test set not found: $TEST_SET" >&2; exit 2; }
+[[ "$BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || { echo "[ERROR] BATCH_SIZE must be positive: $BATCH_SIZE" >&2; exit 2; }
+[[ "$N_STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "[ERROR] N_STEPS must be positive: $N_STEPS" >&2; exit 2; }
+[[ "$NUM_WORKERS" =~ ^[1-9][0-9]*$ ]] || { echo "[ERROR] NUM_WORKERS must be positive: $NUM_WORKERS" >&2; exit 2; }
+
+if [[ "$MODE" == "generate" ]]; then
+  CKPT=$(realpath "$CKPT")
+fi
 TEST_SET=$(realpath "$TEST_SET")
 TEST_DIR=$(dirname "$TEST_SET")
 
 if [[ -z "$SAVE_DIR" ]]; then
+  if [[ "$MODE" == "metrics-only" ]]; then
+    echo "[ERROR] metrics-only requires an existing save_dir." >&2
+    exit 2
+  fi
   SAVE_DIR="$(dirname "$CKPT")/results"
 fi
 mkdir -p "$SAVE_DIR"
@@ -68,7 +100,6 @@ if [[ "$TASK" == "rabd" ]]; then
   export ABFLOW_PROJECT_ROOT="$CODE_DIR"
 
   ARGS=(
-    --ckpt "$CKPT"
     --test_set "$TEST_SET"
     --save_dir "$SAVE_DIR"
     --pep_file "$PEP_FILE"
@@ -77,8 +108,15 @@ if [[ "$TASK" == "rabd" ]]; then
     --n_steps "$N_STEPS"
     --base_seed "$BASE_SEED"
     --metric_workers "$NUM_WORKERS"
-    --cdr "$TEST_CDR"
   )
+
+  if [[ "$MODE" == "generate" ]]; then
+    ARGS+=(--ckpt "$CKPT")
+  fi
+
+  if [[ -n "$EVAL_CDR" ]]; then
+    ARGS+=(--eval_cdr "$EVAL_CDR")
+  fi
 
   case "${SHOW_SAMPLE_PROGRESS,,}" in
     1|true|yes|y|on) ARGS+=(--show_sample_progress) ;;
@@ -86,17 +124,23 @@ if [[ "$TASK" == "rabd" ]]; then
   case "${KEEP_STRUCTURES,,}" in
     0|false|no|n|off) ARGS+=(--delete_structures_after_metrics) ;;
   esac
+  case "${METRICS_ONLY,,}" in
+    1|true|yes|y|on) ARGS+=(--metrics_only) ;;
+  esac
 
   echo "[FormalTest] task=rabd"
-  echo "[FormalTest] checkpoint=$CKPT"
+  echo "[FormalTest] mode=$MODE checkpoint=${CKPT:-not_used}"
   echo "[FormalTest] GPUs=$GPU world_size=$NPROC"
   echo "[FormalTest] test_set=$TEST_SET"
-  echo "[FormalTest] logical_batch_size=$BATCH_SIZE n_steps=$N_STEPS base_seed=$BASE_SEED cdr=$TEST_CDR"
+  echo "[FormalTest] logical_batch_size=$BATCH_SIZE n_steps=$N_STEPS base_seed=$BASE_SEED"
+  echo "[FormalTest] eval_cdr=${EVAL_CDR:-checkpoint_contract} metric_workers=$NUM_WORKERS"
+  echo "[FormalTest] metrics_only=$METRICS_ONLY keep_structures=$KEEP_STRUCTURES"
   echo "[FormalTest] save_dir=$SAVE_DIR"
 
   cd "$CODE_DIR"
+  export PYTHONUNBUFFERED=1
   if (( NPROC > 1 )); then
-    torchrun --standalone --nproc_per_node="$NPROC" \
+    torchrun --nproc_per_node="$NPROC" --master_port="$PORT" \
       scripts/test/generate_epoch_test_ddp.py "${ARGS[@]}"
   else
     python scripts/test/generate_epoch_test_ddp.py "${ARGS[@]}"

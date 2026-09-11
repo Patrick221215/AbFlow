@@ -13,6 +13,9 @@ Design goals
    streams from ``torch.randn``, ``torch.randint``, ``torch.multinomial`` and
    ``torch.rand`` inside AbFlow sampling.
 4. Never feed test metrics back into optimization/model selection.
+5. Fail before PDB metrics if sampling changes any residue outside the exact
+   JSON-defined design mask. The current formal configs select H3, but the
+   invariant itself is task-generic.
 
 This module does not modify model parameters, losses, samplers or scientific
 configuration.  The Trainer wrapper is responsible for applying EMA and for
@@ -21,6 +24,7 @@ saving/restoring the training RNG state around this evaluator.
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import re
@@ -38,8 +42,6 @@ import torch.distributed as dist
 from data.dataset import E2EDataset
 from data.pdb_utils import VOCAB, Residue, Peptide, Protein, AgAbComplex
 
-
-V207_EXPLICIT_EPOCH_TEST_CDR_CONTRACT = True
 
 METRIC_NAMES = [
     "AAR H3",
@@ -78,6 +80,25 @@ TB_METRICS = {
     "DockQ_above_0.8": "Test/DockQ_above_0.8",
 }
 
+# These fields are produced for both the single-CDR and whole-antibody branches
+# of the original ``cal_metrics.py``.  A zero return code without all of them is
+# not a valid Test result (for example, a truncated worker log must not be
+# accepted as a successful evaluation).
+CORE_METRIC_KEYS = {
+    "AAR_mean",
+    "CAAR_mean",
+    "RMSDCA_aligned_mean",
+    "RMSDCA_CDRH3_mean",
+    "RMSDCA_CDRH3_aligned_mean",
+    "TMscore_mean",
+    "LDDT_mean",
+    "DockQ_mean",
+    "DockQ_above_0.23",
+    "DockQ_above_0.49",
+    "DockQ_above_0.8",
+}
+CDR_NAME_RE = re.compile(r"^[HL][123]$")
+
 
 def _metric_key(name: str) -> str:
     return (
@@ -103,6 +124,131 @@ def parse_cal_metrics_output(text: str) -> Dict[str, float]:
             out["DockQ_above_0.49"] = float(dm.group("p49"))
             out["DockQ_above_0.8"] = float(dm.group("p80"))
     return out
+
+
+def _normalise_cdr_type(value):
+    """Return a cal_metrics-compatible CDR selection or ``None``.
+
+    Older checkpoints sometimes stored ``cdr_type=None`` while keeping the
+    actual design region in ``model.paratope``.  Treating that checkpoint as a
+    whole-antibody task silently inflates AAR because unchanged framework
+    residues dominate the average.  This normaliser only accepts canonical CDR
+    names and therefore cannot turn an arbitrary paratope definition into a CDR
+    task by accident.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        parts = [x.strip().upper() for x in re.split(r"[,\s]+", value) if x.strip()]
+    elif isinstance(value, (list, tuple, set)):
+        parts = [str(x).strip().upper() for x in value if str(x).strip()]
+    else:
+        return None
+    if not parts or any(CDR_NAME_RE.fullmatch(x) is None for x in parts):
+        return None
+    parts = list(dict.fromkeys(parts))
+    return parts[0] if len(parts) == 1 else parts
+
+
+def resolve_eval_cdr_type(model):
+    """Resolve the metric region without changing model sampling semantics."""
+    env_value = os.environ.get("ABFLOW_EPOCH_TEST_CDR", "").strip()
+    if env_value:
+        resolved = _normalise_cdr_type(env_value)
+        if resolved is None:
+            raise ValueError(
+                "ABFLOW_EPOCH_TEST_CDR must contain canonical CDR names "
+                f"(H1/H2/H3/L1/L2/L3), got {env_value!r}."
+            )
+        return resolved, "env"
+
+    resolved = _normalise_cdr_type(getattr(model, "cdr_type", None))
+    if resolved is not None:
+        return resolved, "model.cdr_type"
+
+    resolved = _normalise_cdr_type(getattr(model, "paratope", None))
+    if resolved is not None:
+        return resolved, "model.paratope_fallback"
+    return None, "whole_antibody"
+
+
+def _atomic_write_json(path: str, payload: object) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fout:
+        json.dump(payload, fout, ensure_ascii=False, indent=2, sort_keys=True)
+        fout.write("\n")
+    os.replace(tmp, path)
+
+
+def _log_tail(text: str, max_lines: int = 80) -> str:
+    lines = text.rstrip().splitlines()
+    return "\n".join(lines[-max(1, int(max_lines)):])
+
+
+def _metric_validation_error(metrics: Dict[str, float]) -> str:
+    missing = sorted(CORE_METRIC_KEYS.difference(metrics))
+    nonfinite = sorted(
+        key for key, value in metrics.items()
+        if not math.isfinite(float(value))
+    )
+    problems = []
+    if missing:
+        problems.append("missing=" + ",".join(missing))
+    if nonfinite:
+        problems.append("nonfinite=" + ",".join(nonfinite))
+    return "; ".join(problems)
+
+
+def _validate_summary_file(summary_file: str, save_dir: str) -> int:
+    required = {"mod_pdb", "ref_pdb", "H", "L", "A", "cdr_type", "pdb"}
+    records = []
+    with open(summary_file, "r", encoding="utf-8") as fin:
+        for line_no, line in enumerate(fin, 1):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except Exception as exc:
+                raise ValueError(
+                    f"Invalid JSON in summary line {line_no}: {exc}"
+                ) from exc
+            missing = sorted(required.difference(item))
+            if missing:
+                raise ValueError(
+                    f"summary line {line_no} misses fields: {','.join(missing)}"
+                )
+            records.append(item)
+    if not records:
+        raise ValueError("summary.json contains no evaluation records.")
+
+    seen_mod = set()
+    missing_files = []
+    for item in records:
+        mod = os.path.realpath(str(item["mod_pdb"]))
+        if mod in seen_mod:
+            raise ValueError(f"Duplicate generated structure in summary: {mod}")
+        seen_mod.add(mod)
+        for field in ("mod_pdb", "ref_pdb"):
+            path = str(item[field])
+            if not os.path.isfile(path) or os.path.getsize(path) == 0:
+                missing_files.append(path)
+    if missing_files:
+        raise FileNotFoundError(
+            "summary.json references missing/empty PDB files: "
+            + ", ".join(missing_files[:5])
+        )
+
+    protocol_path = os.path.join(save_dir, "test_protocol.json")
+    if os.path.isfile(protocol_path):
+        with open(protocol_path, "r", encoding="utf-8") as fin:
+            protocol = json.load(fin)
+        expected = protocol.get("n_items")
+        if expected is not None and int(expected) != len(records):
+            raise ValueError(
+                "summary/protocol coverage mismatch: "
+                f"summary={len(records)} protocol_n_items={expected}."
+            )
+    return len(records)
 
 
 def dist_info() -> Tuple[int, int]:
@@ -235,20 +381,6 @@ def _split_graph_outputs(batch: dict, X: torch.Tensor, S: torch.Tensor):
     return X_list, S_list
 
 
-def normalize_test_cdr(cdr_type) -> List[str]:
-    """Normalize the formal evaluation CDR identity without consulting model state."""
-    if cdr_type is None:
-        raw = str(os.environ.get("ABFLOW_EPOCH_TEST_CDR", "H3") or "H3")
-        values = [x.strip().upper() for x in raw.split(",") if x.strip()]
-    elif isinstance(cdr_type, str):
-        values = [x.strip().upper() for x in cdr_type.split(",") if x.strip()]
-    else:
-        values = [str(x).strip().upper() for x in cdr_type if str(x).strip()]
-    if values != ["H3"]:
-        raise RuntimeError(f"Formal RAbD Test requires cdr=['H3']; got {values!r}")
-    return values
-
-
 @dataclass
 class GenerationResult:
     summary_file: Optional[str]
@@ -267,11 +399,9 @@ def generate_distributed(
     n_steps: int = 10,
     base_seed: int = 2023,
     show_sample_progress: bool = False,
-    cdr_type=None,
 ) -> GenerationResult:
     """Generate the full test set exactly once across the current DDP world."""
     rank, world_size = dist_info()
-    formal_cdr = normalize_test_cdr(cdr_type)
     save_dir = os.path.abspath(save_dir)
     rank_dir = os.path.join(save_dir, f"rank_{rank:02d}")
     os.makedirs(rank_dir, exist_ok=True)
@@ -280,6 +410,16 @@ def generate_distributed(
     assignments = assigned_logical_batches(
         len(dataset), batch_size, rank=rank, world_size=world_size
     )
+    eval_cdr_type, eval_cdr_source = resolve_eval_cdr_type(model)
+    if rank == 0:
+        print(
+            "[EpochTestGeneration] "
+            f"n_items={len(dataset)} logical_batch_size={int(batch_size)} "
+            f"logical_batches={len(logical_batches(len(dataset), batch_size))} "
+            f"world_size={world_size} eval_cdr={eval_cdr_type} "
+            f"cdr_source={eval_cdr_source}",
+            flush=True,
+        )
 
     local_error = ""
     try:
@@ -288,13 +428,49 @@ def generate_distributed(
             items = [dataset[i] for i in global_indices]
             batch = dataset.collate_fn(items)
             batch = _to_device(batch, device)
-            batch.pop("xloss_mask", None)
+            if "S" not in batch or "paratope_mask" not in batch:
+                raise KeyError(
+                    "Epoch-test batch must contain S and paratope_mask for the "
+                    "V207 task-mask sequence invariant."
+                )
+            input_S = batch["S"].detach().clone()
+            design_mask = batch["paratope_mask"].detach().bool().clone()
 
             with torch.no_grad():
                 X, S, _ = model.sample(
                     **batch,
                     n_steps=int(n_steps),
                     show_progress=bool(show_sample_progress and rank == 0),
+                )
+
+            if not torch.is_tensor(X) or not torch.is_tensor(S):
+                raise TypeError(
+                    "model.sample() must return tensor X and S outputs; "
+                    f"got X={type(X).__name__}, S={type(S).__name__}."
+                )
+            if S.shape != input_S.shape or design_mask.shape != input_S.shape:
+                raise ValueError(
+                    "Generated/input sequence mask shape mismatch: "
+                    f"generated={tuple(S.shape)} input={tuple(input_S.shape)} "
+                    f"paratope={tuple(design_mask.shape)}."
+                )
+            framework_changed = (S != input_S) & ~design_mask
+            if bool(framework_changed.any().item()):
+                first = int(
+                    framework_changed.nonzero(as_tuple=False)[0].item()
+                )
+                raise RuntimeError(
+                    "[V207FrameworkSequenceFAIL] model.sample() changed "
+                    "sequence outside the JSON-defined task mask before PDB writing: "
+                    f"logical_batch_id={logical_batch_id} "
+                    f"flat_residue_index={first} "
+                    f"changed={int(framework_changed.sum().item())}."
+                )
+            if not bool(torch.isfinite(X).all().item()):
+                bad = int((~torch.isfinite(X)).sum().item())
+                raise FloatingPointError(
+                    f"Generated coordinates contain {bad} non-finite values "
+                    f"in logical_batch_id={logical_batch_id}."
                 )
 
             X_list, S_list = _split_graph_outputs(batch, X, S)
@@ -325,7 +501,7 @@ def generate_distributed(
                         "H": cplx.heavy_chain,
                         "L": cplx.light_chain,
                         "A": cplx.antigen.get_chain_names(),
-                        "cdr_type": formal_cdr,
+                        "cdr_type": eval_cdr_type,
                         "pdb": pdb_id,
                         "pmetric": None,
                     }
@@ -350,40 +526,74 @@ def generate_distributed(
         all_records = local_records
 
     summary_file: Optional[str] = None
+    finalise_payload: List[object] = [None]
     if rank == 0:
-        all_records.sort(key=lambda x: int(x["_global_index"]))
-        expected = list(range(len(dataset)))
-        actual = [int(x["_global_index"]) for x in all_records]
-        if actual != expected:
-            raise RuntimeError(
-                "Distributed test coverage is not exact. "
-                f"expected={expected[:5]}...{expected[-5:] if expected else []}, "
-                f"actual={actual[:5]}...{actual[-5:] if actual else []}"
-            )
+        try:
+            all_records.sort(key=lambda x: int(x["_global_index"]))
+            expected = list(range(len(dataset)))
+            actual = [int(x["_global_index"]) for x in all_records]
+            if actual != expected:
+                raise RuntimeError(
+                    "Distributed test coverage is not exact. "
+                    f"expected={expected[:5]}...{expected[-5:] if expected else []}, "
+                    f"actual={actual[:5]}...{actual[-5:] if actual else []}"
+                )
 
-        os.makedirs(save_dir, exist_ok=True)
-        summary_file = os.path.join(save_dir, "summary.json")
-        with open(summary_file, "w", encoding="utf-8") as fout:
+            os.makedirs(save_dir, exist_ok=True)
+            summary_file = os.path.join(save_dir, "summary.json")
+            summary_tmp = summary_file + ".tmp"
+            with open(summary_tmp, "w", encoding="utf-8") as fout:
+                for item in all_records:
+                    public_item = {
+                        k: v for k, v in item.items() if not k.startswith("_")
+                    }
+                    fout.write(json.dumps(public_item, ensure_ascii=False) + "\n")
+            os.replace(summary_tmp, summary_file)
+
+            missing_files = []
             for item in all_records:
-                public_item = {
-                    k: v for k, v in item.items() if not k.startswith("_")
-                }
-                fout.write(json.dumps(public_item, ensure_ascii=False) + "\n")
+                for field in ("mod_pdb", "ref_pdb"):
+                    path = str(item[field])
+                    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+                        missing_files.append(path)
+            if missing_files:
+                raise RuntimeError(
+                    "Generated summary references missing/empty PDB files: "
+                    + ", ".join(missing_files[:5])
+                )
 
-        plan = {
-            "protocol": "logical_batch_seeded_v1",
-            "base_seed": int(base_seed),
-            "logical_batch_size": int(batch_size),
-            "n_steps": int(n_steps),
-            "n_items": int(len(dataset)),
-            "world_size": int(world_size),
-            "cdr_type": formal_cdr,
-            "logical_batches": logical_batches(len(dataset), batch_size),
-        }
-        with open(os.path.join(save_dir, "test_protocol.json"), "w", encoding="utf-8") as f:
-            json.dump(plan, f, ensure_ascii=False, indent=2)
+            plan = {
+                "protocol": "logical_batch_seeded_v2",
+                "base_seed": int(base_seed),
+                "logical_batch_size": int(batch_size),
+                "n_steps": int(n_steps),
+                "n_items": int(len(dataset)),
+                "world_size": int(world_size),
+                "logical_batches": logical_batches(len(dataset), batch_size),
+                "eval_cdr_type": eval_cdr_type,
+                "eval_cdr_source": eval_cdr_source,
+            }
+            _atomic_write_json(os.path.join(save_dir, "test_protocol.json"), plan)
+            finalise_payload[0] = {"summary_file": summary_file, "error": ""}
+        except Exception as exc:
+            finalise_payload[0] = {
+                "summary_file": None,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
 
-    dist_barrier()
+    if world_size > 1:
+        dist.broadcast_object_list(finalise_payload, src=0)
+    finalise_result = finalise_payload[0]
+    if not isinstance(finalise_result, dict):
+        raise RuntimeError("Failed to broadcast epoch-test finalisation result.")
+    if finalise_result.get("error"):
+        raise RuntimeError(
+            "Distributed epoch-test finalisation failed: "
+            + str(finalise_result["error"])
+        )
+    summary_file = (
+        str(finalise_result["summary_file"]) if rank == 0 else None
+    )
     return GenerationResult(
         summary_file=summary_file,
         records=all_records if rank == 0 else [],
@@ -392,40 +602,20 @@ def generate_distributed(
     )
 
 
-def validate_summary_contract(summary_file: str, expected_cdr=None) -> int:
-    """Cheap fail-fast validation before launching the external metric program."""
-    expected = normalize_test_cdr(expected_cdr)
-    records = []
-    with open(summary_file, "r", encoding="utf-8") as f:
-        for lineno, line in enumerate(f, 1):
-            if not line.strip():
-                continue
-            item = json.loads(line)
-            for key in ("mod_pdb", "ref_pdb", "H", "L", "A", "cdr_type", "pdb"):
-                if key not in item:
-                    raise RuntimeError(f"summary.json line {lineno} missing key {key!r}")
-            if normalize_test_cdr(item.get("cdr_type")) != expected:
-                raise RuntimeError(
-                    f"summary.json line {lineno} cdr_type={item.get('cdr_type')!r}; expected {expected!r}"
-                )
-            for key in ("mod_pdb", "ref_pdb"):
-                if not os.path.isfile(item[key]):
-                    raise FileNotFoundError(f"summary.json line {lineno} missing file: {item[key]}")
-            records.append(item)
-    if not records:
-        raise RuntimeError("summary.json contains zero generated complexes")
-    return len(records)
-
-
 def run_cal_metrics_rank0(
     *,
     summary_file: Optional[str],
     save_dir: str,
     project_root: str,
     num_workers: int = 8,
-    cdr_type=None,
 ) -> Dict[str, float]:
-    """Run the project's original cal_metrics.py on rank 0 and parse output."""
+    """Run the original metrics, retrying serially only after a failed parallel run.
+
+    The retry does not change metric definitions or the evaluated structures.  It
+    removes only ``cal_metrics.py`` worker concurrency, which is a known failure
+    mode for external TM-score/DockQ subprocesses.  We never average a partial
+    subset: success requires every core metric to be present and finite.
+    """
     rank, world_size = dist_info()
     payload: List[object] = [None]
 
@@ -434,63 +624,112 @@ def run_cal_metrics_rank0(
         try:
             if not summary_file or not os.path.isfile(summary_file):
                 raise FileNotFoundError(f"summary.json not found: {summary_file}")
+            n_records = _validate_summary_file(summary_file, save_dir)
             cal_metrics = os.path.join(os.path.abspath(project_root), "cal_metrics.py")
             if not os.path.isfile(cal_metrics):
                 raise FileNotFoundError(f"cal_metrics.py not found: {cal_metrics}")
 
-            n_records = validate_summary_contract(summary_file, expected_cdr=cdr_type)
             env = os.environ.copy()
             env["OPENMM_CPU_THREADS"] = "1"
+            env.setdefault("OMP_NUM_THREADS", "1")
+            env.setdefault("MKL_NUM_THREADS", "1")
 
-            def _run_metric_process(workers: int):
-                cmd = [
-                    sys.executable, cal_metrics,
-                    "--test_set", os.path.abspath(summary_file),
-                    "--num_workers", str(int(workers)),
-                ]
-                return subprocess.run(
-                    cmd, cwd=os.path.abspath(project_root), env=env,
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            attempts = []
+            attempt_outputs = []
+            worker_plan = [max(1, int(num_workers))]
+            if worker_plan[0] > 1:
+                worker_plan.append(1)
+            successful = None
+            for attempt_index, workers in enumerate(worker_plan):
+                per_sample_tmp = os.path.join(
+                    save_dir, f"per_sample_metrics.workers_{workers}.pkl"
                 )
+                cmd = [
+                    sys.executable,
+                    cal_metrics,
+                    "--test_set",
+                    os.path.abspath(summary_file),
+                    "--metrics_path",
+                    per_sample_tmp,
+                    "--num_workers",
+                    str(workers),
+                ]
+                proc = subprocess.run(
+                    cmd,
+                    cwd=os.path.abspath(project_root),
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                attempt_text = proc.stdout or ""
+                attempt_log_path = os.path.join(
+                    save_dir,
+                    f"cal_metrics.attempt_{attempt_index + 1}.workers_{workers}.log",
+                )
+                with open(attempt_log_path, "w", encoding="utf-8") as fout:
+                    fout.write(attempt_text)
+                attempt_outputs.append(attempt_text)
+                attempt_metrics = parse_cal_metrics_output(attempt_text)
+                validation_error = _metric_validation_error(attempt_metrics)
+                attempt = {
+                    "attempt": int(attempt_index + 1),
+                    "workers": int(workers),
+                    "returncode": int(proc.returncode),
+                    "metrics": attempt_metrics,
+                    "validation_error": validation_error,
+                    "log": attempt_log_path,
+                    "log_tail": _log_tail(attempt_text),
+                    "per_sample_metrics": per_sample_tmp,
+                }
+                attempts.append(attempt)
+                if proc.returncode == 0 and not validation_error:
+                    successful = (attempt, attempt_text)
+                    if os.path.isfile(per_sample_tmp):
+                        os.replace(
+                            per_sample_tmp,
+                            os.path.join(save_dir, "per_sample_metrics.pkl"),
+                        )
+                    break
 
-            requested_workers = max(1, int(num_workers))
-            proc = _run_metric_process(requested_workers)
-            log_text = proc.stdout or ""
+            log_sections = []
+            for attempt, attempt_text in zip(attempts, attempt_outputs):
+                log_sections.append(
+                    "[EpochTestMetricAttempt] "
+                    f"attempt={attempt['attempt']} workers={attempt['workers']} "
+                    f"returncode={attempt['returncode']} "
+                    f"validation_error={attempt['validation_error'] or 'none'}\n"
+                    f"{attempt_text.rstrip()}"
+                )
+            log_text = "\n\n".join(log_sections) + "\n"
             log_path = os.path.join(save_dir, "cal_metrics.log")
             with open(log_path, "w", encoding="utf-8") as f:
-                f.write(
-                    f"[V207MetricContract] records={n_records} cdr={normalize_test_cdr(cdr_type)} "
-                    f"workers={requested_workers}\n"
-                )
                 f.write(log_text)
 
-            # Same scientific evaluator, execution-only fallback. Some metric stacks
-            # fail under multiprocessing/OpenMM yet are deterministic with one worker.
-            if int(proc.returncode) != 0 and requested_workers != 1:
-                retry = _run_metric_process(1)
-                retry_text = retry.stdout or ""
-                retry_path = os.path.join(save_dir, "cal_metrics_retry_worker1.log")
-                with open(retry_path, "w", encoding="utf-8") as f:
-                    f.write(retry_text)
-                if int(retry.returncode) == 0:
-                    proc, log_text, log_path = retry, retry_text, retry_path
-                else:
-                    tail0 = "\n".join(log_text.splitlines()[-40:])
-                    tail1 = "\n".join(retry_text.splitlines()[-40:])
-                    raise RuntimeError(
-                        "cal_metrics.py failed with requested workers and worker=1. "
-                        f"requested_tail=\n{tail0}\nworker1_tail=\n{tail1}"
-                    )
-
-            metrics = parse_cal_metrics_output(log_text)
-            result = {
-                "returncode": int(proc.returncode),
-                "metrics": metrics,
-                "log": log_path,
-                "error": "",
-                "records": int(n_records),
-                "cdr_type": normalize_test_cdr(cdr_type),
-            }
+            if successful is None:
+                last = attempts[-1]
+                result = {
+                    "returncode": int(last["returncode"] or 1),
+                    "metrics": {},
+                    "log": log_path,
+                    "attempts": attempts,
+                    "error": (
+                        "All cal_metrics.py attempts failed; last attempt: "
+                        + (last["validation_error"] or "non-zero return code")
+                    ),
+                }
+            else:
+                success_attempt, _ = successful
+                result = {
+                    "returncode": 0,
+                    "metrics": dict(success_attempt["metrics"]),
+                    "log": log_path,
+                    "attempts": attempts,
+                    "workers_used": int(success_attempt["workers"]),
+                    "n_records": int(n_records),
+                    "serial_retry_used": bool(success_attempt["workers"] == 1 and int(num_workers) > 1),
+                    "error": "",
+                }
         except Exception as exc:
             result = {
                 "returncode": -999,
@@ -501,8 +740,7 @@ def run_cal_metrics_rank0(
             with open(result["log"], "a", encoding="utf-8") as f:
                 f.write("\n[EpochTestError] " + result["error"] + "\n")
 
-        with open(os.path.join(save_dir, "metrics.json"), "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2, sort_keys=True)
+        _atomic_write_json(os.path.join(save_dir, "metrics.json"), result)
         payload[0] = result
 
     if world_size > 1:
@@ -512,8 +750,25 @@ def run_cal_metrics_rank0(
     if not isinstance(result, dict):
         raise RuntimeError("Failed to broadcast test metric result from rank 0.")
     if int(result.get("returncode", 1)) != 0:
+        detail = str(result.get("error", "")).strip()
+        attempts = result.get("attempts") or []
+        tail = ""
+        if attempts and isinstance(attempts[-1], dict):
+            tail = str(attempts[-1].get("log_tail", "")).strip()
         raise RuntimeError(
-            "cal_metrics.py failed. See: " + str(result.get("log", "<unknown>"))
+            "cal_metrics.py failed after parallel/serial exact retries. "
+            + detail
+            + "\nSee: " + str(result.get("log", "<unknown>"))
+            + ("\n--- cal_metrics tail ---\n" + tail if tail else "")
+        )
+    if rank == 0:
+        print(
+            "[EpochTestMetrics] "
+            f"n_records={result.get('n_records')} "
+            f"workers_used={result.get('workers_used')} "
+            f"serial_retry={result.get('serial_retry_used', False)} "
+            f"log={result.get('log')}",
+            flush=True,
         )
     return dict(result.get("metrics", {}))
 
@@ -539,7 +794,7 @@ def append_epoch_metrics(
     epoch: int,
     global_step: int,
     metrics: Dict[str, float],
-    protocol: str = "logical_batch_seeded_v1",
+    protocol: str = "logical_batch_seeded_v2",
 ) -> None:
     rank, _ = dist_info()
     if rank != 0:
