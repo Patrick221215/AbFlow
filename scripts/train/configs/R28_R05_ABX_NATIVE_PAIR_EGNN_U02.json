@@ -1,0 +1,198 @@
+{
+  "experiment": {
+    "id": "R28_R05_ABX_NATIVE_PAIR_EGNN_U02",
+    "parent": "R05_PCS_RC_LC_R1_ABX_FF_FIXEDG_RESIDUE_U02_SCOREFLOW",
+    "scientific_factor": "source_faithful_single_pair_to_native_R05_EGNN"
+  },
+  "data": {
+    "train": {
+      "set": "./datasets/RAbD/train.json",
+      "pep": "./datasets/RAbD/train.pkl",
+      "surface": "./datasets/RAbD/train_surf.pkl"
+    },
+    "valid": {
+      "set": "./datasets/RAbD/valid.json",
+      "pep": "./datasets/RAbD/valid.pkl",
+      "surface": "./datasets/RAbD/valid_surf.pkl"
+    },
+    "test": {
+      "set": "./datasets/RAbD/test.json",
+      "pep": "./datasets/RAbD/test.pkl",
+      "surface": "./datasets/RAbD/test_surf.pkl"
+    },
+    "task": {
+      "cdr": [
+        "H3"
+      ],
+      "paratope": [
+        "H3"
+      ],
+      "num_verts": 50
+    }
+  },
+  "training": {
+    "output_dir": "./results_module/R28_R05_ABX_NATIVE_PAIR_EGNN_U02",
+    "optimizer": {
+      "lr": 0.001,
+      "final_lr": 0.0001,
+      "warmup": 0,
+      "grad_clip": 1.0
+    },
+    "schedule": {
+      "max_epoch": 200,
+      "patience": 1000,
+      "save_topk": 10,
+      "save_interval": 1,
+      "resume_checkpoint": ""
+    },
+    "loader": {
+      "batch_size": 20,
+      "shuffle": true,
+      "num_workers": 8,
+      "prefetch_factor": 4,
+      "valid_num_workers": 2,
+      "valid_prefetch_factor": 2,
+      "valid_persistent_workers": false
+    },
+    "precision": {
+      "amp": true,
+      "amp_dtype": "bf16",
+      "allow_tf32": true
+    },
+    "ema": {
+      "enabled": true,
+      "decay": 0.999
+    },
+    "logging": {
+      "log_interval": 20,
+      "tqdm_mininterval": 5.0
+    },
+    "snapshot": {
+      "enabled": true,
+      "max_mb": 20.0
+    }
+  },
+  "model": {
+    "type": "AbFlow",
+    "architecture": {
+      "embed_dim": 64,
+      "hidden_size": 128,
+      "k_neighbors": 9,
+      "n_layers": 3,
+      "iter_round": 3,
+      "dropout": 0.1,
+      "relative_position": false
+    },
+    "task": {
+      "pep_seq": true,
+      "pep_struct": true,
+      "struct_only": false,
+      "bind_dist_cutoff": 6.6,
+      "pred_edge_dist": true,
+      "backbone_only": false,
+      "fix_channel_weights": false,
+      "keep_memory": true,
+      "seq_warmup": 0
+    },
+    "r05": {
+      "source": {
+        "mode": "pcs_rc",
+        "coord_pep_as_condition": true,
+        "coord_pep_source_weight": 1.0,
+        "seq_pep_source_weight": 1.0,
+        "recurrent_proposal_context": true,
+        "recurrent_proposal_sequence_context": true,
+        "proposal_adapter_start_round": 1
+      },
+      "flow": {
+        "state_path": true,
+        "time_embed": true,
+        "per_sample_t": true,
+        "t_sampling": "uniform",
+        "min_sigma": 0.01,
+        "t_min": 0.0,
+        "t_max": 1.0,
+        "hybrid_t_min": 0.2,
+        "sampler": "f01_canonical_carrier"
+      },
+      "r3": {
+        "g_mode": "foldflow_fixed_scaled",
+        "fixed_g_scaled": 0.1,
+        "coordinate_scaling": 0.1,
+        "noise_scope": "residue",
+        "path_min_sigma": 0.0,
+        "score_min_sigma": 0.01,
+        "transport_fraction": 0.05
+      },
+      "sequence": {
+        "context_mode": "legacy",
+        "source_mode": "proposal",
+        "recycle": false,
+        "decode_mode": "argmax",
+        "final_readout": "integrated_endpoint"
+      }
+    },
+    "representation": {
+      "native_pair": {
+        "enabled": true,
+        "init_seed": 314159,
+        "forward_seed": 271828,
+        "bridge_mode": "zero_reparameterized",
+        "common_center": true,
+        "time_embed": true,
+        "recycling": false,
+        "width_profile": "localized",
+        "triangle_chunk_size": 64,
+        "activation_checkpoint": true,
+        "antigen_context_mode": "framework_anchor_ca",
+        "max_antigen": 32,
+        "reference_max_antigen": 32,
+        "ca_fill_tol2": 1e-12,
+        "torsion_norm_eps": 1e-12
+      }
+    }
+  },
+  "loss": {
+    "sequence": 1.0,
+    "structure": 1.0,
+    "interface": 1.0,
+    "edge": 1.0,
+    "distogram": {
+      "enabled": false,
+      "weight": 0.0,
+      "pair_scope": "all_resolved"
+    },
+    "smooth_lddt": {
+      "enabled": false,
+      "weight": 0.0,
+      "context_mode": "fixed_observed",
+      "cutoff": 15.0
+    }
+  },
+  "runtime": {
+    "gpus": [
+      0,
+      1
+    ],
+    "master_addr": "localhost",
+    "master_port": 29728,
+    "nnodes": 1,
+    "omp_num_threads": 2,
+    "ddp": {
+      "cost_balanced": true,
+      "find_unused_parameters": false,
+      "static_graph": true
+    },
+    "cuda_allocator": "max_split_size_mb:128"
+  },
+  "generation": {
+    "checkpoint": "",
+    "save_dir": "./results_generation/R28_R05_ABX_NATIVE_PAIR_EGNN_U02",
+    "gpu": 0,
+    "batch_size": 20,
+    "num_workers": 4,
+    "n_steps": 10,
+    "seed": 2023,
+    "show_sample_progress": false
+  }
+}

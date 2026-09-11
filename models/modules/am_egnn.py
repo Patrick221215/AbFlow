@@ -151,6 +151,7 @@ class AM_E_GCL(nn.Module):
                 )
             nn.init.zeros_(self.edge_attr_linear.weight)
         self.last_bridge_diagnostics = {}
+        self.capture_bridge_diagnostics = False
         self.radial_linear = nn.Linear(channel_nf ** 2, radial_nf)
 
         self.node_mlp = nn.Sequential(
@@ -175,60 +176,37 @@ class AM_E_GCL(nn.Module):
                 nn.Sigmoid())
 
     def edge_model(self, source, target, radial, edge_attr):
-        '''
-        :param source: [n_edge, input_size]
-        :param target: [n_edge, input_size]
-        :param radial: [n_edge, d, d]
-        :param edge_attr: [n_edge, edge_dim]
-        '''
-        radial = radial.reshape(radial.shape[0], -1)  # [n_edge, d ^ 2]
-
+        """Build an invariant edge message with zero-start pair conditioning."""
+        radial = radial.reshape(radial.shape[0], -1)
         base = torch.cat([source, target, radial], dim=1)
         base_pre = self.edge_mlp[0](base)
         if self.edge_attr_linear is None:
             pair_delta = torch.zeros_like(base_pre)
         else:
             if edge_attr is None:
-                edge_attr = base_pre.new_zeros(
-                    (base_pre.shape[0], self.edges_in_d)
-                )
-            if edge_attr.ndim != 2 or edge_attr.shape[0] != base_pre.shape[0] \
-                    or edge_attr.shape[1] != self.edges_in_d:
-                raise ValueError(
-                    "native Pair edge_attr shape mismatch: expected "
-                    f"({base_pre.shape[0]}, {self.edges_in_d}), "
-                    f"got {tuple(edge_attr.shape)}"
-                )
+                edge_attr = base_pre.new_zeros((base_pre.shape[0], self.edges_in_d))
             pair_delta = self.edge_attr_linear(edge_attr)
         out = base_pre + pair_delta
-        for layer in self.edge_mlp[1:]:
-            out = layer(out)
-        out = self.dropout(out)
-
-        if bool(getattr(self, "capture_bridge_diagnostics", False)):
+        if self.capture_bridge_diagnostics:
             with torch.no_grad():
-                base_rms = torch.sqrt(base_pre.detach().float().square().mean())
-                delta_rms = torch.sqrt(pair_delta.detach().float().square().mean())
-                if self.edge_attr_linear is None:
-                    weight_rms = base_rms.new_zeros(())
-                else:
-                    weight_rms = torch.sqrt(
-                        self.edge_attr_linear.weight.detach().float().square().mean()
-                    )
+                base_rms = base_pre.float().square().mean().sqrt()
+                delta_rms = pair_delta.float().square().mean().sqrt()
                 self.last_bridge_diagnostics = {
-                    "pair_base_rms": base_rms.to(base_pre.dtype),
-                    "pair_delta_rms": delta_rms.to(base_pre.dtype),
-                    "pair_delta_to_base_ratio": (
+                    'pair_delta_to_base_ratio': (
                         delta_rms / base_rms.clamp_min(1.0e-8)
                     ).to(base_pre.dtype),
-                    "pair_adapter_weight_rms": weight_rms.to(base_pre.dtype),
+                    'pair_adapter_weight_rms': (
+                        base_rms.new_zeros(()) if self.edge_attr_linear is None
+                        else self.edge_attr_linear.weight.detach().float().square().mean().sqrt()
+                    ).to(base_pre.dtype),
                 }
         else:
             self.last_bridge_diagnostics = {}
-
+        for layer in self.edge_mlp[1:]:
+            out = layer(out)
+        out = self.dropout(out)
         if self.attention:
-            att_val = self.att_mlp(out)
-            out = out * att_val
+            out = out * self.att_mlp(out)
         return out
 
     def node_model(self, x, edge_index, edge_attr, node_attr):
@@ -281,8 +259,7 @@ class AM_E_GCL(nn.Module):
         return coord
 
     def forward(self, h, edge_index, coord, channel_attr, channel_weights,
-                edge_attr=None, node_attr=None,
-                capture_bridge_diagnostics=False):
+                edge_attr=None, node_attr=None, capture_bridge_diagnostics=False):
         '''
         h: [bs * n_node, hidden_size]
         edge_index: list of [n_row] and [n_col] where n_row == n_col (with no cutoff, n_row == bs * n_node * (n_node - 1))
@@ -431,6 +408,7 @@ class MS_E_GCL(nn.Module):
                 )
             nn.init.zeros_(self.edge_attr_linear.weight)
         self.last_bridge_diagnostics = {}
+        self.capture_bridge_diagnostics = False
         self.radial_linear = nn.Linear(channel_nf ** 2, radial_nf)
         self.scale_linear = nn.Linear(surf_nf, channel_nf)
 
@@ -456,60 +434,37 @@ class MS_E_GCL(nn.Module):
                 nn.Sigmoid())
 
     def edge_model(self, source, target, radial, edge_attr):
-        '''
-        :param source: [n_edge, input_size]
-        :param target: [n_edge, input_size]
-        :param radial: [n_edge, d, d]
-        :param edge_attr: [n_edge, edge_dim]
-        '''
-        radial = radial.reshape(radial.shape[0], -1)  # [n_edge, d ^ 2]
-
+        """Build a surface-aware edge message with zero-start pair conditioning."""
+        radial = radial.reshape(radial.shape[0], -1)
         base = torch.cat([source, target, radial], dim=1)
         base_pre = self.edge_mlp[0](base)
         if self.edge_attr_linear is None:
             pair_delta = torch.zeros_like(base_pre)
         else:
             if edge_attr is None:
-                edge_attr = base_pre.new_zeros(
-                    (base_pre.shape[0], self.edges_in_d)
-                )
-            if edge_attr.ndim != 2 or edge_attr.shape[0] != base_pre.shape[0] \
-                    or edge_attr.shape[1] != self.edges_in_d:
-                raise ValueError(
-                    "native surface Pair edge_attr shape mismatch: expected "
-                    f"({base_pre.shape[0]}, {self.edges_in_d}), "
-                    f"got {tuple(edge_attr.shape)}"
-                )
+                edge_attr = base_pre.new_zeros((base_pre.shape[0], self.edges_in_d))
             pair_delta = self.edge_attr_linear(edge_attr)
         out = base_pre + pair_delta
-        for layer in self.edge_mlp[1:]:
-            out = layer(out)
-        out = self.dropout(out)
-
-        if bool(getattr(self, "capture_bridge_diagnostics", False)):
+        if self.capture_bridge_diagnostics:
             with torch.no_grad():
-                base_rms = torch.sqrt(base_pre.detach().float().square().mean())
-                delta_rms = torch.sqrt(pair_delta.detach().float().square().mean())
-                if self.edge_attr_linear is None:
-                    weight_rms = base_rms.new_zeros(())
-                else:
-                    weight_rms = torch.sqrt(
-                        self.edge_attr_linear.weight.detach().float().square().mean()
-                    )
+                base_rms = base_pre.float().square().mean().sqrt()
+                delta_rms = pair_delta.float().square().mean().sqrt()
                 self.last_bridge_diagnostics = {
-                    "pair_base_rms": base_rms.to(base_pre.dtype),
-                    "pair_delta_rms": delta_rms.to(base_pre.dtype),
-                    "pair_delta_to_base_ratio": (
+                    'pair_delta_to_base_ratio': (
                         delta_rms / base_rms.clamp_min(1.0e-8)
                     ).to(base_pre.dtype),
-                    "pair_adapter_weight_rms": weight_rms.to(base_pre.dtype),
+                    'pair_adapter_weight_rms': (
+                        base_rms.new_zeros(()) if self.edge_attr_linear is None
+                        else self.edge_attr_linear.weight.detach().float().square().mean().sqrt()
+                    ).to(base_pre.dtype),
                 }
         else:
             self.last_bridge_diagnostics = {}
-
+        for layer in self.edge_mlp[1:]:
+            out = layer(out)
+        out = self.dropout(out)
         if self.attention:
-            att_val = self.att_mlp(out)
-            out = out * att_val
+            out = out * self.att_mlp(out)
         return out
 
     def node_model(self, x, edge_index, edge_attr, node_attr):
@@ -562,8 +517,7 @@ class MS_E_GCL(nn.Module):
         return coord
 
     def forward(self, h, edge_index, epi_index, coord, surf_verts, channel_attr, channel_weights,
-                edge_attr=None, node_attr=None,
-                capture_bridge_diagnostics=False):
+                edge_attr=None, node_attr=None, capture_bridge_diagnostics=False):
         '''
         h: [bs * n_node, hidden_size]
         edge_index: list of [n_row] and [n_col] where n_row == n_col (with no cutoff, n_row == bs * n_node * (n_node - 1))

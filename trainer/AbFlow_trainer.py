@@ -147,10 +147,10 @@ class AbFlowTrainer(Trainer):
         # V185: diagnostics-only cadence. First few steps verify the new
         # representation/time/edge routing without changing optimization.
         self._science_log_first_steps = max(0, _env_int(
-            "ABFLOW_SCI_LOG_FIRST_STEPS", 8
+            "ABFLOW_SCI_LOG_FIRST_STEPS", 3
         ))
-        self._science_log_interval = max(1, _env_int(
-            "ABFLOW_SCI_LOG_INTERVAL", int(getattr(config, "log_interval", 20))
+        self._science_log_interval = max(0, _env_int(
+            "ABFLOW_SCI_LOG_INTERVAL", 0
         ))
 
         # Earlier R28/R30 summaries exposed rare ~1e5-1e6 structure-loss means
@@ -266,45 +266,30 @@ class AbFlowTrainer(Trainer):
                 "V203 formal protocol requires ABFLOW_EPOCH_TEST_JSON."
             )
         if self._diag_main_rank:
-            print(
-                "[V203TrainValTestContract] "
-                f"epoch_test=on interval={self._epoch_test_interval} "
-                f"json={self._epoch_test_json} pep={self._epoch_test_pep or '<auto:test.pkl>'} "
-                f"surf={self._epoch_test_surf or '<auto:test_surf.pkl>'} "
-                f"batch={self._epoch_test_batch_size} n_steps={self._epoch_test_n_steps} "
-                f"seed={self._epoch_test_base_seed} fail_fast=on"
-            )
-
-        if self._diag_main_rank:
             raw_model = model.module if hasattr(model, "module") else model
-            fingerprint_fn = getattr(
-                raw_model, "shared_initialization_fingerprint", None
-            )
-            if callable(fingerprint_fn):
-                fingerprint = fingerprint_fn()
-                print(
-                    "[V211SharedInitFingerprint] "
-                    f"sha256={fingerprint['sha256']} "
-                    f"parameter_tensors={fingerprint['parameter_tensors']} "
-                    f"parameter_elements={fingerprint['parameter_elements']} "
-                    f"excluded={fingerprint['excluded_prefix']}"
-                )
+            trunk = getattr(raw_model, "native_trunk", None)
+            trunk_cfg = getattr(getattr(trunk, "trunk", None), "config", None)
+            repr_cfg = getattr(trunk, "representation_config", {}) if trunk is not None else {}
+            geom_cfg = repr_cfg.get("geometry", {}) if isinstance(repr_cfg, dict) else {}
             print(
-                "[LossContract] "
-                f"sequence={getattr(raw_model, 'loss_sequence_weight', 1.0):.4g} "
-                f"structure={getattr(raw_model, 'loss_structure_weight', 1.0):.4g} "
-                f"interface={getattr(raw_model, 'loss_interface_weight', 1.0):.4g} "
-                f"edge={getattr(raw_model, 'loss_edge_weight', 1.0):.4g} "
+                "[FormalModelContract] "
+                f"rounds={getattr(raw_model, 'round', 'NA')} "
+                f"single={getattr(trunk_cfg, 'seq_channel', 'NA')} "
+                f"pair={getattr(trunk_cfg, 'pair_channel', 'NA')} "
+                f"time={int(bool(getattr(trunk_cfg, 'time_embed', False)))} "
+                "recycling=0 "
+                f"frame={geom_cfg.get('frame', 'NA')} "
+                "context=full_antibody+dataset_epitope "
+                "bridge=zero_start_residual "
                 f"distogram={getattr(raw_model, 'loss_distogram_weight', 0.0):.4g} "
                 f"smooth_lddt={getattr(raw_model, 'loss_smooth_lddt_weight', 0.0):.4g}"
             )
             print(
-                "[R05AbXContract] "
-                f"R05_time={int(bool(getattr(raw_model, 'scorefm_time_embed', False)))} "
-                f"AbX_time={int(bool(getattr(getattr(raw_model, 'abx_repr', None), 'trunk', None) and getattr(raw_model.abx_repr.trunk, 'use_abx_time', False)))} "
-                f"AbX_recycling={int(bool(getattr(getattr(raw_model, 'abx_repr', None), 'trunk', None) and (getattr(raw_model.abx_repr.trunk, 'recycle_features', False) or getattr(raw_model.abx_repr.trunk, 'recycle_pos', False))))} "
-                "single=R05_full+zero_start_AbX "
-                "pair=native_edge_zero_reparameterized recurrence=R05x3"
+                "[FormalEvalContract] "
+                "ckpt=validation test=observation_only "
+                f"test_batch={self._epoch_test_batch_size} "
+                f"test_steps={self._epoch_test_n_steps} "
+                f"seed={self._epoch_test_base_seed} fail_fast=1"
             )
 
 
@@ -584,18 +569,6 @@ class AbFlowTrainer(Trainer):
                 print(f"[FormalEpochTestFAIL] epoch={self.epoch} {local_message}")
             raise RuntimeError(local_message or "formal Test metric validation failed on rank0")
 
-        if self._is_main_proc():
-            print(
-                "[FormalEpochTestPASS] "
-                f"epoch={self.epoch} "
-                f"AAR={float(metrics['AAR_mean']):.5f} "
-                f"CAAR={float(metrics['CAAR_mean']):.5f} "
-                f"H3raw={float(metrics['RMSDCA_CDRH3_mean']):.5f}A "
-                f"H3aligned={float(metrics['RMSDCA_CDRH3_aligned_mean']):.5f}A "
-                f"TM={float(metrics['TMscore_mean']):.5f} "
-                f"lDDT={float(metrics['LDDT_mean']):.5f} "
-                f"DockQ={float(metrics['DockQ_mean']):.5f}"
-            )
 
     def _print_epoch_test_authority_trace(self, local_records):
         """Aggregate model.sample authority diagnostics across Test ranks.
@@ -905,28 +878,17 @@ class AbFlowTrainer(Trainer):
             "loss_structure": m("Struct/StructLoss/Validation"),
             "loss_interface": m("Dock/SPLoss/Validation"),
             "loss_edge": m("Dock/EDLoss/Validation"),
-            "mf_distogram_loss": m("DTM/mf_distogram_loss/Validation"),
-            "mf_smooth_lddt_loss": m("DTM/mf_smooth_lddt_loss/Validation"),
-            "mf_smooth_lddt_intra_loss": m("DTM/mf_smooth_lddt_intra_loss/Validation"),
-            "mf_smooth_lddt_scaffold_loss": m("DTM/mf_smooth_lddt_scaffold_loss/Validation"),
-            "mf_smooth_lddt_antigen_loss": m("DTM/mf_smooth_lddt_antigen_loss/Validation"),
-            "mf_smooth_lddt_intra_pairs": m("DTM/mf_smooth_lddt_intra_pairs/Validation"),
-            "mf_smooth_lddt_scaffold_pairs": m("DTM/mf_smooth_lddt_scaffold_pairs/Validation"),
-            "mf_smooth_lddt_antigen_pairs": m("DTM/mf_smooth_lddt_antigen_pairs/Validation"),
-            "mf_smooth_lddt_antigen_score": m("DTM/mf_smooth_lddt_antigen_score/Validation"),
-            "mf_smooth_lddt_fixed_context_pred_drift_rms": m("DTM/mf_smooth_lddt_fixed_context_pred_drift_rms/Validation"),
-            "mf_smooth_lddt_fixed_context_restored_rate": m("DTM/mf_smooth_lddt_fixed_context_restored_rate/Validation"),
-            "mf_smooth_lddt_perfect_floor": m("DTM/mf_smooth_lddt_perfect_floor/Validation"),
-            "mf_smooth_lddt_excess": m("DTM/mf_smooth_lddt_excess/Validation"),
-            # Native-AbX pair diagnostics; smooth-lDDT remains an MF/Boltz loss.
-            "abx_distogram_loss": m("DTM/abx_distogram_loss/Validation"),
-            "disto_all_pair_raw_loss": m("DTM/disto_all_pair_raw_loss/Validation"),
-            "disto_task_pair_fraction": m("DTM/disto_task_pair_fraction/Validation"),
-            "abx_single_rms": m("DTM/abx_single_rms/Validation"),
-            "abx_pair_rms": m("DTM/abx_pair_rms/Validation"),
-            "abx_token_count": m("DTM/abx_token_count/Validation"),
-            "abx_pair_count": m("DTM/abx_pair_count/Validation"),
-            "abx_design_embedding_mask_rate": m("DTM/abx_design_embedding_mask_rate/Validation"),
+            "distogram_loss": m("DTM/distogram_loss/Validation"),
+            "smooth_lddt_loss": m("DTM/smooth_lddt_loss/Validation"),
+            "smooth_lddt_DD": m("DTM/smooth_lddt_DD/Validation"),
+            "smooth_lddt_DF": m("DTM/smooth_lddt_DF/Validation"),
+            "smooth_lddt_DA": m("DTM/smooth_lddt_DA/Validation"),
+            "relational_single_rms": m("DTM/relational_single_rms/Validation"),
+            "relational_pair_rms": m("DTM/relational_pair_rms/Validation"),
+            "relational_antigen_keep_fraction": m("DTM/relational_antigen_keep_fraction/Validation"),
+            "distogram_da_ce": m("DTM/distogram_da_ce/Validation"),
+            "distogram_da_contact_precision": m("DTM/distogram_da_contact_precision/Validation"),
+            "distogram_head_weight_rms": m("DTM/distogram_head_weight_rms/Validation"),
             "r05_parent_static_bio_rms": m("AbFlowDiag/r05_parent_static_bio_rms/Validation"),
             "r05_parent_dynamic_bio_rms": m("AbFlowDiag/r05_parent_dynamic_bio_rms/Validation"),
             "abx_single_bio_rms": m("AbFlowDiag/abx_single_bio_rms/Validation"),
@@ -1080,139 +1042,16 @@ class AbFlowTrainer(Trainer):
     def _print_validation_audits(self, summary):
         if not self._is_main_proc():
             return
-        module_diag = {k.replace('r05v173_', ''): v for k, v in summary.items()
-                       if k.startswith('r05v173_')}
-        if module_diag:
-            print('[R05ModuleAudit:Validation] epoch='+str(self.epoch)+' '+
-                  ' '.join(k+'='+self._fmt(v, 5) for k,v in sorted(module_diag.items())))
         print(
-            "[ValidationPhysical] "
+            "[Validation] "
             f"epoch={self.epoch} val={self._fmt(summary.get('validation_metric'), 5)} "
-            f"H3CAraw={self._fmt(summary.get('h3ca_raw_r2'), 5, 'A')} "
-            f"H3CAaligned={self._fmt(summary.get('h3ca_aligned_r2'), 5, 'A')} "
-            f"contactF1={self._fmt(summary.get('contact_f1'), 5)} "
-            f"CAAR={self._fmt(summary.get('caar'), 5)}"
-        )
-        print(
-            "[R05RoundAudit] "
-            f"epoch={self.epoch} "
-            f"r0_raw={self._fmt(summary.get('h3ca_raw_r0'), 4, 'A')} "
-            f"r1_raw={self._fmt(summary.get('h3ca_raw_r1'), 4, 'A')} "
-            f"r2_raw={self._fmt(summary.get('h3ca_raw_r2'), 4, 'A')} "
-            f"r0_aligned={self._fmt(summary.get('h3ca_aligned_r0'), 4, 'A')} "
-            f"r1_aligned={self._fmt(summary.get('h3ca_aligned_r1'), 4, 'A')} "
-            f"r2_aligned={self._fmt(summary.get('h3ca_aligned_r2'), 4, 'A')} "
-            f"r0_AAR={self._fmt(summary.get('aar_r0'), 4)} "
-            f"r1_AAR={self._fmt(summary.get('aar_r1'), 4)} "
-            f"r2_AAR={self._fmt(summary.get('aar_r2'), 4)} "
-            f"raw_delta={self._fmt(summary.get('refinement_raw_delta'), 4, 'A')} "
-            f"aligned_delta={self._fmt(summary.get('refinement_aligned_delta'), 4, 'A')}"
-        )
-        print(
-            "[SequenceForensic] "
-            f"epoch={self.epoch} lossmask_AAR={self._fmt(summary.get('aar'), 4)} "
-            f"val_CE={self._fmt(summary.get('loss_seq'), 4)} "
-            f"entropy={self._fmt(summary.get('seq_entropy'), 4)} "
-            f"max_prob={self._fmt(summary.get('seq_max_prob'), 4)} "
-            f"dominant_MAP={self._fmt(summary.get('seq_dominant_map_fraction'), 4)} "
-            f"unique_MAP={self._fmt(summary.get('seq_unique_map_classes'), 1)} "
-            f"proposal_AAR={self._fmt(summary.get('proposal_aar'), 4)} "
-            f"pred_vs_proposal={self._fmt(summary.get('pred_vs_proposal_aar'), 4)}"
-        )
-        print(
-            "[SequencePathAudit:Validation] "
-            f"epoch={self.epoch} "
-            f"exact={self._fmt(summary.get('sequence_path_contract_exact'), 0)} "
-            f"path_design={self._fmt(summary.get('sequence_path_participation_rate'), 4)} "
-            f"external_native={self._fmt(summary.get('sequence_external_native_context_rate'), 4)} "
-            f"noisy_branch={self._fmt(summary.get('sequence_noisy_branch_rate'), 4)} "
-            f"clean_branch={self._fmt(summary.get('sequence_clean_branch_rate'), 4)} "
-            f"state_native={self._fmt(summary.get('sequence_state_native_fraction'), 4)} "
-            f"loss_design={self._fmt(summary.get('sequence_loss_coverage_design'), 4)} "
-            f"loss_on_noisy={self._fmt(summary.get('sequence_loss_on_noisy_precision'), 4)}"
-        )
-        print(
-            "[SequenceRoundAudit] "
-            f"epoch={self.epoch} "
-            f"AAR=({self._fmt(summary.get('aar_r0'), 4)},"
-            f"{self._fmt(summary.get('aar_r1'), 4)},"
-            f"{self._fmt(summary.get('aar_r2'), 4)}) "
-            f"dAAR01={self._fmt(summary.get('aar_delta01'), 4)} "
-            f"dAAR12={self._fmt(summary.get('aar_delta12'), 4)} "
-            f"entropy=({self._fmt(summary.get('round0_seq_entropy'), 4)},"
-            f"{self._fmt(summary.get('round1_seq_entropy'), 4)},"
-            f"{self._fmt(summary.get('round2_seq_entropy'), 4)}) "
-            f"native_p=({self._fmt(summary.get('round0_seq_native_prob'), 4)},"
-            f"{self._fmt(summary.get('round1_seq_native_prob'), 4)},"
-            f"{self._fmt(summary.get('round2_seq_native_prob'), 4)}) "
-            f"margin=({self._fmt(summary.get('round0_seq_top1_margin'), 4)},"
-            f"{self._fmt(summary.get('round1_seq_top1_margin'), 4)},"
-            f"{self._fmt(summary.get('round2_seq_top1_margin'), 4)})"
-        )
-        print(
-            "[SequenceProposalAudit] "
-            f"epoch={self.epoch} proposal_AAR={self._fmt(summary.get('proposal_aar'), 4)} "
-            f"pred_eq_proposal={self._fmt(summary.get('pred_vs_proposal_aar'), 4)} "
-            f"change={self._fmt(summary.get('proposal_change_rate'), 4)} "
-            f"preserve_correct={self._fmt(summary.get('proposal_preservation_rate'), 4)} "
-            f"correct_wrong={self._fmt(summary.get('proposal_correction_rate'), 4)} "
-            f"damage_correct={self._fmt(summary.get('proposal_damage_rate'), 4)}"
-        )
-        print(
-            "[R05AbXRepresentationAudit] "
-            f"epoch={self.epoch} "
-            f"single_rms={self._fmt(summary.get('abx_single_rms'), 5)} "
-            f"pair_rms={self._fmt(summary.get('abx_pair_rms'), 5)} "
-            f"tokens={self._fmt(summary.get('abx_token_count'), 1)} "
-            f"pairs={self._fmt(summary.get('abx_pair_count'), 1)} "
-            f"design_mask={self._fmt(summary.get('abx_design_embedding_mask_rate'), 4)} "
-            f"parent_static={self._fmt(summary.get('r05_parent_static_bio_rms'), 5)} "
-            f"parent_dynamic={self._fmt(summary.get('r05_parent_dynamic_bio_rms'), 5)} "
-            f"abx_single_bio={self._fmt(summary.get('abx_single_bio_rms'), 5)} "
-            f"time=R05:{self._fmt(summary.get('r05_time_embed_on'), 0)}/AbX:{self._fmt(summary.get('abx_time_embed_on'), 0)}"
-        )
-        print(
-            "[R05AbXEdgeAudit] "
-            f"epoch={self.epoch} "
-            f"ctx_rms={self._fmt(summary.get('abx_ctx_edge_attr_rms'), 5)} "
-            f"inter_rms={self._fmt(summary.get('abx_inter_edge_attr_rms'), 5)} "
-            f"surf_rms={self._fmt(summary.get('abx_surf_edge_attr_rms'), 5)} "
-            f"counts=({self._fmt(summary.get('abx_ctx_edge_count'), 0)},"
-            f"{self._fmt(summary.get('abx_inter_edge_count'), 0)},"
-            f"{self._fmt(summary.get('abx_surf_edge_count'), 0)})"
-        )
-        print(
-            "[V211BridgeAuthorityAudit] "
-            f"epoch={self.epoch} "
-            f"single_delta_to_base={self._fmt(summary.get('bridge_single_delta_to_base_ratio'), 6)} "
-            f"pair_delta_to_base_mean={self._fmt(summary.get('bridge_pair_delta_to_base_ratio_mean'), 6)} "
-            f"pair_delta_to_base_max={self._fmt(summary.get('bridge_pair_delta_to_base_ratio_max'), 6)}"
-        )
-        print(
-            "[R05AbXAuxAudit] "
-            f"epoch={self.epoch} "
-            f"disto={self._fmt(summary.get('abx_distogram_loss'), 5)} "
-            f"disto_all={self._fmt(summary.get('disto_all_pair_raw_loss'), 5)} "
-            f"task_pair_fraction={self._fmt(summary.get('disto_task_pair_fraction'), 4)} "
-            f"lddt={self._fmt(summary.get('mf_smooth_lddt_loss'), 5)} "
-            f"lddt_intra={self._fmt(summary.get('mf_smooth_lddt_intra_loss'), 5)} "
-            f"lddt_scaffold={self._fmt(summary.get('mf_smooth_lddt_scaffold_loss'), 5)} "
-            f"lddt_antigen={self._fmt(summary.get('mf_smooth_lddt_antigen_loss'), 5)} "
-            f"lddt_antigen_score={self._fmt(summary.get('mf_smooth_lddt_antigen_score'), 5)} "
-            f"fixed_context_drift_A={self._fmt(summary.get('mf_smooth_lddt_fixed_context_pred_drift_rms'), 5)} "
-            f"fixed_context_restored={self._fmt(summary.get('mf_smooth_lddt_fixed_context_restored_rate'), 4)} "
-            f"pairs=({self._fmt(summary.get('mf_smooth_lddt_intra_pairs'), 0)},"
-            f"{self._fmt(summary.get('mf_smooth_lddt_scaffold_pairs'), 0)},"
-            f"{self._fmt(summary.get('mf_smooth_lddt_antigen_pairs'), 0)})"
-        )
-        bins = []
-        for bidx in range(5):
-            bins.append(
-                f"b{bidx}={self._fmt(summary.get(f'timebin{bidx}_h3ca_raw'), 4, 'A')}"
-                f"(n={int(summary.get(f'timebin{bidx}_count', 0) or 0)})"
-            )
-        print(
-            f"[ValidationPhysicalBins] epoch={self.epoch} " + " ".join(bins)
+            f"H3raw={self._fmt(summary.get('h3ca_raw_r2'), 4, 'A')} "
+            f"H3aligned={self._fmt(summary.get('h3ca_aligned_r2'), 4, 'A')} "
+            f"AAR={self._fmt(summary.get('aar_r2'), 4)} "
+            f"CAAR={self._fmt(summary.get('caar'), 4)} "
+            f"contactF1={self._fmt(summary.get('contact_f1'), 4)} "
+            f"bridge_s={self._fmt(summary.get('bridge_single_delta_to_base_ratio'), 5)} "
+            f"bridge_z={self._fmt(summary.get('bridge_pair_delta_to_base_ratio_mean'), 5)}"
         )
 
 
@@ -1433,8 +1272,8 @@ class AbFlowTrainer(Trainer):
             "val_structure": validation_summary.get("loss_structure", float("nan")),
             "val_interface": validation_summary.get("loss_interface", float("nan")),
             "val_edge": validation_summary.get("loss_edge", float("nan")),
-            "val_distogram": validation_summary.get("abx_distogram_loss", validation_summary.get("mf_distogram_loss", float("nan"))),
-            "val_smooth_lddt": validation_summary.get("mf_smooth_lddt_loss", float("nan")),
+            "val_distogram": validation_summary.get("distogram_loss", float("nan")),
+            "val_smooth_lddt": validation_summary.get("smooth_lddt_loss", float("nan")),
         }
         for key, value in current_test.items():
             row[f"test_{key}"] = value
@@ -1458,60 +1297,31 @@ class AbFlowTrainer(Trainer):
 
             print(
                 "[EpochSummary] "
-                f"epoch={row['epoch']} "
-                f"train={self._fmt(row['train_loss'], 5)} "
-                f"seq={self._fmt(row['train_seq'], 5)} "
-                f"struct={self._fmt(row['train_structure'], 5)} "
-                f"interface={self._fmt(row['train_interface'], 5)} "
-                f"edge={self._fmt(row['train_edge'], 5)} "
-                f"disto={self._fmt(row['train_distogram'], 5)} "
-                f"slddt={self._fmt(row['train_smooth_lddt'], 5)} | "
+                f"epoch={row['epoch']} train={self._fmt(row['train_loss'], 5)} "
                 f"val={self._fmt(row['val_loss'], 5)} "
-                f"vseq={self._fmt(row['val_seq'], 5)} "
-                f"vstruct={self._fmt(row['val_structure'], 5)} "
-                f"vinterface={self._fmt(row['val_interface'], 5)} "
-                f"vedge={self._fmt(row['val_edge'], 5)} "
-                f"vdisto={self._fmt(row['val_distogram'], 5)} "
-                f"vslddt={self._fmt(row['val_smooth_lddt'], 5)} | "
-                f"AAR={self._fmt(row['test_AAR'], 5)} "
-                f"CAAR={self._fmt(row['test_CAAR'], 5)} "
-                f"H3raw={self._fmt(row['test_H3raw'], 5, 'A')} "
-                f"H3aligned={self._fmt(row['test_H3aligned'], 5, 'A')} "
-                f"TM={self._fmt(row['test_TM'], 5)} "
-                f"lDDT={self._fmt(row['test_lDDT'], 5)} "
-                f"DockQ={self._fmt(row['test_DockQ'], 5)} | "
-                f"best_val_epoch={row['best_val_epoch']} "
-                f"best_val={self._fmt(row['best_val_loss'], 5)} "
-                f"best_AAR={self._fmt(row['best_test_AAR'], 5)} "
-                f"best_CAAR={self._fmt(row['best_test_CAAR'], 5)} "
-                f"best_H3raw={self._fmt(row['best_test_H3raw'], 5, 'A')} "
-                f"best_H3aligned={self._fmt(row['best_test_H3aligned'], 5, 'A')} "
-                f"best_TM={self._fmt(row['best_test_TM'], 5)} "
-                f"best_lDDT={self._fmt(row['best_test_lDDT'], 5)} "
-                f"best_DockQ={self._fmt(row['best_test_DockQ'], 5)}"
+                f"AAR={self._fmt(row['test_AAR'], 5)} CAAR={self._fmt(row['test_CAAR'], 5)} "
+                f"H3raw={self._fmt(row['test_H3raw'], 4, 'A')} H3aligned={self._fmt(row['test_H3aligned'], 4, 'A')} "
+                f"TM={self._fmt(row['test_TM'], 5)} lDDT={self._fmt(row['test_lDDT'], 5)} DockQ={self._fmt(row['test_DockQ'], 5)} "
+                f"best_val_epoch={row['best_val_epoch']} best_val={self._fmt(row['best_val_loss'], 5)}"
             )
 
     def _requires_live_pair_gradient_contract(self):
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
         return bool(
-            getattr(raw_model, "abx_native_repr", False)
-            and getattr(raw_model, "abx_distogram", False)
+            getattr(raw_model, "relational_trunk_enabled", False)
+            and getattr(raw_model, "distogram_enabled", False)
             and abs(float(getattr(raw_model, "loss_distogram_weight", 0.0))) > 0.0
         )
 
     def _requires_live_bridge_contract(self):
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
-        return bool(
-            getattr(raw_model, "abx_native_repr", False)
-            and getattr(raw_model, "abx_bridge_mode", "")
-            == "zero_reparameterized"
-        )
+        return bool(getattr(raw_model, "relational_trunk_enabled", False))
 
     def _requires_live_smooth_lddt_pair_gradient_contract(self):
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
         return bool(
-            getattr(raw_model, "abx_native_repr", False)
-            and getattr(raw_model, "mf_smooth_lddt", False)
+            getattr(raw_model, "relational_trunk_enabled", False)
+            and getattr(raw_model, "smooth_lddt_enabled", False)
             and abs(float(getattr(raw_model, "loss_smooth_lddt_weight", 0.0))) > 0.0
         )
 
@@ -1547,8 +1357,11 @@ class AbFlowTrainer(Trainer):
         # epoch mechanism audit.  Training captures them only for the periodic
         # gradient-authority probe.  No per-step diagnostic files are written.
         probe_grad_now = self._should_probe_grad(val)
-        first_step_diag = (not val) and int(self.global_step) < self._science_log_first_steps
-        capture_diagnostics = bool(val) or probe_grad_now or first_step_diag
+        science_step_diag = (not val) and (
+            int(self.global_step) < self._science_log_first_steps
+            or (self._science_log_interval > 0 and int(self.global_step) % self._science_log_interval == 0)
+        )
+        capture_diagnostics = bool(val) or probe_grad_now or science_step_diag
         raw_model._diagnostic_capture = bool(capture_diagnostics)
         raw_model._diagnostic_validation_mode = bool(val and capture_diagnostics)
 
@@ -1663,9 +1476,9 @@ class AbFlowTrainer(Trainer):
             )
 
             scorefm_now = getattr(raw_model, "last_scorefm_losses", None) or {}
-            raw_disto = self._scalar(scorefm_now.get("disto_raw_loss"))
-            valid_pairs = self._scalar(scorefm_now.get("disto_valid_pairs_total"))
-            head = getattr(getattr(raw_model, "abx_repr", None), "distogram_head", None)
+            raw_disto = self._scalar(scorefm_now.get("distogram_loss"))
+            valid_pairs = self._scalar(scorefm_now.get("distogram_valid_pairs"))
+            head = getattr(getattr(raw_model, "native_trunk", None), "distogram_head", None)
             projection = getattr(head, "proj", None)
             head_parameter_norm = None
             if isinstance(projection, torch.nn.Module):
@@ -1757,15 +1570,9 @@ class AbFlowTrainer(Trainer):
             grad_diag = getattr(raw_model, "last_gradient_diagnostics", None) or {}
             gl_scalar = self._scalar(grad_diag.get("grad_pair_norm_smooth_lddt"))
             scorefm_now = getattr(raw_model, "last_scorefm_losses", None) or {}
-            raw_lddt = self._scalar(scorefm_now.get("mf_smooth_lddt_loss"))
-            pair_counts = [
-                self._scalar(scorefm_now.get(f"mf_smooth_lddt_{name}_pairs"))
-                for name in ("intra", "scaffold", "antigen")
-            ]
-            valid_pairs = (
-                sum(float(value) for value in pair_counts if value is not None)
-                if any(value is not None for value in pair_counts)
-                else None
+            raw_lddt = self._scalar(scorefm_now.get("smooth_lddt_loss"))
+            valid_pairs = self._scalar(
+                scorefm_now.get("smooth_lddt_support_weight")
             )
             local_live = bool(
                 gl_scalar is not None
@@ -1895,7 +1702,7 @@ class AbFlowTrainer(Trainer):
                 self._bridge_cold_start_observed = True
                 if self._diag_main_rank:
                     print(
-                        "[V211BridgeColdStartPASS] "
+                        "[BridgeContract] phase=cold_start PASS "
                         f"step={self.global_step} single_ratio={self._fmte(single_ratio, 3)} "
                         f"pair_ratio={self._fmte(pair_ratio, 3)} "
                         "parent_identity=exact next_batch_requires_live=1"
@@ -1904,7 +1711,7 @@ class AbFlowTrainer(Trainer):
                 self._live_bridge_contract_verified = True
                 if self._diag_main_rank:
                     print(
-                        "[V211BridgeLivePASS] "
+                        "[BridgeContract] phase=live PASS "
                         f"step={self.global_step} single_ratio={self._fmte(single_ratio, 3)} "
                         f"pair_ratio={self._fmte(pair_ratio, 3)} all_ranks=PASS"
                     )
@@ -1949,71 +1756,48 @@ class AbFlowTrainer(Trainer):
 
         if not val and (
             int(self.global_step) < self._science_log_first_steps
-            or int(self.global_step) % self._science_log_interval == 0
+            or (self._science_log_interval > 0 and int(self.global_step) % self._science_log_interval == 0)
         ) and self._diag_main_rank:
             def _sf(name):
                 return self._scalar(scorefm_losses.get(name))
             def _ad(name):
                 return self._scalar(abflow_diagnostics.get(name))
             print(
-                "[R05AbXStep] "
+                "[RelationalStep] "
                 f"epoch={self.epoch} step={self.global_step} "
                 f"loss={self._fmt(self._scalar(loss), 5)} "
                 f"seq={self._fmt(self._scalar(snll), 5)} "
                 f"struct={self._fmt(self._scalar(struct_loss), 5)} "
                 f"interface={self._fmt(self._scalar(interface_loss), 5)} "
                 f"edge={self._fmt(self._scalar(ed_loss), 5)} "
-                f"disto={self._fmt(_sf('abx_distogram_loss'), 5)} "
-                f"lddt={self._fmt(_sf('mf_smooth_lddt_loss'), 5)} "
-                f"t=({self._fmt(_ad('t_min'), 3)},{self._fmt(_ad('t_mean'), 3)},{self._fmt(_ad('t_max'), 3)}) "
-                f"s={self._fmt(_sf('abx_single_rms'), 4)} "
-                f"z={self._fmt(_sf('abx_pair_rms'), 4)} "
+                f"t={self._fmt(_ad('t_mean'), 3)} "
+                f"s={self._fmt(_sf('relational_single_rms'), 4)} "
+                f"z={self._fmt(_sf('relational_pair_rms'), 4)} "
                 f"edge_z=({self._fmt(_ad('abx_ctx_edge_attr_rms'), 4)},"
                 f"{self._fmt(_ad('abx_inter_edge_attr_rms'), 4)},"
                 f"{self._fmt(_ad('abx_surf_edge_attr_rms'), 4)}) "
                 f"bridge_s={self._fmt(_ad('bridge_single_delta_to_base_ratio'), 6)} "
-                f"bridge_z_mean={self._fmt(_ad('bridge_pair_delta_to_base_ratio_mean'), 6)} "
-                f"bridge_z_max={self._fmt(_ad('bridge_pair_delta_to_base_ratio_max'), 6)} "
-                f"mask={self._fmt(_sf('abx_design_embedding_mask_rate'), 3)}"
+                f"bridge_z={self._fmt(_ad('bridge_pair_delta_to_base_ratio_mean'), 6)}"
             )
-            if bool(getattr(raw_model, "abx_distogram", False)):
+            if bool(getattr(raw_model, "distogram_enabled", False)):
                 print(
-                    "[DistoAudit] "
+                    "[Distogram] "
                     f"epoch={self.epoch} step={self.global_step} "
-                    f"raw_loss={self._fmt(_sf('disto_raw_loss'), 6)} "
-                    f"all_pair_raw_loss={self._fmt(_sf('disto_all_pair_raw_loss'), 6)} "
-                    f"weighted_loss={self._fmt(_sf('disto_weighted_loss'), 6)} "
-                    f"scope_design_anchored={self._fmt(_sf('disto_scope_design_anchored'), 0)} "
-                    f"resolved_pseudo_beta_rate={self._fmt(_sf('disto_resolved_pseudo_beta_rate'), 4)} "
-                    f"resolved_atom_rate={self._fmt(_sf('disto_resolved_atom_rate'), 4)} "
-                    f"objective_pairs={self._fmt(_sf('disto_valid_pairs_total'), 0)} "
-                    f"donor_pairs={self._fmt(_sf('disto_donor_valid_pairs_total'), 0)} "
-                    f"task_pair_fraction={self._fmt(_sf('disto_task_pair_fraction'), 4)} "
-                    f"pairs_DD={self._fmt(_sf('disto_design_design_pairs'), 0)} "
-                    f"pairs_DF={self._fmt(_sf('disto_design_framework_pairs'), 0)} "
-                    f"pairs_DA={self._fmt(_sf('disto_design_antigen_pairs'), 0)} "
-                    f"pairs_CC={self._fmt(_sf('disto_context_context_pairs'), 0)} "
-                    f"ce_DD={self._fmt(_sf('disto_ce_design_design'), 4)} "
-                    f"ce_DF={self._fmt(_sf('disto_ce_design_framework'), 4)} "
-                    f"ce_DA={self._fmt(_sf('disto_ce_design_antigen'), 4)} "
-                    f"ce_CC={self._fmt(_sf('disto_ce_context_context'), 4)} "
-                    f"contact_precision_8A_DA={self._fmt(_sf('disto_contact_precision_8A_design_antigen'), 4)}"
+                    f"raw={self._fmt(_sf('distogram_loss'), 6)} "
+                    f"weighted={self._fmt(_sf('distogram_weighted_loss'), 6)} "
+                    f"head_rms={self._fmt(_sf('distogram_head_weight_rms'), 6)} "
+                    f"DA_ce={self._fmt(_sf('distogram_da_ce'), 4)} "
+                    f"DA_contactP={self._fmt(_sf('distogram_da_contact_precision'), 4)}"
                 )
-            if bool(getattr(raw_model, "mf_smooth_lddt", False)):
+            if bool(getattr(raw_model, "smooth_lddt_enabled", False)):
                 print(
-                    "[SmoothLDDTAudit] "
+                    "[SmoothLDDT] "
                     f"epoch={self.epoch} step={self.global_step} "
-                    f"raw_loss={self._fmt(_sf('mf_smooth_lddt_loss'), 6)} "
-                    f"weighted_loss={self._fmt(_sf('mf_smooth_lddt_weighted_loss'), 6)} "
-                    f"loss_DD={self._fmt(_sf('mf_smooth_lddt_intra_loss'), 5)} "
-                    f"loss_DF={self._fmt(_sf('mf_smooth_lddt_scaffold_loss'), 5)} "
-                    f"loss_DA={self._fmt(_sf('mf_smooth_lddt_antigen_loss'), 5)} "
-                    f"score_DA={self._fmt(_sf('mf_smooth_lddt_antigen_score'), 5)} "
-                    f"pairs=({self._fmt(_sf('mf_smooth_lddt_intra_pairs'), 0)},"
-                    f"{self._fmt(_sf('mf_smooth_lddt_scaffold_pairs'), 0)},"
-                    f"{self._fmt(_sf('mf_smooth_lddt_antigen_pairs'), 0)}) "
-                    f"fixed_context_drift_A={self._fmt(_sf('mf_smooth_lddt_fixed_context_pred_drift_rms'), 5)} "
-                    f"fixed_context_restored_rate={self._fmt(_sf('mf_smooth_lddt_fixed_context_restored_rate'), 4)}"
+                    f"raw={self._fmt(_sf('smooth_lddt_loss'), 6)} "
+                    f"weighted={self._fmt(_sf('smooth_lddt_weighted_loss'), 6)} "
+                    f"DD={self._fmt(_sf('smooth_lddt_DD'), 5)} "
+                    f"DF={self._fmt(_sf('smooth_lddt_DF'), 5)} "
+                    f"DA={self._fmt(_sf('smooth_lddt_DA'), 5)}"
                 )
         if probe_grad_now:
             if (not val) and self._diag_main_rank:
@@ -2067,9 +1851,9 @@ class AbFlowTrainer(Trainer):
             self._accumulate_train_component("interface", interface_loss)
             self._accumulate_train_component("edge", ed_loss)
             self._accumulate_train_component(
-                "distogram", scorefm_losses.get("abx_distogram_loss", scorefm_losses.get("mf_distogram_loss"))
+                "distogram", scorefm_losses.get("distogram_loss")
             )
             self._accumulate_train_component(
-                "smooth_lddt", scorefm_losses.get("mf_smooth_lddt_loss")
+                "smooth_lddt", scorefm_losses.get("smooth_lddt_loss")
             )
         return loss

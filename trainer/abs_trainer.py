@@ -220,7 +220,8 @@ class Trainer:
     def _train_memory_log(self, stage, device):
         """Early-step CUDA memory audit; diagnostic only, no training semantics."""
         if (
-            not torch.cuda.is_available()
+            stage != "after_backward"
+            or not torch.cuda.is_available()
             or int(self.global_step) >= self._runtime_guard_steps()
             or not self._is_main_proc()
         ):
@@ -231,7 +232,7 @@ class Trainer:
         peak_alloc = torch.cuda.max_memory_allocated(dev) / (1024 ** 3)
         peak_reserved = torch.cuda.max_memory_reserved(dev) / (1024 ** 3)
         print_log(
-            f"[TrainMemory] epoch={self.epoch} step={self.global_step} stage={stage} "
+            f"[RuntimeMemory] epoch={self.epoch} step={self.global_step} "
             f"alloc={alloc:.3f}GiB reserved={reserved:.3f}GiB "
             f"peak_alloc={peak_alloc:.3f}GiB peak_reserved={peak_reserved:.3f}GiB"
         )
@@ -531,8 +532,6 @@ class Trainer:
             self._load_topk_checkpoint_map()
 
         if local_rank != -1:
-            print_log(f'Using data parallel, local rank {local_rank}, all {device_ids}')
-
             def _env_bool(name, default=False):
                 raw = str(os.environ.get(name, 'on' if default else 'off')).strip().lower()
                 if raw in {'1', 'true', 'yes', 'y', 'on'}:
@@ -541,40 +540,27 @@ class Trainer:
                     return False
                 raise ValueError(f'{name} must be on/off, got {raw!r}')
 
-            # V193 formal R05+AbX runtime contract (PyTorch 1.11):
-            # - the same AbX Seqformer block is activation-checkpointed once in
-            #   each of the three R05 physical recurrence rounds;
-            # - the same parameter set must therefore participate every round;
-            # - empty surface-edge batches are handled inside MS_E_GCL with an
-            #   exact zero-message identity that still yields zero (not None)
-            #   gradients for the surf_gcl parameters.
-            # Under this contract repeated re-entrant checkpointing is run with
-            # DDP static_graph=True and find_unused_parameters=False.
             find_unused = _env_bool('ABFLOW_DDP_FIND_UNUSED_PARAMETERS', False)
             static_graph = _env_bool('ABFLOW_DDP_STATIC_GRAPH', False)
-            triangle_ckpt = _env_bool('ABFLOW_MF_TRIANGLE_CHECKPOINT', False)
-            abx_ckpt = _env_bool('ABFLOW_ABX_ACTIVATION_CHECKPOINT', False)
+            # The formal relational trunk owns its checkpoint setting in JSON.
+            # Read the live model instead of historical ABFLOW_ABX_* switches.
+            native_trunk = getattr(self.model, 'native_trunk', None)
+            trunk_cfg = getattr(getattr(native_trunk, 'trunk', None), 'config', None)
+            relational_ckpt = bool(getattr(trunk_cfg, 'activation_checkpoint', False))
 
             if static_graph and find_unused:
                 raise RuntimeError(
-                    'ABFLOW_DDP_STATIC_GRAPH=on must use '
-                    'ABFLOW_DDP_FIND_UNUSED_PARAMETERS=off.'
+                    'DDP static_graph=True requires find_unused_parameters=False.'
                 )
-            if triangle_ckpt and find_unused:
+            if relational_ckpt and find_unused:
                 raise RuntimeError(
-                    'PyTorch 1.11 DDP cannot safely combine shared re-entrant triangle '
-                    'checkpointing with find_unused_parameters=True.'
+                    'PyTorch 1.11 re-entrant relational checkpointing requires '
+                    'find_unused_parameters=False.'
                 )
-            if abx_ckpt and find_unused:
+            if relational_ckpt and not static_graph:
                 raise RuntimeError(
-                    'ABFLOW_ABX_ACTIVATION_CHECKPOINT=on must use '
-                    'ABFLOW_DDP_FIND_UNUSED_PARAMETERS=off in the V193 runtime.'
-                )
-            if abx_ckpt and not static_graph:
-                raise RuntimeError(
-                    'ABFLOW_ABX_ACTIVATION_CHECKPOINT=on requires '
-                    'ABFLOW_DDP_STATIC_GRAPH=on under PyTorch 1.11 because the '
-                    'shared AbX block is checkpointed in all three R05 rounds.'
+                    'PyTorch 1.11 formal relational checkpointing requires '
+                    'DDP static_graph=True.'
                 )
 
             self.model = torch.nn.parallel.DistributedDataParallel(
@@ -588,18 +574,18 @@ class Trainer:
             if static_graph:
                 if not hasattr(self.model, '_set_static_graph'):
                     raise RuntimeError(
-                        'ABFLOW_DDP_STATIC_GRAPH=on was requested, but this torch DDP '
+                        'DDP static_graph=True was requested, but this torch DDP '
                         'implementation does not expose _set_static_graph().'
                     )
                 self.model._set_static_graph()
 
             if self._is_main_proc():
                 print_log(
-                    '[DDPGraphContract] '
-                    f'find_unused_parameters={str(find_unused).lower()} '
-                    f'static_graph={str(static_graph).lower()} '
-                    f'triangle_checkpoint={str(triangle_ckpt).lower()} ' +
-                    f'abx_checkpoint={str(abx_ckpt).lower()}'
+                    '[DDPGraph] '
+                    f'world={len(device_ids)} '
+                    f'find_unused={int(find_unused)} '
+                    f'static_graph={int(static_graph)} '
+                    f'relational_checkpoint={int(relational_ckpt)}'
                 )
         else:
             print_log(f'training on {device_ids}')

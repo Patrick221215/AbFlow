@@ -1,22 +1,512 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
-"""FoldFlow-R3-inspired stochastic conditional paths for AbFlow.
+"""Core AbFlow representation boundary and R3 flow-matching components.
 
-Only Euclidean translation ideas are absorbed.  No SO(3), SE(3), OT, ESM,
-IPA replacement, or whole-complex COM recentering is introduced.
-
-AbFlow time convention:
-    t=0 : PCS-RC proposal/source X0
-    t=1 : native endpoint X1
-
-The current AbFlow network stays endpoint-parameterized.  For an arbitrary
-velocity target u*, its equivalent endpoint-like target is
-    Y* = Xt + (1-t) u*.
-This lets us test FoldFlow's R3 conditional-flow target without adding a new
-velocity head or changing the sampler interface.
+`NativeTrunk` owns the padded single/pair representation adapter.
+`AbFlowR3Matcher` owns Cartesian R3 path/score/velocity algebra.
+The top-level `AbFlowModel` imports these components instead of defining them.
 """
+
 import math
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from configs import (
+    CDR_TO_ENUM, UNKNOWN_AB_REGION_INDEX, imgt_region_index, normalize_regions,
+)
+from utils.nn_utils import (
+    DistogramHead, SinglePairEncoder, _atom14_chemical_mask,
+    _atom14_exists_from_seq, _torsions_from_atom14, pseudo_beta_fn_v2,
+)
+
+class NativeTrunk(nn.Module):
+    """Dense single/pair representation with an R05-only boundary adapter.
+
+    The relational operators (compact residue geometry, PairEmbedding, time embedding
+    and one-block Seqformer) are adapted from the supplied AbX implementation for R05.
+    Only data routing is adapted:
+
+    * AbFlow is flat/ragged, AbFlow is padded [B,L,...]; this class packs/unpacks.
+    * ESM is intentionally absent because the project has a frozen no-ESM
+      boundary. No Seqformer operator is removed.
+    * AbFlow recycling is deliberately disabled. R05's three physical refinement
+      rounds remain the sole recurrent mechanism in this experiment family.
+    * ``fixed_mask`` retains the donor's information barrier: design-region structural
+      features are masked in ResidueEmbedding/PairEmbedding. This is important
+      here because R05 already exposes the current flow state through its native
+      full-atom radial geometry; copying clean/native design geometry into the
+      donor trunk would leak X1, while redundantly re-encoding the shadow Xt would
+      create a dual-coordinate-state ambiguity between ctx and local branches.
+    """
+    # Widths are instance-level because  supports both donor and localized
+    # profiles.  ``single_dim`` / ``pair_dim`` are derived from trunk.config in
+    # __init__ and are the single source of truth for all downstream consumers.
+
+    def __init__(self, representation_config, distogram_config=None,
+                 forward_seed=271828):
+        super().__init__()
+        self.representation_config = representation_config
+        self.trunk = SinglePairEncoder(representation_config)
+        geometry_cfg = representation_config.get("geometry", {})
+        self.torsion_norm_eps = float(geometry_cfg.get("torsion_norm_eps", 1e-12))
+        self.ca_fill_tol2 = float(geometry_cfg.get("ca_fill_tol2", 1e-12))
+        self.single_dim = int(
+            self.trunk.config.seq_channel + self.trunk.config.index_embed_size
+        )
+        self.pair_dim = int(
+            self.trunk.config.pair_channel + 2 * self.trunk.config.index_embed_size
+        )
+        distogram_config = distogram_config or {}
+        self.enable_distogram = float(
+            distogram_config.get("weight", 0.0)
+        ) > 0.0
+        self.distogram_pair_scope = distogram_config.get(
+            "pair_scope", "all_resolved"
+        )
+        self.distogram_bins = int(distogram_config.get("bins", 64))
+        self.distogram_min = float(distogram_config.get("min_bin", 2.3125))
+        self.distogram_max = float(distogram_config.get("max_bin", 21.6875))
+
+        self.forward_seed = int(forward_seed)
+        self.register_buffer(
+            "_training_forward_call",
+            torch.zeros((), dtype=torch.long),
+            persistent=True,
+        )
+        self.distogram_head = (
+            DistogramHead(
+                pair_dim=self.pair_dim,
+                num_bins=self.distogram_bins,
+                first_break=self.distogram_min,
+                last_break=self.distogram_max,
+            )
+            if self.enable_distogram else None
+        )
+        self.last_diagnostics = {}
+
+    def _ordered_nodes(self, valid_mask, batch_id, is_antigen):
+        """Use the complete antibody plus the dataset-defined epitope."""
+        nodes, antibody_lens, antigen_counts = [], [], []
+        B = int(batch_id.max().item()) + 1 if batch_id.numel() else 0
+        for gid in range(B):
+            g = valid_mask & (batch_id == gid)
+            ab = torch.nonzero(g & (~is_antigen), as_tuple=False).flatten()
+            ag = torch.nonzero(g & is_antigen, as_tuple=False).flatten()
+            nodes.append(torch.cat([ab, ag], dim=0))
+            antibody_lens.append(int(ab.numel()))
+            antigen_counts.append(int(ag.numel()))
+        return nodes, antibody_lens, antigen_counts
+
+    @staticmethod
+    def _remap_chain_ids(seg, mask):
+        out = seg.new_zeros(seg.shape)
+        for b in range(seg.shape[0]):
+            seen = []
+            for j in range(int(mask[b].sum().item())):
+                value = int(seg[b, j].item())
+                if value not in seen:
+                    seen.append(value)
+                out[b, j] = seen.index(value)
+        return out
+
+    @staticmethod
+    def _cdr_definition(residue_index, chain_id, mask, antibody_len, cdr_type, design_mask):
+        """Map packed antibody residues through the canonical IMGT authority.
+
+        Runtime packing decides only which packed chain is heavy/light.  The
+        numerical IMGT ranges and region ids live exclusively in ``configs.py``.
+        """
+        out = residue_index.new_full(residue_index.shape, UNKNOWN_AB_REGION_INDEX)
+        B = residue_index.shape[0]
+        for b in range(B):
+            ab_n = min(int(antibody_len[b].item()), int(mask[b].sum().item()))
+            for j in range(ab_n):
+                cid = int(chain_id[b, j].item())
+                chain_kind = "H" if cid == 0 else "L"
+                out[b, j] = imgt_region_index(
+                    int(residue_index[b, j].item()), chain_kind
+                )
+
+        names = normalize_regions(cdr_type)
+        if len(names) == 1 and names[0] in CDR_TO_ENUM:
+            out = torch.where(
+                design_mask,
+                torch.full_like(out, CDR_TO_ENUM[names[0]]),
+                out,
+            )
+        return out
+
+    def _pack(self, X, S, segment_ids, residue_pos, batch_id, valid_mask,
+              is_antigen, design_mask, flow_t, cdr_type, atom_observed_mask=None):
+        nodes, ab_lens, antigen_counts = self._ordered_nodes(
+            valid_mask, batch_id, is_antigen,
+        )
+        B = len(nodes)
+        L = max([int(idx.numel()) for idx in nodes] or [0])
+        if L == 0:
+            raise RuntimeError("AbFlow trunk received no biological residues")
+        if X.shape[1] != 14:
+            raise ValueError(
+                f" single/pair port requires the donor's formal 14-slot full-atom state; got {tuple(X.shape)}"
+            )
+
+        Sp = S.new_full((B, L), 20)
+        Xp = X.new_zeros((B, L, 14, 3))
+        Obsp = X.new_zeros((B, L, 14)) if atom_observed_mask is not None else None
+        Seg = segment_ids.new_zeros((B, L))
+        Rp = torch.zeros((B, L), device=X.device, dtype=torch.long)
+        M = torch.zeros((B, L), device=X.device, dtype=torch.bool)
+        Design = torch.zeros_like(M)
+        IsAg = torch.zeros_like(M)
+        GI = S.new_full((B, L), -1)
+        if atom_observed_mask is not None:
+            if tuple(atom_observed_mask.shape) != tuple(X.shape[:-1]):
+                raise ValueError(
+                    f"AbFlow xloss_mask shape mismatch: {tuple(atom_observed_mask.shape)} "
+                    f"vs X {tuple(X.shape)}"
+                )
+        for b, idx in enumerate(nodes):
+            n = int(idx.numel())
+            if n == 0:
+                continue
+            Sp[b, :n] = S[idx].long().clamp(0, 22)
+            Xp[b, :n] = X[idx]
+            if Obsp is not None:
+                Obsp[b, :n] = atom_observed_mask[idx].to(dtype=Xp.dtype)
+            Seg[b, :n] = segment_ids[idx]
+            rp = residue_pos[idx]
+            rp = rp[..., 0] if rp.dim() > 1 else rp
+            # torch<=1.11 CUDA does not implement round() for Long tensors.
+            # R05 residue_pos is normally already integer-valued; round only a
+            # floating representation before the final semantic cast.
+            if torch.is_floating_point(rp):
+                rp = torch.round(rp)
+            Rp[b, :n] = rp.to(dtype=torch.long)
+            M[b, :n] = True
+            Design[b, :n] = design_mask[idx].bool()
+            IsAg[b, :n] = is_antigen[idx].bool()
+            GI[b, :n] = idx
+
+        Chain = self._remap_chain_ids(Seg, M)
+        antibody_len = torch.tensor(ab_lens, device=X.device, dtype=torch.long)
+        Cdr = self._cdr_definition(Rp, Chain, M, antibody_len, cdr_type, Design)
+        #  formal atom-observation contract. AbFlow stores unresolved atom
+        # slots as a copy of CA and records the true observation state in
+        # xloss_mask; donor AbFlow stores unresolved atom14 coordinates as zero.
+        # Translate only this private donor input representation. Parent R05 X,
+        # EGNN geometry, losses and coordinate authority are untouched.
+        Exists = _atom14_exists_from_seq(
+            Sp, Xp, Obsp, tol2=self.ca_fill_tol2
+        ) * M[..., None].to(Xp.dtype)
+        Xp_donor = torch.where(Exists.bool()[..., None], Xp, torch.zeros_like(Xp))
+
+        # single/pair semantics: design region is not a clean/native structural condition.
+        # Fixed scaffold/antigen structural embeddings are visible; design
+        # ResidueEmbedding/PairEmbedding geometry is blocked. The current Xt still
+        # enters R05 AM_E_GCL through its original multi-channel radial path.
+        Fixed = M & (~Design)
+        Tors = _torsions_from_atom14(
+            Sp, Xp_donor, Chain, Fixed, atom_exists=Exists.bool(),
+            epsilon=self.torsion_norm_eps,
+        )
+
+        t = flow_t
+        if t is None:
+            t = Xp.new_zeros(B)
+        elif t.dim() == 0:
+            t = t.expand(B)
+        elif t.numel() != B:
+            t = torch.stack([t[batch_id == gid].reshape(-1)[0] for gid in range(B)])
+
+        batch = {
+            'seq': Sp, 'seq_t': Sp, 'mask': M, 'fixed_mask': Fixed,
+            'chain_id': Chain, 'residx': Rp, 'cdr_def': Cdr,
+            'atom14_gt_positions': Xp_donor, 'atom14_gt_exists': Exists,
+            'torsion_angles_sin_cos': Tors, 't': t.to(Xp.dtype),
+            'antibody_len': antibody_len, 'is_recycling': False,
+            '_design_mask': Design, '_is_antigen': IsAg,
+        }
+        return batch, GI, nodes, antigen_counts
+
+    @staticmethod
+    def _node_lookup(GI, mask, n_global):
+        graph = GI.new_full((n_global,), -1)
+        local = GI.new_full((n_global,), -1)
+        for b in range(mask.shape[0]):
+            n = int(mask[b].sum().item())
+            if n == 0:
+                continue
+            idx = GI[b, :n].long()
+            graph[idx] = b
+            local[idx] = torch.arange(n, device=GI.device, dtype=GI.dtype)
+        return graph, local
+
+    @staticmethod
+    def gather_pair(z, query_edges_global, node_graph, node_local):
+        """Restrict dense z[i,j] to the exact directed R05 edge order.
+
+        R05 uses ``col -> row`` message flow.  Seqformer pair state ``z[i,j]``
+        uses the first index as the receiving/query residue and the second as
+        the sending/key residue, so an R05 edge (row=i, col=j) consumes z[i,j]
+        without transposition or symmetrization.
+        """
+        if query_edges_global.numel() == 0:
+            return z.new_zeros((0, z.shape[-1]))
+        row, col = query_edges_global.long()
+        gr, gc = node_graph[row], node_graph[col]
+        lr, lc = node_local[row], node_local[col]
+        valid = (gr >= 0) & (gr == gc) & (lr >= 0) & (lc >= 0)
+        out = z.new_zeros((row.numel(), z.shape[-1]))
+        if bool(valid.any()):
+            out[valid] = z[gr[valid], lr[valid], lc[valid]]
+        return out
+
+    def forward(self, X, S, segment_ids, residue_pos, batch_id, valid_mask,
+                is_antigen, design_mask, flow_t, cdr_type, residue_feature,
+                round_idx=-1, atom_observed_mask=None):
+        batch, GI, nodes, antigen_counts = self._pack(
+            X, S, segment_ids, residue_pos, batch_id, valid_mask,
+            is_antigen, design_mask, flow_t, cdr_type,
+            atom_observed_mask=atom_observed_mask,
+        )
+
+        # single/pair donor dropout remains fully active, but it must not advance the
+        # RNG stream later consumed by the parent R05 EGNN dropout. Otherwise a
+        # mathematically zero bridge would still alter the parent's stochastic
+        # training function. A call-indexed, rank-local donor RNG gives fresh
+        # masks while fork_rng restores parent CPU/current-CUDA states on exit.
+        if self.training:
+            call_index = int(self._training_forward_call.item())
+            self._training_forward_call.add_(1)
+            rank = (
+                int(torch.distributed.get_rank())
+                if torch.distributed.is_available() and torch.distributed.is_initialized()
+                else 0
+            )
+            donor_seed = self.forward_seed + 1_000_003 * rank + call_index
+            rng_devices = (
+                [int(X.device.index)]
+                if X.is_cuda and X.device.index is not None else []
+            )
+            with torch.random.fork_rng(devices=rng_devices):
+                torch.default_generator.manual_seed(donor_seed)
+                if X.is_cuda:
+                    with torch.cuda.device(X.device):
+                        torch.cuda.manual_seed(donor_seed)
+                s, z = self.trunk(batch, residue_feature)
+        else:
+            s, z = self.trunk(batch, residue_feature)
+        mask = batch['mask']
+        N = int(S.shape[0])
+        global_s = s.new_zeros((N, s.shape[-1]))
+        for b, idx in enumerate(nodes):
+            n = int(idx.numel())
+            if n:
+                global_s[idx] = s[b, :n]
+        node_graph, node_local = self._node_lookup(GI, mask, N)
+        logits = self.distogram_head(z) if self.distogram_head is not None else None
+        with torch.no_grad():
+            self.last_diagnostics = {
+                'relational_single_rms': torch.sqrt(global_s.float().pow(2).mean() + 1e-8).to(X.dtype),
+                'relational_pair_rms': torch.sqrt(z.float().pow(2).mean() + 1e-8).to(X.dtype),
+            }
+        return {
+            'single_global': global_s,
+            'pair_dense': z,
+            'node_graph': node_graph,
+            'node_local': node_local,
+            'global_index': GI,
+            'mask': mask,
+            'seq_padded': batch['seq'],
+            'atom_exists_padded': batch['atom14_gt_exists'].bool(),
+            'design_padded': batch['_design_mask'].bool(),
+            'is_antigen_padded': batch['_is_antigen'].bool(),
+            'distogram_logits': logits,
+            'biological_mask': valid_mask.bool(),
+            'diag': self.last_diagnostics,
+        }
+
+    def distogram_loss_from_native(self, state, true_X, true_S, collect_audit=False):
+        """AbX-style distogram supervision on the live dense pair state.
+
+        The head/targets follow the supplied AbX implementation: symmetric
+        logits, pseudo-beta targets and 64 bins over 2.3125--21.6875 Angstrom.
+        For the support mask we adopt the standard Boltz-style non-self rule so
+        trivial i==j zero-distance labels do not dilute relational supervision.
+        ``all_resolved`` remains the formal R29/R30 scope; DA statistics are
+        observation-only and never rebalance the objective.
+        """
+        zero = true_X.sum() * 0.0
+        if not self.enable_distogram or state.get('distogram_logits') is None:
+            return zero, {}
+
+        GI, token_mask = state['global_index'], state['mask']
+        logits = state['distogram_logits']
+        B, L = token_mask.shape
+        Xp = true_X.new_zeros((B, L, 14, 3))
+        Sp = true_S.new_full((B, L), 20)
+        Obs = torch.zeros((B, L, 14), device=true_X.device, dtype=torch.bool)
+        packed_obs = state['atom_exists_padded'].bool()
+        for b in range(B):
+            n = int(token_mask[b].sum().item())
+            if n:
+                idx = GI[b, :n].long()
+                Xp[b, :n] = true_X[idx]
+                Sp[b, :n] = true_S[idx].long().clamp(0, 22)
+                Obs[b, :n] = packed_obs[b, :n]
+
+        pseudo_beta, pseudo_beta_mask = pseudo_beta_fn_v2(Sp, Xp, Obs)
+        pseudo_beta_mask = pseudo_beta_mask.bool() & token_mask
+        boundaries = torch.linspace(
+            self.distogram_min, self.distogram_max, self.distogram_bins - 1,
+            device=logits.device, dtype=pseudo_beta.dtype,
+        )
+        d2 = torch.sum(
+            (pseudo_beta[:, :, None, :] - pseudo_beta[:, None, :, :]).square(),
+            dim=-1, keepdim=True,
+        )
+        target = torch.sum(d2 > boundaries.square(), dim=-1).long()
+        ce = F.cross_entropy(
+            logits.reshape(-1, self.distogram_bins),
+            target.reshape(-1), reduction='none',
+        ).reshape(B, L, L)
+
+        pair_mask = pseudo_beta_mask[:, :, None] & pseudo_beta_mask[:, None, :]
+        pair_mask = pair_mask & (~torch.eye(
+            L, device=logits.device, dtype=torch.bool
+        )[None, :, :])
+        design = state['design_padded'].bool() & pseudo_beta_mask
+        if self.distogram_pair_scope == 'design_anchored':
+            pair_mask = pair_mask & (design[:, :, None] | design[:, None, :])
+        elif self.distogram_pair_scope != 'all_resolved':
+            raise ValueError(
+                f'unknown distogram pair_scope={self.distogram_pair_scope!r}'
+            )
+
+        denom = pair_mask.sum(dim=(-1, -2)).to(ce.dtype).clamp_min(1.0)
+        per_graph = (ce * pair_mask.to(ce.dtype)).sum(dim=(-1, -2)) / denom
+        loss = per_graph.mean()
+
+        audit = {}
+        if collect_audit:
+            with torch.no_grad():
+                antigen = state['is_antigen_padded'].bool() & pseudo_beta_mask
+                da = pair_mask & design[:, :, None] & antigen[:, None, :]
+                da_n = da.sum()
+                da_ce = (
+                    (ce * da.to(ce.dtype)).sum() / da_n.clamp_min(1).to(ce.dtype)
+                )
+                probs = torch.softmax(logits.float(), dim=-1)
+                last_contact_bin = int((boundaries < 8.0).sum().item())
+                contact_prob = probs[..., :last_contact_bin + 1].sum(dim=-1)
+                native_contact = d2.squeeze(-1) < (8.0 ** 2)
+                soft_tp = (contact_prob * native_contact.float() * da.float()).sum()
+                soft_pred = (contact_prob * da.float()).sum()
+                audit = {
+                    'distogram_valid_pairs': pair_mask.sum().to(loss.dtype),
+                    'distogram_da_ce': da_ce.to(loss.dtype),
+                    'distogram_da_contact_precision': (
+                        soft_tp / soft_pred.clamp_min(1e-8)
+                    ).to(loss.dtype),
+                    'distogram_head_weight_rms': (
+                        self.distogram_head.proj.weight.detach().float()
+                        .square().mean().sqrt()
+                    ).to(loss.dtype),
+                }
+        return loss, audit
+
+
+def design_region_smooth_lddt_loss(
+    pred_X, true_X, valid_atom_mask, design_residue_mask, batch_id,
+    is_antigen_mask=None, cutoff=15.0, collect_audit=False,
+):
+    """Task-localized Boltz smooth-lDDT with an exact O(N_design*N) kernel.
+
+    The formal objective is identical to the symmetric full pair mask that keeps
+    all resolved non-self pairs within the native-distance cutoff and requires at
+    least one endpoint to be a design atom.  Because the score is symmetric, the
+    same numerator/denominator can be evaluated from design rows only: design--
+    context pairs receive weight 2 (for both directions), while design--design
+    ordered pairs already appear in both directions across the design rows.
+    This reduces memory from O(N^2) to O(N_design*N) without changing the loss
+    or its gradient with respect to generated design coordinates.
+    """
+    if is_antigen_mask is None:
+        is_antigen_mask = torch.zeros_like(design_residue_mask, dtype=torch.bool)
+    cutoff = float(cutoff)
+    graph_losses = []
+    rel_values = {'intra': [], 'scaffold': [], 'antigen': []}
+    support_weight_total = pred_X.detach().new_zeros(())
+
+    for gid_t in torch.unique(batch_id):
+        graph = batch_id == gid_t
+        pred = pred_X[graph].reshape(-1, 3).float()
+        true = true_X[graph].reshape(-1, 3).float()
+        valid = valid_atom_mask[graph].bool().reshape(-1)
+        nr, na = valid_atom_mask[graph].shape
+        design = design_residue_mask[graph].bool()[:, None].expand(nr, na).reshape(-1)
+        antigen = is_antigen_mask[graph].bool()[:, None].expand(nr, na).reshape(-1)
+        scaffold = (~design) & (~antigen)
+
+        all_idx = torch.nonzero(valid, as_tuple=False).flatten()
+        design_idx = torch.nonzero(valid & design, as_tuple=False).flatten()
+        if all_idx.numel() == 0 or design_idx.numel() == 0:
+            continue
+
+        true_d = torch.cdist(true[design_idx], true[all_idx])
+        pred_d = torch.cdist(pred[design_idx], pred[all_idx])
+        delta = (pred_d - true_d).abs()
+        score = 0.25 * (
+            torch.sigmoid(0.5 - delta)
+            + torch.sigmoid(1.0 - delta)
+            + torch.sigmoid(2.0 - delta)
+            + torch.sigmoid(4.0 - delta)
+        )
+
+        support = true_d < cutoff
+        support = support & (design_idx[:, None] != all_idx[None, :])
+        col_is_design = design[all_idx]
+        weights = torch.where(
+            col_is_design[None, :],
+            torch.ones_like(score),
+            torch.full_like(score, 2.0),
+        )
+        weighted_support = support.to(score.dtype) * weights
+        denom = weighted_support.sum()
+        support_weight_total = support_weight_total + denom.detach().to(pred_X.dtype)
+        if bool(support.any()):
+            graph_losses.append(
+                1.0 - (score * weighted_support).sum() / denom.clamp_min(1.0)
+            )
+
+        if collect_audit:
+            with torch.no_grad():
+                relation_cols = {
+                    'intra': design[all_idx],
+                    'scaffold': scaffold[all_idx],
+                    'antigen': antigen[all_idx],
+                }
+                for name, col_mask in relation_cols.items():
+                    rel = support & col_mask[None, :]
+                    if bool(rel.any()):
+                        rel_values[name].append(1.0 - score[rel].mean().detach())
+
+    zero = pred_X.sum() * 0.0
+    total = torch.stack(graph_losses).mean().to(pred_X.dtype) if graph_losses else zero
+
+    def relation_mean(name):
+        return (
+            torch.stack(rel_values[name]).mean().to(pred_X.dtype)
+            if rel_values[name] else zero.detach()
+        )
+
+    return total, {
+        'intra': relation_mean('intra'),
+        'scaffold': relation_mean('scaffold'),
+        'antigen': relation_mean('antigen'),
+        'support_weight': support_weight_total,
+    }
 
 
 class AbFlowR3Matcher:
@@ -65,7 +555,7 @@ class AbFlowR3Matcher:
 
     @staticmethod
     def endpoint_target_for_velocity(xt, velocity, t_int):
-        """Encode a velocity target through AbFlow's endpoint parameterization."""
+        """Encode a velocity target through the donor's endpoint parameterization."""
         return xt + (1.0 - t_int) * velocity
 
     # ============================================================
@@ -110,7 +600,7 @@ class AbFlowR3Matcher:
     def scaled_score_residual(
             self, z_t, z0, true_z1, pred_z1, t_graph, g_graph,
             score_min_sigma=1e-2):
-        """ABX-style scaled DSM residual under the SAME F01 corruption kernel.
+        """endpoint-style scaled DSM residual under the SAME F01 corruption kernel.
 
         The network remains endpoint-parameterized:
             pred_z1 -> analytic pred score.
@@ -788,7 +1278,7 @@ class AbFlowR3Matcher:
 
         The factor 2 normalizes lambda(0.5)=1.  Critically, lambda does NOT
         contain g_graph, because g_graph depends on the latent endpoint pair in
-        AbFlow's task-adaptive F01 path.  This preserves the standard
+        the donor's task-adaptive F01 path.  This preserves the standard
         conditional-score-matching optimum for the marginal score.
         """
         t = torch.as_tensor(t_graph)
@@ -810,11 +1300,11 @@ class AbFlowR3Matcher:
 
 
     # ============================================================
-    # v103: AbX-centered Cartesian Flow / Score--Flow algebra
+    # v103: endpoint-centered Cartesian Flow / Score--Flow algebra
     # ============================================================
     @staticmethod
     def direct_cartesian_cfm_velocity(x0, x1):
-        """FoldFlow/CFM Euclidean target on AbFlow's full Cartesian state.
+        """FoldFlow/CFM Euclidean target on the donor's full Cartesian state.
 
         For X_t=(1-t)X0+tX1, the exact conditional velocity is X1-X0.
         No endpoint carrier and no (1-t) reweighting are introduced.

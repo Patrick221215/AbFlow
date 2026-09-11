@@ -117,3 +117,137 @@ HDOCK_DIR = './HDOCKlite-v1.1'
 MEAN_DIR = './MEAN'
 Rosetta_DIR = './rosetta/rosetta.binary.linux.release-315/main/source/bin'
 DiffAb_DIR = './diffab'
+
+# 5. AbFlow representation constants
+# IMGT above is the single source of truth for antibody residue-number ranges.
+# The tables below describe atom14 chemistry and region IDs only; they do not
+# duplicate any numbering ranges.
+from types import MappingProxyType
+import torch
+
+IMGT_REGION_ORDER = (
+    "HFR1", "H1", "HFR2", "H2", "HFR3", "H3", "HFR4",
+    "LFR1", "L1", "LFR2", "L2", "LFR3", "L3", "LFR4",
+)
+IMGT_REGION_TO_ENUM = MappingProxyType(
+    {name: index for index, name in enumerate(IMGT_REGION_ORDER)}
+)
+CDR_TO_ENUM = MappingProxyType(
+    {name: IMGT_REGION_TO_ENUM[name] for name in ("H1", "H2", "H3", "L1", "L2", "L3")}
+)
+NUM_AB_REGIONS = len(IMGT_REGION_ORDER)
+UNKNOWN_AB_REGION_INDEX = NUM_AB_REGIONS
+
+# Canonical chain-local IMGT region order.  NativeTrunk and other runtime code
+# must query this authority rather than carrying their own copies of region names.
+IMGT_REGIONS_BY_CHAIN = MappingProxyType({
+    "H": tuple(name for name in IMGT_REGION_ORDER if name.startswith("H")),
+    "L": tuple(name for name in IMGT_REGION_ORDER if name.startswith("L")),
+})
+
+def imgt_region_index(residue_number, chain_kind):
+    """Return the canonical IMGT region enum for one antibody residue.
+
+    ``residue_number`` is the IMGT residue number already stored by the dataset.
+    ``chain_kind`` is ``"H"`` or ``"L"``.  Antigen/padding/out-of-range
+    residues are represented by ``UNKNOWN_AB_REGION_INDEX`` by their caller.
+    """
+    chain_kind = str(chain_kind).upper()
+    if chain_kind not in IMGT_REGIONS_BY_CHAIN:
+        return UNKNOWN_AB_REGION_INDEX
+    r = int(residue_number)
+    for name in IMGT_REGIONS_BY_CHAIN[chain_kind]:
+        lo, hi = getattr(IMGT, name)
+        if lo <= r <= hi:
+            return IMGT_REGION_TO_ENUM[name]
+    return UNKNOWN_AB_REGION_INDEX
+
+RESTYPES = (
+    "A", "R", "N", "D", "C", "Q", "E", "G", "H", "I",
+    "L", "K", "M", "F", "P", "S", "T", "W", "Y", "V",
+)
+RESTYPE_ORDER = MappingProxyType({name: index for index, name in enumerate(RESTYPES)})
+RESTYPE_NUM = len(RESTYPES)
+UNK_RESTYPE_INDEX = RESTYPE_NUM
+RESTYPE_1TO3 = MappingProxyType({
+    "A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS",
+    "Q": "GLN", "E": "GLU", "G": "GLY", "H": "HIS", "I": "ILE",
+    "L": "LEU", "K": "LYS", "M": "MET", "F": "PHE", "P": "PRO",
+    "S": "SER", "T": "THR", "W": "TRP", "Y": "TYR", "V": "VAL",
+})
+
+ATOM14_NAMES = MappingProxyType({
+    "ALA": ("N", "CA", "C", "O", "CB", "", "", "", "", "", "", "", "", ""),
+    "ARG": ("N", "CA", "C", "O", "CB", "CG", "CD", "NE", "CZ", "NH1", "NH2", "", "", ""),
+    "ASN": ("N", "CA", "C", "O", "CB", "CG", "OD1", "ND2", "", "", "", "", "", ""),
+    "ASP": ("N", "CA", "C", "O", "CB", "CG", "OD1", "OD2", "", "", "", "", "", ""),
+    "CYS": ("N", "CA", "C", "O", "CB", "SG", "", "", "", "", "", "", "", ""),
+    "GLN": ("N", "CA", "C", "O", "CB", "CG", "CD", "OE1", "NE2", "", "", "", "", ""),
+    "GLU": ("N", "CA", "C", "O", "CB", "CG", "CD", "OE1", "OE2", "", "", "", "", ""),
+    "GLY": ("N", "CA", "C", "O", "", "", "", "", "", "", "", "", "", ""),
+    "HIS": ("N", "CA", "C", "O", "CB", "CG", "ND1", "CD2", "CE1", "NE2", "", "", "", ""),
+    "ILE": ("N", "CA", "C", "O", "CB", "CG1", "CG2", "CD1", "", "", "", "", "", ""),
+    "LEU": ("N", "CA", "C", "O", "CB", "CG", "CD1", "CD2", "", "", "", "", "", ""),
+    "LYS": ("N", "CA", "C", "O", "CB", "CG", "CD", "CE", "NZ", "", "", "", "", ""),
+    "MET": ("N", "CA", "C", "O", "CB", "CG", "SD", "CE", "", "", "", "", "", ""),
+    "PHE": ("N", "CA", "C", "O", "CB", "CG", "CD1", "CD2", "CE1", "CE2", "CZ", "", "", ""),
+    "PRO": ("N", "CA", "C", "O", "CB", "CG", "CD", "", "", "", "", "", "", ""),
+    "SER": ("N", "CA", "C", "O", "CB", "OG", "", "", "", "", "", "", "", ""),
+    "THR": ("N", "CA", "C", "O", "CB", "OG1", "CG2", "", "", "", "", "", "", ""),
+    "TRP": ("N", "CA", "C", "O", "CB", "CG", "CD1", "CD2", "NE1", "CE2", "CE3", "CZ2", "CZ3", "CH2"),
+    "TYR": ("N", "CA", "C", "O", "CB", "CG", "CD1", "CD2", "CE1", "CE2", "CZ", "OH", "", ""),
+    "VAL": ("N", "CA", "C", "O", "CB", "CG1", "CG2", "", "", "", "", "", "", ""),
+    "UNK": ("", "", "", "", "", "", "", "", "", "", "", "", "", ""),
+})
+ATOM14_ORDER = MappingProxyType({"N": 0, "CA": 1, "C": 2, "O": 3})
+CHI_ANGLES_ATOMS = MappingProxyType({
+    "ALA": (),
+    "ARG": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD"), ("CB", "CG", "CD", "NE"), ("CG", "CD", "NE", "CZ")),
+    "ASN": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "OD1")),
+    "ASP": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "OD1")),
+    "CYS": (("N", "CA", "CB", "SG"),),
+    "GLN": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD"), ("CB", "CG", "CD", "OE1")),
+    "GLU": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD"), ("CB", "CG", "CD", "OE1")),
+    "GLY": (),
+    "HIS": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "ND1")),
+    "ILE": (("N", "CA", "CB", "CG1"), ("CA", "CB", "CG1", "CD1")),
+    "LEU": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
+    "LYS": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD"), ("CB", "CG", "CD", "CE"), ("CG", "CD", "CE", "NZ")),
+    "MET": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "SD"), ("CB", "CG", "SD", "CE")),
+    "PHE": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
+    "PRO": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD")),
+    "SER": (("N", "CA", "CB", "OG"),),
+    "THR": (("N", "CA", "CB", "OG1"),),
+    "TRP": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
+    "TYR": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")),
+    "VAL": (("N", "CA", "CB", "CG1"),),
+})
+ATOM14_INDEX = MappingProxyType({
+    residue: MappingProxyType({atom: index for index, atom in enumerate(names) if atom})
+    for residue, names in ATOM14_NAMES.items()
+})
+ATOM14_MASK = torch.tensor(
+    [[1.0 if atom else 0.0 for atom in ATOM14_NAMES[RESTYPE_1TO3[restype]]] for restype in RESTYPES]
+    + [[0.0] * 14],
+    dtype=torch.float32,
+)
+
+
+def normalize_regions(value):
+    """Normalize CDR/region arguments without guessing a default region."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        raw = value.replace(",", " ").split()
+    elif isinstance(value, (list, tuple, set)):
+        raw = list(value)
+    else:
+        raw = [value]
+    regions = []
+    for item in raw:
+        name = str(item).strip().upper()
+        if name and name not in regions:
+            regions.append(name)
+    return tuple(regions)
+
+

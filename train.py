@@ -55,11 +55,11 @@ class CostBalancedDistributedSampler(Sampler):
     ranks using a deterministic cost proxy.  Therefore the DDP-averaged gradient
     sees the same global batch; only device ownership changes.
 
-    For the R05×MF triangle-closed representation the dominant local attention
-    tensor scales as O(L_local^3), so the cost proxy is
-        whole_residue_count + local_token_count^3.
+    For R28-R30, dense Triangle operations scale approximately as O(L_rel^3),
+    where L_rel is the complete antibody plus the dataset-defined epitope.
+    The cost proxy is whole_residue_count + relational_token_count^3.
     """
-    def __init__(self, dataset, global_batch_size, num_replicas, rank, shuffle=True, seed=0, local_antigen_k=18):
+    def __init__(self, dataset, global_batch_size, num_replicas, rank, shuffle=True, seed=0):
         self.dataset = dataset
         self.global_batch_size = int(global_batch_size)
         self.num_replicas = int(num_replicas)
@@ -67,7 +67,6 @@ class CostBalancedDistributedSampler(Sampler):
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
         self.epoch = 0
-        self.local_antigen_k = int(local_antigen_k)
         if self.num_replicas <= 0 or not (0 <= self.rank < self.num_replicas):
             raise ValueError('invalid distributed sampler rank/world_size')
         if self.global_batch_size <= 0:
@@ -87,13 +86,6 @@ class CostBalancedDistributedSampler(Sampler):
             return [1.0] * len(self.dataset)
         if hasattr(self.dataset, 'file_names') and len(self.dataset.file_names) != 1:
             return [1.0] * len(self.dataset)
-        cdrs = self.dataset.cdr
-        if cdrs is None:
-            cdrs = []
-        elif isinstance(cdrs, str):
-            cdrs = [cdrs]
-        else:
-            cdrs = list(cdrs)
         out = []
         try:
             for logical_idx in range(len(self.dataset)):
@@ -108,16 +100,10 @@ class CostBalancedDistributedSampler(Sampler):
                         ag_n += len(ag_obj.get_chain(chain_name))
                 else:
                     ag_n = len(item.get_epitope())
-                if cdrs:
-                    design_n = 0
-                    for cdr in cdrs:
-                        a, b = item.get_cdr_pos(cdr)
-                        design_n += int(b - a + 1)
-                else:
-                    design_n = int(len(h) + len(l))
-                whole_n = int(ag_n + len(h) + len(l) + 3)
-                local_n = int(design_n + min(ag_n, self.local_antigen_k))
-                out.append(float(whole_n + local_n ** 3))
+                antibody_n = int(len(h) + len(l))
+                whole_n = int(ag_n + antibody_n + 3)
+                relational_n = int(antibody_n + ag_n)
+                out.append(float(whole_n + relational_n ** 3))
             return out
         except Exception as exc:
             print_log(f'[DDPBatchBalance][WARN] cost estimation fallback to uniform: {exc}', level='WARN')
@@ -578,119 +564,182 @@ def finalize_code_snapshot(args, model=None, trainer_cls=None):
 # 1. Arguments
 # ============================================================
 
+def _resolve_project_path(project_root, value):
+    if value in (None, ""):
+        return ""
+    value = str(value)
+    return value if os.path.isabs(value) else os.path.abspath(os.path.join(project_root, value))
+
+def _apply_trainer_runtime_from_config(cfg, config_path):
+    """Bridge JSON runtime/evaluation settings into the existing Trainer API.
+
+    The V203 Trainer intentionally consumes runtime infrastructure through
+    ``ABFLOW_*`` variables.  Scientific model parameters never pass through this
+    bridge.  Paths and sampling settings keep JSON as their single authority.
+    """
+    project_root = os.path.abspath(
+        os.environ.get("ABFLOW_PROJECT_ROOT") or os.path.dirname(__file__)
+    )
+    os.environ["ABFLOW_PROJECT_ROOT"] = project_root
+
+    runtime = cfg["runtime"]
+    ddp = runtime.get("ddp", {})
+    os.environ["ABFLOW_DDP_FIND_UNUSED_PARAMETERS"] = (
+        "on" if ddp.get("find_unused_parameters", False) else "off"
+    )
+    os.environ["ABFLOW_DDP_STATIC_GRAPH"] = (
+        "on" if ddp.get("static_graph", True) else "off"
+    )
+    os.environ["ABFLOW_DDP_VALIDATION"] = "on"
+
+    # Formal project protocol: every epoch is Train -> Val -> observational Test.
+    # Sampling hyperparameters are shared with standalone generation instead of
+    # being duplicated under a second epoch-test configuration tree.
+    data_test = cfg["data"]["test"]
+    generation = cfg["generation"]
+    evaluation = cfg.get("evaluation", {})
+    os.environ["ABFLOW_EPOCH_TEST"] = "on"
+    os.environ["ABFLOW_EPOCH_TEST_INTERVAL"] = "1"
+    os.environ["ABFLOW_EPOCH_TEST_JSON"] = _resolve_project_path(
+        project_root, data_test["set"]
+    )
+    os.environ["ABFLOW_EPOCH_TEST_PEP"] = _resolve_project_path(
+        project_root, data_test.get("pep")
+    )
+    os.environ["ABFLOW_EPOCH_TEST_SURF"] = _resolve_project_path(
+        project_root, data_test.get("surface")
+    )
+    os.environ["ABFLOW_EPOCH_TEST_BATCH_SIZE"] = str(int(generation["batch_size"]))
+    os.environ["ABFLOW_EPOCH_TEST_N_STEPS"] = str(int(generation["n_steps"]))
+    os.environ["ABFLOW_EPOCH_TEST_BASE_SEED"] = str(int(generation["seed"]))
+    os.environ["ABFLOW_EPOCH_TEST_SHOW_SAMPLE_PROGRESS"] = (
+        "on" if generation.get("show_sample_progress", False) else "off"
+    )
+    os.environ["ABFLOW_EPOCH_TEST_METRIC_WORKERS"] = str(
+        int(evaluation.get("metric_workers", 8))
+    )
+    os.environ["ABFLOW_EPOCH_TEST_KEEP_STRUCTURES"] = (
+        "on" if evaluation.get("keep_structures", False) else "off"
+    )
+    # A formal Test error is evidence of a broken epoch, never a NaN placeholder.
+    os.environ["ABFLOW_EPOCH_TEST_FAIL_FAST"] = "on"
+
+    logging_cfg = cfg["training"]["logging"]
+    os.environ["ABFLOW_SCI_LOG_FIRST_STEPS"] = str(
+        int(logging_cfg.get("science_first_steps", 3))
+    )
+    os.environ["ABFLOW_SCI_LOG_INTERVAL"] = str(
+        int(logging_cfg.get("science_interval", 0))
+    )
+    os.environ["ABFLOW_GRAD_FINITE_GUARD_STEPS"] = str(
+        int(logging_cfg.get("runtime_guard_steps", 2))
+    )
+    os.environ["ABFLOW_TRAIN_LOSS_OUTLIER_THRESHOLD"] = str(
+        float(logging_cfg.get("train_loss_outlier_threshold", 1.0e4))
+    )
+
+
+def _namespace_from_config(config_path):
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    data = cfg["data"]
+    task = data["task"]
+    tr = cfg["training"]
+    opt = tr["optimizer"]
+    sched = tr["schedule"]
+    loader = tr["loader"]
+    precision = tr["precision"]
+    ema = tr["ema"]
+    logging_cfg = tr["logging"]
+    snapshot = tr["snapshot"]
+
+    model = cfg["model"]
+    arch = model["architecture"]
+    model_task = model["task"]
+    runtime = cfg["runtime"]
+
+    _apply_trainer_runtime_from_config(cfg, config_path)
+
+    return argparse.Namespace(
+        config=config_path,
+
+        train_set=data["train"]["set"],
+        valid_set=data["valid"]["set"],
+        train_pep=data["train"].get("pep"),
+        valid_pep=data["valid"].get("pep"),
+        train_surf=data["train"].get("surface"),
+        valid_surf=data["valid"].get("surface"),
+        cdr=task["cdr"],
+        paratope=task["paratope"],
+
+        lr=opt["lr"],
+        final_lr=opt["final_lr"],
+        warmup=opt["warmup"],
+        max_epoch=sched["max_epoch"],
+        grad_clip=opt["grad_clip"],
+        save_dir=tr["output_dir"],
+        batch_size=loader["batch_size"],
+        patience=sched["patience"],
+        save_topk=sched["save_topk"],
+        shuffle=loader["shuffle"],
+        num_workers=loader["num_workers"],
+        prefetch_factor=loader["prefetch_factor"],
+        valid_num_workers=loader["valid_num_workers"],
+        valid_prefetch_factor=loader["valid_prefetch_factor"],
+        valid_persistent_workers=loader["valid_persistent_workers"],
+        amp=precision["amp"],
+        amp_dtype=precision["amp_dtype"],
+        log_interval=logging_cfg["log_interval"],
+        tqdm_mininterval=logging_cfg["tqdm_mininterval"],
+        allow_tf32=precision["allow_tf32"],
+        save_interval=sched["save_interval"],
+        resume_checkpoint=sched.get("resume_checkpoint", ""),
+        use_ema=ema["enabled"],
+        ema_decay=ema["decay"],
+
+        run_name=None,
+        auto_run_name=False,
+        snapshot_max_mb=snapshot["max_mb"],
+        no_snapshot=not snapshot["enabled"],
+
+        gpus=list(range(len(runtime["gpus"]))),
+        local_rank=-1,
+
+        model_type=model["type"],
+        embed_dim=arch["embed_dim"],
+        hidden_size=arch["hidden_size"],
+        k_neighbors=arch["k_neighbors"],
+        n_layers=arch["n_layers"],
+        iter_round=arch["iter_round"],
+        num_verts=task["num_verts"],
+        dropout=arch["dropout"],
+        relative_position=arch["relative_position"],
+
+        seq_warmup=model_task["seq_warmup"],
+        pep_seq=model_task["pep_seq"],
+        pep_struct=model_task["pep_struct"],
+        struct_only=model_task["struct_only"],
+        bind_dist_cutoff=model_task["bind_dist_cutoff"],
+        no_pred_edge_dist=not model_task["pred_edge_dist"],
+        backbone_only=model_task["backbone_only"],
+        fix_channel_weights=model_task["fix_channel_weights"],
+        no_memory=not model_task["keep_memory"],
+
+        experiment=cfg.get("experiment", {}),
+        model_config=model,
+        loss=cfg["loss"],
+        runtime=runtime,
+        generation=cfg.get("generation", {}),
+        evaluation=cfg.get("evaluation", {}),
+    )
+
+
 def parse():
-    parser = argparse.ArgumentParser(description='training')
-    # data
-    parser.add_argument('--train_set', type=str, required=True, help='path to train set')
-    parser.add_argument('--valid_set', type=str, required=True, help='path to valid set')
-    parser.add_argument('--train_pep', type=str, default=None, help='path to train pep set')
-    parser.add_argument('--valid_pep', type=str, default=None, help='path to valid pep set')
-    parser.add_argument('--train_surf', type=str, default=None, help='path to train surf set')
-    parser.add_argument('--valid_surf', type=str, default=None, help='path to valid surf set')
-    parser.add_argument('--cdr', type=str, default=None, nargs='+', help='cdr to generate, L1/2/3, H1/2/3,(can be list, e.g., L3 H3) None for all including framework')
-    parser.add_argument('--paratope', type=str, default='H3', nargs='+', help='cdrs to use as paratope')
-
-    # training related
-    parser.add_argument('--lr', type=float, default=1e-3, help='learning rate')
-    parser.add_argument('--final_lr', type=float, default=1e-4, help='exponential decay from lr to final_lr')
-    parser.add_argument('--warmup', type=int, default=0, help='linear learning rate warmup')
-    parser.add_argument('--max_epoch', type=int, default=10, help='max training epoch')
-    parser.add_argument('--grad_clip', type=float, default=1.0, help='clip gradients with too big norm')
-    parser.add_argument('--save_dir', type=str, required=True, help='directory to save model, logs and experiment records')
-    parser.add_argument('--batch_size', type=int, required=True, help='batch size')
-    parser.add_argument('--patience', type=int, default=1000, help='patience before early stopping (set with a large number to turn off early stopping)')
-    parser.add_argument('--save_topk', type=int, default=10, help='save topk checkpoint. -1 for saving all ckpt that has a better validation metric than its previous epoch')
-    parser.add_argument('--shuffle', action='store_true', help='shuffle data')
-    parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument(
-        '--prefetch_factor',
-        type=int,
-        default=4,
-        help='Train DataLoader prefetch factor when num_workers > 0.'
-    )
-
-    parser.add_argument(
-        '--valid_num_workers',
-        type=int,
-        default=2,
-        help='Validation DataLoader workers. Formal validation keeps all metrics, but uses fewer workers to avoid RAM/pinned-memory spikes.'
-    )
-
-    parser.add_argument(
-        '--valid_prefetch_factor',
-        type=int,
-        default=2,
-        help='Validation DataLoader prefetch factor when valid_num_workers > 0.'
-    )
-
-    parser.add_argument(
-        '--valid_persistent_workers',
-        action='store_true',
-        help='Keep validation DataLoader workers persistent. Default off to avoid train+valid worker memory spikes.'
-    )
-    parser.add_argument('--amp', action='store_true',
-                        help='Enable CUDA automatic mixed precision training.')
-    parser.add_argument('--amp_dtype', type=str, default='bf16',
-                        choices=['bf16', 'fp16'],
-                        help='AMP dtype. bf16 is preferred on Ampere/A6000 for stability.')
-    parser.add_argument('--log_interval', type=int, default=1,
-                        help='Write training scalar logs every N steps to reduce CUDA sync.')
-    parser.add_argument('--tqdm_mininterval', type=float, default=5.0,
-                        help='Minimum seconds between tqdm screen refreshes.')
-    parser.add_argument('--allow_tf32', action='store_true',
-                        help='Allow TF32 matmul/cudnn on Ampere GPUs.')
-    
-    parser.add_argument('--save_interval', type=int, default=1,
-                    help='Save full training-state checkpoint every N completed epochs. Set <=0 to disable periodic last checkpoint saves.')
-    parser.add_argument('--resume_checkpoint', type=str, default='',
-                        help='Path to a full training-state checkpoint. Empty means train from scratch.')
-    parser.add_argument('--use_ema', action='store_true',
-                        help='Enable EMA for training and validation. Keep disabled for first clean S3/S3CG retrain.')
-    parser.add_argument('--ema_decay', type=float, default=0.999,
-                        help='EMA decay. Only used when --use_ema is set.')
-    
-
-    # reproducibility recording
-    parser.add_argument('--run_name', type=str, default=None,
-                        help='Optional subdirectory name under save_dir. Useful for ablations such as e8_dtm_core.')
-    parser.add_argument('--auto_run_name', action='store_true',
-                        help='If set, create save_dir/<timestamp or run_name>. If unset and run_name is empty, use save_dir directly to preserve old behavior.')
-    parser.add_argument('--snapshot_max_mb', type=float, default=20.0,
-                        help='Max file size in MB for copying files into record/config_snapshot or record/code_snapshot. Larger files are only hashed.')
-    parser.add_argument('--no_snapshot', action='store_true',
-                        help='Disable copying snapshot files. Manifests and cfg_runtime.json are still written.')
-
-    # device
-    parser.add_argument('--gpus', type=int, nargs='+', required=True, help='gpu to use, -1 for cpu')
-    parser.add_argument("--local_rank", type=int, default=-1,
-                        help="Local rank. Necessary for using torch.distributed launch/torchrun.")
-    
-    # model
-    parser.add_argument('--model_type', type=str, required=True, choices=['AbFlow', 'AbFlowStruct', 'AbFlowOpt'],
-                        help='Type of model')
-    parser.add_argument('--embed_dim', type=int, default=64, help='dimension of residue/atom embedding')
-    parser.add_argument('--hidden_size', type=int, default=128, help='dimension of hidden states')
-    parser.add_argument('--k_neighbors', type=int, default=9, help='Number of neighbors in KNN graph')
-    parser.add_argument('--n_layers', type=int, default=3, help='Number of layers')
-    parser.add_argument('--iter_round', type=int, default=3, help='Number of iterations for generation')
-    parser.add_argument('--num_verts', type=int, default=50, help='Number of surface verts per epitope residue')
-
-    # isMEANOpt related
-    parser.add_argument('--seq_warmup', type=int, default=0, help='Number of epochs before starting training sequence')
-
-    # task setting
-    parser.add_argument('--pep_seq', action='store_true', help='use pep sequence')
-    parser.add_argument('--pep_struct', action='store_true', help='use pep structure')
-    parser.add_argument('--struct_only', action='store_true', help='Predict complex structure given the sequence')
-    parser.add_argument('--bind_dist_cutoff', type=float, default=6.6, help='distance cutoff to decide the binding interface')
-
-    # ablation
-    parser.add_argument('--no_pred_edge_dist', action='store_true', help='Turn off edge distance prediction at the interface')
-    parser.add_argument('--backbone_only', action='store_true', help='Model backbone only')
-    parser.add_argument('--fix_channel_weights', action='store_true', help='Fix channel weights, may also for special use (e.g. antigen with modified AAs)')
-    parser.add_argument('--no_memory', action='store_true', help='No memory passing')
-
-    return parser.parse_args()
+    parser = argparse.ArgumentParser(description="AbFlow training")
+    parser.add_argument("--config", required=True, help="Experiment JSON")
+    cli = parser.parse_args()
+    return _namespace_from_config(cli.config)
 
 
 # ============================================================
@@ -747,12 +796,16 @@ def main(args):
 
     ########### load your train / valid set ###########
     if _is_main_rank(args.local_rank):
-        print_log(args)
-        print_log(f'Run dir: {args.save_dir}')
-        print_log(f'CDR type: {args.cdr}')
-        print_log(f'Paratope: {args.paratope}')
-        print_log('structure only' if args.struct_only else 'sequence & structure codesign')
-        print_log('ABFLOW env: ' + json.dumps(_collect_env(prefixes=["ABFLOW_"]), ensure_ascii=False))
+        print_log(
+            "[FormalRun] "
+            f"experiment={args.experiment.get('id', '<unknown>')} "
+            f"protocol={args.experiment.get('protocol', '<unknown>')} "
+            f"train={args.train_set} valid={args.valid_set} "
+            f"test={os.environ['ABFLOW_EPOCH_TEST_JSON']} "
+            f"cdr={','.join(args.cdr)} paratope={','.join(args.paratope)} "
+            f"global_batch={args.batch_size} "
+            f"epochs={args.max_epoch} ckpt=validation test=observation_only"
+        )
 
     train_set = E2EDataset(args.train_set, pep_file=args.train_pep, surf_file=args.train_surf,
                            cdr=args.cdr, paratope=args.paratope, num_verts=args.num_verts)
@@ -772,6 +825,7 @@ def main(args):
                    VOCAB.get_num_amino_acid_type(), args.num_verts, VOCAB.get_mask_idx(),
                    args.k_neighbors, bind_dist_cutoff=args.bind_dist_cutoff,
                    n_layers=args.n_layers,
+                   dropout=args.dropout,
                    pep_seq=args.pep_seq,
                    pep_struct=args.pep_struct,
                    struct_only=args.struct_only,
@@ -780,7 +834,10 @@ def main(args):
                    fix_channel_weights=args.fix_channel_weights,
                    pred_edge_dist=not args.no_pred_edge_dist,
                    keep_memory=not args.no_memory,
-                   cdr_type=args.cdr, paratope=args.paratope)
+                   cdr_type=args.cdr, paratope=args.paratope,
+                   relative_position=args.relative_position,
+                   model_config=args.model_config,
+                   loss_config=args.loss)
     elif args.model_type == 'AbFlowStruct':
         from trainer import AbFlowTrainer as Trainer
         from models import AbFlowStructModel
@@ -810,35 +867,26 @@ def main(args):
 
     if is_ddp:
         global_batch_size = int(args.batch_size)
-        use_cost_balance = str(os.environ.get('ABFLOW_DDP_COST_BALANCED', 'off')).lower() in {'1','true','yes','y','on'}
+        use_cost_balance = bool(
+            args.runtime.get("ddp", {}).get("cost_balanced", False)
+        )
         if use_cost_balance:
-            local_antigen_k = int(os.environ.get('ABFLOW_MF_LOCAL_ANTIGEN_K', os.environ.get('ABFLOW_MF_PAIR_ANTIGEN_K', '18')))
             train_sampler = CostBalancedDistributedSampler(
                 train_set, global_batch_size=global_batch_size,
                 num_replicas=world_size, rank=rank, shuffle=args.shuffle,
-                seed=0, local_antigen_k=local_antigen_k,
+                seed=0,
             )
-            if _is_main_rank(args.local_rank):
-                print_log(
-                    '[DDPBatchBalance] enabled: preserves each shuffled global batch; '
-                    'rank ownership is balanced by whole_residues + local_tokens^3'
-                )
         else:
             train_sampler = torch.utils.data.distributed.DistributedSampler(train_set, shuffle=args.shuffle)
         # Keep old AbFlow behavior: input batch_size is global, split across GPUs.
         args.batch_size = max(1, int(global_batch_size / max(1, world_size)))
         # TrainConfig was already built from original args; keep it consistent.
         config.batch_size = args.batch_size
-        if _is_main_rank(args.local_rank):
-            print_log(f'Batch size on a single GPU: {args.batch_size}')
     else:
         train_sampler = None
 
     config.local_rank = args.local_rank
 
-    if _is_main_rank(args.local_rank):
-        print_log(f'step per epoch: {step_per_epoch}')
-        print_log(f'world_size: {world_size}, rank: {rank}, local_rank: {args.local_rank}')
 
     # DataLoader settings.  GPU under-utilization is often caused by the GPU
     # waiting for CPU collation / host-to-device transfer.  pin_memory,
@@ -877,11 +925,11 @@ def main(args):
 
     if _is_main_rank(args.local_rank):
         print_log(
-            f"DataLoader workers: train={args.num_workers}, "
-            f"valid={args.valid_num_workers}, "
-            f"train_prefetch={args.prefetch_factor}, "
-            f"valid_prefetch={args.valid_prefetch_factor}, "
-            f"valid_persistent_workers={args.valid_persistent_workers}"
+            "[DDPData] "
+            f"world={world_size} global_batch={global_batch_size} "
+            f"local_batch={args.batch_size} steps_per_epoch={step_per_epoch} "
+            f"cost_balanced={int(bool(is_ddp and args.runtime.get('ddp', {}).get('cost_balanced', False)))} "
+            f"workers=train:{args.num_workers}/valid:{args.valid_num_workers}"
         )
 
     train_loader = DataLoader(
@@ -908,8 +956,6 @@ def main(args):
     # version directory. Put record/ under that directory, e.g. version=7/record.
     actual_run_dir = _infer_trainer_run_dir(trainer, args.save_dir, version_dirs_before)
     args.actual_run_dir = actual_run_dir
-    if _is_main_rank(args.local_rank):
-        print_log(f'Actual trainer run dir: {actual_run_dir}')
     setup_experiment_record(
         args,
         local_rank=args.local_rank,
