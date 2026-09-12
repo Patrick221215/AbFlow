@@ -166,6 +166,25 @@ class AbFlowTrainer(Trainer):
         self._train_loss_outlier_epoch = -1
         self._train_loss_outlier_count = 0
 
+        # V213 authority telemetry.  V212 correctly bounded only the relational
+        # coordinate residual; R33 showed that the shared/base controller can
+        # still enter a high-gain regime without crossing the 1e4 loss alert.
+        # These thresholds are observational only and never alter optimization.
+        self._geometry_authority_interval = max(0, _env_int(
+            "ABFLOW_GEOMETRY_AUTHORITY_INTERVAL", 20
+        ))
+        self._geometry_authority_base_alert = _env_float(
+            "ABFLOW_GEOMETRY_AUTHORITY_BASE_ALERT", 64.0
+        )
+        self._geometry_authority_update_alert = _env_float(
+            "ABFLOW_GEOMETRY_AUTHORITY_UPDATE_ALERT", 1.0e4
+        )
+        self._geometry_authority_alert_max_per_epoch = max(1, _env_int(
+            "ABFLOW_GEOMETRY_AUTHORITY_ALERT_MAX_PER_EPOCH", 3
+        ))
+        self._geometry_authority_alert_epoch = -1
+        self._geometry_authority_alert_count = 0
+
         self._epoch_summary_path = os.path.join(
             self.config.save_dir, "epoch_summary.csv"
         )
@@ -301,7 +320,8 @@ class AbFlowTrainer(Trainer):
                 "context=full_antibody+dataset_epitope "
                 "bridge=zero_start_residual "
                 f"distogram={getattr(raw_model, 'loss_distogram_weight', 0.0):.4g} "
-                f"smooth_lddt={getattr(raw_model, 'loss_smooth_lddt_weight', 0.0):.4g}"
+                f"smooth_lddt={getattr(raw_model, 'loss_smooth_lddt_weight', 0.0):.4g} "
+                f"smooth_lddt_source={getattr(raw_model, 'smooth_lddt_prediction_source', 'pred_design_endpoint')}"
             )
             print(
                 "[FormalEvalContract] "
@@ -2001,6 +2021,83 @@ class AbFlowTrainer(Trainer):
                     f"cold_start_seen={self._bridge_cold_start_observed}."
                 )
 
+        # V213: periodic + threshold-triggered observation of the *base* Cartesian
+        # controller.  This closes the blind spot that let R33 epoch30 move the
+        # model state substantially while staying below the 1e4 loss threshold.
+        if not val:
+            round_egnn_authority = getattr(raw_model, '_last_round_egnn_diagnostics', None) or []
+
+            def _auth_num(value):
+                try:
+                    if torch.is_tensor(value):
+                        return float(value.detach().float().cpu().item())
+                    return float(value)
+                except Exception:
+                    return None
+
+            def _auth_stage_max(diag, suffix):
+                vals = []
+                for key, value in diag.items():
+                    if not key.endswith(suffix):
+                        continue
+                    fv = _auth_num(value)
+                    if fv is not None and isfinite(fv):
+                        vals.append(fv)
+                return max(vals) if vals else None
+
+            authority_rows = []
+            for rec in round_egnn_authority:
+                cd = rec.get('coord', {}) or {}
+                authority_rows.append({
+                    'round': rec.get('round_idx', 'NA'),
+                    'base': _auth_stage_max(cd, '.coord_base_coeff_absmax'),
+                    'state': _auth_stage_max(cd, '.coord_state_coeff_absmax'),
+                    'pair_bounded': _auth_stage_max(cd, '.coord_pair_delta_bounded_absmax'),
+                    'update': _auth_num(cd.get('coord_update_absmax_max')),
+                })
+
+            max_base = max(
+                [r['base'] for r in authority_rows if r['base'] is not None],
+                default=None,
+            )
+            max_update = max(
+                [r['update'] for r in authority_rows if r['update'] is not None],
+                default=None,
+            )
+            authority_interval_hit = bool(
+                self._geometry_authority_interval > 0
+                and int(self.global_step) % self._geometry_authority_interval == 0
+            )
+            authority_alert = bool(
+                (max_base is not None and max_base >= self._geometry_authority_base_alert)
+                or (max_update is not None and max_update >= self._geometry_authority_update_alert)
+            )
+            current_epoch = int(self.epoch)
+            if self._geometry_authority_alert_epoch != current_epoch:
+                self._geometry_authority_alert_epoch = current_epoch
+                self._geometry_authority_alert_count = 0
+            allow_alert = (
+                authority_alert
+                and self._geometry_authority_alert_count
+                < self._geometry_authority_alert_max_per_epoch
+            )
+            if allow_alert:
+                self._geometry_authority_alert_count += 1
+
+            if (authority_interval_hit and self._diag_main_rank) or allow_alert:
+                rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+                tag = 'GeometryAuthorityAlert' if authority_alert else 'GeometryAuthority'
+                print(
+                    f'[{tag}] '
+                    f'epoch={self.epoch} step={self.global_step} rank={rank} '
+                    f"base_coeff_absmax={[None if r['base'] is None else round(r['base'], 6) for r in authority_rows]} "
+                    f"state_coeff_absmax={[None if r['state'] is None else round(r['state'], 6) for r in authority_rows]} "
+                    f"pair_bounded_absmax={[None if r['pair_bounded'] is None else round(r['pair_bounded'], 6) for r in authority_rows]} "
+                    f"coord_update_absmax={[None if r['update'] is None else round(r['update'], 6) for r in authority_rows]} "
+                    f'base_alert={self._geometry_authority_base_alert:g} '
+                    f'update_alert={self._geometry_authority_update_alert:g}'
+                )
+
         log_type = 'Validation' if val else 'Train'
         self.log(f'Overall/Loss/{log_type}', loss, batch_idx, val)
         self.log(f'Seq/SNLL/{log_type}', snll, batch_idx, val)
@@ -2069,8 +2166,14 @@ class AbFlowTrainer(Trainer):
                 print(
                     "[SmoothLDDT] "
                     f"epoch={self.epoch} step={self.global_step} "
+                    f"source={getattr(raw_model, 'smooth_lddt_prediction_source', 'pred_design_endpoint')} "
                     f"raw={self._fmt(_sf('smooth_lddt_loss'), 6)} "
                     f"weighted={self._fmt(_sf('smooth_lddt_weighted_loss'), 6)} "
+                    f"endpoint_rms_A={self._fmt(_sf('smooth_lddt_endpoint_rms_A'), 5)} "
+                    f"endpoint_absmax_A={self._fmt(_sf('smooth_lddt_endpoint_absmax_A'), 5)} "
+                    f"design_rows={self._fmt(_sf('smooth_lddt_design_rows'), 0)} "
+                    f"coord_rows={self._fmt(_sf('smooth_lddt_coord_rows'), 0)} "
+                    f"coord_outside_design={self._fmt(_sf('smooth_lddt_coord_outside_design_rows'), 0)} "
                     f"DD={self._fmt(_sf('smooth_lddt_DD'), 5)} "
                     f"DF={self._fmt(_sf('smooth_lddt_DF'), 5)} "
                     f"DA={self._fmt(_sf('smooth_lddt_DA'), 5)}"
