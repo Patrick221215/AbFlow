@@ -44,7 +44,7 @@
       "patience": 1000,
       "save_topk": 10,
       "save_interval": 1,
-      "resume_checkpoint": ""
+      "resume_checkpoint": "/home/data3/cjm/project/AbFlow/results_module/R28_R05_ABX_NATIVE_PAIR_EGNN_U02/version_0/checkpoint/last_step4050.pt"
     },
     "loader": {
       "batch_size": 20,
@@ -170,8 +170,8 @@
   },
   "runtime": {
     "gpus": [
-      2,
-      3
+      4,
+      5
     ],
     "master_addr": "localhost",
     "master_port": 29728,

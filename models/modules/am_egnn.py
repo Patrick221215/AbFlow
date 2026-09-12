@@ -116,7 +116,8 @@ class AM_E_GCL(nn.Module):
 
     def __init__(self, input_nf, output_nf, hidden_nf, n_channel, channel_nf, radial_nf,
                  edges_in_d=0, node_attr_d=0, act_fn=nn.SiLU(), residual=True, attention=False,
-                 normalize=False, coords_agg='mean', tanh=False, dropout=0.1):
+                 normalize=False, coords_agg='mean', tanh=False, dropout=0.1,
+                 pair_coord_mode='bounded_residual', pair_coord_delta_bound=1.0):
         super(AM_E_GCL, self).__init__()
 
         input_edge = input_nf * 2
@@ -126,6 +127,12 @@ class AM_E_GCL(nn.Module):
         self.coords_agg = coords_agg
         self.tanh = tanh
         self.epsilon = 1e-8
+        self.pair_coord_mode = str(pair_coord_mode or 'bounded_residual').strip().lower()
+        if self.pair_coord_mode not in {'bounded_residual', 'legacy_shared'}:
+            raise ValueError(f'Unsupported pair_coord_mode={self.pair_coord_mode!r}')
+        self.pair_coord_delta_bound = float(pair_coord_delta_bound)
+        if self.pair_coord_delta_bound <= 0.0:
+            raise ValueError('pair_coord_delta_bound must be > 0')
 
         self.dropout = nn.Dropout(dropout)
 
@@ -151,6 +158,7 @@ class AM_E_GCL(nn.Module):
                 )
             nn.init.zeros_(self.edge_attr_linear.weight)
         self.last_bridge_diagnostics = {}
+        self.last_coord_diagnostics = {}
         self.capture_bridge_diagnostics = False
         self.radial_linear = nn.Linear(channel_nf ** 2, radial_nf)
 
@@ -175,23 +183,44 @@ class AM_E_GCL(nn.Module):
                 nn.Linear(hidden_nf, 1),
                 nn.Sigmoid())
 
-    def edge_model(self, source, target, radial, edge_attr):
-        """Build an invariant edge message with zero-start pair conditioning."""
+    def edge_model(self, source, target, radial, edge_attr, base_source=None, base_target=None):
+        """Return state and pair-free coordinate messages from one edge path.
+
+        ``state_edge`` keeps the full learned pair conditioning.  ``base_edge``
+        removes only the *direct* z_ij adapter before the shared nonlinear edge
+        stack.  A single shared dropout mask is applied to both streams, so the
+        state stream preserves the original stochastic contract while the
+        coordinate stream can measure a clean direct-pair residual.
+        """
         radial = radial.reshape(radial.shape[0], -1)
-        base = torch.cat([source, target, radial], dim=1)
-        base_pre = self.edge_mlp[0](base)
+        if base_source is None:
+            base_source = source
+        if base_target is None:
+            base_target = target
+        state_input = torch.cat([source, target, radial], dim=1)
+        base_input = torch.cat([base_source, base_target, radial], dim=1)
+        base_pre = self.edge_mlp[0](base_input)
+        state_parent_pre = self.edge_mlp[0](state_input)
         if self.edge_attr_linear is None:
             pair_delta = torch.zeros_like(base_pre)
         else:
             if edge_attr is None:
                 edge_attr = base_pre.new_zeros((base_pre.shape[0], self.edges_in_d))
             pair_delta = self.edge_attr_linear(edge_attr)
-        out = base_pre + pair_delta
+        state_pre = state_parent_pre + pair_delta
+
         if self.capture_bridge_diagnostics:
             with torch.no_grad():
-                base_rms = base_pre.float().square().mean().sqrt()
-                delta_rms = pair_delta.float().square().mean().sqrt()
+                base_f = state_parent_pre.detach().float()
+                delta_f = pair_delta.detach().float()
+                combined_f = state_pre.detach().float()
+                base_rms = base_f.square().mean().sqrt()
+                delta_rms = delta_f.square().mean().sqrt()
                 self.last_bridge_diagnostics = {
+                    'pair_base_preact_rms': base_rms.to(base_pre.dtype),
+                    'pair_delta_rms': delta_rms.to(base_pre.dtype),
+                    'pair_delta_absmax': delta_f.abs().amax().to(base_pre.dtype),
+                    'pair_combined_preact_rms': combined_f.square().mean().sqrt().to(base_pre.dtype),
                     'pair_delta_to_base_ratio': (
                         delta_rms / base_rms.clamp_min(1.0e-8)
                     ).to(base_pre.dtype),
@@ -202,12 +231,24 @@ class AM_E_GCL(nn.Module):
                 }
         else:
             self.last_bridge_diagnostics = {}
+
+        base_edge = base_pre
+        state_edge = state_pre
         for layer in self.edge_mlp[1:]:
-            out = layer(out)
-        out = self.dropout(out)
+            base_edge = layer(base_edge)
+            state_edge = layer(state_edge)
+
+        # One Bernoulli mask, shared by both streams.  At zero pair adapter the
+        # two values are exactly identical, preserving the R05 parent value.
+        if self.training and self.dropout.p > 0.0:
+            dropout_scale = self.dropout(torch.ones_like(state_edge))
+            base_edge = base_edge * dropout_scale
+            state_edge = state_edge * dropout_scale
+
         if self.attention:
-            out = out * self.att_mlp(out)
-        return out
+            base_edge = base_edge * self.att_mlp(base_edge)
+            state_edge = state_edge * self.att_mlp(state_edge)
+        return state_edge, base_edge
 
     def node_model(self, x, edge_index, edge_attr, node_attr):
         '''
@@ -231,31 +272,108 @@ class AM_E_GCL(nn.Module):
             out = x + out
         return out, agg
 
-    def coord_model(self, coord, edge_index, coord_diff, edge_feat, channel_weights):
-        '''
-        coord: [bs * n_node, n_channel, d]
-        edge_index: list of [n_edge], [n_edge]
-        coord_diff: [n_edge, n_channel, d]
-        edge_feat: [n_edge, hidden_size]
-        channel_weights: [N, n_channel]
+    def node_model_dual(self, state_x, base_x, edge_index, state_edge_attr,
+                        base_edge_attr, node_attr):
+        """Shared-parameter state/base node update with one dropout mask."""
+        row, col = edge_index
+        state_agg = unsorted_segment_sum(
+            state_edge_attr, row, num_segments=state_x.size(0)
+        )
+        base_agg = unsorted_segment_sum(
+            base_edge_attr, row, num_segments=base_x.size(0)
+        )
+        if node_attr is not None:
+            state_in = torch.cat([state_x, state_agg, node_attr], dim=1)
+            base_in = torch.cat([base_x, base_agg, node_attr], dim=1)
+        else:
+            state_in = torch.cat([state_x, state_agg], dim=1)
+            base_in = torch.cat([base_x, base_agg], dim=1)
+        state_out = self.node_mlp(state_in)
+        base_out = self.node_mlp(base_in)
+        if self.training and self.dropout.p > 0.0:
+            dropout_scale = self.dropout(torch.ones_like(state_out))
+            state_out = state_out * dropout_scale
+            base_out = base_out * dropout_scale
+        if self.residual:
+            state_out = state_x + state_out
+            base_out = base_x + base_out
+        return state_out, base_out
+
+    def coord_model(self, coord, edge_index, coord_diff, state_edge_feat,
+                    channel_weights, base_edge_feat=None):
+        '''Pair-aware Cartesian update with bounded direct-pair authority.
+
+        The state/message stream may use the full pair-conditioned edge feature.
+        Geometry uses the pair-free base coefficient plus a bounded residual from
+        direct pair conditioning:
+
+            alpha = alpha_base + B * tanh((alpha_state-alpha_base) / B).
+
+        For a zero pair adapter, alpha_state == alpha_base exactly.  For small
+        learned corrections this is first-order identity; only pathological
+        direct-pair authority is saturated.  No coordinate clipping is used.
         '''
         row, col = edge_index
-
-        # first pooling, then element-wise multiply
         n_channel = channel_weights.shape[-1]
-        edge_feat = self.coord_mlp(edge_feat)  # [n_edge, n_channel]
-        channel_sum = (channel_weights != 0).long().sum(-1)  # [N]
-        pooled_edge_feat = RollerPooling(n_channel)(edge_feat, channel_sum[row])  # [n_edge, n_channel, 1]
-        trans = coord_diff * pooled_edge_feat  # [n_edge, n_channel, d]
+        coord_before = coord
 
-        # aggregate
+        state_coeff = self.coord_mlp(state_edge_feat)
+        if base_edge_feat is None or self.pair_coord_mode == 'legacy_shared':
+            base_coeff = state_coeff
+            pair_coeff_raw = torch.zeros_like(state_coeff)
+            pair_coeff_bounded = pair_coeff_raw
+            coord_coeff = state_coeff
+        else:
+            base_coeff = self.coord_mlp(base_edge_feat)
+            pair_coeff_raw = state_coeff - base_coeff
+            bound = pair_coeff_raw.new_tensor(self.pair_coord_delta_bound)
+            pair_coeff_bounded = bound * torch.tanh(pair_coeff_raw / bound)
+            coord_coeff = base_coeff + pair_coeff_bounded
+
+        channel_sum = (channel_weights != 0).long().sum(-1)
+        pooled_edge_feat = RollerPooling(n_channel)(coord_coeff, channel_sum[row])
+        trans = coord_diff * pooled_edge_feat
+
         if self.coords_agg == 'sum':
             agg = unsorted_segment_sum(trans, row, num_segments=coord.size(0))
         elif self.coords_agg == 'mean':
-            agg = unsorted_segment_mean(trans, row, num_segments=coord.size(0))  # [bs * n_node, n_channel, d]
+            agg = unsorted_segment_mean(trans, row, num_segments=coord.size(0))
         else:
             raise Exception('Wrong coords_agg parameter' % self.coords_agg)
-        coord = coord + agg
+        coord = coord_before + agg
+
+        if self.capture_bridge_diagnostics:
+            with torch.no_grad():
+                def _rms(v):
+                    vf = v.detach().float()
+                    return vf.square().mean().sqrt().to(coord_before.dtype) if vf.numel() else coord_before.new_zeros(())
+                def _amax(v):
+                    vf = v.detach().float()
+                    return vf.abs().amax().to(coord_before.dtype) if vf.numel() else coord_before.new_zeros(())
+                self.last_coord_diagnostics = {
+                    'coord_input_rms': _rms(coord_before),
+                    'coord_input_absmax': _amax(coord_before),
+                    'coord_diff_rms': _rms(coord_diff),
+                    'coord_diff_absmax': _amax(coord_diff),
+                    'coord_base_coeff_rms': _rms(base_coeff),
+                    'coord_base_coeff_absmax': _amax(base_coeff),
+                    'coord_state_coeff_rms': _rms(state_coeff),
+                    'coord_state_coeff_absmax': _amax(state_coeff),
+                    'coord_pair_delta_raw_rms': _rms(pair_coeff_raw),
+                    'coord_pair_delta_raw_absmax': _amax(pair_coeff_raw),
+                    'coord_pair_delta_bounded_rms': _rms(pair_coeff_bounded),
+                    'coord_pair_delta_bounded_absmax': _amax(pair_coeff_bounded),
+                    'coord_coeff_rms': _rms(coord_coeff),
+                    'coord_coeff_absmax': _amax(coord_coeff),
+                    'coord_trans_rms': _rms(trans),
+                    'coord_trans_absmax': _amax(trans),
+                    'coord_update_rms': _rms(agg),
+                    'coord_update_absmax': _amax(agg),
+                    'coord_output_rms': _rms(coord),
+                    'coord_output_absmax': _amax(coord),
+                }
+        else:
+            self.last_coord_diagnostics = {}
         return coord
 
     def forward(self, h, edge_index, coord, channel_attr, channel_weights,
@@ -272,14 +390,40 @@ class AM_E_GCL(nn.Module):
         # print('row, col : ', row, col)
 
         radial, coord_diff = coord2radial(edge_index, coord, channel_attr, channel_weights, self.radial_linear)
-        # print('radial, coord_diff : ', radial.shape, coord_diff.shape)
-
-        edge_feat = self.edge_model(h[row], h[col], radial, edge_attr)  # [n_edge, hidden_size]
-        coord = self.coord_model(coord, edge_index, coord_diff, edge_feat, channel_weights)    # [bs * n_node, n_channel, d]
+        edge_feat, base_edge_feat = self.edge_model(h[row], h[col], radial, edge_attr)
+        coord = self.coord_model(
+            coord, edge_index, coord_diff, edge_feat, channel_weights,
+            base_edge_feat=base_edge_feat,
+        )
         h, agg = self.node_model(h, edge_index, edge_feat, node_attr)
-        # print('h, x : ', coord, coord.shape)
-
         return h, coord
+
+    def forward_dual(self, h, h_base, edge_index, coord, channel_attr,
+                     channel_weights, edge_attr=None, node_attr=None,
+                     capture_bridge_diagnostics=False):
+        """Relational state stream + R05-like geometry reference stream.
+
+        ``h`` receives single/pair relational context. ``h_base`` never receives
+        the direct single/pair adapters.  Coordinate authority is the base-stream
+        coefficient plus a bounded residual from the relational stream.
+        """
+        row, col = edge_index
+        self.capture_bridge_diagnostics = bool(capture_bridge_diagnostics)
+        radial, coord_diff = coord2radial(
+            edge_index, coord, channel_attr, channel_weights, self.radial_linear
+        )
+        edge_feat, base_edge_feat = self.edge_model(
+            h[row], h[col], radial, edge_attr,
+            base_source=h_base[row], base_target=h_base[col],
+        )
+        coord = self.coord_model(
+            coord, edge_index, coord_diff, edge_feat, channel_weights,
+            base_edge_feat=base_edge_feat,
+        )
+        h, h_base = self.node_model_dual(
+            h, h_base, edge_index, edge_feat, base_edge_feat, node_attr
+        )
+        return h, h_base, coord
 
 
 def unsorted_segment_sum(data, segment_ids, num_segments):
@@ -380,7 +524,8 @@ class MS_E_GCL(nn.Module):
 
     def __init__(self, input_nf, output_nf, hidden_nf, n_channel, channel_nf, radial_nf, surf_nf=50,
                  edges_in_d=0, node_attr_d=0, act_fn=nn.SiLU(), residual=True, attention=False,
-                 normalize=False, coords_agg='mean', tanh=False, dropout=0.1):
+                 normalize=False, coords_agg='mean', tanh=False, dropout=0.1,
+                 pair_coord_mode='bounded_residual', pair_coord_delta_bound=1.0):
         super(MS_E_GCL, self).__init__()
 
         input_edge = input_nf * 2
@@ -390,6 +535,12 @@ class MS_E_GCL(nn.Module):
         self.coords_agg = coords_agg
         self.tanh = tanh
         self.epsilon = 1e-8
+        self.pair_coord_mode = str(pair_coord_mode or 'bounded_residual').strip().lower()
+        if self.pair_coord_mode not in {'bounded_residual', 'legacy_shared'}:
+            raise ValueError(f'Unsupported pair_coord_mode={self.pair_coord_mode!r}')
+        self.pair_coord_delta_bound = float(pair_coord_delta_bound)
+        if self.pair_coord_delta_bound <= 0.0:
+            raise ValueError('pair_coord_delta_bound must be > 0')
 
         self.dropout = nn.Dropout(dropout)
 
@@ -408,6 +559,7 @@ class MS_E_GCL(nn.Module):
                 )
             nn.init.zeros_(self.edge_attr_linear.weight)
         self.last_bridge_diagnostics = {}
+        self.last_coord_diagnostics = {}
         self.capture_bridge_diagnostics = False
         self.radial_linear = nn.Linear(channel_nf ** 2, radial_nf)
         self.scale_linear = nn.Linear(surf_nf, channel_nf)
@@ -433,23 +585,44 @@ class MS_E_GCL(nn.Module):
                 nn.Linear(hidden_nf, 1),
                 nn.Sigmoid())
 
-    def edge_model(self, source, target, radial, edge_attr):
-        """Build a surface-aware edge message with zero-start pair conditioning."""
+    def edge_model(self, source, target, radial, edge_attr, base_source=None, base_target=None):
+        """Return surface state and pair-free coordinate messages from one edge path.
+
+        ``state_edge`` keeps the full learned pair conditioning.  ``base_edge``
+        removes only the *direct* z_ij adapter before the shared nonlinear edge
+        stack.  A single shared dropout mask is applied to both streams, so the
+        state stream preserves the original stochastic contract while the
+        coordinate stream can measure a clean direct-pair residual.
+        """
         radial = radial.reshape(radial.shape[0], -1)
-        base = torch.cat([source, target, radial], dim=1)
-        base_pre = self.edge_mlp[0](base)
+        if base_source is None:
+            base_source = source
+        if base_target is None:
+            base_target = target
+        state_input = torch.cat([source, target, radial], dim=1)
+        base_input = torch.cat([base_source, base_target, radial], dim=1)
+        base_pre = self.edge_mlp[0](base_input)
+        state_parent_pre = self.edge_mlp[0](state_input)
         if self.edge_attr_linear is None:
             pair_delta = torch.zeros_like(base_pre)
         else:
             if edge_attr is None:
                 edge_attr = base_pre.new_zeros((base_pre.shape[0], self.edges_in_d))
             pair_delta = self.edge_attr_linear(edge_attr)
-        out = base_pre + pair_delta
+        state_pre = state_parent_pre + pair_delta
+
         if self.capture_bridge_diagnostics:
             with torch.no_grad():
-                base_rms = base_pre.float().square().mean().sqrt()
-                delta_rms = pair_delta.float().square().mean().sqrt()
+                base_f = state_parent_pre.detach().float()
+                delta_f = pair_delta.detach().float()
+                combined_f = state_pre.detach().float()
+                base_rms = base_f.square().mean().sqrt()
+                delta_rms = delta_f.square().mean().sqrt()
                 self.last_bridge_diagnostics = {
+                    'pair_base_preact_rms': base_rms.to(base_pre.dtype),
+                    'pair_delta_rms': delta_rms.to(base_pre.dtype),
+                    'pair_delta_absmax': delta_f.abs().amax().to(base_pre.dtype),
+                    'pair_combined_preact_rms': combined_f.square().mean().sqrt().to(base_pre.dtype),
                     'pair_delta_to_base_ratio': (
                         delta_rms / base_rms.clamp_min(1.0e-8)
                     ).to(base_pre.dtype),
@@ -460,12 +633,24 @@ class MS_E_GCL(nn.Module):
                 }
         else:
             self.last_bridge_diagnostics = {}
+
+        base_edge = base_pre
+        state_edge = state_pre
         for layer in self.edge_mlp[1:]:
-            out = layer(out)
-        out = self.dropout(out)
+            base_edge = layer(base_edge)
+            state_edge = layer(state_edge)
+
+        # One Bernoulli mask, shared by both streams.  At zero pair adapter the
+        # two values are exactly identical, preserving the R05 parent value.
+        if self.training and self.dropout.p > 0.0:
+            dropout_scale = self.dropout(torch.ones_like(state_edge))
+            base_edge = base_edge * dropout_scale
+            state_edge = state_edge * dropout_scale
+
         if self.attention:
-            out = out * self.att_mlp(out)
-        return out
+            base_edge = base_edge * self.att_mlp(base_edge)
+            state_edge = state_edge * self.att_mlp(state_edge)
+        return state_edge, base_edge
 
     def node_model(self, x, edge_index, edge_attr, node_attr):
         '''
@@ -489,31 +674,108 @@ class MS_E_GCL(nn.Module):
             out = x + out
         return out, agg
 
-    def coord_model(self, coord, edge_index, coord_diff, edge_feat, channel_weights):
-        '''
-        coord: [bs * n_node, n_channel, d]
-        edge_index: list of [n_edge], [n_edge]
-        coord_diff: [n_edge, n_channel, d]
-        edge_feat: [n_edge, hidden_size]
-        channel_weights: [N, n_channel]
+    def node_model_dual(self, state_x, base_x, edge_index, state_edge_attr,
+                        base_edge_attr, node_attr):
+        """Shared-parameter state/base node update with one dropout mask."""
+        row, col = edge_index
+        state_agg = unsorted_segment_sum(
+            state_edge_attr, row, num_segments=state_x.size(0)
+        )
+        base_agg = unsorted_segment_sum(
+            base_edge_attr, row, num_segments=base_x.size(0)
+        )
+        if node_attr is not None:
+            state_in = torch.cat([state_x, state_agg, node_attr], dim=1)
+            base_in = torch.cat([base_x, base_agg, node_attr], dim=1)
+        else:
+            state_in = torch.cat([state_x, state_agg], dim=1)
+            base_in = torch.cat([base_x, base_agg], dim=1)
+        state_out = self.node_mlp(state_in)
+        base_out = self.node_mlp(base_in)
+        if self.training and self.dropout.p > 0.0:
+            dropout_scale = self.dropout(torch.ones_like(state_out))
+            state_out = state_out * dropout_scale
+            base_out = base_out * dropout_scale
+        if self.residual:
+            state_out = state_x + state_out
+            base_out = base_x + base_out
+        return state_out, base_out
+
+    def coord_model(self, coord, edge_index, coord_diff, state_edge_feat,
+                    channel_weights, base_edge_feat=None):
+        '''Pair-aware Cartesian update with bounded direct-pair authority.
+
+        The state/message stream may use the full pair-conditioned edge feature.
+        Geometry uses the pair-free base coefficient plus a bounded residual from
+        direct pair conditioning:
+
+            alpha = alpha_base + B * tanh((alpha_state-alpha_base) / B).
+
+        For a zero pair adapter, alpha_state == alpha_base exactly.  For small
+        learned corrections this is first-order identity; only pathological
+        direct-pair authority is saturated.  No coordinate clipping is used.
         '''
         row, col = edge_index
-
-        # first pooling, then element-wise multiply
         n_channel = channel_weights.shape[-1]
-        edge_feat = self.coord_mlp(edge_feat)  # [n_edge, n_channel]
-        channel_sum = (channel_weights != 0).long().sum(-1)  # [N]
-        pooled_edge_feat = RollerPooling(n_channel)(edge_feat, channel_sum[row])  # [n_edge, n_channel, 1]
-        trans = coord_diff * pooled_edge_feat  # [n_edge, n_channel, d]
+        coord_before = coord
 
-        # aggregate
+        state_coeff = self.coord_mlp(state_edge_feat)
+        if base_edge_feat is None or self.pair_coord_mode == 'legacy_shared':
+            base_coeff = state_coeff
+            pair_coeff_raw = torch.zeros_like(state_coeff)
+            pair_coeff_bounded = pair_coeff_raw
+            coord_coeff = state_coeff
+        else:
+            base_coeff = self.coord_mlp(base_edge_feat)
+            pair_coeff_raw = state_coeff - base_coeff
+            bound = pair_coeff_raw.new_tensor(self.pair_coord_delta_bound)
+            pair_coeff_bounded = bound * torch.tanh(pair_coeff_raw / bound)
+            coord_coeff = base_coeff + pair_coeff_bounded
+
+        channel_sum = (channel_weights != 0).long().sum(-1)
+        pooled_edge_feat = RollerPooling(n_channel)(coord_coeff, channel_sum[row])
+        trans = coord_diff * pooled_edge_feat
+
         if self.coords_agg == 'sum':
             agg = unsorted_segment_sum(trans, row, num_segments=coord.size(0))
         elif self.coords_agg == 'mean':
-            agg = unsorted_segment_mean(trans, row, num_segments=coord.size(0))  # [bs * n_node, n_channel, d]
+            agg = unsorted_segment_mean(trans, row, num_segments=coord.size(0))
         else:
             raise Exception('Wrong coords_agg parameter' % self.coords_agg)
-        coord = coord + agg
+        coord = coord_before + agg
+
+        if self.capture_bridge_diagnostics:
+            with torch.no_grad():
+                def _rms(v):
+                    vf = v.detach().float()
+                    return vf.square().mean().sqrt().to(coord_before.dtype) if vf.numel() else coord_before.new_zeros(())
+                def _amax(v):
+                    vf = v.detach().float()
+                    return vf.abs().amax().to(coord_before.dtype) if vf.numel() else coord_before.new_zeros(())
+                self.last_coord_diagnostics = {
+                    'coord_input_rms': _rms(coord_before),
+                    'coord_input_absmax': _amax(coord_before),
+                    'coord_diff_rms': _rms(coord_diff),
+                    'coord_diff_absmax': _amax(coord_diff),
+                    'coord_base_coeff_rms': _rms(base_coeff),
+                    'coord_base_coeff_absmax': _amax(base_coeff),
+                    'coord_state_coeff_rms': _rms(state_coeff),
+                    'coord_state_coeff_absmax': _amax(state_coeff),
+                    'coord_pair_delta_raw_rms': _rms(pair_coeff_raw),
+                    'coord_pair_delta_raw_absmax': _amax(pair_coeff_raw),
+                    'coord_pair_delta_bounded_rms': _rms(pair_coeff_bounded),
+                    'coord_pair_delta_bounded_absmax': _amax(pair_coeff_bounded),
+                    'coord_coeff_rms': _rms(coord_coeff),
+                    'coord_coeff_absmax': _amax(coord_coeff),
+                    'coord_trans_rms': _rms(trans),
+                    'coord_trans_absmax': _amax(trans),
+                    'coord_update_rms': _rms(agg),
+                    'coord_update_absmax': _amax(agg),
+                    'coord_output_rms': _rms(coord),
+                    'coord_output_absmax': _amax(coord),
+                }
+        else:
+            self.last_coord_diagnostics = {}
         return coord
 
     def forward(self, h, edge_index, epi_index, coord, surf_verts, channel_attr, channel_weights,
@@ -528,6 +790,7 @@ class MS_E_GCL(nn.Module):
         row, col = edge_index
         self.capture_bridge_diagnostics = bool(capture_bridge_diagnostics)
         self.last_bridge_diagnostics = {}
+        self.last_coord_diagnostics = {}
         # Empty aligned surface edges are a valid no-message case (especially
         # with local batch=1).  Do not fabricate geometry and do not bypass this
         # module in AMEncoder: return an exact identity value while attaching a
@@ -548,16 +811,53 @@ class MS_E_GCL(nn.Module):
                 coord + zero_anchor.to(device=coord.device, dtype=coord.dtype),
             )
 
-        radial, abX = coord_SR(edge_index, epi_index, coord, surf_verts, channel_attr, self.scale_linear, self.radial_linear)
-        # radial, coord_diff = coord2radial(edge_index, coord, channel_attr, channel_weights, self.radial_linear)
-        # print('radial, coord_diff : ', radial.shape, coord_diff.shape)
-
-        edge_feat = self.edge_model(h[row], h[col], radial, edge_attr)  # [n_edge, hidden_size]
-        coord = self.coord_model(coord, edge_index, abX, edge_feat, channel_weights)    # [bs * n_node, n_channel, d]
+        radial, abX = coord_SR(
+            edge_index, epi_index, coord, surf_verts, channel_attr,
+            self.scale_linear, self.radial_linear
+        )
+        edge_feat, base_edge_feat = self.edge_model(h[row], h[col], radial, edge_attr)
+        coord = self.coord_model(
+            coord, edge_index, abX, edge_feat, channel_weights,
+            base_edge_feat=base_edge_feat,
+        )
         h, agg = self.node_model(h, edge_index, edge_feat, node_attr)
-        # print('h, x : ', coord, coord.shape)
-
         return h, coord
+
+    def forward_dual(self, h, h_base, edge_index, epi_index, coord, surf_verts,
+                     channel_attr, channel_weights, edge_attr=None, node_attr=None,
+                     capture_bridge_diagnostics=False):
+        row, col = edge_index
+        self.capture_bridge_diagnostics = bool(capture_bridge_diagnostics)
+        self.last_bridge_diagnostics = {}
+        self.last_coord_diagnostics = {}
+        if row.numel() == 0 or epi_index is None or epi_index.numel() == 0:
+            zero_anchor = None
+            for param in self.parameters():
+                if param.requires_grad:
+                    term = param.reshape(-1)[0] * 0.0
+                    zero_anchor = term if zero_anchor is None else zero_anchor + term
+            if zero_anchor is None:
+                return h, h_base, coord
+            z_h = zero_anchor.to(device=h.device, dtype=h.dtype)
+            z_x = zero_anchor.to(device=coord.device, dtype=coord.dtype)
+            return h + z_h, h_base + z_h, coord + z_x
+
+        radial, abX = coord_SR(
+            edge_index, epi_index, coord, surf_verts, channel_attr,
+            self.scale_linear, self.radial_linear
+        )
+        edge_feat, base_edge_feat = self.edge_model(
+            h[row], h[col], radial, edge_attr,
+            base_source=h_base[row], base_target=h_base[col],
+        )
+        coord = self.coord_model(
+            coord, edge_index, abX, edge_feat, channel_weights,
+            base_edge_feat=base_edge_feat,
+        )
+        h, h_base = self.node_model_dual(
+            h, h_base, edge_index, edge_feat, base_edge_feat, node_attr
+        )
+        return h, h_base, coord
         
         
 def coord_SR(aligned_edge_index, epi_index, local_coord, surf_verts, attr, scale_map, linear_map):

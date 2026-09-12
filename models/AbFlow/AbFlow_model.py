@@ -1,6 +1,7 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -58,6 +59,13 @@ class AbFlowModel(nn.Module):
         flow_config = r05_config.get("flow", {})
         r3_config = r05_config.get("r3", {})
         representation_config = model_config.get("representation", {}).get("single_pair", {})
+        pair_coord_config = representation_config.get("pair_coordinate", {})
+        self.pair_coord_mode = str(
+            pair_coord_config.get("mode", "bounded_residual")
+        ).strip().lower()
+        self.pair_coord_delta_bound = float(
+            pair_coord_config.get("delta_bound", 1.0)
+        )
 
         atom_embed_size = embed_size // 4
         self.aa_feature = SeparatedAminoAcidFeature(
@@ -125,7 +133,9 @@ class AbFlowModel(nn.Module):
             in_edge_nf=self.native_trunk.pair_dim,
             in_single_nf=self.native_trunk.single_dim,
             num_verts=num_verts, n_layers=n_layers, residual=True,
-            dropout=dropout, dense=False)
+            dropout=dropout, dense=False,
+            pair_coord_mode=self.pair_coord_mode,
+            pair_coord_delta_bound=self.pair_coord_delta_bound)
 
         self.normalizer = SeperatedCoordNormalizer()
         self.batch_constants = {}
@@ -175,10 +185,183 @@ class AbFlowModel(nn.Module):
         self.last_abflow_diagnostics = {}
         self._last_trunk_state = {}
         self._last_message_diagnostics = {}
+        self._last_round_egnn_diagnostics = []
         self.last_gradient_diagnostics = {}
         self.grad_conflict_diagnostics = False
         self._diagnostic_capture = False
         self._diagnostic_validation_mode = False
+
+        # Geometry forensics are observational only.  These are plain Python
+        # attributes (not Parameters / buffers), so strict resume state_dict
+        # compatibility is unchanged.
+        _gf = str(os.environ.get("ABFLOW_GEOMETRY_FORENSICS", "off") or "off").strip().lower()
+        self.geometry_forensics_enabled = _gf in {"1", "true", "yes", "y", "on"}
+        _sf = str(os.environ.get("ABFLOW_SAMPLE_FORENSICS", "off") or "off").strip().lower()
+        self.sample_forensics_enabled = _sf in {"1", "true", "yes", "y", "on"}
+        self.sample_forensics_threshold_A = float(
+            os.environ.get("ABFLOW_SAMPLE_FORENSICS_THRESHOLD_A", "500") or 500.0
+        )
+        self.last_geometry_forensics = {}
+        self._sample_forensic_context = {}
+        self._sample_forensic_records = []
+        self._sample_forensic_alerted = False
+
+        # Plain runtime metadata; not part of state_dict.
+        self.geometry_coupling_contract = {
+            'pair_coord_mode': self.pair_coord_mode,
+            'pair_coord_delta_bound': self.pair_coord_delta_bound,
+        }
+
+    def set_sample_forensic_context(self, logical_batch_id=None, global_indices=None, names=None):
+        """Attach evaluation identity to the next ``sample`` call.
+
+        Runtime-only metadata: it is never inserted into ``state_dict`` and has
+        no effect on the model/sampler computation.
+        """
+        self._sample_forensic_context = {
+            'logical_batch_id': None if logical_batch_id is None else int(logical_batch_id),
+            'global_indices': [] if global_indices is None else [int(v) for v in global_indices],
+            'names': [] if names is None else [str(v) for v in names],
+        }
+
+    def reset_sample_forensics(self):
+        self._sample_forensic_records = []
+        self._sample_forensic_alerted = False
+
+    def consume_sample_forensics(self):
+        records = list(self._sample_forensic_records)
+        self._sample_forensic_records = []
+        self._sample_forensic_alerted = False
+        return records
+
+    @staticmethod
+    def _forensic_graph_stats(value, graph_id, n_graph):
+        """Return JSON-safe per-graph statistics without changing ``value``."""
+        value = value.detach().float()
+        graph_id = graph_id.detach().long()
+        rows = []
+        for gid in range(int(n_graph)):
+            part = value[graph_id == gid]
+            if part.numel() == 0:
+                rows.append({
+                    'finite': True, 'absmax': 0.0, 'rms': 0.0,
+                    'min': 0.0, 'max': 0.0,
+                })
+                continue
+            finite = bool(torch.isfinite(part).all().item())
+            if finite:
+                part32 = part.float()
+                rows.append({
+                    'finite': True,
+                    'absmax': float(part32.abs().amax().item()),
+                    'rms': float(part32.square().mean().sqrt().item()),
+                    'min': float(part32.amin().item()),
+                    'max': float(part32.amax().item()),
+                })
+            else:
+                finite_part = part[torch.isfinite(part)]
+                rows.append({
+                    'finite': False,
+                    'absmax': float(finite_part.abs().amax().item()) if finite_part.numel() else float('nan'),
+                    'rms': float(finite_part.square().mean().sqrt().item()) if finite_part.numel() else float('nan'),
+                    'min': float(finite_part.amin().item()) if finite_part.numel() else float('nan'),
+                    'max': float(finite_part.amax().item()) if finite_part.numel() else float('nan'),
+                })
+        return rows
+
+    @staticmethod
+    def _diag_float(diag, key):
+        value = (diag or {}).get(key)
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            if value.numel() != 1:
+                return None
+            return float(value.detach().float().item())
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    def _sample_forensic_identity(self, local_graph):
+        ctx = self._sample_forensic_context or {}
+        global_indices = ctx.get('global_indices', []) or []
+        names = ctx.get('names', []) or []
+        return {
+            'logical_batch_id': ctx.get('logical_batch_id'),
+            'local_graph': int(local_graph),
+            'global_index': (
+                int(global_indices[local_graph])
+                if local_graph < len(global_indices) else None
+            ),
+            'name': str(names[local_graph]) if local_graph < len(names) else '',
+        }
+
+    def _append_sample_forensic_record(self, row):
+        if not self.sample_forensics_enabled:
+            return
+        self._sample_forensic_records.append(dict(row))
+        if self._sample_forensic_alerted:
+            return
+
+        bad_field = None
+        bad_value = None
+        ordered = (
+            'xt_absmax_A', 'carrier_absmax_A', 'implied_x1_absmax_A',
+            'xnext_absmax_A', 'pred_final_absmax_A',
+            'gen_pre_align_absmax_A', 'kabsch_translation_norm_A',
+            'gen_post_align_absmax_A',
+        )
+        for field in ordered:
+            value = row.get(field)
+            if value is None:
+                continue
+            try:
+                fv = float(value)
+            except Exception:
+                continue
+            if (not math.isfinite(fv)) or abs(fv) > float(self.sample_forensics_threshold_A):
+                bad_field, bad_value = field, fv
+                break
+        if row.get('finite') is False and bad_field is None:
+            bad_field, bad_value = 'nonfinite', float('nan')
+
+        if bad_field is not None:
+            self._sample_forensic_alerted = True
+            print(
+                '[SampleGeometryOutlier] '
+                f"logical_batch_id={row.get('logical_batch_id')} "
+                f"global_index={row.get('global_index')} name={row.get('name', '')!r} "
+                f"stage={row.get('stage')} step={row.get('step')} "
+                f"t={row.get('t')} field={bad_field} value_A={bad_value:.6g} "
+                f"threshold_A={float(self.sample_forensics_threshold_A):.6g}",
+                flush=True,
+            )
+
+    @staticmethod
+    def _per_graph_coord_rms(pred, target, atom_mask, graph_id, n_graph):
+        """Vectorized coordinate RMS (Angstrom) for training diagnostics."""
+        pred32 = pred.detach().float()
+        target32 = target.detach().float()
+        atom_mask = atom_mask.detach().bool()
+        graph_id = graph_id.detach().long()
+        per_res_ss = ((pred32 - target32).square().sum(dim=-1) * atom_mask.float()).sum(dim=-1)
+        per_res_count = atom_mask.float().sum(dim=-1) * 3.0
+        ss = pred32.new_zeros(int(n_graph))
+        count = pred32.new_zeros(int(n_graph))
+        ss.scatter_add_(0, graph_id, per_res_ss)
+        count.scatter_add_(0, graph_id, per_res_count)
+        return torch.sqrt(ss / count.clamp_min(1.0))
+
+    @staticmethod
+    def _per_graph_absmax(value, graph_id, n_graph):
+        value = value.detach().float()
+        graph_id = graph_id.detach().long()
+        out = []
+        for gid in range(int(n_graph)):
+            part = value[graph_id == gid]
+            out.append(part.abs().amax() if part.numel() else value.new_zeros(()))
+        return torch.stack(out) if out else value.new_zeros((0,))
 
     def init_mask(self, X, S, cmask, smask, template):
         if not self.struct_only:
@@ -452,7 +635,11 @@ class AbFlowModel(nn.Module):
             trunk_state['pair_dense'], surf_global,
             trunk_state['node_graph'], trunk_state['node_local']).to(H_0)
 
-        capture_diag = bool(getattr(self, '_diagnostic_capture', False))
+        capture_diag = bool(
+            getattr(self, '_diagnostic_capture', False)
+            or getattr(self, 'geometry_forensics_enabled', False)
+            or getattr(self, 'sample_forensics_enabled', False)
+        )
         H, pred_X, pred_local_X = self.gnn(
             H_0, X, ctx_edges, local_mask, local_X, surf, local_edges,
             paratope_mask, local_is_ab, surf_edges, epi_index,
@@ -622,6 +809,15 @@ class AbFlowModel(nn.Module):
                  interface_init=None, sequence_init=None, flow_t=None):
         """R05 predictor at one transport state."""
         batch_id = self.batch_constants['batch_id']
+        # V10.1: `_forward` owns its diagnostic-capture scope.  The same flag is
+        # also evaluated inside `message_passing`, but that local variable is not
+        # visible here.  Keep the predicates identical so round-level EGNN
+        # diagnostics are collected exactly when message-level diagnostics are.
+        capture_diag = bool(
+            getattr(self, '_diagnostic_capture', False)
+            or getattr(self, 'geometry_forensics_enabled', False)
+            or getattr(self, 'sample_forensics_enabled', False)
+        )
         X, S, surface = X.clone(), S.clone(), surface.clone()
         X, S = self.init_mask(X, S, cmask, smask, template)
         X, S = self.replace_pep(X, S, paratope_mask, X_pep, S_pep)
@@ -677,6 +873,7 @@ class AbFlowModel(nn.Module):
 
         r_logits, r_interface_X, r_edge_dist = [], [interface_X.clone()], []
         pred_S_dist, memory_H = None, None
+        round_egnn_diagnostics = []
         for round_idx in range(self.round):
             if round_idx >= self.proposal_adapter_start_round:
                 coord_cond, coord_mask = self._build_coord_pep_condition_for_residues(
@@ -695,6 +892,19 @@ class AbFlowModel(nn.Module):
                 seq_pep_condition=seq_this,
                 seq_pep_condition_mask=seq_mask_this,
                 trunk_state=trunk_state)
+
+            if capture_diag:
+                round_egnn_diagnostics.append({
+                    'round_idx': int(round_idx),
+                    'bridge': {
+                        k: v.detach() if torch.is_tensor(v) else v
+                        for k, v in (self._last_message_diagnostics or {}).items()
+                    },
+                    'coord': {
+                        k: v.detach() if torch.is_tensor(v) else v
+                        for k, v in (getattr(self.gnn, 'last_coord_diagnostics', {}) or {}).items()
+                    },
+                })
 
             memory_H = H
             r_interface_X.append(interface_X.clone())
@@ -720,6 +930,7 @@ class AbFlowModel(nn.Module):
             r_interface_X[i] = self.normalizer.uncentering(
                 value, interface_batch_id, _type=4)
         self.normalizer.clear_cache()
+        self._last_round_egnn_diagnostics = round_egnn_diagnostics
         return H, S, r_logits, pred_X, r_interface_X, r_edge_dist, prmsd
 
 
@@ -855,6 +1066,58 @@ class AbFlowModel(nn.Module):
         if pdev_loss is not None:
             loss = loss + pdev_loss
 
+        # Per-complex geometry diagnostics are computed only when explicitly
+        # enabled.  They are detached and never enter the objective.
+        if self.geometry_forensics_enabled:
+            with torch.no_grad():
+                design_gid = batch_id[cmask]
+                design_atom_mask = xloss_mask[cmask].bool()
+                pred_design_rms = self._per_graph_coord_rms(
+                    pred_X[cmask], true_X[cmask], design_atom_mask,
+                    design_gid, batch_size)
+                pred_design_absmax = self._per_graph_absmax(
+                    pred_X[cmask], design_gid, batch_size)
+                carrier_target_rms = self._per_graph_coord_rms(
+                    r_interface_X[-1], coord_target, atom_mask,
+                    interface_batch_id, batch_size)
+                carrier_absmax = self._per_graph_absmax(
+                    r_interface_X[-1], interface_batch_id, batch_size)
+
+                # Physical refinement-round growth in Angstrom.  r_interface_X
+                # is already unnormalized/uncentered at this point, so these
+                # diagnostics directly reveal whether round 1/2/3 is the first
+                # Cartesian amplification point.
+                round_delta_rms = []
+                round_absmax = []
+                for ridx in range(1, len(r_interface_X)):
+                    round_delta_rms.append(self._per_graph_coord_rms(
+                        r_interface_X[ridx], r_interface_X[ridx - 1], atom_mask,
+                        interface_batch_id, batch_size))
+                    round_absmax.append(self._per_graph_absmax(
+                        r_interface_X[ridx], interface_batch_id, batch_size))
+                round_delta_rms = (
+                    torch.stack(round_delta_rms, dim=0)
+                    if round_delta_rms else pred_design_rms.new_zeros((0, batch_size))
+                )
+                round_absmax = (
+                    torch.stack(round_absmax, dim=0)
+                    if round_absmax else pred_design_rms.new_zeros((0, batch_size))
+                )
+
+                worst_graph = torch.argmax(pred_design_rms) if pred_design_rms.numel() else torch.zeros((), device=X.device, dtype=torch.long)
+                self.last_geometry_forensics = {
+                    'per_graph_pred_design_rms_A': pred_design_rms.detach(),
+                    'per_graph_pred_design_absmax_A': pred_design_absmax.detach(),
+                    'per_graph_carrier_target_rms_A': carrier_target_rms.detach(),
+                    'per_graph_carrier_absmax_A': carrier_absmax.detach(),
+                    'per_round_graph_delta_rms_A': round_delta_rms.detach(),
+                    'per_round_graph_absmax_A': round_absmax.detach(),
+                    'per_graph_t': t_graph.detach().float(),
+                    'worst_graph_index': worst_graph.detach(),
+                }
+        else:
+            self.last_geometry_forensics = {}
+
         with torch.no_grad():
             aar = ((pred_S[sequence_loss_mask] == true_S[sequence_loss_mask]).float().mean()
                    if bool(sequence_loss_mask.any()) else X.new_zeros(()))
@@ -924,6 +1187,8 @@ class AbFlowModel(nn.Module):
                progress_desc=None, xloss_mask=None):
         """Generate with the matched R05/U02 canonical-carrier sampler."""
         n_steps = max(1, int(n_steps))
+        if self.sample_forensics_enabled:
+            self.reset_sample_forensics()
         cmask, smask = cmask.bool(), smask.bool()
         if self.backbone_only:
             X, template = X[:, :4], template[:, :4]
@@ -968,17 +1233,113 @@ class AbFlowModel(nn.Module):
             if show_progress and hasattr(steps, 'set_postfix'):
                 steps.set_postfix(t=f'{float(t):.2f}')
 
-            H, pred_S, r_logits, pred_X, r_interface_X, _, prmsd = self._forward(
-                X, S, cmask, smask, paratope_mask, X_pep, S_pep,
-                surface, residue_pos, template, lengths,
-                interface_init=Xt,
-                sequence_init=None if self.struct_only else St,
-                flow_t=flow_t)
+            prev_diag_capture = bool(getattr(self, '_diagnostic_capture', False))
+            if self.sample_forensics_enabled:
+                self._diagnostic_capture = True
+            try:
+                H, pred_S, r_logits, pred_X, r_interface_X, _, prmsd = self._forward(
+                    X, S, cmask, smask, paratope_mask, X_pep, S_pep,
+                    surface, residue_pos, template, lengths,
+                    interface_init=Xt,
+                    sequence_init=None if self.struct_only else St,
+                    flow_t=flow_t)
+                bridge_diag = dict(self._last_message_diagnostics or {})
+            finally:
+                self._diagnostic_capture = prev_diag_capture
+
             carrier = r_interface_X[-1]
-            Xt, _ = self.r3_matcher.exact_carrier_scoreflow_step_gfree(
-                x_t=Xt, x0=source_X0, carrier=carrier,
+            Xt_before = Xt
+            Xt_next, matcher_diag = self.r3_matcher.exact_carrier_scoreflow_step_gfree(
+                x_t=Xt_before, x0=source_X0, carrier=carrier,
                 t=t, t_next=t_next,
                 canonical_t_min=self.f01_hybrid_t_min)
+
+            if self.sample_forensics_enabled:
+                t_value = float(t.detach().float().item())
+                t_next_value = float(t_next.detach().float().item())
+                if t_value < float(self.f01_hybrid_t_min):
+                    implied_x1 = carrier
+                    carrier_mode = 'endpoint_boundary'
+                else:
+                    implied_x1 = self.r3_matcher.endpoint_from_canonical_carrier_gfree(
+                        x_t=Xt_before, x0=source_X0, carrier=carrier,
+                        t=t, boundary_eps=self.f01_hybrid_t_min)
+                    carrier_mode = 'canonical'
+
+                xt_stats = self._forensic_graph_stats(
+                    Xt_before, interface_batch_id, batch_size)
+                carrier_stats = self._forensic_graph_stats(
+                    carrier, interface_batch_id, batch_size)
+                x1_stats = self._forensic_graph_stats(
+                    implied_x1, interface_batch_id, batch_size)
+                next_stats = self._forensic_graph_stats(
+                    Xt_next, interface_batch_id, batch_size)
+                carrier_residual_stats = self._forensic_graph_stats(
+                    carrier - Xt_before, interface_batch_id, batch_size)
+                step_stats = self._forensic_graph_stats(
+                    Xt_next - Xt_before, interface_batch_id, batch_size)
+
+                # Physical-round EGNN diagnostics from this exact sampler
+                # forward.  Values are batch-level maxima, repeated in each
+                # row only to keep every JSONL record self-contained.
+                round_coord_update_absmax = []
+                round_coord_coeff_absmax = []
+                round_worst_stage = []
+                for rec in (self._last_round_egnn_diagnostics or []):
+                    coord_diag = rec.get('coord', {}) or {}
+                    round_coord_update_absmax.append(self._diag_float(
+                        coord_diag, 'coord_update_absmax_max'))
+                    round_coord_coeff_absmax.append(self._diag_float(
+                        coord_diag, 'coord_coeff_absmax_max'))
+                    candidates = []
+                    for key, value in coord_diag.items():
+                        if key.endswith('.coord_update_absmax'):
+                            try:
+                                fv = float(value.detach().float().item()) if torch.is_tensor(value) else float(value)
+                            except Exception:
+                                continue
+                            if math.isfinite(fv):
+                                candidates.append((fv, key.rsplit('.', 1)[0]))
+                    round_worst_stage.append(
+                        max(candidates, default=(float('nan'), 'NA'))[1]
+                    )
+
+                for gid in range(batch_size):
+                    row = {
+                        **self._sample_forensic_identity(gid),
+                        'stage': 'sampling_step',
+                        'step': int(i),
+                        't': t_value,
+                        't_next': t_next_value,
+                        'carrier_mode': carrier_mode,
+                        'finite': bool(
+                            xt_stats[gid]['finite'] and carrier_stats[gid]['finite']
+                            and x1_stats[gid]['finite'] and next_stats[gid]['finite']
+                        ),
+                        'xt_absmax_A': xt_stats[gid]['absmax'],
+                        'carrier_absmax_A': carrier_stats[gid]['absmax'],
+                        'carrier_residual_rms_A': carrier_residual_stats[gid]['rms'],
+                        'implied_x1_absmax_A': x1_stats[gid]['absmax'],
+                        'implied_x1_rms_A': x1_stats[gid]['rms'],
+                        'xnext_absmax_A': next_stats[gid]['absmax'],
+                        'step_delta_rms_A': step_stats[gid]['rms'],
+                        'canonical_residual_rms': self._diag_float(
+                            matcher_diag, 'canonical_residual_rms'),
+                        'canonical_ratio_mean': self._diag_float(
+                            matcher_diag, 'canonical_ratio_mean'),
+                        'bridge_single_ratio': self._diag_float(
+                            bridge_diag, 'bridge_single_delta_to_base_ratio'),
+                        'bridge_pair_ratio_mean': self._diag_float(
+                            bridge_diag, 'bridge_pair_delta_to_base_ratio_mean'),
+                        'bridge_pair_ratio_max': self._diag_float(
+                            bridge_diag, 'bridge_pair_delta_to_base_ratio_max'),
+                        'physical_round_coord_update_absmax': round_coord_update_absmax,
+                        'physical_round_coord_coeff_absmax': round_coord_coeff_absmax,
+                        'physical_round_worst_stage': round_worst_stage,
+                    }
+                    self._append_sample_forensic_record(row)
+
+            Xt = Xt_next
 
             if not self.struct_only:
                 logits = r_logits[-1][0][paratope_mask]
@@ -1018,9 +1379,62 @@ class AbFlowModel(nn.Module):
             design = graph & paratope_mask
             ori = gen_X[design][:, :4]
             pred = interface_X_final[interface_batch_id == b][:, :4]
-            _, R, trans = kabsch_torch(ori.reshape(-1, 3), pred.reshape(-1, 3))
             ab = graph & is_ab
+
+            if self.sample_forensics_enabled:
+                pre = {
+                    **self._sample_forensic_identity(b),
+                    'stage': 'terminal_pre_kabsch',
+                    'step': int(n_steps),
+                    't': 1.0,
+                    'finite': bool(
+                        torch.isfinite(ori).all().item()
+                        and torch.isfinite(pred).all().item()
+                        and torch.isfinite(gen_X[ab]).all().item()
+                    ),
+                    'pred_final_absmax_A': (
+                        float(ori.detach().float().abs().amax().item())
+                        if ori.numel() else 0.0
+                    ),
+                    'implied_x1_absmax_A': (
+                        float(pred.detach().float().abs().amax().item())
+                        if pred.numel() else 0.0
+                    ),
+                    'gen_pre_align_absmax_A': (
+                        float(gen_X[ab].detach().float().abs().amax().item())
+                        if bool(ab.any().item()) else 0.0
+                    ),
+                }
+                self._append_sample_forensic_record(pre)
+
+            try:
+                _, R, trans = kabsch_torch(ori.reshape(-1, 3), pred.reshape(-1, 3))
+            except Exception as exc:
+                if self.sample_forensics_enabled:
+                    self._sample_forensic_records.append({
+                        **self._sample_forensic_identity(b),
+                        'stage': 'terminal_kabsch_exception',
+                        'step': int(n_steps),
+                        't': 1.0,
+                        'error': f'{type(exc).__name__}: {exc}',
+                    })
+                raise
             gen_X[ab] = torch.matmul(gen_X[ab], R.T) + trans
+
+            if self.sample_forensics_enabled:
+                post = gen_X[ab].detach().float()
+                self._append_sample_forensic_record({
+                    **self._sample_forensic_identity(b),
+                    'stage': 'terminal_post_kabsch',
+                    'step': int(n_steps),
+                    't': 1.0,
+                    'finite': bool(torch.isfinite(post).all().item()),
+                    'kabsch_translation_norm_A': float(
+                        trans.detach().float().norm().item()),
+                    'gen_post_align_absmax_A': (
+                        float(post.abs().amax().item()) if post.numel() else 0.0
+                    ),
+                })
 
         self._clean_batch_constants()
         if return_hidden:

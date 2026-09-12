@@ -621,13 +621,17 @@ def _apply_trainer_runtime_from_config(cfg, config_path):
     os.environ["ABFLOW_EPOCH_TEST_KEEP_STRUCTURES"] = (
         "on" if evaluation.get("keep_structures", False) else "off"
     )
-    # Infrastructure/protocol failures remain fail-fast.  A generated structure
-    # that is itself invalid is a model-quality observation, not an evaluator
-    # infrastructure failure; its policy is explicit in JSON.
-    os.environ["ABFLOW_EPOCH_TEST_FAIL_FAST"] = "on"
-    os.environ["ABFLOW_EPOCH_TEST_MODEL_INVALID_POLICY"] = str(
-        evaluation.get("model_output_invalid_policy", "record_and_continue")
-    )
+    # Test metric validity remains strict, but Test is observation-only.
+    # JSON controls whether an observational Test failure can terminate training.
+    failure_policy = str(
+        evaluation.get("failure_policy", "abort")
+    ).strip().lower()
+    if failure_policy not in {"abort", "record_and_continue"}:
+        raise ValueError(
+            "evaluation.failure_policy must be 'abort' or "
+            f"'record_and_continue', got {failure_policy!r}"
+        )
+    os.environ["ABFLOW_EPOCH_TEST_FAILURE_POLICY"] = failure_policy
 
     logging_cfg = cfg["training"]["logging"]
     os.environ["ABFLOW_SCI_LOG_FIRST_STEPS"] = str(
@@ -642,6 +646,38 @@ def _apply_trainer_runtime_from_config(cfg, config_path):
     os.environ["ABFLOW_TRAIN_LOSS_OUTLIER_THRESHOLD"] = str(
         float(logging_cfg.get("train_loss_outlier_threshold", 1.0e4))
     )
+
+
+def _runtime_local_gpu_count():
+    """Resolve local CUDA worker count from torchrun/launcher, never JSON.
+
+    GPU placement is an execution resource decision.  The scientific JSON must
+    not encode physical GPU ids.  ``torchrun`` exports LOCAL_WORLD_SIZE/WORLD_SIZE;
+    direct single-process fallback uses CUDA_VISIBLE_DEVICES.
+    """
+    for key in ("LOCAL_WORLD_SIZE", "WORLD_SIZE", "ABFLOW_NPROC_PER_NODE"):
+        raw = os.environ.get(key)
+        if raw:
+            try:
+                value = int(raw)
+                if value > 0:
+                    return value
+            except ValueError:
+                pass
+    visible = str(os.environ.get("CUDA_VISIBLE_DEVICES", "")).strip()
+    if visible:
+        ids = [x.strip() for x in visible.split(',') if x.strip()]
+        if ids:
+            return len(ids)
+    return 1
+
+
+def _runtime_resume_checkpoint(schedule_cfg):
+    """CLI/launcher resume overrides JSON; JSON fallback remains compatible."""
+    env_value = str(os.environ.get("ABFLOW_RESUME_CHECKPOINT", "") or "").strip()
+    if env_value:
+        return env_value
+    return schedule_cfg.get("resume_checkpoint", "") or ""
 
 
 def _namespace_from_config(config_path):
@@ -699,7 +735,7 @@ def _namespace_from_config(config_path):
         tqdm_mininterval=logging_cfg["tqdm_mininterval"],
         allow_tf32=precision["allow_tf32"],
         save_interval=sched["save_interval"],
-        resume_checkpoint=sched.get("resume_checkpoint", ""),
+        resume_checkpoint=_runtime_resume_checkpoint(sched),
         use_ema=ema["enabled"],
         ema_decay=ema["decay"],
 
@@ -708,7 +744,7 @@ def _namespace_from_config(config_path):
         snapshot_max_mb=snapshot["max_mb"],
         no_snapshot=not snapshot["enabled"],
 
-        gpus=list(range(len(runtime["gpus"]))),
+        gpus=list(range(_runtime_local_gpu_count())),
         local_rank=-1,
 
         model_type=model["type"],

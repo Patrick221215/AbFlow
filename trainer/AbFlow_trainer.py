@@ -160,7 +160,11 @@ class AbFlowTrainer(Trainer):
         self._train_loss_outlier_threshold = _env_float(
             "ABFLOW_TRAIN_LOSS_OUTLIER_THRESHOLD", 1.0e4
         )
-        self._train_loss_outlier_logged_epoch = -1
+        self._train_loss_outlier_max_per_epoch = max(1, _env_int(
+            "ABFLOW_TRAIN_LOSS_OUTLIER_MAX_PER_EPOCH", 3
+        ))
+        self._train_loss_outlier_epoch = -1
+        self._train_loss_outlier_count = 0
 
         self._epoch_summary_path = os.path.join(
             self.config.save_dir, "epoch_summary.csv"
@@ -910,6 +914,53 @@ class AbFlowTrainer(Trainer):
             return "nan"
         return f"{value:.{int(digits)}e}"
 
+    def _formal_train_batch_indices(self, batch):
+        """Reconstruct current formal sampler indices without touching global RNG.
+
+        The R28/R29/R30 launcher uses CostBalancedDistributedSampler, whose
+        ``__iter__`` is a pure function of seed+epoch via a private Generator.
+        For unknown sampler types we deliberately return no guess.
+        """
+        sampler = getattr(self.train_loader, 'sampler', None)
+        if sampler is None or sampler.__class__.__name__ != 'CostBalancedDistributedSampler':
+            return []
+        local_bs = getattr(self.train_loader, 'batch_size', None)
+        if local_bs is None:
+            return []
+        try:
+            ordered = list(iter(sampler))
+            epoch_steps = max(1, len(self.train_loader))
+            step_in_epoch = int(self.global_step) - int(self.epoch) * epoch_steps
+            if not (0 <= step_in_epoch < epoch_steps):
+                step_in_epoch = int(self.global_step) % epoch_steps
+            n_graph = int(batch['lengths'].numel()) if torch.is_tensor(batch.get('lengths')) else int(local_bs)
+            start = step_in_epoch * int(local_bs)
+            return [int(v) for v in ordered[start:start + n_graph]]
+        except Exception:
+            return []
+
+    def _formal_dataset_labels(self, logical_indices):
+        dataset = getattr(self.train_loader, 'dataset', None)
+        if dataset is None:
+            return [str(v) for v in logical_indices]
+        labels = []
+        for logical_idx in logical_indices:
+            label = f'idx:{int(logical_idx)}'
+            try:
+                raw_idx = (
+                    int(dataset.idx_mapping[int(logical_idx)])
+                    if hasattr(dataset, 'idx_mapping') else int(logical_idx)
+                )
+                obj = dataset.data[raw_idx] if hasattr(dataset, 'data') else None
+                if obj is not None and hasattr(obj, 'get_id'):
+                    label = str(obj.get_id()).split('(')[0]
+                elif obj is not None and hasattr(obj, 'pdb_id'):
+                    label = str(obj.pdb_id)
+            except Exception:
+                pass
+            labels.append(label)
+        return labels
+
     def _weighted_timebin_metric(self, buffer, bin_idx, aligned=False):
         prefix = f"AbFlowDiag/val_proxy_timebin{int(bin_idx)}_"
         if aligned:
@@ -1440,18 +1491,29 @@ class AbFlowTrainer(Trainer):
         dock_loss, interface_loss, ed_loss, r_ed_losses = dock_detail
         pdev_loss, prmsd_loss = pdev_detail
 
-        if not val and self._train_loss_outlier_logged_epoch != int(self.epoch):
+        if not val:
+            current_epoch = int(self.epoch)
+            if self._train_loss_outlier_epoch != current_epoch:
+                self._train_loss_outlier_epoch = current_epoch
+                self._train_loss_outlier_count = 0
+
             struct_scalar = self._scalar(struct_loss)
-            if (
+            is_outlier = (
                 struct_scalar is not None
                 and isfinite(struct_scalar)
                 and abs(float(struct_scalar)) >= float(self._train_loss_outlier_threshold)
+            )
+            if (
+                is_outlier
+                and self._train_loss_outlier_count < self._train_loss_outlier_max_per_epoch
             ):
+                self._train_loss_outlier_count += 1
                 rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
                 loss_scalar = self._scalar(loss)
                 print(
                     "[TrainLossOutlier] "
                     f"epoch={self.epoch} step={self.global_step} rank={rank} "
+                    f"ordinal={self._train_loss_outlier_count}/{self._train_loss_outlier_max_per_epoch} "
                     f"loss={self._fmte(loss_scalar, 6)} "
                     f"struct={self._fmte(struct_scalar, 6)} "
                     f"threshold={self._fmte(self._train_loss_outlier_threshold, 3)}"
@@ -1474,6 +1536,123 @@ class AbFlowTrainer(Trainer):
                     f"context_ratio={self._fmt(self._scalar(batch.get('context_ratio')), 5)}"
                 )
 
+                logical_indices = self._formal_train_batch_indices(batch)
+                labels = self._formal_dataset_labels(logical_indices)
+                geom = getattr(raw_model, 'last_geometry_forensics', None) or {}
+                worst_idx = geom.get('worst_graph_index')
+                try:
+                    worst_idx = int(worst_idx.detach().cpu().item()) if torch.is_tensor(worst_idx) else int(worst_idx)
+                except Exception:
+                    worst_idx = None
+
+                def _graph_scalar(key):
+                    value = geom.get(key)
+                    if value is None or worst_idx is None:
+                        return None
+                    try:
+                        if torch.is_tensor(value):
+                            return float(value.detach().float().reshape(-1)[worst_idx].cpu().item())
+                        return float(value[worst_idx])
+                    except Exception:
+                        return None
+
+                worst_label = (
+                    labels[worst_idx]
+                    if worst_idx is not None and worst_idx < len(labels)
+                    else 'NA'
+                )
+                lengths = batch.get('lengths')
+                worst_length = None
+                if torch.is_tensor(lengths) and worst_idx is not None:
+                    try:
+                        worst_length = int(lengths.detach().reshape(-1)[worst_idx].cpu().item())
+                    except Exception:
+                        pass
+                print(
+                    "[TrainGeometryOutlier] "
+                    f"epoch={self.epoch} step={self.global_step} rank={rank} "
+                    f"worst_graph={worst_idx} dataset_index={logical_indices[worst_idx] if worst_idx is not None and worst_idx < len(logical_indices) else 'NA'} "
+                    f"name={worst_label!r} length={worst_length if worst_length is not None else 'NA'} "
+                    f"t={self._fmt(_graph_scalar('per_graph_t'), 5)} "
+                    f"pred_design_rms_A={self._fmt(_graph_scalar('per_graph_pred_design_rms_A'), 5)} "
+                    f"pred_design_absmax_A={self._fmt(_graph_scalar('per_graph_pred_design_absmax_A'), 5)} "
+                    f"carrier_target_rms_A={self._fmt(_graph_scalar('per_graph_carrier_target_rms_A'), 5)} "
+                    f"carrier_absmax_A={self._fmt(_graph_scalar('per_graph_carrier_absmax_A'), 5)}"
+                )
+
+                def _round_graph_values(key):
+                    value = geom.get(key)
+                    if value is None or worst_idx is None:
+                        return []
+                    try:
+                        if torch.is_tensor(value):
+                            vv = value.detach().float().cpu()
+                            if vv.ndim != 2 or worst_idx >= vv.shape[1]:
+                                return []
+                            return [float(x) for x in vv[:, worst_idx].tolist()]
+                        return [float(row[worst_idx]) for row in value]
+                    except Exception:
+                        return []
+
+                round_delta = _round_graph_values('per_round_graph_delta_rms_A')
+                round_absmax = _round_graph_values('per_round_graph_absmax_A')
+                if round_delta or round_absmax:
+                    print(
+                        "[TrainGeometryRounds] "
+                        f"epoch={self.epoch} step={self.global_step} rank={rank} "
+                        f"worst_graph={worst_idx} "
+                        f"delta_rms_A={[round(v, 5) for v in round_delta]} "
+                        f"absmax_A={[round(v, 5) for v in round_absmax]}"
+                    )
+
+                # Relational-message -> coordinate-head causal trace from the
+                # exact physical forwards already used to compute this loss.
+                round_egnn = getattr(raw_model, '_last_round_egnn_diagnostics', None) or []
+                def _diag_number(value):
+                    try:
+                        if torch.is_tensor(value):
+                            return float(value.detach().float().cpu().item())
+                        return float(value)
+                    except Exception:
+                        return None
+                def _diag_stage_max(diag, suffix):
+                    vals = []
+                    for key, value in diag.items():
+                        if not key.endswith(suffix):
+                            continue
+                        val = _diag_number(value)
+                        if val is not None and isfinite(val):
+                            vals.append(val)
+                    return max(vals) if vals else None
+
+                for rec in round_egnn:
+                    coord_diag = rec.get('coord', {}) or {}
+                    bridge_diag = rec.get('bridge', {}) or {}
+                    candidates = []
+                    for key, value in coord_diag.items():
+                        if key.endswith('.coord_update_absmax'):
+                            val = _diag_number(value)
+                            if val is not None and isfinite(val):
+                                candidates.append((val, key.rsplit('.', 1)[0]))
+                    worst_update = max(candidates, default=(None, 'NA'))
+                    print(
+                        "[TrainEGNNOutlier] "
+                        f"epoch={self.epoch} step={self.global_step} rank={rank} "
+                        f"physical_round={rec.get('round_idx', 'NA')} "
+                        f"coord_update_absmax={self._fmt(_diag_number(coord_diag.get('coord_update_absmax_max')), 6)} "
+                        f"coord_coeff_absmax={self._fmt(_diag_number(coord_diag.get('coord_coeff_absmax_max')), 6)} "
+                        f"base_coeff_absmax={self._fmt(_diag_stage_max(coord_diag, '.coord_base_coeff_absmax'), 6)} "
+                        f"state_coeff_absmax={self._fmt(_diag_stage_max(coord_diag, '.coord_state_coeff_absmax'), 6)} "
+                        f"pair_raw_absmax={self._fmt(_diag_stage_max(coord_diag, '.coord_pair_delta_raw_absmax'), 6)} "
+                        f"pair_bounded_absmax={self._fmt(_diag_stage_max(coord_diag, '.coord_pair_delta_bounded_absmax'), 6)} "
+                        f"pair_coord_bound={self._fmt(_diag_number(coord_diag.get('pair_coord_delta_bound')), 6)} "
+                        f"worst_stage={worst_update[1]} "
+                        f"worst_stage_update_absmax={self._fmt(worst_update[0], 6)} "
+                        f"single_ratio={self._fmt(_diag_number(bridge_diag.get('bridge_single_delta_to_base_ratio')), 6)} "
+                        f"pair_ratio_mean={self._fmt(_diag_number(bridge_diag.get('bridge_pair_delta_to_base_ratio_mean')), 6)} "
+                        f"pair_ratio_max={self._fmt(_diag_number(bridge_diag.get('bridge_pair_delta_to_base_ratio_max')), 6)}"
+                    )
+
                 def _safe_preview(value, limit=8):
                     try:
                         if torch.is_tensor(value):
@@ -1490,8 +1669,12 @@ class AbFlowTrainer(Trainer):
                     return None
 
                 meta = []
+                if logical_indices:
+                    meta.append(f"dataset_indices={logical_indices[:8]}{'...' if len(logical_indices) > 8 else ''}")
+                if labels:
+                    meta.append(f"dataset_names={labels[:8]}{'...' if len(labels) > 8 else ''}")
                 for key in (
-                    "pdb", "pdb_id", "complex_id", "sample_id", "id",
+                    "names", "pdb", "pdb_id", "complex_id", "sample_id", "id",
                     "name", "summary", "lengths"
                 ):
                     if key in batch:
@@ -1505,7 +1688,6 @@ class AbFlowTrainer(Trainer):
                     f"epoch={self.epoch} step={self.global_step} rank={rank} "
                     + " ".join(meta)
                 )
-                self._train_loss_outlier_logged_epoch = int(self.epoch)
 
         if probe_grad_now and hasattr(raw_model, "compute_gradient_conflict_diagnostics"):
             raw_model.compute_gradient_conflict_diagnostics()

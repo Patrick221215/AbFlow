@@ -1,8 +1,8 @@
 {
   "experiment": {
-    "id": "R30_R05_ABX_NATIVE_PAIR_EGNN_DISTOGRAM_LDDT_U02",
-    "parent": "R29_R05_ABX_NATIVE_PAIR_EGNN_DISTOGRAM_U02",
-    "factor": "R29 + design-localized smooth-lDDT (0.1)",
+    "id": "R28_R05_ABX_NATIVE_PAIR_EGNN_U02",
+    "parent": "R05_PCS_RC_LC_R1_ABX_FF_FIXEDG_RESIDUE_U02_SCOREFLOW",
+    "factor": "R05 + compact dense single/pair relational representation + zero-start native EGNN bridge",
     "protocol": "formal_train_val_test"
   },
   "data": {
@@ -32,7 +32,7 @@
     }
   },
   "training": {
-    "output_dir": "./results_module/R30_R05_ABX_NATIVE_PAIR_EGNN_DISTOGRAM_LDDT_U02",
+    "output_dir": "./results_module/R31_R05_ABX_NATIVE_PAIR_EGNN_BOUNDED_GEOM_U02",
     "optimizer": {
       "lr": 0.001,
       "final_lr": 0.0001,
@@ -44,7 +44,7 @@
       "patience": 1000,
       "save_topk": 10,
       "save_interval": 1,
-      "resume_checkpoint": "/home/data3/cjm/project/AbFlow/results_module/R30_R05_ABX_NATIVE_PAIR_EGNN_DISTOGRAM_LDDT_U02/version_0/checkpoint/last_step9558.pt"
+      "resume_checkpoint": ""
     },
     "loader": {
       "batch_size": 20,
@@ -147,6 +147,11 @@
           "triangle_chunk_size": 64,
           "activation_checkpoint": true,
           "pair_distance_chunk_size": 8
+        },
+        "pair_coordinate": {
+          "mode": "bounded_residual",
+          "delta_bound": 1.0,
+          "semantics": "dual_state_geometry_stream; full relational state, bounded Cartesian residual"
         }
       }
     }
@@ -157,36 +162,27 @@
     "interface": 1.0,
     "edge": 1.0,
     "distogram": {
-      "weight": 0.03,
+      "weight": 0.0,
       "pair_scope": "all_resolved",
       "bins": 64,
       "min_bin": 2.3125,
       "max_bin": 21.6875
     },
     "smooth_lddt": {
-      "weight": 0.1,
+      "weight": 0.0,
       "cutoff": 15.0
     }
   },
   "runtime": {
-    "gpus": [
-      6,
-      7
-    ],
-    "master_addr": "localhost",
-    "master_port": 29730,
-    "nnodes": 1,
-    "omp_num_threads": 2,
     "ddp": {
       "cost_balanced": true,
       "find_unused_parameters": false,
       "static_graph": true
-    },
-    "cuda_allocator": "max_split_size_mb:128"
+    }
   },
   "generation": {
     "checkpoint": "",
-    "save_dir": "./results_generation/R30_R05_ABX_NATIVE_PAIR_EGNN_DISTOGRAM_LDDT_U02",
+    "save_dir": "./results_generation/R28_R05_ABX_NATIVE_PAIR_EGNN_U02",
     "batch_size": 20,
     "num_workers": 4,
     "n_steps": 10,
@@ -195,6 +191,7 @@
   },
   "evaluation": {
     "metric_workers": 8,
-    "keep_structures": false
+    "keep_structures": false,
+    "failure_policy": "record_and_continue"
   }
 }

@@ -91,34 +91,74 @@ PDB_COORD_MAX = 9999.999
 
 
 def _validate_generated_coordinates_for_pdb(
-    X: torch.Tensor, logical_batch_id: int
+    X,
+    logical_batch_id: int,
+    *,
+    global_index: Optional[int] = None,
+    pdb_id: Optional[str] = None,
 ) -> None:
-    """Validate model coordinates before converting them into a PDB artifact.
+    """Validate one generated graph before PDB serialization.
 
-    This check is evaluation-only.  It does not clamp, rescale or otherwise
-    alter generated structures; invalid model outputs remain invalid evidence.
+    Observation-only: no clamp/rescale/repair is performed.  ``global_index``
+    and ``pdb_id`` make the first invalid complex directly identifiable.
     """
-    if not torch.is_tensor(X):
-        raise TypeError(f"X must be a tensor, got {type(X).__name__}")
-
+    X = torch.as_tensor(X)
     finite = torch.isfinite(X)
+    identity = (
+        f"logical_batch_id={int(logical_batch_id)} "
+        f"global_index={global_index if global_index is not None else 'NA'} "
+        f"pdb={pdb_id if pdb_id is not None else 'NA'}"
+    )
     if not bool(finite.all().item()):
         bad = int((~finite).sum().item())
+        first_bad = int((~finite).reshape(-1).nonzero(as_tuple=False)[0].item())
         raise RuntimeError(
             f"{MODEL_OUTPUT_INVALID_MARKER} generated coordinates contain "
-            f"{bad} non-finite values in logical_batch_id={logical_batch_id}."
+            f"{bad} non-finite values: {identity} first_bad_flat_index={first_bad}."
         )
 
     x32 = X.detach().float()
     xmin = float(x32.min().item()) if x32.numel() else 0.0
     xmax = float(x32.max().item()) if x32.numel() else 0.0
     if xmin < PDB_COORD_MIN or xmax > PDB_COORD_MAX:
+        flat_abs = x32.abs().reshape(-1)
+        worst_flat = int(flat_abs.argmax().item()) if flat_abs.numel() else -1
+        worst_value = float(x32.reshape(-1)[worst_flat].item()) if worst_flat >= 0 else 0.0
         raise RuntimeError(
             f"{MODEL_OUTPUT_INVALID_MARKER} generated coordinates exceed the "
             "PDB 8.3 Cartesian field range before serialization: "
-            f"logical_batch_id={logical_batch_id} min={xmin:.6g} "
-            f"max={xmax:.6g} allowed=[{PDB_COORD_MIN},{PDB_COORD_MAX}]."
+            f"{identity} min={xmin:.6g} max={xmax:.6g} "
+            f"worst_flat_index={worst_flat} worst_value={worst_value:.6g} "
+            f"allowed=[{PDB_COORD_MIN},{PDB_COORD_MAX}]."
         )
+
+
+def _json_safe_forensic(value):
+    if isinstance(value, dict):
+        return {str(k): _json_safe_forensic(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_forensic(v) for v in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _append_forensic_jsonl(path: str, rows: Sequence[dict]) -> None:
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'a', encoding='utf-8') as fout:
+        for row in rows:
+            fout.write(
+                json.dumps(
+                    _json_safe_forensic(row),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                + '\n'
+            )
+
 
 # These fields are produced for both the single-CDR and whole-antibody branches
 # of the original ``cal_metrics.py``.  A zero return code without all of them is
@@ -445,6 +485,13 @@ def generate_distributed(
     save_dir = os.path.abspath(save_dir)
     rank_dir = os.path.join(save_dir, f"rank_{rank:02d}")
     os.makedirs(rank_dir, exist_ok=True)
+    forensic_path = os.path.join(
+        save_dir, f"sampling_forensics_rank{rank:02d}.jsonl"
+    )
+    # An epoch can be rerun after resume.  Never mix a previous failed attempt's
+    # trace with the current deterministic generation pass.
+    if os.path.isfile(forensic_path):
+        os.remove(forensic_path)
 
     local_records: List[dict] = []
     assignments = assigned_logical_batches(
@@ -476,12 +523,34 @@ def generate_distributed(
             input_S = batch["S"].detach().clone()
             design_mask = batch["paratope_mask"].detach().bool().clone()
 
-            with torch.no_grad():
-                X, S, _ = model.sample(
-                    **batch,
-                    n_steps=int(n_steps),
-                    show_progress=bool(show_sample_progress and rank == 0),
+            sample_names = []
+            for global_i in global_indices:
+                try:
+                    sample_names.append(str(dataset.data[global_i].get_id()).split("(")[0])
+                except Exception:
+                    sample_names.append(f"index_{int(global_i)}")
+
+            if hasattr(model, 'set_sample_forensic_context'):
+                model.set_sample_forensic_context(
+                    logical_batch_id=logical_batch_id,
+                    global_indices=global_indices,
+                    names=sample_names,
                 )
+            if hasattr(model, 'reset_sample_forensics'):
+                model.reset_sample_forensics()
+
+            forensic_rows = []
+            try:
+                with torch.no_grad():
+                    X, S, _ = model.sample(
+                        **batch,
+                        n_steps=int(n_steps),
+                        show_progress=bool(show_sample_progress and rank == 0),
+                    )
+            finally:
+                if hasattr(model, 'consume_sample_forensics'):
+                    forensic_rows = model.consume_sample_forensics()
+                _append_forensic_jsonl(forensic_path, forensic_rows)
 
             if not torch.is_tensor(X) or not torch.is_tensor(S):
                 raise TypeError(
@@ -506,10 +575,6 @@ def generate_distributed(
                     f"flat_residue_index={first} "
                     f"changed={int(framework_changed.sum().item())}."
                 )
-            _validate_generated_coordinates_for_pdb(
-                X, logical_batch_id=logical_batch_id
-            )
-
             X_list, S_list = _split_graph_outputs(batch, X, S)
             if len(X_list) != len(global_indices):
                 raise RuntimeError(
@@ -520,6 +585,16 @@ def generate_distributed(
 
             for local_i, global_i in enumerate(global_indices):
                 ori_cplx = dataset.data[global_i]
+                try:
+                    source_pdb_id = str(ori_cplx.get_id()).split("(")[0]
+                except Exception:
+                    source_pdb_id = f"index_{int(global_i)}"
+                _validate_generated_coordinates_for_pdb(
+                    X_list[local_i],
+                    logical_batch_id=logical_batch_id,
+                    global_index=int(global_i),
+                    pdb_id=source_pdb_id,
+                )
                 cplx = to_cplx(ori_cplx, X_list[local_i], S_list[local_i])
                 pdb_id = cplx.get_id().split("(")[0]
                 # Prefix by global index to make filenames collision-proof while

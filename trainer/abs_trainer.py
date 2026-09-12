@@ -127,6 +127,14 @@ class Trainer:
         self.last_valid_metric = None
         self.topk_ckpt_map = []
         self.patience = self.config.patience
+
+        # Runtime-only numerical diagnostics.  These values are deliberately
+        # absent from checkpoints; they never affect optimizer/scheduler state.
+        self._grad_norm_overflow_epoch = -1
+        self._grad_norm_overflow_count = 0
+        self._grad_norm_overflow_log_limit = max(
+            1, int(os.environ.get("ABFLOW_GRAD_OVERFLOW_LOG_LIMIT", "3") or 3)
+        )
         
         self.last_state_path = None
         resume_checkpoint = _normalize_optional_path(getattr(self.config, "resume_checkpoint", ""))
@@ -261,8 +269,110 @@ class Trainer:
         )
         return bad
 
+    @staticmethod
+    def _stable_tensor_l2_norm(tensor):
+        """L2 norm with scale separation so finite FP32 values cannot overflow.
+
+        This is algebraically the usual Euclidean norm.  Only the reduction is
+        performed in a numerically stable form; no gradient value is repaired or
+        altered here.
+        """
+        value = tensor.detach().float()
+        if value.numel() == 0:
+            return torch.zeros((), dtype=torch.float64, device=value.device)
+        max_abs = value.abs().amax()
+        if not bool(torch.isfinite(max_abs).detach().cpu().item()):
+            return max_abs.to(torch.float64)
+        if float(max_abs.detach().cpu().item()) == 0.0:
+            return max_abs.to(torch.float64)
+        scaled = value / max_abs
+        scaled_sq = scaled.square().sum(dtype=torch.float64)
+        return max_abs.to(torch.float64) * torch.sqrt(scaled_sq)
+
+    def _stable_finite_grad_l2_norm(self):
+        """Stable global L2 norm for already-verified finite gradients."""
+        grads = [
+            p.grad for p in self.model.parameters()
+            if p.grad is not None
+        ]
+        if not grads:
+            device = next(self.model.parameters()).device
+            return torch.zeros((), dtype=torch.float64, device=device)
+
+        # One global scale gives the exact same norm while preventing g^2 from
+        # overflowing FP32.  The scalar sum is accumulated in FP64.
+        maxima = torch.stack([g.detach().float().abs().amax() for g in grads])
+        global_max = maxima.amax()
+        if not bool(torch.isfinite(global_max).detach().cpu().item()):
+            return global_max.to(torch.float64)
+        if float(global_max.detach().cpu().item()) == 0.0:
+            return global_max.to(torch.float64)
+
+        total_scaled_sq = torch.zeros(
+            (), dtype=torch.float64, device=global_max.device
+        )
+        for grad in grads:
+            scaled = grad.detach().float() / global_max
+            total_scaled_sq = total_scaled_sq + scaled.square().sum(dtype=torch.float64)
+        return global_max.to(torch.float64) * torch.sqrt(total_scaled_sq)
+
+    def _finite_grad_magnitude_summary(self, limit=12):
+        """Failure-only ranking of huge but finite parameter gradients."""
+        rows = []
+        for name, param in self.model.named_parameters():
+            grad = param.grad
+            if grad is None or grad.numel() == 0:
+                continue
+            finite = torch.isfinite(grad)
+            if not bool(finite.all().detach().cpu().item()):
+                continue
+            norm64 = self._stable_tensor_l2_norm(grad)
+            norm = float(norm64.detach().cpu().item())
+            max_abs = float(grad.detach().float().abs().amax().cpu().item())
+            rms = norm / max(float(grad.numel()) ** 0.5, 1.0)
+            rows.append((norm, name, max_abs, rms, int(grad.numel())))
+        rows.sort(key=lambda x: x[0], reverse=True)
+        top = rows[:max(1, int(limit))]
+        text = [
+            {
+                'name': name,
+                'l2': norm,
+                'absmax': max_abs,
+                'rms': rms,
+                'numel': numel,
+            }
+            for norm, name, max_abs, rms, numel in top
+        ]
+        print_log(
+            f"[FiniteGradMagnitude] epoch={self.epoch} step={self.global_step} "
+            f"rank={self.local_rank} top={text}"
+        )
+        return text
+
+    def _stable_clip_finite_grad_norm(self, max_norm):
+        """Apply mathematically intended clipping after FP32 norm overflow.
+
+        Preconditions: every gradient element is finite.  The only recovered
+        condition is a reduction overflow in ``clip_grad_norm_``.
+        """
+        total_norm = self._stable_finite_grad_l2_norm()
+        if not bool(torch.isfinite(total_norm).detach().cpu().item()):
+            raise FloatingPointError(
+                "stable FP64 gradient norm is non-finite despite finite elements"
+            )
+        denom = total_norm + total_norm.new_tensor(1.0e-12)
+        clip_coef = total_norm.new_tensor(float(max_norm)) / denom
+        clip_value = float(clip_coef.detach().cpu().item())
+        if clip_value < 1.0:
+            for param in self.model.parameters():
+                if param.grad is not None:
+                    param.grad.mul_(clip_coef.to(
+                        device=param.grad.device, dtype=param.grad.dtype
+                    ))
+        return total_norm, min(1.0, clip_value)
+
     def _checked_clip_grad_norm(self):
-        """Parent grad clipping + fail-fast before a NaN norm can poison all grads."""
+        """Parent grad clipping with stable recovery for finite-norm overflow."""
         max_norm = self.config.grad_clip
         if max_norm is None:
             return None
@@ -286,11 +396,39 @@ class Trainer:
             total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
         except RuntimeError as exc:
             bad = self._nonfinite_grad_summary(limit=24)
-            print_log(
-                f"[NonFiniteGrad] epoch={self.epoch} step={self.global_step} "
-                f"rank={self.local_rank} params={bad[:16] or ['<unable-to-localize>']}"
+            message = str(exc).lower()
+            norm_overflow = (
+                not bad
+                and "total norm" in message
+                and "non-finite" in message
             )
-            raise FloatingPointError("non-finite gradient before optimizer.step") from exc
+            if not norm_overflow:
+                print_log(
+                    f"[NonFiniteGrad] epoch={self.epoch} step={self.global_step} "
+                    f"rank={self.local_rank} params={bad[:16] or ['<unable-to-localize>']}"
+                )
+                raise FloatingPointError("non-finite gradient before optimizer.step") from exc
+
+            # Every gradient element is finite; only the FP32 norm reduction
+            # overflowed.  Recompute the same Euclidean norm stably and apply
+            # the configured clipping instead of aborting a mathematically
+            # valid optimizer step.
+            total_norm, clip_coef = self._stable_clip_finite_grad_norm(max_norm)
+            current_epoch = int(self.epoch)
+            if self._grad_norm_overflow_epoch != current_epoch:
+                self._grad_norm_overflow_epoch = current_epoch
+                self._grad_norm_overflow_count = 0
+            self._grad_norm_overflow_count += 1
+            if self._grad_norm_overflow_count <= self._grad_norm_overflow_log_limit:
+                print_log(
+                    f"[GradientNormOverflowRecovered] epoch={self.epoch} "
+                    f"step={self.global_step} rank={self.local_rank} "
+                    f"stable_preclip_norm={float(total_norm.detach().cpu().item()):.6e} "
+                    f"clip={float(max_norm):.6g} clip_coef={clip_coef:.6e} "
+                    f"ordinal={self._grad_norm_overflow_count}/{self._grad_norm_overflow_log_limit}"
+                )
+                self._finite_grad_magnitude_summary(limit=12)
+            return total_norm
 
         if self._is_main_proc() and int(self.global_step) < self._runtime_guard_steps():
             print_log(

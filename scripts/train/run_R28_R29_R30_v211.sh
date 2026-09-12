@@ -47,6 +47,10 @@ mkdir -p "$OUTPUT_ROOT"
 # Allocate one version directory atomically before torchrun so both DDP ranks
 # and the tee logger share exactly the same run authority.
 if [[ -n "$RESUME_CHECKPOINT" ]]; then
+  [[ -f "$RESUME_CHECKPOINT" ]] || {
+    echo "resume checkpoint not found: $RESUME_CHECKPOINT" >&2
+    exit 2
+  }
   RUN_DIR=$(dirname "$(dirname "$RESUME_CHECKPOINT")")
   VERSION_BASE=$(basename "$RUN_DIR")
   if [[ ! "$VERSION_BASE" =~ ^version_([0-9]+)$ ]]; then
@@ -74,10 +78,23 @@ export CUDA_VISIBLE_DEVICES="$GPU_CSV"
 export OMP_NUM_THREADS="$OMP_THREADS"
 [[ -n "$CUDA_ALLOC" ]] && export PYTORCH_CUDA_ALLOC_CONF="$CUDA_ALLOC"
 
+# V10 numerical/geometry forensics are observational except for the stable
+# finite-gradient norm fallback in trainer/abs_trainer.py.  These defaults do
+# not alter loss weights, model architecture, sampler equations, RNG seeds, or
+# checkpoint keys.  Callers may explicitly override any logging threshold.
+export ABFLOW_GEOMETRY_FORENSICS="${ABFLOW_GEOMETRY_FORENSICS:-on}"
+export ABFLOW_SAMPLE_FORENSICS="${ABFLOW_SAMPLE_FORENSICS:-on}"
+export ABFLOW_SAMPLE_FORENSICS_THRESHOLD_A="${ABFLOW_SAMPLE_FORENSICS_THRESHOLD_A:-500}"
+export ABFLOW_TRAIN_LOSS_OUTLIER_THRESHOLD="${ABFLOW_TRAIN_LOSS_OUTLIER_THRESHOLD:-10000}"
+export ABFLOW_TRAIN_LOSS_OUTLIER_MAX_PER_EPOCH="${ABFLOW_TRAIN_LOSS_OUTLIER_MAX_PER_EPOCH:-3}"
+export ABFLOW_GRAD_OVERFLOW_LOG_LIMIT="${ABFLOW_GRAD_OVERFLOW_LOG_LIMIT:-3}"
+
 {
   echo "[RunLog] canonical=$RUN_LOG latest=$LATEST_LOG"
   echo "[RunVersion] fixed_version=$VERSION dir=$RUN_DIR"
   echo "[RunConfig] config=$CONFIG_PATH gpus=$GPU_CSV nproc=$NPROC port=$MASTER_PORT"
+  echo "[RunResume] checkpoint=${RESUME_CHECKPOINT:-scratch}"
+  echo "[ForensicsConfig] geometry=$ABFLOW_GEOMETRY_FORENSICS sample=$ABFLOW_SAMPLE_FORENSICS sample_threshold_A=$ABFLOW_SAMPLE_FORENSICS_THRESHOLD_A train_loss_threshold=$ABFLOW_TRAIN_LOSS_OUTLIER_THRESHOLD train_outliers_per_epoch=$ABFLOW_TRAIN_LOSS_OUTLIER_MAX_PER_EPOCH grad_overflow_logs=$ABFLOW_GRAD_OVERFLOW_LOG_LIMIT"
 } | tee -a "$RUN_LOG"
 
 set +e

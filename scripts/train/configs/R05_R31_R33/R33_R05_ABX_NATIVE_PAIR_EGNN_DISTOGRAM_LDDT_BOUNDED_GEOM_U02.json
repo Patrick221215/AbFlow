@@ -32,7 +32,7 @@
     }
   },
   "training": {
-    "output_dir": "./results_module/R30_R05_ABX_NATIVE_PAIR_EGNN_DISTOGRAM_LDDT_U02",
+    "output_dir": "./results_module/R33_R05_ABX_NATIVE_PAIR_EGNN_DISTOGRAM_LDDT_BOUNDED_GEOM_U02",
     "optimizer": {
       "lr": 0.001,
       "final_lr": 0.0001,
@@ -44,7 +44,7 @@
       "patience": 1000,
       "save_topk": 10,
       "save_interval": 1,
-      "resume_checkpoint": "/home/data3/cjm/project/AbFlow/results_module/R30_R05_ABX_NATIVE_PAIR_EGNN_DISTOGRAM_LDDT_U02/version_0/checkpoint/last_step9558.pt"
+      "resume_checkpoint": ""
     },
     "loader": {
       "batch_size": 20,
@@ -147,6 +147,11 @@
           "triangle_chunk_size": 64,
           "activation_checkpoint": true,
           "pair_distance_chunk_size": 8
+        },
+        "pair_coordinate": {
+          "mode": "bounded_residual",
+          "delta_bound": 1.0,
+          "semantics": "dual_state_geometry_stream; full relational state, bounded Cartesian residual"
         }
       }
     }
@@ -169,20 +174,11 @@
     }
   },
   "runtime": {
-    "gpus": [
-      6,
-      7
-    ],
-    "master_addr": "localhost",
-    "master_port": 29730,
-    "nnodes": 1,
-    "omp_num_threads": 2,
     "ddp": {
       "cost_balanced": true,
       "find_unused_parameters": false,
       "static_graph": true
-    },
-    "cuda_allocator": "max_split_size_mb:128"
+    }
   },
   "generation": {
     "checkpoint": "",
@@ -195,6 +191,7 @@
   },
   "evaluation": {
     "metric_workers": 8,
-    "keep_structures": false
+    "keep_structures": false,
+    "failure_policy": "record_and_continue"
   }
 }
