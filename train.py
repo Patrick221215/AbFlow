@@ -621,8 +621,13 @@ def _apply_trainer_runtime_from_config(cfg, config_path):
     os.environ["ABFLOW_EPOCH_TEST_KEEP_STRUCTURES"] = (
         "on" if evaluation.get("keep_structures", False) else "off"
     )
-    # A formal Test error is evidence of a broken epoch, never a NaN placeholder.
+    # Infrastructure/protocol failures remain fail-fast.  A generated structure
+    # that is itself invalid is a model-quality observation, not an evaluator
+    # infrastructure failure; its policy is explicit in JSON.
     os.environ["ABFLOW_EPOCH_TEST_FAIL_FAST"] = "on"
+    os.environ["ABFLOW_EPOCH_TEST_MODEL_INVALID_POLICY"] = str(
+        evaluation.get("model_output_invalid_policy", "record_and_continue")
+    )
 
     logging_cfg = cfg["training"]["logging"]
     os.environ["ABFLOW_SCI_LOG_FIRST_STEPS"] = str(

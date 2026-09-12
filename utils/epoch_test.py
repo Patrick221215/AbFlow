@@ -13,9 +13,8 @@ Design goals
    streams from ``torch.randn``, ``torch.randint``, ``torch.multinomial`` and
    ``torch.rand`` inside AbFlow sampling.
 4. Never feed test metrics back into optimization/model selection.
-5. Fail before PDB metrics if sampling changes any residue outside the exact
-   JSON-defined design mask. The current formal configs select H3, but the
-   invariant itself is task-generic.
+5. Fail before PDB metrics if sampling changes any framework/antigen residue;
+   H3 is the only legal sequence-design region for the V206 test contract.
 
 This module does not modify model parameters, losses, samplers or scientific
 configuration.  The Trainer wrapper is responsible for applying EMA and for
@@ -79,6 +78,47 @@ TB_METRICS = {
     "DockQ_above_0.49": "Test/DockQ_above_0.49",
     "DockQ_above_0.8": "Test/DockQ_above_0.8",
 }
+
+
+MODEL_OUTPUT_INVALID_MARKER = "[ModelOutputInvalid]"
+
+# Bio.PDB writes Cartesian coordinates with the PDB fixed-width 8.3 format.
+# Values outside this interval can remain finite tensors while overflowing the
+# coordinate columns, after which PDBParser reports "Invalid or missing
+# coordinate(s)".  This is a model-output failure, not an evaluator bug.
+PDB_COORD_MIN = -999.999
+PDB_COORD_MAX = 9999.999
+
+
+def _validate_generated_coordinates_for_pdb(
+    X: torch.Tensor, logical_batch_id: int
+) -> None:
+    """Validate model coordinates before converting them into a PDB artifact.
+
+    This check is evaluation-only.  It does not clamp, rescale or otherwise
+    alter generated structures; invalid model outputs remain invalid evidence.
+    """
+    if not torch.is_tensor(X):
+        raise TypeError(f"X must be a tensor, got {type(X).__name__}")
+
+    finite = torch.isfinite(X)
+    if not bool(finite.all().item()):
+        bad = int((~finite).sum().item())
+        raise RuntimeError(
+            f"{MODEL_OUTPUT_INVALID_MARKER} generated coordinates contain "
+            f"{bad} non-finite values in logical_batch_id={logical_batch_id}."
+        )
+
+    x32 = X.detach().float()
+    xmin = float(x32.min().item()) if x32.numel() else 0.0
+    xmax = float(x32.max().item()) if x32.numel() else 0.0
+    if xmin < PDB_COORD_MIN or xmax > PDB_COORD_MAX:
+        raise RuntimeError(
+            f"{MODEL_OUTPUT_INVALID_MARKER} generated coordinates exceed the "
+            "PDB 8.3 Cartesian field range before serialization: "
+            f"logical_batch_id={logical_batch_id} min={xmin:.6g} "
+            f"max={xmax:.6g} allowed=[{PDB_COORD_MIN},{PDB_COORD_MAX}]."
+        )
 
 # These fields are produced for both the single-CDR and whole-antibody branches
 # of the original ``cal_metrics.py``.  A zero return code without all of them is
@@ -431,7 +471,7 @@ def generate_distributed(
             if "S" not in batch or "paratope_mask" not in batch:
                 raise KeyError(
                     "Epoch-test batch must contain S and paratope_mask for the "
-                    "V207 task-mask sequence invariant."
+                    "V206 framework-sequence invariant."
                 )
             input_S = batch["S"].detach().clone()
             design_mask = batch["paratope_mask"].detach().bool().clone()
@@ -460,18 +500,15 @@ def generate_distributed(
                     framework_changed.nonzero(as_tuple=False)[0].item()
                 )
                 raise RuntimeError(
-                    "[V207FrameworkSequenceFAIL] model.sample() changed "
-                    "sequence outside the JSON-defined task mask before PDB writing: "
+                    "[V206FrameworkSequenceFAIL] model.sample() changed "
+                    "sequence outside H3 before PDB writing: "
                     f"logical_batch_id={logical_batch_id} "
                     f"flat_residue_index={first} "
                     f"changed={int(framework_changed.sum().item())}."
                 )
-            if not bool(torch.isfinite(X).all().item()):
-                bad = int((~torch.isfinite(X)).sum().item())
-                raise FloatingPointError(
-                    f"Generated coordinates contain {bad} non-finite values "
-                    f"in logical_batch_id={logical_batch_id}."
-                )
+            _validate_generated_coordinates_for_pdb(
+                X, logical_batch_id=logical_batch_id
+            )
 
             X_list, S_list = _split_graph_outputs(batch, X, S)
             if len(X_list) != len(global_indices):

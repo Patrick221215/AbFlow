@@ -6,7 +6,7 @@
 # Distogram gradient contract is retained.
 # V203_FORMAL_TRAIN_VAL_TEST_EVERY_EPOCH
 # Fixed project protocol: every epoch executes Train -> Val -> formal EMA Test generation.
-# Test failures are fail-fast and may never be silently converted into NaN summaries.
+# Infrastructure Test failures are fail-fast; invalid model outputs are recorded explicitly.
 """AbFlow trainer: stable v163 training/validation behavior with minimal V185 diagnostics.
 
 V185 deliberately restores the previously stable trainer instead of using the
@@ -231,6 +231,21 @@ class AbFlowTrainer(Trainer):
         self._epoch_test_fail_fast = _env_flag(
             "ABFLOW_EPOCH_TEST_FAIL_FAST", False
         )
+        self._epoch_test_model_invalid_policy = str(
+            os.environ.get(
+                "ABFLOW_EPOCH_TEST_MODEL_INVALID_POLICY",
+                "record_and_continue",
+            )
+            or "record_and_continue"
+        ).strip().lower()
+        if self._epoch_test_model_invalid_policy not in {
+            "record_and_continue", "fail_fast"
+        }:
+            raise ValueError(
+                "ABFLOW_EPOCH_TEST_MODEL_INVALID_POLICY must be "
+                "'record_and_continue' or 'fail_fast', got "
+                f"{self._epoch_test_model_invalid_policy!r}."
+            )
         self._epoch_test_project_root = str(os.environ.get(
             "ABFLOW_PROJECT_ROOT", os.getcwd()
         ) or os.getcwd()).strip()
@@ -258,8 +273,8 @@ class AbFlowTrainer(Trainer):
             )
         if not self._epoch_test_fail_fast:
             raise RuntimeError(
-                "V203 formal protocol requires ABFLOW_EPOCH_TEST_FAIL_FAST=on; "
-                "formal Test errors must never be converted into NaN and ignored."
+                "V203 formal protocol requires ABFLOW_EPOCH_TEST_FAIL_FAST=on "
+                "for infrastructure/protocol failures."
             )
         if not self._epoch_test_json:
             raise RuntimeError(
@@ -289,7 +304,8 @@ class AbFlowTrainer(Trainer):
                 "ckpt=validation test=observation_only "
                 f"test_batch={self._epoch_test_batch_size} "
                 f"test_steps={self._epoch_test_n_steps} "
-                f"seed={self._epoch_test_base_seed} fail_fast=1"
+                f"seed={self._epoch_test_base_seed} fail_fast=infra "
+                f"model_invalid={self._epoch_test_model_invalid_policy}"
             )
 
 
@@ -426,6 +442,30 @@ class AbFlowTrainer(Trainer):
                 f"pep={pep_file} surf={surf_file}"
             )
         return self._epoch_test_dataset
+
+    @staticmethod
+    def _is_model_output_invalid_test_error(exc):
+        """Return True only for failures caused by the generated structure itself.
+
+        Infrastructure, DDP, dataset and evaluator-code failures must still abort.
+        The marker is emitted by the shared epoch-test coordinate guard.  The
+        Bio.PDB phrase keeps backward compatibility with already-generated bad
+        structures from the current R28/R29 runs.
+        """
+        text = str(exc)
+        markers = (
+            "[ModelOutputInvalid]",
+            "Generated coordinates contain",
+            "PDBConstructionException: Invalid or missing coordinate(s)",
+        )
+        return any(marker in text for marker in markers)
+
+    @staticmethod
+    def _compact_test_error(exc, limit=800):
+        text = " ".join(str(exc).split())
+        if len(text) > int(limit):
+            text = text[: int(limit) - 3] + "..."
+        return f"{type(exc).__name__}: {text}"
 
     def _write_epoch_test_error(self, message):
         # Errors are printed by the caller and captured in run_time.log.
@@ -750,12 +790,30 @@ class AbFlowTrainer(Trainer):
             )
         try:
             test_metrics = self._run_epoch_test(device) or {}
+            test_metrics["_status"] = "ok"
+            test_metrics["_error"] = ""
         except Exception as exc:
-            message = f"{type(exc).__name__}: {exc}"
+            message = self._compact_test_error(exc)
             self._write_epoch_test_error(message)
-            if self._is_main_proc():
-                print(f"[EpochTest][ERROR] {message}")
-            raise
+            is_model_invalid = self._is_model_output_invalid_test_error(exc)
+            if (
+                is_model_invalid
+                and self._epoch_test_model_invalid_policy == "record_and_continue"
+            ):
+                test_metrics = {
+                    "_status": "model_output_invalid",
+                    "_error": message,
+                }
+                if self._is_main_proc():
+                    print(
+                        "[FormalEpochTestINVALID] "
+                        f"epoch={self.epoch} status=model_output_invalid "
+                        f"action=record_and_continue reason={message}"
+                    )
+            else:
+                if self._is_main_proc():
+                    print(f"[EpochTest][ERROR] {message}")
+                raise
         self._last_epoch_test_metrics = dict(test_metrics)
         self._finalize_epoch_summary(
             train_summary=train_summary,
@@ -1198,6 +1256,7 @@ class AbFlowTrainer(Trainer):
             "train_edge", "train_distogram", "train_smooth_lddt",
             "val_loss", "val_seq", "val_structure", "val_interface",
             "val_edge", "val_distogram", "val_smooth_lddt",
+            "test_status", "test_error",
             "test_AAR", "test_CAAR", "test_H3raw", "test_H3aligned",
             "test_TM", "test_lDDT", "test_DockQ",
             "best_val_epoch", "best_val_loss",
@@ -1275,6 +1334,8 @@ class AbFlowTrainer(Trainer):
             "val_distogram": validation_summary.get("distogram_loss", float("nan")),
             "val_smooth_lddt": validation_summary.get("smooth_lddt_loss", float("nan")),
         }
+        row["test_status"] = str(test_metrics.get("_status", "ok"))
+        row["test_error"] = str(test_metrics.get("_error", ""))
         for key, value in current_test.items():
             row[f"test_{key}"] = value
         row["best_val_epoch"] = (
@@ -1297,7 +1358,8 @@ class AbFlowTrainer(Trainer):
 
             print(
                 "[EpochSummary] "
-                f"epoch={row['epoch']} train={self._fmt(row['train_loss'], 5)} "
+                f"epoch={row['epoch']} status={row['test_status']} "
+                f"train={self._fmt(row['train_loss'], 5)} "
                 f"val={self._fmt(row['val_loss'], 5)} "
                 f"AAR={self._fmt(row['test_AAR'], 5)} CAAR={self._fmt(row['test_CAAR'], 5)} "
                 f"H3raw={self._fmt(row['test_H3raw'], 4, 'A')} H3aligned={self._fmt(row['test_H3aligned'], 4, 'A')} "
@@ -1361,7 +1423,14 @@ class AbFlowTrainer(Trainer):
             int(self.global_step) < self._science_log_first_steps
             or (self._science_log_interval > 0 and int(self.global_step) % self._science_log_interval == 0)
         )
-        capture_diagnostics = bool(val) or probe_grad_now or science_step_diag
+        bridge_contract_probe = bool(
+            (not val)
+            and self._requires_live_bridge_contract()
+            and not self._live_bridge_contract_verified
+        )
+        capture_diagnostics = (
+            bool(val) or probe_grad_now or science_step_diag or bridge_contract_probe
+        )
         raw_model._diagnostic_capture = bool(capture_diagnostics)
         raw_model._diagnostic_validation_mode = bool(val and capture_diagnostics)
 
@@ -1679,8 +1748,12 @@ class AbFlowTrainer(Trainer):
                 single_ratio is not None and pair_ratio is not None
                 and isfinite(float(single_ratio)) and isfinite(float(pair_ratio))
             )
+            is_resume_state = bool(
+                int(self.global_step) > 0 and not self._bridge_cold_start_observed
+            )
             local_cold = bool(
-                not self._bridge_cold_start_observed
+                (not is_resume_state)
+                and not self._bridge_cold_start_observed
                 and finite_ratios
                 and abs(float(single_ratio)) <= 1.0e-12
                 and abs(float(pair_ratio)) <= 1.0e-12
@@ -1691,13 +1764,25 @@ class AbFlowTrainer(Trainer):
                 and float(single_ratio) > 1.0e-12
                 and float(pair_ratio) > 1.0e-12
             )
+            local_resume_live = bool(
+                is_resume_state
+                and finite_ratios
+                and float(single_ratio) > 1.0e-12
+                and float(pair_ratio) > 1.0e-12
+            )
             states = loss.detach().new_tensor(
-                [1 if local_cold else 0, 1 if local_live else 0],
+                [
+                    1 if local_cold else 0,
+                    1 if local_live else 0,
+                    1 if local_resume_live else 0,
+                ],
                 dtype=torch.int32,
             )
             if dist.is_available() and dist.is_initialized():
                 dist.all_reduce(states, op=dist.ReduceOp.MIN)
-            cold_all, live_all = [bool(int(v)) for v in states.cpu().tolist()]
+            cold_all, live_all, resume_live_all = [
+                bool(int(v)) for v in states.cpu().tolist()
+            ]
             if cold_all:
                 self._bridge_cold_start_observed = True
                 if self._diag_main_rank:
@@ -1715,11 +1800,20 @@ class AbFlowTrainer(Trainer):
                         f"step={self.global_step} single_ratio={self._fmte(single_ratio, 3)} "
                         f"pair_ratio={self._fmte(pair_ratio, 3)} all_ranks=PASS"
                     )
+            elif resume_live_all:
+                self._live_bridge_contract_verified = True
+                if self._diag_main_rank:
+                    print(
+                        "[BridgeContract] phase=resume_live PASS "
+                        f"step={self.global_step} single_ratio={self._fmte(single_ratio, 3)} "
+                        f"pair_ratio={self._fmte(pair_ratio, 3)} "
+                        "checkpoint_bridge_already_live=1 all_ranks=PASS"
+                    )
             else:
                 raise RuntimeError(
-                    "V211 Single/Pair bridge contract failed: expected exact "
-                    "zero deltas on the first batch and finite non-zero deltas "
-                    "on the next batch. "
+                    "V211 Single/Pair bridge contract failed: a fresh run must "
+                    "show exact zero deltas then live deltas; a resumed run must "
+                    "restore finite non-zero bridge deltas immediately. "
                     f"step={self.global_step}, single_ratio={single_ratio}, "
                     f"pair_ratio={pair_ratio}, "
                     f"cold_start_seen={self._bridge_cold_start_observed}."
