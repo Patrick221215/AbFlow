@@ -1,8 +1,8 @@
 {
   "experiment": {
-    "id": "R28_R05_ABX_NATIVE_PAIR_EGNN_U02",
-    "parent": "R05_PCS_RC_LC_R1_ABX_FF_FIXEDG_RESIDUE_U02_SCOREFLOW",
-    "factor": "R05 + compact dense single/pair relational representation + zero-start native EGNN bridge",
+    "id": "R31_R05_ABX_NATIVE_PAIR_EGNN_BOUNDED_GEOM_U02",
+    "parent": "R28_R05_ABX_NATIVE_PAIR_EGNN_U02",
+    "factor": "R28 + dual-state parent-preserving bounded relational Cartesian coupling (delta_bound=1.0)",
     "protocol": "formal_train_val_test"
   },
   "data": {

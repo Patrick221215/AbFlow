@@ -1,8 +1,8 @@
 {
   "experiment": {
-    "id": "R29_R05_ABX_NATIVE_PAIR_EGNN_DISTOGRAM_U02",
-    "parent": "R28_R05_ABX_NATIVE_PAIR_EGNN_U02",
-    "factor": "R28 + distogram supervision (0.03)",
+    "id": "R32_R05_ABX_NATIVE_PAIR_EGNN_DISTOGRAM_BOUNDED_GEOM_U02",
+    "parent": "R31_R05_ABX_NATIVE_PAIR_EGNN_BOUNDED_GEOM_U02",
+    "factor": "R31 + distogram supervision (0.03)",
     "protocol": "formal_train_val_test"
   },
   "data": {

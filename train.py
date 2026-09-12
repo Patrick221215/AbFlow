@@ -621,10 +621,21 @@ def _apply_trainer_runtime_from_config(cfg, config_path):
     os.environ["ABFLOW_EPOCH_TEST_KEEP_STRUCTURES"] = (
         "on" if evaluation.get("keep_structures", False) else "off"
     )
-    # Test metric validity remains strict, but Test is observation-only.
-    # JSON controls whether an observational Test failure can terminate training.
+
+    # V203 formal failure contract has two deliberately different authorities:
+    #   1) infrastructure/protocol failures are always fail-fast;
+    #   2) finite-but-invalid model outputs are observational and are recorded
+    #      without terminating training.
+    # Keep these explicit here so direct train.py invocation and launcher-based
+    # invocation have identical semantics.
+    os.environ["ABFLOW_EPOCH_TEST_FAIL_FAST"] = "on"
+    os.environ["ABFLOW_EPOCH_TEST_MODEL_INVALID_POLICY"] = "record_and_continue"
+
+    # Legacy evaluation.failure_policy is retained for compatibility with
+    # downstream metric/evaluation code, but it must not weaken the V203
+    # infrastructure fail-fast contract above.
     failure_policy = str(
-        evaluation.get("failure_policy", "abort")
+        evaluation.get("failure_policy", "record_and_continue")
     ).strip().lower()
     if failure_policy not in {"abort", "record_and_continue"}:
         raise ValueError(

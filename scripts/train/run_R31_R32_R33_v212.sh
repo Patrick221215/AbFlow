@@ -150,6 +150,12 @@ export ABFLOW_TRAIN_LOSS_OUTLIER_THRESHOLD="${ABFLOW_TRAIN_LOSS_OUTLIER_THRESHOL
 export ABFLOW_TRAIN_LOSS_OUTLIER_MAX_PER_EPOCH="${ABFLOW_TRAIN_LOSS_OUTLIER_MAX_PER_EPOCH:-3}"
 export ABFLOW_GRAD_OVERFLOW_LOG_LIMIT="${ABFLOW_GRAD_OVERFLOW_LOG_LIMIT:-3}"
 
+# V203 formal Test failure contract. Infrastructure/protocol failures must abort;
+# finite model-output invalidity remains observation-only. train.py asserts the same
+# contract again so direct invocation cannot silently diverge.
+export ABFLOW_EPOCH_TEST_FAIL_FAST="on"
+export ABFLOW_EPOCH_TEST_MODEL_INVALID_POLICY="record_and_continue"
+
 # Single logging authority: everything visible in tmux from this point onward
 # (Python logger, raw print, tqdm, warnings, forensic lines and tracebacks) is
 # also appended to the canonical version_N/run_time.log exactly once.
@@ -161,6 +167,29 @@ echo "[RunConfig] config=$CONFIG_PATH"
 echo "[RunResources] physical_gpus=$GPU_CSV nproc=$NPROC master_addr=$MASTER_ADDR port=$MASTER_PORT nnodes=$NNODES omp=$OMP_THREADS"
 echo "[RunResume] checkpoint=${RESUME_CHECKPOINT:-scratch}"
 echo "[ForensicsConfig] geometry=$ABFLOW_GEOMETRY_FORENSICS sample=$ABFLOW_SAMPLE_FORENSICS sample_threshold_A=$ABFLOW_SAMPLE_FORENSICS_THRESHOLD_A train_loss_threshold=$ABFLOW_TRAIN_LOSS_OUTLIER_THRESHOLD train_outliers_per_epoch=$ABFLOW_TRAIN_LOSS_OUTLIER_MAX_PER_EPOCH grad_overflow_logs=$ABFLOW_GRAD_OVERFLOW_LOG_LIMIT"
+echo "[EpochTestFailureContract] infra_fail_fast=$ABFLOW_EPOCH_TEST_FAIL_FAST model_invalid=$ABFLOW_EPOCH_TEST_MODEL_INVALID_POLICY"
+
+# Fail before GPU training on protocol/provenance regressions.
+python - "$CONFIG_PATH" "$OUTPUT_ROOT" <<'PYIDENTITY'
+import json, os, sys
+config_path, output_root = sys.argv[1:3]
+cfg = json.load(open(config_path, encoding='utf-8'))
+exp = cfg.get('experiment', {})
+exp_id = str(exp.get('id', '') or '').strip()
+config_stem = os.path.splitext(os.path.basename(config_path))[0]
+output_id = os.path.basename(os.path.normpath(output_root))
+if not exp_id:
+    raise SystemExit('V212.1 identity preflight failed: experiment.id is missing')
+if not (exp_id == config_stem == output_id):
+    raise SystemExit(
+        'V212.1 identity preflight failed:\n'
+        f'  experiment.id={exp_id}\n'
+        f'  config_stem={config_stem}\n'
+        f'  output_dir_id={output_id}\n'
+        'All three must match exactly.'
+    )
+print(f'[ExperimentIdentity] PASS id={exp_id}')
+PYIDENTITY
 
 # Fail before GPU training on syntax/infrastructure regressions.
 python -m py_compile \

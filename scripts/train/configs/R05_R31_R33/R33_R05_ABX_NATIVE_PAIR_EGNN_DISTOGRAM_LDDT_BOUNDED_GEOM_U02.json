@@ -1,8 +1,8 @@
 {
   "experiment": {
-    "id": "R30_R05_ABX_NATIVE_PAIR_EGNN_DISTOGRAM_LDDT_U02",
-    "parent": "R29_R05_ABX_NATIVE_PAIR_EGNN_DISTOGRAM_U02",
-    "factor": "R29 + design-localized smooth-lDDT (0.1)",
+    "id": "R33_R05_ABX_NATIVE_PAIR_EGNN_DISTOGRAM_LDDT_BOUNDED_GEOM_U02",
+    "parent": "R32_R05_ABX_NATIVE_PAIR_EGNN_DISTOGRAM_BOUNDED_GEOM_U02",
+    "factor": "R32 + design-localized smooth-lDDT supervision (0.1)",
     "protocol": "formal_train_val_test"
   },
   "data": {
