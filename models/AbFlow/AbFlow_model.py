@@ -67,18 +67,18 @@ class AbFlowModel(nn.Module):
             pair_coord_config.get("delta_bound", 1.0)
         )
 
-        # V218 formal controller: restore the R05 EGNN Cartesian recurrence and
-        # keep Pair as a first-class edge condition, but separate distance
-        # magnitude from Cartesian action.  Raw distances remain in the radial
-        # representation while the final equivariant basis is a differentiable
-        # unit direction.  The scalar field is not tanh/clamped/rescaled.
+        # V219 formal controller: preserve Pair as a first-class EGNN edge condition
+        # and restore the original R05 raw Cartesian relative-vector operator.
+        # Stability is introduced only at the representation->action boundary by
+        # LayerNorm before the coordinate scalar head; the scalar remains
+        # unsaturated and no clipping/trust-radius/manual movement scale is used.
         coord_controller = representation_config.get("coordinate_controller", {})
         self.coord_controller_mode = str(
             coord_controller.get("mode", "legacy_unbounded")
         ).strip().lower()
         _coord_controller_modes = {
             "legacy_unbounded", "egnn_tanh", "egnn_tanh_normalized",
-            "egnn_unit_direction",
+            "egnn_unit_direction", "egnn_prenorm_raw",
         }
         if self.coord_controller_mode not in _coord_controller_modes:
             raise ValueError(
@@ -90,9 +90,10 @@ class AbFlowModel(nn.Module):
         self.coord_normalize = self.coord_controller_mode in {
             "egnn_tanh_normalized", "egnn_unit_direction"
         }
-        if self.coord_controller_mode == "egnn_unit_direction" and self.pair_coord_mode != "direct_shared":
+        self.coord_prenorm = self.coord_controller_mode == "egnn_prenorm_raw"
+        if self.coord_controller_mode in {"egnn_unit_direction", "egnn_prenorm_raw"} and self.pair_coord_mode != "direct_shared":
             raise ValueError(
-                "V218 egnn_unit_direction requires pair_coordinate.mode='direct_shared': "
+                f"{self.coord_controller_mode} requires pair_coordinate.mode='direct_shared': "
                 "Pair must condition the actual EGNN edge message used by both node and coordinate updates."
             )
 
@@ -186,7 +187,8 @@ class AbFlowModel(nn.Module):
             dropout=dropout, dense=False,
             pair_coord_mode=self.pair_coord_mode,
             pair_coord_delta_bound=self.pair_coord_delta_bound,
-            coord_tanh=self.coord_tanh, coord_normalize=self.coord_normalize)
+            coord_tanh=self.coord_tanh, coord_normalize=self.coord_normalize,
+            coord_prenorm=self.coord_prenorm)
 
         self.normalizer = SeperatedCoordNormalizer()
         self.batch_constants = {}
@@ -280,11 +282,10 @@ class AbFlowModel(nn.Module):
             return float('nan')
 
     def _maybe_log_coordinate_controller_audit(self, round_egnn_diagnostics):
-        """Rank-0 observational audit of the EGNN Cartesian control contract.
+        """Compact V221 controller audit (diagnostic-only).
 
-        V218 records raw distance, unit-direction norm, full pair-conditioned
-        scalar authority, the direct Pair contribution, and realized coordinate
-        updates.  The audit is detached and never changes the objective.
+        Scientific controller is unchanged from V219.  RMS/max pairs distinguish
+        distribution-wide gain drift from sparse extreme actions.
         """
         if not self.training or not self.geometry_forensics_enabled:
             return
@@ -295,31 +296,35 @@ class AbFlowModel(nn.Module):
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             if torch.distributed.get_rank() != 0:
                 return
-        rows=[]
+
+        rows = []
         for rec in (round_egnn_diagnostics or []):
-            d=rec.get('coord', {}) or {}
+            d = rec.get('coord', {}) or {}
             rows.append((
                 int(rec.get('round_idx', len(rows))),
+                self._coord_diag_scalar(d, 'coord_state_coeff_raw_rms_max'),
                 self._coord_diag_scalar(d, 'coord_state_coeff_raw_absmax_max'),
+                self._coord_diag_scalar(d, 'coord_pair_delta_raw_rms_max'),
                 self._coord_diag_scalar(d, 'coord_pair_delta_raw_absmax_max'),
-                self._coord_diag_scalar(d, 'coord_coeff_absmax_max'),
+                self._coord_diag_scalar(d, 'coord_diff_norm_rms_max'),
                 self._coord_diag_scalar(d, 'coord_diff_norm_absmax_max'),
-                self._coord_diag_scalar(d, 'coord_direction_norm_absmax_max'),
-                self._coord_diag_scalar(d, 'coord_trans_absmax_max'),
+                self._coord_diag_scalar(d, 'coord_update_rms_max'),
                 self._coord_diag_scalar(d, 'coord_update_absmax_max'),
                 self._coord_diag_scalar(d, 'coord_update_to_input_rms_ratio_max'),
+                self._coord_diag_scalar(d, 'coord_state_edge_rms_max'),
+                self._coord_diag_scalar(d, 'coord_state_head_input_rms_max'),
             ))
-        fmt=lambda v: 'nan' if not math.isfinite(v) else f'{v:.6g}'
-        payload=';'.join(
-            f'r{r}:raw_alpha={fmt(raw)} pair_delta={fmt(pd)} eff_alpha={fmt(eff)} '
-            f'raw_dnorm={fmt(dn)} dir_norm={fmt(un)} trans={fmt(tr)} '
-            f'update={fmt(up)} upd_in_rms={fmt(ur)}'
-            for r,raw,pd,eff,dn,un,tr,up,ur in rows
+        fmt = lambda v: 'nan' if not math.isfinite(v) else f'{v:.6g}'
+        payload = ';'.join(
+            f'r{r}:alpha={fmt(ar)}/{fmt(am)} pair={fmt(pr)}/{fmt(pm)} '
+            f'd={fmt(dr)}/{fmt(dm)} dx={fmt(xr)}/{fmt(xm)} '
+            f'dx_x={fmt(rx)} edge={fmt(er)} head={fmt(hi)}'
+            for r, ar, am, pr, pm, dr, dm, xr, xm, rx, er, hi in rows
         )
         print(
-            '[CoordinateControllerAudit] '
+            '[ControllerAudit] '
             f'train_call={call} mode={self.coord_controller_mode} '
-            f'tanh={int(self.coord_tanh)} normalize={int(self.coord_normalize)} {payload}',
+            f'prenorm={int(self.coord_prenorm)} fields=rms/max {payload}',
             flush=True,
         )
 
@@ -448,6 +453,39 @@ class AbFlowModel(nn.Module):
                 f"threshold_A={float(self.sample_forensics_threshold_A):.6g}",
                 flush=True,
             )
+
+            # Failure-only trajectory: all preceding sampler steps for exactly
+            # this sample.  No extra forward/RNG call is introduced.
+            gid = row.get('global_index')
+            name = row.get('name', '')
+            trace = [
+                r for r in self._sample_forensic_records
+                if r.get('global_index') == gid and r.get('name', '') == name
+            ]
+            step_rows = [r for r in trace if r.get('stage') == 'sampling_step']
+            if step_rows:
+                step_rows.sort(key=lambda r: int(r.get('step', -1)))
+                def arr(key, nd=3):
+                    vals = []
+                    for rr in step_rows:
+                        vv = rr.get(key)
+                        try:
+                            fv = float(vv)
+                            vals.append('nan' if not math.isfinite(fv) else f'{fv:.{nd}g}')
+                        except Exception:
+                            vals.append('nan')
+                    return '(' + ','.join(vals) + ')'
+                print(
+                    '[SampleOutlierTrajectory] '
+                    f'global_index={gid} name={name!r} '
+                    f't={arr("t", 3)} '
+                    f'xt={arr("xt_absmax_A", 4)} '
+                    f'carrier={arr("carrier_absmax_A", 4)} '
+                    f'x1={arr("implied_x1_absmax_A", 4)} '
+                    f'xnext={arr("xnext_absmax_A", 4)} '
+                    f'step_rms={arr("step_delta_rms_A", 4)}',
+                    flush=True,
+                )
 
     @staticmethod
     def _per_graph_coord_rms(pred, target, atom_mask, graph_id, n_graph):

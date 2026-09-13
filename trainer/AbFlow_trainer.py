@@ -692,7 +692,7 @@ class AbFlowTrainer(Trainer):
                     vals.append(v)
             tvals.append(sum(vals) / len(vals) if vals else float('nan'))
         print(
-            '[EpochTestAuthorityTrace] '
+            '[TestTrajectoryAudit] '
             f'epoch={self.epoch} '
             f't=(' + ','.join(self._fmt(v, 2) for v in tvals) + ') '
             f'seq_raw={arr("seq_raw_ratio")} '
@@ -1171,14 +1171,12 @@ class AbFlowTrainer(Trainer):
     def _print_validation_audits(self, summary):
         if not self._is_main_proc():
             return
+        # Proxy validation is used for checkpoint selection.  Do not print
+        # unavailable generator metrics as "nan"; free-running metrics are
+        # reported by the mandatory observational Test phase below.
         print(
             "[Validation] "
             f"epoch={self.epoch} val={self._fmt(summary.get('validation_metric'), 5)} "
-            f"H3raw={self._fmt(summary.get('h3ca_raw_r2'), 4, 'A')} "
-            f"H3aligned={self._fmt(summary.get('h3ca_aligned_r2'), 4, 'A')} "
-            f"AAR={self._fmt(summary.get('aar_r2'), 4)} "
-            f"CAAR={self._fmt(summary.get('caar'), 4)} "
-            f"contactF1={self._fmt(summary.get('contact_f1'), 4)} "
             f"bridge_s={self._fmt(summary.get('bridge_single_delta_to_base_ratio'), 5)} "
             f"bridge_z={self._fmt(summary.get('bridge_pair_delta_to_base_ratio_mean'), 5)}"
         )

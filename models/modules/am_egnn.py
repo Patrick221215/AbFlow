@@ -117,7 +117,7 @@ class AM_E_GCL(nn.Module):
     def __init__(self, input_nf, output_nf, hidden_nf, n_channel, channel_nf, radial_nf,
                  edges_in_d=0, node_attr_d=0, act_fn=nn.SiLU(), residual=True, attention=False,
                  normalize=False, coords_agg='mean', tanh=False, dropout=0.1,
-                 pair_coord_mode='bounded_residual', pair_coord_delta_bound=1.0):
+                 pair_coord_mode='bounded_residual', pair_coord_delta_bound=1.0, coord_prenorm=False):
         super(AM_E_GCL, self).__init__()
 
         input_edge = input_nf * 2
@@ -133,6 +133,7 @@ class AM_E_GCL(nn.Module):
         self.pair_coord_delta_bound = float(pair_coord_delta_bound)
         if self.pair_coord_mode == 'bounded_residual' and self.pair_coord_delta_bound <= 0.0:
             raise ValueError('pair_coord_delta_bound must be > 0 for bounded_residual mode')
+        self.coord_prenorm = bool(coord_prenorm)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -167,6 +168,12 @@ class AM_E_GCL(nn.Module):
             act_fn,
             nn.Linear(hidden_nf, output_nf))
 
+        # V219: action-space pre-normalization.  Edge messages carry semantic
+        # and recurrent information whose amplitude is not itself a physical
+        # displacement scale.  Normalize only at the representation->action
+        # boundary; the node/message stream itself is left unchanged.
+        self.coord_input_norm = nn.LayerNorm(hidden_nf) if self.coord_prenorm else nn.Identity()
+
         layer = nn.Linear(hidden_nf, n_channel, bias=False)
         torch.nn.init.xavier_uniform_(layer.weight, gain=0.001)
 
@@ -191,7 +198,7 @@ class AM_E_GCL(nn.Module):
 
         ``state_edge`` receives the zero-start Pair adapter. ``base_edge`` omits
         that direct adapter and is retained for diagnostics and historical
-        bounded-residual compatibility.  V218 ``direct_shared`` uses
+        bounded-residual compatibility.  V219 ``direct_shared`` uses
         ``state_edge`` for both node and coordinate updates.
         """
         radial = radial.reshape(radial.shape[0], -1)
@@ -301,41 +308,56 @@ class AM_E_GCL(nn.Module):
             base_out = base_x + base_out
         return state_out, base_out
 
+    def _coord_head_forward(self, edge_feat):
+        """Map invariant edge representation to coordinate scalar authority.
+
+        V219 normalizes only the coordinate-action input.  This separates
+        representation amplitude from physical action amplitude without clipping
+        or saturating the learned scalar field.
+        """
+        head_input = self.coord_input_norm(edge_feat)
+        hidden = self.coord_mlp[0](head_input)
+        hidden = self.coord_mlp[1](hidden)
+        out = self.coord_mlp[2](hidden)
+        return out, head_input, hidden
+
     def coord_model(self, coord, edge_index, coord_diff, state_edge_feat,
                     channel_weights, base_edge_feat=None):
         '''Pair-aware Cartesian update with selectable geometry authority.
 
-        V218 formal mode (``direct_shared`` + ``normalize=True`` + ``tanh=False``):
+        V219 formal mode (``direct_shared`` + ``coord_prenorm=True`` + ``normalize=False``):
 
-            alpha_ij = phi_x(m_ij(h_i, h_j, radial_ij, z_ij))
-            u_ij     = d_ij / max(||d_ij||, eps)
-            Delta x_i = Mean_j[u_ij * alpha_ij]
+            mbar_ij  = LayerNorm(m_ij(h_i, h_j, radial_ij, z_ij))
+            alpha_ij = phi_x(mbar_ij)
+            Delta x_i = Mean_j[d_ij * alpha_ij]
 
-        Raw distances remain available to the invariant radial/message pathway;
-        only the final equivariant Cartesian basis is normalized.  Therefore Pair
-        remains a genuine EGNN edge condition without acquiring the old
-        raw-distance-times-unbounded-scalar multiplicative gain.
+        This restores the original R05 raw Cartesian relative-vector operator while
+        separating representation amplitude from physical scalar authority.  Pair
+        remains a genuine EGNN edge condition; no tanh/clamp/trust radius or manual
+        movement scale is introduced.
         '''
         row, col = edge_index
         n_channel = channel_weights.shape[-1]
         coord_before = coord
 
-        # Pair-conditioned EGNN scalar authority.  V218 formal runs use
+        # Pair-conditioned EGNN scalar authority.  V219 formal runs use
         # ``direct_shared``: the same pair-conditioned edge message drives both
-        # representation and the invariant coordinate scalar.  The Pair adapter
-        # itself is zero-initialized in ``edge_model``, so cold-start is still
-        # exactly the pair-free parent.  No tanh/clamp/trust-radius is applied in
-        # the formal V218 controller; legacy bounded modes remain reproducible.
-        state_coeff_raw = self.coord_mlp(state_edge_feat)
+        # representation and the invariant coordinate scalar.  Before the scalar
+        # action head only, LayerNorm removes uncontrolled representation amplitude.
+        # The Pair adapter remains zero-initialized.  No tanh/clamp/trust-radius is
+        # applied; historical bounded modes remain reproducible.
+        state_coeff_raw, state_head_input, state_head_hidden = self._coord_head_forward(state_edge_feat)
         state_coeff = torch.tanh(state_coeff_raw) if self.tanh else state_coeff_raw
         if base_edge_feat is None:
             base_coeff_raw = state_coeff_raw
+            base_head_input = state_head_input
+            base_head_hidden = state_head_hidden
             base_coeff = state_coeff
             pair_coeff_raw = torch.zeros_like(state_coeff_raw)
             pair_coeff_applied = pair_coeff_raw
             coord_coeff = state_coeff
         else:
-            base_coeff_raw = self.coord_mlp(base_edge_feat)
+            base_coeff_raw, base_head_input, base_head_hidden = self._coord_head_forward(base_edge_feat)
             base_coeff = torch.tanh(base_coeff_raw) if self.tanh else base_coeff_raw
             pair_coeff_raw = state_coeff - base_coeff
             if self.pair_coord_mode == 'bounded_residual':
@@ -350,12 +372,10 @@ class AM_E_GCL(nn.Module):
                 pair_coeff_applied = pair_coeff_raw
                 coord_coeff = state_coeff
 
-        # V218 unit-direction Cartesian basis.  Distance magnitude is retained in
-        # ``radial`` and therefore in the edge message, but it is not multiplied
-        # into the final Cartesian action.  This is the standard separation used
-        # by directional equivariant message passing: invariant radial information
-        # controls a scalar magnitude while a normalized relative vector supplies
-        # orientation.  Keep the normalization differentiable (no stop-gradient).
+        # V219 restores the original R05 raw Cartesian relative-vector basis.  The
+        # stability intervention is upstream at representation->action pre-normalization,
+        # not a change of the physical vector operator.  Historical normalize=True
+        # remains available only for reproducibility of V215/V218-style runs.
         coord_diff_raw = coord_diff
         coord_diff_norm = torch.norm(coord_diff_raw, dim=-1, keepdim=True)
         if self.normalize:
@@ -394,6 +414,17 @@ class AM_E_GCL(nn.Module):
                     'coord_direction_absmax': _amax(coord_direction),
                     'coord_direction_norm_absmax': _amax(torch.norm(coord_direction, dim=-1)),
                     'coord_normalize': coord_before.new_tensor(1.0 if self.normalize else 0.0),
+                    'coord_prenorm': coord_before.new_tensor(1.0 if self.coord_prenorm else 0.0),
+                    'coord_state_edge_rms': _rms(state_edge_feat),
+                    'coord_state_edge_absmax': _amax(state_edge_feat),
+                    'coord_state_head_input_rms': _rms(state_head_input),
+                    'coord_state_head_input_absmax': _amax(state_head_input),
+                    'coord_state_head_hidden_rms': _rms(state_head_hidden),
+                    'coord_state_head_hidden_absmax': _amax(state_head_hidden),
+                    'coord_head_w1_rms': _rms(self.coord_mlp[0].weight),
+                    'coord_head_w1_absmax': _amax(self.coord_mlp[0].weight),
+                    'coord_head_w2_rms': _rms(self.coord_mlp[2].weight),
+                    'coord_head_w2_absmax': _amax(self.coord_mlp[2].weight),
                     'coord_base_coeff_raw_rms': _rms(base_coeff_raw),
                     'coord_base_coeff_raw_absmax': _amax(base_coeff_raw),
                     'coord_state_coeff_raw_rms': _rms(state_coeff_raw),
@@ -571,7 +602,7 @@ class MS_E_GCL(nn.Module):
     def __init__(self, input_nf, output_nf, hidden_nf, n_channel, channel_nf, radial_nf, surf_nf=50,
                  edges_in_d=0, node_attr_d=0, act_fn=nn.SiLU(), residual=True, attention=False,
                  normalize=False, coords_agg='mean', tanh=False, dropout=0.1,
-                 pair_coord_mode='bounded_residual', pair_coord_delta_bound=1.0):
+                 pair_coord_mode='bounded_residual', pair_coord_delta_bound=1.0, coord_prenorm=False):
         super(MS_E_GCL, self).__init__()
 
         input_edge = input_nf * 2
@@ -587,6 +618,7 @@ class MS_E_GCL(nn.Module):
         self.pair_coord_delta_bound = float(pair_coord_delta_bound)
         if self.pair_coord_mode == 'bounded_residual' and self.pair_coord_delta_bound <= 0.0:
             raise ValueError('pair_coord_delta_bound must be > 0 for bounded_residual mode')
+        self.coord_prenorm = bool(coord_prenorm)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -615,6 +647,12 @@ class MS_E_GCL(nn.Module):
             act_fn,
             nn.Linear(hidden_nf, output_nf))
 
+        # V219: action-space pre-normalization.  Edge messages carry semantic
+        # and recurrent information whose amplitude is not itself a physical
+        # displacement scale.  Normalize only at the representation->action
+        # boundary; the node/message stream itself is left unchanged.
+        self.coord_input_norm = nn.LayerNorm(hidden_nf) if self.coord_prenorm else nn.Identity()
+
         layer = nn.Linear(hidden_nf, n_channel, bias=False)
         torch.nn.init.xavier_uniform_(layer.weight, gain=0.001)
 
@@ -637,7 +675,7 @@ class MS_E_GCL(nn.Module):
     def edge_model(self, source, target, radial, edge_attr, base_source=None, base_target=None):
         """Return pair-conditioned and pair-free surface edge messages.
 
-        V218 ``direct_shared`` uses the Pair-conditioned ``state_edge`` as the
+        V219 ``direct_shared`` uses the Pair-conditioned ``state_edge`` as the
         shared representation/geometry message; ``base_edge`` is diagnostic and
         historical-compatibility state only.
         """
@@ -748,41 +786,56 @@ class MS_E_GCL(nn.Module):
             base_out = base_x + base_out
         return state_out, base_out
 
+    def _coord_head_forward(self, edge_feat):
+        """Map invariant edge representation to coordinate scalar authority.
+
+        V219 normalizes only the coordinate-action input.  This separates
+        representation amplitude from physical action amplitude without clipping
+        or saturating the learned scalar field.
+        """
+        head_input = self.coord_input_norm(edge_feat)
+        hidden = self.coord_mlp[0](head_input)
+        hidden = self.coord_mlp[1](hidden)
+        out = self.coord_mlp[2](hidden)
+        return out, head_input, hidden
+
     def coord_model(self, coord, edge_index, coord_diff, state_edge_feat,
                     channel_weights, base_edge_feat=None):
         '''Pair-aware Cartesian update with selectable geometry authority.
 
-        V218 formal mode (``direct_shared`` + ``normalize=True`` + ``tanh=False``):
+        V219 formal mode (``direct_shared`` + ``coord_prenorm=True`` + ``normalize=False``):
 
-            alpha_ij = phi_x(m_ij(h_i, h_j, radial_ij, z_ij))
-            u_ij     = d_ij / max(||d_ij||, eps)
-            Delta x_i = Mean_j[u_ij * alpha_ij]
+            mbar_ij  = LayerNorm(m_ij(h_i, h_j, radial_ij, z_ij))
+            alpha_ij = phi_x(mbar_ij)
+            Delta x_i = Mean_j[d_ij * alpha_ij]
 
-        Raw distances remain available to the invariant radial/message pathway;
-        only the final equivariant Cartesian basis is normalized.  Therefore Pair
-        remains a genuine EGNN edge condition without acquiring the old
-        raw-distance-times-unbounded-scalar multiplicative gain.
+        This restores the original R05 raw Cartesian relative-vector operator while
+        separating representation amplitude from physical scalar authority.  Pair
+        remains a genuine EGNN edge condition; no tanh/clamp/trust radius or manual
+        movement scale is introduced.
         '''
         row, col = edge_index
         n_channel = channel_weights.shape[-1]
         coord_before = coord
 
-        # Pair-conditioned EGNN scalar authority.  V218 formal runs use
+        # Pair-conditioned EGNN scalar authority.  V219 formal runs use
         # ``direct_shared``: the same pair-conditioned edge message drives both
-        # representation and the invariant coordinate scalar.  The Pair adapter
-        # itself is zero-initialized in ``edge_model``, so cold-start is still
-        # exactly the pair-free parent.  No tanh/clamp/trust-radius is applied in
-        # the formal V218 controller; legacy bounded modes remain reproducible.
-        state_coeff_raw = self.coord_mlp(state_edge_feat)
+        # representation and the invariant coordinate scalar.  Before the scalar
+        # action head only, LayerNorm removes uncontrolled representation amplitude.
+        # The Pair adapter remains zero-initialized.  No tanh/clamp/trust-radius is
+        # applied; historical bounded modes remain reproducible.
+        state_coeff_raw, state_head_input, state_head_hidden = self._coord_head_forward(state_edge_feat)
         state_coeff = torch.tanh(state_coeff_raw) if self.tanh else state_coeff_raw
         if base_edge_feat is None:
             base_coeff_raw = state_coeff_raw
+            base_head_input = state_head_input
+            base_head_hidden = state_head_hidden
             base_coeff = state_coeff
             pair_coeff_raw = torch.zeros_like(state_coeff_raw)
             pair_coeff_applied = pair_coeff_raw
             coord_coeff = state_coeff
         else:
-            base_coeff_raw = self.coord_mlp(base_edge_feat)
+            base_coeff_raw, base_head_input, base_head_hidden = self._coord_head_forward(base_edge_feat)
             base_coeff = torch.tanh(base_coeff_raw) if self.tanh else base_coeff_raw
             pair_coeff_raw = state_coeff - base_coeff
             if self.pair_coord_mode == 'bounded_residual':
@@ -797,12 +850,10 @@ class MS_E_GCL(nn.Module):
                 pair_coeff_applied = pair_coeff_raw
                 coord_coeff = state_coeff
 
-        # V218 unit-direction Cartesian basis.  Distance magnitude is retained in
-        # ``radial`` and therefore in the edge message, but it is not multiplied
-        # into the final Cartesian action.  This is the standard separation used
-        # by directional equivariant message passing: invariant radial information
-        # controls a scalar magnitude while a normalized relative vector supplies
-        # orientation.  Keep the normalization differentiable (no stop-gradient).
+        # V219 restores the original R05 raw Cartesian relative-vector basis.  The
+        # stability intervention is upstream at representation->action pre-normalization,
+        # not a change of the physical vector operator.  Historical normalize=True
+        # remains available only for reproducibility of V215/V218-style runs.
         coord_diff_raw = coord_diff
         coord_diff_norm = torch.norm(coord_diff_raw, dim=-1, keepdim=True)
         if self.normalize:
@@ -841,6 +892,17 @@ class MS_E_GCL(nn.Module):
                     'coord_direction_absmax': _amax(coord_direction),
                     'coord_direction_norm_absmax': _amax(torch.norm(coord_direction, dim=-1)),
                     'coord_normalize': coord_before.new_tensor(1.0 if self.normalize else 0.0),
+                    'coord_prenorm': coord_before.new_tensor(1.0 if self.coord_prenorm else 0.0),
+                    'coord_state_edge_rms': _rms(state_edge_feat),
+                    'coord_state_edge_absmax': _amax(state_edge_feat),
+                    'coord_state_head_input_rms': _rms(state_head_input),
+                    'coord_state_head_input_absmax': _amax(state_head_input),
+                    'coord_state_head_hidden_rms': _rms(state_head_hidden),
+                    'coord_state_head_hidden_absmax': _amax(state_head_hidden),
+                    'coord_head_w1_rms': _rms(self.coord_mlp[0].weight),
+                    'coord_head_w1_absmax': _amax(self.coord_mlp[0].weight),
+                    'coord_head_w2_rms': _rms(self.coord_mlp[2].weight),
+                    'coord_head_w2_absmax': _amax(self.coord_mlp[2].weight),
                     'coord_base_coeff_raw_rms': _rms(base_coeff_raw),
                     'coord_base_coeff_raw_absmax': _amax(base_coeff_raw),
                     'coord_state_coeff_raw_rms': _rms(state_coeff_raw),

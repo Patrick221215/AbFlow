@@ -462,12 +462,15 @@ class Trainer:
         if self.train_loader.sampler is not None and self.local_rank != -1:
             self.train_loader.sampler.set_epoch(self.epoch)
 
+        _tqdm_on = str(os.environ.get("ABFLOW_TQDM", "off")).strip().lower() in {
+            "1", "true", "yes", "y", "on"
+        }
         t_iter = tqdm(
             self.train_loader,
             dynamic_ncols=True,
             mininterval=float(getattr(self.config, "tqdm_mininterval", 5.0)),
             leave=False,
-        ) if self._is_main_proc() else self.train_loader
+        ) if self._is_main_proc() and _tqdm_on else self.train_loader
 
         for batch in t_iter:
             batch = self.to_device(batch, device)
@@ -544,12 +547,15 @@ class Trainer:
         self.model.eval()
         with validation_ema(self):
             with torch.no_grad():
+                _tqdm_on = str(os.environ.get("ABFLOW_TQDM", "off")).strip().lower() in {
+                    "1", "true", "yes", "y", "on"
+                }
                 t_iter = tqdm(
                     self.valid_loader,
                     dynamic_ncols=True,
                     mininterval=float(getattr(self.config, "tqdm_mininterval", 5.0)),
                     leave=False,
-                ) if self._is_main_proc() else self.valid_loader
+                ) if self._is_main_proc() and _tqdm_on else self.valid_loader
                 for batch in t_iter:
                     batch = self.to_device(batch, device)
                     with self._amp_autocast(device):
