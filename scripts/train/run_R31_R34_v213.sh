@@ -15,7 +15,8 @@ usage() {
   cat >&2 <<'USAGE'
 Usage:
   bash scripts/train/run_R31_R34_v213.sh <config.json> \
-    --gpus 2,3 --port 29728 [--resume /path/version_N/checkpoint/last_stepXXXX.pt]
+    --gpus 3 --port 29728 [--resume /path/version_N/checkpoint/last_stepXXXX.pt]
+  # or: --gpus 2,3 / --gpus 0,2,5,7
 
 GPU ids are execution resources and MUST be supplied on the command line.
 They are intentionally not stored in the scientific JSON.
@@ -36,7 +37,7 @@ done
 
 [[ -n "$GPU_CSV" ]] || { echo "--gpus is required" >&2; usage; exit 2; }
 [[ "$GPU_CSV" =~ ^[0-9]+(,[0-9]+)*$ ]] || {
-  echo "--gpus must be a comma-separated list such as 2,3; got '$GPU_CSV'" >&2
+  echo "--gpus must be one or more comma-separated physical GPU ids, e.g. 3 or 2,3; got '$GPU_CSV'" >&2
   exit 2
 }
 IFS=',' read -r -a GPU_IDS <<< "$GPU_CSV"
@@ -78,6 +79,7 @@ values = {
     'OMP_THREADS': runtime.get('omp_num_threads', 2),
     'CUDA_ALLOC': runtime.get('cuda_allocator', 'max_split_size_mb:128'),
     'OUTPUT_ROOT': output,
+    'GLOBAL_BATCH_SIZE': training.get('loader', {}).get('batch_size', ''),
     'CFG_RESUME_CHECKPOINT': resume,
 }
 for key, value in values.items():
@@ -93,6 +95,20 @@ MASTER_PORT=${MASTER_PORT:-$CFG_MASTER_PORT}
 }
 [[ "$MASTER_PORT" =~ ^[0-9]+$ ]] || { echo "Invalid --port '$MASTER_PORT'" >&2; exit 2; }
 RESUME_CHECKPOINT=${RESUME_CHECKPOINT:-$CFG_RESUME_CHECKPOINT}
+
+# Batch/world-size contract. Physical GPU ids may be arbitrary, but the formal
+# global optimizer batch must split exactly across the selected workers.
+[[ "$GLOBAL_BATCH_SIZE" =~ ^[0-9]+$ ]] || {
+  echo "Invalid training.loader.batch_size='$GLOBAL_BATCH_SIZE' in $CONFIG_PATH" >&2
+  exit 2
+}
+(( GLOBAL_BATCH_SIZE > 0 )) || { echo "global batch must be > 0" >&2; exit 2; }
+if (( GLOBAL_BATCH_SIZE % NPROC != 0 )); then
+  echo "global batch $GLOBAL_BATCH_SIZE is not divisible by selected GPU count $NPROC" >&2
+  echo "Choose a GPU count dividing $GLOBAL_BATCH_SIZE or change the scientific batch config explicitly." >&2
+  exit 2
+fi
+LOCAL_BATCH_SIZE=$((GLOBAL_BATCH_SIZE / NPROC))
 
 cd "$PROJECT_ROOT"
 mkdir -p "$OUTPUT_ROOT"
@@ -168,7 +184,7 @@ exec > >(stdbuf -oL -eL tee -a "$RUN_LOG") 2>&1
 echo "[RunLog] canonical=$RUN_LOG latest=$LATEST_LOG"
 echo "[RunVersion] fixed_version=$VERSION dir=$RUN_DIR"
 echo "[RunConfig] config=$CONFIG_PATH"
-echo "[RunResources] physical_gpus=$GPU_CSV nproc=$NPROC master_addr=$MASTER_ADDR port=$MASTER_PORT nnodes=$NNODES omp=$OMP_THREADS"
+echo "[RunResources] physical_gpus=$GPU_CSV nproc=$NPROC global_batch=$GLOBAL_BATCH_SIZE local_batch=$LOCAL_BATCH_SIZE master_addr=$MASTER_ADDR port=$MASTER_PORT nnodes=$NNODES omp=$OMP_THREADS"
 echo "[RunResume] checkpoint=${RESUME_CHECKPOINT:-scratch}"
 echo "[ForensicsConfig] geometry=$ABFLOW_GEOMETRY_FORENSICS sample=$ABFLOW_SAMPLE_FORENSICS sample_threshold_A=$ABFLOW_SAMPLE_FORENSICS_THRESHOLD_A train_loss_threshold=$ABFLOW_TRAIN_LOSS_OUTLIER_THRESHOLD train_outliers_per_epoch=$ABFLOW_TRAIN_LOSS_OUTLIER_MAX_PER_EPOCH grad_overflow_logs=$ABFLOW_GRAD_OVERFLOW_LOG_LIMIT geometry_authority_interval=$ABFLOW_GEOMETRY_AUTHORITY_INTERVAL base_coeff_alert=$ABFLOW_GEOMETRY_AUTHORITY_BASE_ALERT coord_update_alert=$ABFLOW_GEOMETRY_AUTHORITY_UPDATE_ALERT"
 echo "[EpochTestFailureContract] infra_fail_fast=$ABFLOW_EPOCH_TEST_FAIL_FAST model_invalid=$ABFLOW_EPOCH_TEST_MODEL_INVALID_POLICY"

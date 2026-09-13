@@ -621,7 +621,6 @@ def _apply_trainer_runtime_from_config(cfg, config_path):
     os.environ["ABFLOW_EPOCH_TEST_KEEP_STRUCTURES"] = (
         "on" if evaluation.get("keep_structures", False) else "off"
     )
-
     # V203 formal failure contract has two deliberately different authorities:
     #   1) infrastructure/protocol failures are always fail-fast;
     #   2) finite-but-invalid model outputs are observational and are recorded
@@ -914,11 +913,22 @@ def main(args):
     else:
         raise NotImplementedError(f'model {args.model_type} not implemented')
 
-    step_per_epoch = (len(train_set) + args.batch_size - 1) // args.batch_size
+    # Runtime batch-size contract: JSON ``training.loader.batch_size`` is the
+    # global optimizer batch for every world size.  Define it before the DDP
+    # branch so single-GPU torchrun (WORLD_SIZE=1) follows the same semantics.
+    global_batch_size = int(args.batch_size)
+    if global_batch_size <= 0:
+        raise ValueError(f"global batch size must be positive, got {global_batch_size}")
+    if global_batch_size % max(1, world_size) != 0:
+        raise RuntimeError(
+            "formal global batch must be divisible by world_size: "
+            f"global_batch={global_batch_size}, world_size={world_size}"
+        )
+
+    step_per_epoch = (len(train_set) + global_batch_size - 1) // global_batch_size
     config.add_parameter(step_per_epoch=step_per_epoch)
 
     if is_ddp:
-        global_batch_size = int(args.batch_size)
         use_cost_balance = bool(
             args.runtime.get("ddp", {}).get("cost_balanced", False)
         )
@@ -936,6 +946,10 @@ def main(args):
         config.batch_size = args.batch_size
     else:
         train_sampler = None
+        # Single GPU owns the complete global batch.  TrainConfig was created
+        # before runtime sharding, so keep both objects explicitly synchronized.
+        args.batch_size = global_batch_size
+        config.batch_size = global_batch_size
 
     config.local_rank = args.local_rank
 
