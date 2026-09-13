@@ -174,8 +174,11 @@ class AM_E_GCL(nn.Module):
         coord_mlp.append(nn.Linear(hidden_nf, hidden_nf))
         coord_mlp.append(act_fn)
         coord_mlp.append(layer)
-        if self.tanh:
-            coord_mlp.append(nn.Tanh())
+        # Keep the pre-activation explicit so diagnostics can distinguish an
+        # upstream gain excursion from the bounded coordinate controller.
+        # When ``self.tanh`` is enabled, the exact EGNN tanh transform is
+        # applied in ``coord_model`` below; for tanh=False this is bitwise the
+        # same computation as the previous implementation.
         self.coord_mlp = nn.Sequential(*coord_mlp)
 
         if self.attention:
@@ -305,34 +308,61 @@ class AM_E_GCL(nn.Module):
 
         The state/message stream may use the full pair-conditioned edge feature.
         Geometry uses the pair-free base coefficient plus a bounded residual from
-        direct pair conditioning:
+        direct pair conditioning.  With the V215 EGNN controller enabled:
 
+            alpha_base = tanh(alpha_base_raw)
+            alpha_state = tanh(alpha_state_raw)
             alpha = alpha_base + B * tanh((alpha_state-alpha_base) / B).
 
-        For a zero pair adapter, alpha_state == alpha_base exactly.  For small
-        learned corrections this is first-order identity; only pathological
-        direct-pair authority is saturated.  No coordinate clipping is used.
+        For a zero pair adapter, alpha_state == alpha_base exactly.  Around the
+        origin tanh(z)=z+O(z^3), so the zero-start parent is first-order
+        preserved; only high-gain coordinate authority is saturated.  This is
+        scalar-field bounding plus canonical direction normalization, not coordinate clipping.
         '''
         row, col = edge_index
         n_channel = channel_weights.shape[-1]
         coord_before = coord
 
-        state_coeff = self.coord_mlp(state_edge_feat)
+        # EGNN coordinate controller.  The official EGNN implementation
+        # exposes ``tanh`` precisely to bound phi_x(m_ij).  We keep the raw
+        # scalar for forensics, then apply tanh before any Cartesian authority
+        # is granted.  This preserves E(n) equivariance because only an
+        # invariant scalar is transformed; coordinate directions are unchanged.
+        state_coeff_raw = self.coord_mlp(state_edge_feat)
+        state_coeff = torch.tanh(state_coeff_raw) if self.tanh else state_coeff_raw
         if base_edge_feat is None or self.pair_coord_mode == 'legacy_shared':
+            base_coeff_raw = state_coeff_raw
             base_coeff = state_coeff
             pair_coeff_raw = torch.zeros_like(state_coeff)
             pair_coeff_bounded = pair_coeff_raw
             coord_coeff = state_coeff
         else:
-            base_coeff = self.coord_mlp(base_edge_feat)
+            base_coeff_raw = self.coord_mlp(base_edge_feat)
+            base_coeff = torch.tanh(base_coeff_raw) if self.tanh else base_coeff_raw
+            # Preserve V212 semantics: direct Pair authority is measured after
+            # the same coordinate controller used by state/base.  Hence zero
+            # Pair still gives exact equality, while the residual remains
+            # independently bounded by ``pair_coord_delta_bound``.
             pair_coeff_raw = state_coeff - base_coeff
             bound = pair_coeff_raw.new_tensor(self.pair_coord_delta_bound)
             pair_coeff_bounded = bound * torch.tanh(pair_coeff_raw / bound)
             coord_coeff = base_coeff + pair_coeff_bounded
 
+        # V215 canonical EGNN direction normalization.  Keep the original
+        # distance-dependent radial/message features unchanged; normalize only
+        # the equivariant vector that grants Cartesian authority.  This mirrors
+        # the reference EGNN implementation: the norm is detached so the
+        # denominator is not an auxiliary gradient-control path.
+        coord_diff_raw = coord_diff
+        coord_diff_norm = torch.norm(coord_diff_raw, dim=-1, keepdim=True)
+        if self.normalize:
+            coord_direction = coord_diff_raw / (coord_diff_norm.detach() + self.epsilon)
+        else:
+            coord_direction = coord_diff_raw
+
         channel_sum = (channel_weights != 0).long().sum(-1)
         pooled_edge_feat = RollerPooling(n_channel)(coord_coeff, channel_sum[row])
-        trans = coord_diff * pooled_edge_feat
+        trans = coord_direction * pooled_edge_feat
 
         if self.coords_agg == 'sum':
             agg = unsorted_segment_sum(trans, row, num_segments=coord.size(0))
@@ -353,8 +383,18 @@ class AM_E_GCL(nn.Module):
                 self.last_coord_diagnostics = {
                     'coord_input_rms': _rms(coord_before),
                     'coord_input_absmax': _amax(coord_before),
-                    'coord_diff_rms': _rms(coord_diff),
-                    'coord_diff_absmax': _amax(coord_diff),
+                    'coord_diff_rms': _rms(coord_diff_raw),
+                    'coord_diff_absmax': _amax(coord_diff_raw),
+                    'coord_diff_norm_rms': _rms(coord_diff_norm),
+                    'coord_diff_norm_absmax': _amax(coord_diff_norm),
+                    'coord_direction_rms': _rms(coord_direction),
+                    'coord_direction_absmax': _amax(coord_direction),
+                    'coord_direction_norm_absmax': _amax(torch.norm(coord_direction, dim=-1)),
+                    'coord_normalize': coord_before.new_tensor(1.0 if self.normalize else 0.0),
+                    'coord_base_coeff_raw_rms': _rms(base_coeff_raw),
+                    'coord_base_coeff_raw_absmax': _amax(base_coeff_raw),
+                    'coord_state_coeff_raw_rms': _rms(state_coeff_raw),
+                    'coord_state_coeff_raw_absmax': _amax(state_coeff_raw),
                     'coord_base_coeff_rms': _rms(base_coeff),
                     'coord_base_coeff_absmax': _amax(base_coeff),
                     'coord_state_coeff_rms': _rms(state_coeff),
@@ -369,6 +409,9 @@ class AM_E_GCL(nn.Module):
                     'coord_trans_absmax': _amax(trans),
                     'coord_update_rms': _rms(agg),
                     'coord_update_absmax': _amax(agg),
+                    'coord_update_to_input_rms_ratio': (
+                        _rms(agg).float() / _rms(coord_before).float().clamp_min(1.0e-8)
+                    ).to(coord_before.dtype),
                     'coord_output_rms': _rms(coord),
                     'coord_output_absmax': _amax(coord),
                 }
@@ -576,8 +619,11 @@ class MS_E_GCL(nn.Module):
         coord_mlp.append(nn.Linear(hidden_nf, hidden_nf))
         coord_mlp.append(act_fn)
         coord_mlp.append(layer)
-        if self.tanh:
-            coord_mlp.append(nn.Tanh())
+        # Keep the pre-activation explicit so diagnostics can distinguish an
+        # upstream gain excursion from the bounded coordinate controller.
+        # When ``self.tanh`` is enabled, the exact EGNN tanh transform is
+        # applied in ``coord_model`` below; for tanh=False this is bitwise the
+        # same computation as the previous implementation.
         self.coord_mlp = nn.Sequential(*coord_mlp)
 
         if self.attention:
@@ -707,34 +753,61 @@ class MS_E_GCL(nn.Module):
 
         The state/message stream may use the full pair-conditioned edge feature.
         Geometry uses the pair-free base coefficient plus a bounded residual from
-        direct pair conditioning:
+        direct pair conditioning.  With the V215 EGNN controller enabled:
 
+            alpha_base = tanh(alpha_base_raw)
+            alpha_state = tanh(alpha_state_raw)
             alpha = alpha_base + B * tanh((alpha_state-alpha_base) / B).
 
-        For a zero pair adapter, alpha_state == alpha_base exactly.  For small
-        learned corrections this is first-order identity; only pathological
-        direct-pair authority is saturated.  No coordinate clipping is used.
+        For a zero pair adapter, alpha_state == alpha_base exactly.  Around the
+        origin tanh(z)=z+O(z^3), so the zero-start parent is first-order
+        preserved; only high-gain coordinate authority is saturated.  This is
+        scalar-field bounding plus canonical direction normalization, not coordinate clipping.
         '''
         row, col = edge_index
         n_channel = channel_weights.shape[-1]
         coord_before = coord
 
-        state_coeff = self.coord_mlp(state_edge_feat)
+        # EGNN coordinate controller.  The official EGNN implementation
+        # exposes ``tanh`` precisely to bound phi_x(m_ij).  We keep the raw
+        # scalar for forensics, then apply tanh before any Cartesian authority
+        # is granted.  This preserves E(n) equivariance because only an
+        # invariant scalar is transformed; coordinate directions are unchanged.
+        state_coeff_raw = self.coord_mlp(state_edge_feat)
+        state_coeff = torch.tanh(state_coeff_raw) if self.tanh else state_coeff_raw
         if base_edge_feat is None or self.pair_coord_mode == 'legacy_shared':
+            base_coeff_raw = state_coeff_raw
             base_coeff = state_coeff
             pair_coeff_raw = torch.zeros_like(state_coeff)
             pair_coeff_bounded = pair_coeff_raw
             coord_coeff = state_coeff
         else:
-            base_coeff = self.coord_mlp(base_edge_feat)
+            base_coeff_raw = self.coord_mlp(base_edge_feat)
+            base_coeff = torch.tanh(base_coeff_raw) if self.tanh else base_coeff_raw
+            # Preserve V212 semantics: direct Pair authority is measured after
+            # the same coordinate controller used by state/base.  Hence zero
+            # Pair still gives exact equality, while the residual remains
+            # independently bounded by ``pair_coord_delta_bound``.
             pair_coeff_raw = state_coeff - base_coeff
             bound = pair_coeff_raw.new_tensor(self.pair_coord_delta_bound)
             pair_coeff_bounded = bound * torch.tanh(pair_coeff_raw / bound)
             coord_coeff = base_coeff + pair_coeff_bounded
 
+        # V215 canonical EGNN direction normalization.  Keep the original
+        # distance-dependent radial/message features unchanged; normalize only
+        # the equivariant vector that grants Cartesian authority.  This mirrors
+        # the reference EGNN implementation: the norm is detached so the
+        # denominator is not an auxiliary gradient-control path.
+        coord_diff_raw = coord_diff
+        coord_diff_norm = torch.norm(coord_diff_raw, dim=-1, keepdim=True)
+        if self.normalize:
+            coord_direction = coord_diff_raw / (coord_diff_norm.detach() + self.epsilon)
+        else:
+            coord_direction = coord_diff_raw
+
         channel_sum = (channel_weights != 0).long().sum(-1)
         pooled_edge_feat = RollerPooling(n_channel)(coord_coeff, channel_sum[row])
-        trans = coord_diff * pooled_edge_feat
+        trans = coord_direction * pooled_edge_feat
 
         if self.coords_agg == 'sum':
             agg = unsorted_segment_sum(trans, row, num_segments=coord.size(0))
@@ -755,8 +828,18 @@ class MS_E_GCL(nn.Module):
                 self.last_coord_diagnostics = {
                     'coord_input_rms': _rms(coord_before),
                     'coord_input_absmax': _amax(coord_before),
-                    'coord_diff_rms': _rms(coord_diff),
-                    'coord_diff_absmax': _amax(coord_diff),
+                    'coord_diff_rms': _rms(coord_diff_raw),
+                    'coord_diff_absmax': _amax(coord_diff_raw),
+                    'coord_diff_norm_rms': _rms(coord_diff_norm),
+                    'coord_diff_norm_absmax': _amax(coord_diff_norm),
+                    'coord_direction_rms': _rms(coord_direction),
+                    'coord_direction_absmax': _amax(coord_direction),
+                    'coord_direction_norm_absmax': _amax(torch.norm(coord_direction, dim=-1)),
+                    'coord_normalize': coord_before.new_tensor(1.0 if self.normalize else 0.0),
+                    'coord_base_coeff_raw_rms': _rms(base_coeff_raw),
+                    'coord_base_coeff_raw_absmax': _amax(base_coeff_raw),
+                    'coord_state_coeff_raw_rms': _rms(state_coeff_raw),
+                    'coord_state_coeff_raw_absmax': _amax(state_coeff_raw),
                     'coord_base_coeff_rms': _rms(base_coeff),
                     'coord_base_coeff_absmax': _amax(base_coeff),
                     'coord_state_coeff_rms': _rms(state_coeff),
@@ -771,6 +854,9 @@ class MS_E_GCL(nn.Module):
                     'coord_trans_absmax': _amax(trans),
                     'coord_update_rms': _rms(agg),
                     'coord_update_absmax': _amax(agg),
+                    'coord_update_to_input_rms_ratio': (
+                        _rms(agg).float() / _rms(coord_before).float().clamp_min(1.0e-8)
+                    ).to(coord_before.dtype),
                     'coord_output_rms': _rms(coord),
                     'coord_output_absmax': _amax(coord),
                 }

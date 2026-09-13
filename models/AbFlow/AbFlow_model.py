@@ -67,6 +67,25 @@ class AbFlowModel(nn.Module):
             pair_coord_config.get("delta_bound", 1.0)
         )
 
+        # V215: strong local EGNN Cartesian controller.  ``egnn_tanh_normalized``
+        # combines the two canonical EGNN stability switches that act directly
+        # on the coordinate update: bounded invariant scalar authority (tanh)
+        # and detached unit-direction normalization.  Radial/message features
+        # still use the original distances; there is no coordinate clipping.
+        coord_controller = representation_config.get("coordinate_controller", {})
+        self.coord_controller_mode = str(
+            coord_controller.get("mode", "legacy_unbounded")
+        ).strip().lower()
+        _coord_controller_modes = {"legacy_unbounded", "egnn_tanh", "egnn_tanh_normalized"}
+        if self.coord_controller_mode not in _coord_controller_modes:
+            raise ValueError(
+                "model.representation.single_pair.coordinate_controller.mode "
+                f"must be one of {sorted(_coord_controller_modes)}, got "
+                f"{self.coord_controller_mode!r}."
+            )
+        self.coord_tanh = self.coord_controller_mode in {"egnn_tanh", "egnn_tanh_normalized"}
+        self.coord_normalize = self.coord_controller_mode == "egnn_tanh_normalized"
+
         atom_embed_size = embed_size // 4
         self.aa_feature = SeparatedAminoAcidFeature(
             embed_size, atom_embed_size, relative_position=relative_position,
@@ -156,7 +175,8 @@ class AbFlowModel(nn.Module):
             num_verts=num_verts, n_layers=n_layers, residual=True,
             dropout=dropout, dense=False,
             pair_coord_mode=self.pair_coord_mode,
-            pair_coord_delta_bound=self.pair_coord_delta_bound)
+            pair_coord_delta_bound=self.pair_coord_delta_bound,
+            coord_tanh=self.coord_tanh, coord_normalize=self.coord_normalize)
 
         self.normalizer = SeperatedCoordNormalizer()
         self.batch_constants = {}
@@ -223,6 +243,9 @@ class AbFlowModel(nn.Module):
             os.environ.get("ABFLOW_SAMPLE_FORENSICS_THRESHOLD_A", "500") or 500.0
         )
         self.last_geometry_forensics = {}
+        self._coord_audit_train_call = 0
+        self.coord_audit_interval = max(1, int(os.environ.get('ABFLOW_COORD_AUDIT_INTERVAL', '20') or 20))
+        self.coord_audit_first_steps = max(0, int(os.environ.get('ABFLOW_COORD_AUDIT_FIRST_STEPS', '5') or 5))
         self._sample_forensic_context = {}
         self._sample_forensic_records = []
         self._sample_forensic_alerted = False
@@ -231,7 +254,64 @@ class AbFlowModel(nn.Module):
         self.geometry_coupling_contract = {
             'pair_coord_mode': self.pair_coord_mode,
             'pair_coord_delta_bound': self.pair_coord_delta_bound,
+            'coord_controller_mode': self.coord_controller_mode,
+            'coord_tanh': self.coord_tanh,
+            'coord_normalize': self.coord_normalize,
         }
+
+    @staticmethod
+    def _coord_diag_scalar(diag, key):
+        value = (diag or {}).get(key)
+        if value is None:
+            return float('nan')
+        try:
+            return float(value.detach().float().item()) if torch.is_tensor(value) else float(value)
+        except Exception:
+            return float('nan')
+
+    def _maybe_log_coordinate_controller_audit(self, round_egnn_diagnostics):
+        """Rank-0 observational audit of the V215 Cartesian control contract.
+
+        Training-only and detached: this does not participate in the objective.
+        It records both pre-controller pressure (raw scalar and raw distance) and
+        post-controller physical authority (unit direction, bounded scalar,
+        translation/update magnitude), so a stable output cannot hide upstream
+        representation drift.
+        """
+        if not self.training or not self.geometry_forensics_enabled:
+            return
+        call = int(self._coord_audit_train_call)
+        self._coord_audit_train_call += 1
+        if not (call < self.coord_audit_first_steps or call % self.coord_audit_interval == 0):
+            return
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                return
+        rows=[]
+        for rec in (round_egnn_diagnostics or []):
+            d=rec.get('coord', {}) or {}
+            rows.append((
+                int(rec.get('round_idx', len(rows))),
+                self._coord_diag_scalar(d, 'coord_base_coeff_raw_absmax_max'),
+                self._coord_diag_scalar(d, 'coord_coeff_absmax_max'),
+                self._coord_diag_scalar(d, 'coord_diff_norm_absmax_max'),
+                self._coord_diag_scalar(d, 'coord_direction_norm_absmax_max'),
+                self._coord_diag_scalar(d, 'coord_trans_absmax_max'),
+                self._coord_diag_scalar(d, 'coord_update_absmax_max'),
+                self._coord_diag_scalar(d, 'coord_update_to_input_rms_ratio_max'),
+            ))
+        fmt=lambda v: 'nan' if not math.isfinite(v) else f'{v:.6g}'
+        payload=';'.join(
+            f'r{r}:raw_alpha={fmt(raw)} eff_alpha={fmt(eff)} raw_dnorm={fmt(dn)} '
+            f'dir_norm={fmt(un)} trans={fmt(tr)} update={fmt(up)} upd_in_rms={fmt(ur)}'
+            for r,raw,eff,dn,un,tr,up,ur in rows
+        )
+        print(
+            '[CoordinateControllerAudit] '
+            f'train_call={call} mode={self.coord_controller_mode} '
+            f'tanh={int(self.coord_tanh)} normalize={int(self.coord_normalize)} {payload}',
+            flush=True,
+        )
 
     def set_sample_forensic_context(self, logical_batch_id=None, global_indices=None, names=None):
         """Attach evaluation identity to the next ``sample`` call.
@@ -952,6 +1032,7 @@ class AbFlowModel(nn.Module):
                 value, interface_batch_id, _type=4)
         self.normalizer.clear_cache()
         self._last_round_egnn_diagnostics = round_egnn_diagnostics
+        self._maybe_log_coordinate_controller_audit(round_egnn_diagnostics)
         return H, S, r_logits, pred_X, r_interface_X, r_edge_dist, prmsd
 
 

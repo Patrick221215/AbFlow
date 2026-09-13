@@ -14,6 +14,7 @@ class AMEncoder(nn.Module):
         radial_nf, in_edge_nf=0, in_single_nf=0, num_verts=50,
         act_fn=nn.SiLU(), n_layers=4, residual=True, dropout=0.1, dense=False,
         pair_coord_mode='bounded_residual', pair_coord_delta_bound=1.0,
+        coord_tanh=False, coord_normalize=False,
     ):
         super().__init__()
         self.hidden_nf = hidden_nf
@@ -21,6 +22,8 @@ class AMEncoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.pair_coord_mode = str(pair_coord_mode or 'bounded_residual').strip().lower()
         self.pair_coord_delta_bound = float(pair_coord_delta_bound)
+        self.coord_tanh = bool(coord_tanh)
+        self.coord_normalize = bool(coord_normalize)
 
         self.linear_in = nn.Linear(in_node_nf, hidden_nf)
         self.single_linear = None
@@ -49,6 +52,7 @@ class AMEncoder(nn.Module):
                     act_fn=act_fn, residual=residual, dropout=dropout,
                     pair_coord_mode=self.pair_coord_mode,
                     pair_coord_delta_bound=self.pair_coord_delta_bound,
+                    tanh=self.coord_tanh, normalize=self.coord_normalize,
                 ),
             )
             self.add_module(
@@ -59,6 +63,7 @@ class AMEncoder(nn.Module):
                     act_fn=act_fn, residual=residual, dropout=dropout,
                     pair_coord_mode=self.pair_coord_mode,
                     pair_coord_delta_bound=self.pair_coord_delta_bound,
+                    tanh=self.coord_tanh, normalize=self.coord_normalize,
                 ),
             )
             self.add_module(
@@ -70,6 +75,7 @@ class AMEncoder(nn.Module):
                     residual=residual, dropout=dropout,
                     pair_coord_mode=self.pair_coord_mode,
                     pair_coord_delta_bound=self.pair_coord_delta_bound,
+                    tanh=self.coord_tanh, normalize=self.coord_normalize,
                 ),
             )
 
@@ -79,6 +85,7 @@ class AMEncoder(nn.Module):
             act_fn=act_fn, residual=residual,
             pair_coord_mode=self.pair_coord_mode,
             pair_coord_delta_bound=self.pair_coord_delta_bound,
+            tanh=self.coord_tanh, normalize=self.coord_normalize,
         )
 
     def forward(
@@ -128,6 +135,12 @@ class AMEncoder(nn.Module):
         pair_weights = []
         coord_updates = []
         coord_coeffs = []
+        coord_base_raw_coeffs = []
+        coord_state_raw_coeffs = []
+        coord_diff_norms = []
+        coord_direction_norms = []
+        coord_trans = []
+        coord_update_input_ratios = []
 
         def collect_pair(module):
             if not capture_bridge_diagnostics:
@@ -148,10 +161,28 @@ class AMEncoder(nn.Module):
                 self.last_coord_diagnostics[f'{stage}.{key}'] = value
             update = diag.get('coord_update_absmax')
             coeff = diag.get('coord_coeff_absmax')
+            base_raw = diag.get('coord_base_coeff_raw_absmax')
+            state_raw = diag.get('coord_state_coeff_raw_absmax')
+            diff_norm = diag.get('coord_diff_norm_absmax')
+            direction_norm = diag.get('coord_direction_norm_absmax')
+            trans_absmax = diag.get('coord_trans_absmax')
+            update_input_ratio = diag.get('coord_update_to_input_rms_ratio')
             if update is not None:
                 coord_updates.append(update)
             if coeff is not None:
                 coord_coeffs.append(coeff)
+            if base_raw is not None:
+                coord_base_raw_coeffs.append(base_raw)
+            if state_raw is not None:
+                coord_state_raw_coeffs.append(state_raw)
+            if diff_norm is not None:
+                coord_diff_norms.append(diff_norm)
+            if direction_norm is not None:
+                coord_direction_norms.append(direction_norm)
+            if trans_absmax is not None:
+                coord_trans.append(trans_absmax)
+            if update_input_ratio is not None:
+                coord_update_input_ratios.append(update_input_ratio)
 
         inter_h = h[inter_mask]
         inter_h_base = h_base[inter_mask]
@@ -221,6 +252,8 @@ class AMEncoder(nn.Module):
         if capture_bridge_diagnostics:
             self.last_coord_diagnostics['pair_coord_mode'] = self.pair_coord_mode
             self.last_coord_diagnostics['pair_coord_delta_bound'] = x.new_tensor(self.pair_coord_delta_bound)
+            self.last_coord_diagnostics['coord_tanh'] = x.new_tensor(1.0 if self.coord_tanh else 0.0)
+            self.last_coord_diagnostics['coord_normalize'] = x.new_tensor(1.0 if self.coord_normalize else 0.0)
             if pair_ratios:
                 stacked = torch.stack(pair_ratios)
                 self.last_bridge_diagnostics['bridge_pair_delta_to_base_ratio_mean'] = stacked.mean()
@@ -233,4 +266,16 @@ class AMEncoder(nn.Module):
             if coord_coeffs:
                 self.last_coord_diagnostics['coord_coeff_absmax_max'] = torch.stack(coord_coeffs).max()
                 self.last_coord_diagnostics['coord_coeff_absmax_mean'] = torch.stack(coord_coeffs).mean()
+            if coord_base_raw_coeffs:
+                self.last_coord_diagnostics['coord_base_coeff_raw_absmax_max'] = torch.stack(coord_base_raw_coeffs).max()
+            if coord_state_raw_coeffs:
+                self.last_coord_diagnostics['coord_state_coeff_raw_absmax_max'] = torch.stack(coord_state_raw_coeffs).max()
+            if coord_diff_norms:
+                self.last_coord_diagnostics['coord_diff_norm_absmax_max'] = torch.stack(coord_diff_norms).max()
+            if coord_direction_norms:
+                self.last_coord_diagnostics['coord_direction_norm_absmax_max'] = torch.stack(coord_direction_norms).max()
+            if coord_trans:
+                self.last_coord_diagnostics['coord_trans_absmax_max'] = torch.stack(coord_trans).max()
+            if coord_update_input_ratios:
+                self.last_coord_diagnostics['coord_update_to_input_rms_ratio_max'] = torch.stack(coord_update_input_ratios).max()
         return h, x, inter_x
