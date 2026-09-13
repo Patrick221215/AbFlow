@@ -68,18 +68,18 @@ class AbFlowModel(nn.Module):
             pair_coord_config.get("delta_bound", 1.0)
         )
 
-        # V216 geometry semantics. The formal path no longer grants Cartesian
+        # V217 geometry semantics. The formal path no longer grants Cartesian
         # authority to edge coefficients. Pair/single geometry first updates the
         # invariant residue state; a zero-initialized N-CA-C local-frame actuator
-        # then applies an equivariant residue action. Legacy modes remain solely
-        # for historical checkpoint/config reproducibility.
+        # then predicts a coarse rigid pose plus full-atom local internal correction.
+        # Legacy modes remain solely for historical checkpoint/config reproducibility.
         coord_controller = representation_config.get("coordinate_controller", {})
         self.coord_controller_mode = str(
             coord_controller.get("mode", "legacy_unbounded")
         ).strip().lower()
         _coord_controller_modes = {
             "legacy_unbounded", "egnn_tanh", "egnn_tanh_normalized",
-            "local_frame_fullatom_affine",
+            "local_frame_fullatom_affine", "local_frame_hierarchical_fullatom",
         }
         if self.coord_controller_mode not in _coord_controller_modes:
             raise ValueError(
@@ -89,19 +89,37 @@ class AbFlowModel(nn.Module):
             )
         self.coord_tanh = self.coord_controller_mode in {"egnn_tanh", "egnn_tanh_normalized"}
         self.coord_normalize = self.coord_controller_mode == "egnn_tanh_normalized"
-        self.local_frame_actuator = self.coord_controller_mode == "local_frame_fullatom_affine"
+        self.local_frame_actuator = self.coord_controller_mode in {
+            "local_frame_fullatom_affine", "local_frame_hierarchical_fullatom"
+        }
+        self.hierarchical_fullatom_actuator = (
+            self.coord_controller_mode == "local_frame_hierarchical_fullatom"
+        )
         self.local_frame_eps = float(geometry_config.get("frame_eps", 1.0e-6))
         self.local_coordinate_scale = float(geometry_config.get("local_coordinate_scale", 0.1))
         if self.local_frame_actuator:
             if str(geometry_config.get("frame", "")).strip().lower() != "diffab_n_ca_c_local":
                 raise ValueError(
-                    "local_frame_fullatom_affine requires geometry.frame=diffab_n_ca_c_local"
+                    f"{self.coord_controller_mode} requires geometry.frame=diffab_n_ca_c_local"
                 )
             if self.pair_coord_mode != "representation_only":
                 raise ValueError(
-                    "local_frame_fullatom_affine requires pair_coordinate.mode=representation_only; "
+                    f"{self.coord_controller_mode} requires pair_coordinate.mode=representation_only; "
                     "Pair may condition invariant state but must not own a direct Cartesian edge head."
                 )
+            if self.hierarchical_fullatom_actuator:
+                expected = {
+                    "coarse_pose": "zero_init_local_rigid",
+                    "internal_coordinates": "all_observed_except_ca",
+                    "internal_conditioning": "residue_state+atom_embedding+current_local_coordinate",
+                    "ca_role": "frame_origin_translation_only",
+                }
+                for key, value in expected.items():
+                    got = str(coord_controller.get(key, "") or "").strip().lower()
+                    if got != value:
+                        raise ValueError(
+                            f"V217 requires coordinate_controller.{key}={value!r}; got {got!r}."
+                        )
 
         atom_embed_size = embed_size // 4
         self.aa_feature = SeparatedAminoAcidFeature(
@@ -217,7 +235,7 @@ class AbFlowModel(nn.Module):
                 self.local_coordinate_scale, self.flow_coordinate_scaling,
                 rel_tol=0.0, abs_tol=1.0e-12):
             raise ValueError(
-                "V216 requires one coordinate-scale authority: "
+                "V217 local-frame modes require one coordinate-scale authority: "
                 "representation.geometry.local_coordinate_scale must equal "
                 "model.r05.r3.coordinate_scaling."
             )
@@ -287,6 +305,7 @@ class AbFlowModel(nn.Module):
             'coord_tanh': self.coord_tanh,
             'coord_normalize': self.coord_normalize,
             'local_frame_actuator': self.local_frame_actuator,
+            'hierarchical_fullatom_actuator': self.hierarchical_fullatom_actuator,
             'local_coordinate_scale': self.local_coordinate_scale,
             'fixed_context_per_stage': self.local_frame_actuator,
         }
@@ -302,7 +321,7 @@ class AbFlowModel(nn.Module):
             return float('nan')
 
     def _maybe_log_coordinate_controller_audit(self, round_egnn_diagnostics):
-        """Detached rank-0 audit for legacy and V216 geometry actions."""
+        """Detached rank-0 audit for legacy and local-frame geometry actions."""
         if not self.training or not self.geometry_forensics_enabled:
             return
         call = int(self._coord_audit_train_call)
@@ -313,6 +332,43 @@ class AbFlowModel(nn.Module):
             if torch.distributed.get_rank() != 0:
                 return
         fmt=lambda v: 'nan' if not math.isfinite(v) else f'{v:.6g}'
+
+        if self.hierarchical_fullatom_actuator:
+            rows=[]
+            for rec in (round_egnn_diagnostics or []):
+                d=rec.get('coord', {}) or {}
+                rows.append((
+                    int(rec.get('round_idx', len(rows))),
+                    self._coord_diag_scalar(d, 'actuator_translation_norm_A_p99_max'),
+                    self._coord_diag_scalar(d, 'actuator_translation_norm_A_max_max'),
+                    self._coord_diag_scalar(d, 'actuator_rotation_angle_deg_p99_max'),
+                    self._coord_diag_scalar(d, 'actuator_internal_residual_norm_A_p99_max'),
+                    self._coord_diag_scalar(d, 'actuator_backbone_internal_residual_norm_A_p99_max'),
+                    self._coord_diag_scalar(d, 'actuator_sidechain_internal_residual_norm_A_p99_max'),
+                    self._coord_diag_scalar(d, 'actuator_atom_update_norm_A_p99_max'),
+                    self._coord_diag_scalar(d, 'actuator_atom_update_norm_A_max_max'),
+                    self._coord_diag_scalar(d, 'actuator_movable_frame_valid_fraction_min'),
+                    self._coord_diag_scalar(d, 'actuator_fixed_atom_update_absmax_A_max'),
+                    self._coord_diag_scalar(d, 'actuator_ca_internal_update_absmax_A_max'),
+                    self._coord_diag_scalar(d, 'actuator_coarse_rigid_distance_error_max_A_max'),
+                    self._coord_diag_scalar(d, 'actuator_final_backbone_internal_distance_change_A_p99_max'),
+                    self._coord_diag_scalar(d, 'actuator_rigid_head_weight_rms_max'),
+                    self._coord_diag_scalar(d, 'actuator_internal_head_weight_rms_max'),
+                ))
+            payload=';'.join(
+                f'r{r}:trans_p99_A={fmt(tp)} trans_max_A={fmt(tm)} rot_p99_deg={fmt(rp)} '
+                f'int_p99_A={fmt(ip)} bb_int_p99_A={fmt(bp)} sc_int_p99_A={fmt(sp)} '
+                f'atom_p99_A={fmt(ap)} atom_max_A={fmt(am)} frame_valid={fmt(fv)} '
+                f'fixed_update_A={fmt(fx)} ca_internal_A={fmt(ca)} coarse_rigid_err_A={fmt(re)} '
+                f'bb_internal_dchange_p99_A={fmt(bd)} rigid_w={fmt(rw)} internal_w={fmt(iw)}'
+                for r,tp,tm,rp,ip,bp,sp,ap,am,fv,fx,ca,re,bd,rw,iw in rows
+            )
+            print(
+                '[HierarchicalFullAtomActuatorAudit] '
+                f'train_call={call} mode={self.coord_controller_mode} {payload}',
+                flush=True,
+            )
+            return
 
         if self.local_frame_actuator:
             rows=[]

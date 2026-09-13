@@ -4,13 +4,16 @@ import torch
 import torch.nn as nn
 
 from .am_egnn import AM_E_GCL, MS_E_GCL
-from .local_frame_actuator import LocalFrameFullAtomActuator
+from .local_frame_actuator import (
+    LocalFrameFullAtomActuator,
+    HierarchicalLocalFrameFullAtomActuator,
+)
 
 
 class AMEncoder(nn.Module):
     """R05 multi-channel relational encoder with selectable geometry actuator.
 
-    ``local_frame_fullatom_affine`` is the formal V216 path. Edge geometry and
+    ``local_frame_hierarchical_fullatom`` is the formal V217 path. Edge geometry and
     Pair features update invariant node states; Cartesian coordinates are then
     updated by a residue-local frame actuator. Legacy EGNN coordinate paths stay
     available for historical reproducibility only.
@@ -34,7 +37,13 @@ class AMEncoder(nn.Module):
         self.coord_tanh = bool(coord_tanh)
         self.coord_normalize = bool(coord_normalize)
         self.coord_controller_mode = str(coord_controller_mode or 'legacy_unbounded').strip().lower()
-        self.local_frame_mode = self.coord_controller_mode == 'local_frame_fullatom_affine'
+        self.local_frame_mode = self.coord_controller_mode in {
+            'local_frame_fullatom_affine',
+            'local_frame_hierarchical_fullatom',
+        }
+        self.hierarchical_fullatom_mode = (
+            self.coord_controller_mode == 'local_frame_hierarchical_fullatom'
+        )
 
         self.linear_in = nn.Linear(in_node_nf, hidden_nf)
         self.single_linear = None
@@ -88,7 +97,14 @@ class AMEncoder(nn.Module):
         )
 
         self.geometry_actuator = None
-        if self.local_frame_mode:
+        if self.hierarchical_fullatom_mode:
+            self.geometry_actuator = HierarchicalLocalFrameFullAtomActuator(
+                hidden_nf=hidden_nf, channel_nf=channel_nf,
+                frame_eps=frame_eps, coordinate_scale=coordinate_scale,
+                ca_channel=1, backbone_channels=min(4, n_channel),
+            )
+        elif self.local_frame_mode:
+            # Historical V216 compatibility only.
             self.geometry_actuator = LocalFrameFullAtomActuator(
                 hidden_nf=hidden_nf, channel_nf=channel_nf,
                 frame_eps=frame_eps, coordinate_scale=coordinate_scale,
@@ -258,14 +274,28 @@ class AMEncoder(nn.Module):
             self.last_coord_diagnostics['coord_pair_delta_bounded_absmax_max'] = ref.new_zeros(())
             self.last_coord_diagnostics['coord_update_absmax_max'] = self._max_diag(
                 actuator_records, 'coord_update_absmax', ref)
-            for key in [
-                'translation_norm_A_p50','translation_norm_A_p95','translation_norm_A_p99','translation_norm_A_max',
-                'rotation_angle_deg_p50','rotation_angle_deg_p95','rotation_angle_deg_p99','rotation_angle_deg_max',
-                'sidechain_residual_norm_A_p50','sidechain_residual_norm_A_p95','sidechain_residual_norm_A_p99','sidechain_residual_norm_A_max',
-                'atom_update_norm_A_p50','atom_update_norm_A_p95','atom_update_norm_A_p99','atom_update_norm_A_max',
-                'frame_orthogonality_error_max', 'fixed_atom_update_absmax_A','backbone_rigid_distance_error_max_A',
-                'rigid_head_weight_rms','atom_head_weight_rms',
-            ]:
+            if self.hierarchical_fullatom_mode:
+                summary_keys = [
+                    'translation_norm_A_p50','translation_norm_A_p95','translation_norm_A_p99','translation_norm_A_max',
+                    'rotation_angle_deg_p50','rotation_angle_deg_p95','rotation_angle_deg_p99','rotation_angle_deg_max',
+                    'internal_residual_norm_A_p50','internal_residual_norm_A_p95','internal_residual_norm_A_p99','internal_residual_norm_A_max',
+                    'backbone_internal_residual_norm_A_p50','backbone_internal_residual_norm_A_p95','backbone_internal_residual_norm_A_p99','backbone_internal_residual_norm_A_max',
+                    'sidechain_internal_residual_norm_A_p50','sidechain_internal_residual_norm_A_p95','sidechain_internal_residual_norm_A_p99','sidechain_internal_residual_norm_A_max',
+                    'final_backbone_internal_distance_change_A_p50','final_backbone_internal_distance_change_A_p95','final_backbone_internal_distance_change_A_p99','final_backbone_internal_distance_change_A_max',
+                    'atom_update_norm_A_p50','atom_update_norm_A_p95','atom_update_norm_A_p99','atom_update_norm_A_max',
+                    'frame_orthogonality_error_max','fixed_atom_update_absmax_A','ca_internal_update_absmax_A',
+                    'coarse_rigid_distance_error_max_A','rigid_head_weight_rms','internal_head_weight_rms',
+                ]
+            else:
+                summary_keys = [
+                    'translation_norm_A_p50','translation_norm_A_p95','translation_norm_A_p99','translation_norm_A_max',
+                    'rotation_angle_deg_p50','rotation_angle_deg_p95','rotation_angle_deg_p99','rotation_angle_deg_max',
+                    'sidechain_residual_norm_A_p50','sidechain_residual_norm_A_p95','sidechain_residual_norm_A_p99','sidechain_residual_norm_A_max',
+                    'atom_update_norm_A_p50','atom_update_norm_A_p95','atom_update_norm_A_p99','atom_update_norm_A_max',
+                    'frame_orthogonality_error_max','fixed_atom_update_absmax_A','backbone_rigid_distance_error_max_A',
+                    'rigid_head_weight_rms','atom_head_weight_rms',
+                ]
+            for key in summary_keys:
                 self.last_coord_diagnostics[f'actuator_{key}_max'] = self._max_diag(actuator_records, key, ref)
             self.last_coord_diagnostics['actuator_frame_valid_fraction_min'] = self._min_diag(
                 actuator_records, 'frame_valid_fraction', ref)
