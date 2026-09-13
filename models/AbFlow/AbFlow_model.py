@@ -233,13 +233,13 @@ class AbFlowModel(nn.Module):
         nn.init.zeros_(self.seq_pep_condition_adapter[-1].weight)
         nn.init.zeros_(self.seq_pep_condition_adapter[-1].bias)
 
-        # Lightweight trainer compatibility; no diagnostic branch is executed.
+        # Lightweight trainer diagnostics.  These tensors are observational
+        # only and are populated only on explicitly requested diagnostic steps.
         self.last_scorefm_losses = {}
         self.last_abflow_diagnostics = {}
         self._last_trunk_state = {}
         self._last_message_diagnostics = {}
         self._last_round_egnn_diagnostics = []
-        self.last_gradient_diagnostics = {}
         self.grad_conflict_diagnostics = False
         self._diagnostic_capture = False
         self._diagnostic_validation_mode = False
@@ -1417,11 +1417,6 @@ class AbFlowModel(nn.Module):
         return (loss, (snll, aar), (struct_loss, *struct_details),
                 (dock_loss, interface_loss, ed_loss, r_ed_losses),
                 (pdev_loss, prmsd_loss))
-
-    def compute_gradient_conflict_diagnostics(self):
-        self.last_gradient_diagnostics = {}
-        return {}
-
 
     def _sampling_time_grid(self, n_steps, device, dtype):
         return torch.linspace(0.0, 1.0, max(1, int(n_steps)) + 1,

@@ -123,27 +123,10 @@ class AbFlowTrainer(Trainer):
         # complete stdout/stderr stream into version_0/run_time.log, so we do not
         # maintain a second fragmented metrics/latest/alerts file tree.
         self._diag_main_rank = int(getattr(self.config, "local_rank", -1)) in {-1, 0}
-        requested_grad_interval = _env_int("ABFLOW_GRAD_DIAGNOSTIC_INTERVAL", 0)
-        actual_train_steps = max(1, len(self.train_loader))
-        self._diag_grad_interval = (
-            actual_train_steps
-            if requested_grad_interval <= 0
-            else max(1, requested_grad_interval)
-        )
-        # V207.1 two-stage Distogram connectivity contract.  The donor head uses
-        # init='final' (exactly zero projection weights), so dL_D/dz is expected
-        # to be zero before the first optimizer update even though the head is
-        # learnable.  Admit that cold start once; the next batch must demonstrate
-        # a live weighted L_distogram -> shared pair-z gradient on every rank.
-        self._live_pair_gradient_contract_verified = False
-        self._live_pair_gradient_cold_start_observed = False
-        self._live_smooth_lddt_pair_gradient_contract_verified = False
-        self._live_smooth_lddt_pair_gradient_cold_start_observed = False
+        # Diagnostic code must never gate or backpropagate through formal training.
+        # Retain only the ordinary-forward zero-start/live representation bridge.
         self._live_bridge_contract_verified = False
         self._bridge_cold_start_observed = False
-        self._grad_diag_enabled = _env_flag(
-            "ABFLOW_GRAD_CONFLICT_DIAGNOSTICS", False
-        )
         # V185: diagnostics-only cadence. First few steps verify the new
         # representation/time/edge routing without changing optimization.
         self._science_log_first_steps = max(0, _env_int(
@@ -1182,102 +1165,6 @@ class AbFlowTrainer(Trainer):
         )
 
 
-    def _print_loss_authority(self, grad_diagnostics):
-        if not self._is_main_proc() or not grad_diagnostics:
-            return
-        def g(name):
-            return self._scalar(grad_diagnostics.get(name))
-        print(
-            "[LossAuthority] "
-            f"epoch={self.epoch} step={self.global_step} "
-            f"|gT|={self._fmte(g('grad_probe_norm_endpoint'), 3)} "
-            f"|gS|={self._fmte(g('grad_probe_norm_seq'), 3)} "
-            f"|gStruct|={self._fmte(g('grad_probe_norm_structure'), 3)} "
-            f"|gEdge|={self._fmte(g('grad_probe_norm_edge'), 3)} "
-            f"|gD|={self._fmte(g('grad_probe_norm_distogram'), 3)} "
-            f"|gL|={self._fmte(g('grad_probe_norm_smooth_lddt'), 3)} "
-            f"cos(T,S)={self._fmt(g('grad_probe_cos_endpoint_seq'), 3)} "
-            f"cos(S,Struct)={self._fmt(g('grad_probe_cos_seq_structure'), 3)} "
-            f"cos(T,D)={self._fmt(g('grad_probe_cos_endpoint_distogram'), 3)} "
-            f"cos(S,D)={self._fmt(g('grad_probe_cos_seq_distogram'), 3)} "
-            f"cos(Struct,D)={self._fmt(g('grad_probe_cos_structure_distogram'), 3)} "
-            f"cos(T,L)={self._fmt(g('grad_probe_cos_endpoint_smooth_lddt'), 3)} "
-            f"cos(Struct,L)={self._fmt(g('grad_probe_cos_structure_smooth_lddt'), 3)}"
-        )
-        raw_model = self.model.module if hasattr(self.model, "module") else self.model
-        weights = {
-            "endpoint": float(getattr(raw_model, "loss_interface_weight", 1.0)),
-            "seq": float(getattr(raw_model, "loss_sequence_weight", 1.0)),
-            "structure": float(getattr(raw_model, "loss_structure_weight", 1.0)),
-            "edge": float(getattr(raw_model, "loss_edge_weight", 1.0)),
-            "distogram": float(getattr(raw_model, "loss_distogram_weight", 0.0)),
-            "smooth_lddt": float(getattr(raw_model, "loss_smooth_lddt_weight", 0.0)),
-        }
-        gT = g("grad_probe_norm_endpoint")
-        wT = weights["endpoint"]
-
-        def ratio(name):
-            gx = g(f"grad_probe_norm_{name}")
-            if gx is None or gT is None or abs(float(gT)) <= 1.0e-20:
-                return None
-            return float(gx) / float(gT)
-
-        def unit_ratio(name):
-            gx = g(f"grad_probe_norm_{name}")
-            wx = weights[name]
-            if (
-                gx is None or gT is None or abs(float(gT)) <= 1.0e-20
-                or abs(float(wx)) <= 1.0e-20 or abs(float(wT)) <= 1.0e-20
-            ):
-                return None
-            return (float(gx) / float(wx)) / (float(gT) / float(wT))
-
-        print(
-            "[LossAuthorityNormalized] "
-            f"epoch={self.epoch} step={self.global_step} "
-            f"A_S/T={self._fmt(ratio('seq'), 4)} "
-            f"A_Struct/T={self._fmt(ratio('structure'), 4)} "
-            f"A_Edge/T={self._fmt(ratio('edge'), 4)} "
-            f"A_D/T={self._fmt(ratio('distogram'), 4)} "
-            f"A_L/T={self._fmt(ratio('smooth_lddt'), 4)} "
-            f"unit_S/T={self._fmt(unit_ratio('seq'), 4)} "
-            f"unit_Struct/T={self._fmt(unit_ratio('structure'), 4)} "
-            f"unit_Edge/T={self._fmt(unit_ratio('edge'), 4)} "
-            f"unit_D/T={self._fmt(unit_ratio('distogram'), 4)} "
-            f"unit_L/T={self._fmt(unit_ratio('smooth_lddt'), 4)} "
-            f"weights=T:{weights['endpoint']:.4g},S:{weights['seq']:.4g},"
-            f"Struct:{weights['structure']:.4g},Edge:{weights['edge']:.4g},"
-            f"D:{weights['distogram']:.4g},L:{weights['smooth_lddt']:.4g}"
-        )
-        # Distogram and the generator share AbX z, not the later R05 H_0 probe.
-        # Ratios below are therefore mathematically comparable on one tensor.
-        gz_d = g("grad_pair_norm_distogram")
-        gz_l = g("grad_pair_norm_smooth_lddt")
-        gz_t = g("grad_pair_norm_endpoint")
-        gz_s = g("grad_pair_norm_structure")
-        ratio_dt = None if gz_d is None or gz_t is None or abs(gz_t) <= 1e-20 else gz_d / gz_t
-        ratio_ds = None if gz_d is None or gz_s is None or abs(gz_s) <= 1e-20 else gz_d / gz_s
-        ratio_lt = None if gz_l is None or gz_t is None or abs(gz_t) <= 1e-20 else gz_l / gz_t
-        ratio_ls = None if gz_l is None or gz_s is None or abs(gz_s) <= 1e-20 else gz_l / gz_s
-        if any(v is not None for v in (gz_d, gz_l, gz_t, gz_s)):
-            print(
-                "[PairLossAuthority] "
-                f"epoch={self.epoch} step={self.global_step} probe=z "
-                f"|gD|={self._fmte(gz_d, 3)} "
-                f"|gL|={self._fmte(gz_l, 3)} "
-                f"|gT|={self._fmte(gz_t, 3)} "
-                f"|gStruct|={self._fmte(gz_s, 3)} "
-                f"D/T={self._fmt(ratio_dt, 4)} "
-                f"D/Struct={self._fmt(ratio_ds, 4)} "
-                f"L/T={self._fmt(ratio_lt, 4)} "
-                f"L/Struct={self._fmt(ratio_ls, 4)} "
-                f"cos(D,T)={self._fmt(g('grad_pair_cos_distogram_endpoint'), 4)} "
-                f"cos(D,Struct)={self._fmt(g('grad_pair_cos_distogram_structure'), 4)} "
-                f"cos(L,T)={self._fmt(g('grad_pair_cos_smooth_lddt_endpoint'), 4)} "
-                f"cos(L,Struct)={self._fmt(g('grad_pair_cos_smooth_lddt_structure'), 4)}"
-            )
-
-
     def _accumulate_train_component(self, name, value):
         scalar = self._scalar(value)
         if scalar is None or not isfinite(scalar):
@@ -1436,58 +1323,14 @@ class AbFlowTrainer(Trainer):
                 f"best_val_epoch={row['best_val_epoch']} best_val={self._fmt(row['best_val_loss'], 5)}"
             )
 
-    def _requires_live_pair_gradient_contract(self):
-        raw_model = self.model.module if hasattr(self.model, "module") else self.model
-        return bool(
-            getattr(raw_model, "relational_trunk_enabled", False)
-            and getattr(raw_model, "distogram_enabled", False)
-            and abs(float(getattr(raw_model, "loss_distogram_weight", 0.0))) > 0.0
-        )
-
     def _requires_live_bridge_contract(self):
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
         return bool(getattr(raw_model, "relational_trunk_enabled", False))
 
-    def _requires_live_smooth_lddt_pair_gradient_contract(self):
-        raw_model = self.model.module if hasattr(self.model, "module") else self.model
-        return bool(
-            getattr(raw_model, "relational_trunk_enabled", False)
-            and getattr(raw_model, "smooth_lddt_enabled", False)
-            and abs(float(getattr(raw_model, "loss_smooth_lddt_weight", 0.0))) > 0.0
-        )
-
-    def _should_probe_grad(self, val):
-        # R29/R30 get immediate pair-z connectivity probes. After the active
-        # auxiliary passes, interval=0 returns to once-per-epoch authority audit.
-        if (
-            (not val)
-            and self._grad_diag_enabled
-            and (
-                (
-                    self._requires_live_pair_gradient_contract()
-                    and not self._live_pair_gradient_contract_verified
-                )
-                or (
-                    self._requires_live_smooth_lddt_pair_gradient_contract()
-                    and not self._live_smooth_lddt_pair_gradient_contract_verified
-                )
-            )
-        ):
-            return True
-        step = int(self.global_step)
-        return (
-            (not val)
-            and self._grad_diag_enabled
-            and step > 0
-            and step % self._diag_grad_interval == 0
-        )
-
     def share_step(self, batch, batch_idx, val=False):
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
-        # Validation always captures the model-side diagnostics needed for the
-        # epoch mechanism audit.  Training captures them only for the periodic
-        # gradient-authority probe.  No per-step diagnostic files are written.
-        probe_grad_now = self._should_probe_grad(val)
+        # Validation captures epoch diagnostics. Training captures diagnostics
+        # only at the compact science cadence or for the zero-start bridge check.
         science_step_diag = (not val) and (
             int(self.global_step) < self._science_log_first_steps
             or (self._science_log_interval > 0 and int(self.global_step) % self._science_log_interval == 0)
@@ -1498,7 +1341,7 @@ class AbFlowTrainer(Trainer):
             and not self._live_bridge_contract_verified
         )
         capture_diagnostics = (
-            bool(val) or probe_grad_now or science_step_diag or bridge_contract_probe
+            bool(val) or science_step_diag or bridge_contract_probe
         )
         raw_model._diagnostic_capture = bool(capture_diagnostics)
         raw_model._diagnostic_validation_mode = bool(val and capture_diagnostics)
@@ -1707,227 +1550,6 @@ class AbFlowTrainer(Trainer):
                     + " ".join(meta)
                 )
 
-        if probe_grad_now and hasattr(raw_model, "compute_gradient_conflict_diagnostics"):
-            raw_model.compute_gradient_conflict_diagnostics()
-            grad_error = str(getattr(raw_model, "_last_gradient_diagnostic_error", "") or "")
-            if grad_error and self._diag_main_rank:
-                print(
-                    f"[LossAuthority][ERROR] epoch={self.epoch} "
-                    f"step={self.global_step} {grad_error}"
-                )
-        else:
-            raw_model.last_gradient_diagnostics = {}
-
-        # V211 retains the V207.1 two-stage fail-fast Distogram contract.
-        #
-        # AbX initializes the Distogram projection with init='final', i.e. W=0.
-        # Before the first optimizer update the chain rule therefore gives
-        #
-        #     dL_D/dz = W^T dL_D/dlogits = 0,
-        #
-        # which is a correct donor cold start, not a detached graph.  We admit
-        # exactly one such batch only when W=0, the CE is finite, and resolved
-        # supervision contains valid pairs.  Because the trainer updates W after
-        # this share_step returns, the next batch must have finite non-zero
-        # dL_D/dz on every DDP rank or the run is genuinely invalid.
-        if (
-            probe_grad_now
-            and self._requires_live_pair_gradient_contract()
-            and not self._live_pair_gradient_contract_verified
-        ):
-            grad_diag = getattr(raw_model, "last_gradient_diagnostics", None) or {}
-            gd_value = grad_diag.get("grad_pair_norm_distogram")
-            gd_scalar = self._scalar(gd_value)
-            local_live = bool(
-                gd_scalar is not None
-                and isfinite(float(gd_scalar))
-                and float(gd_scalar) > 1.0e-12
-            )
-
-            scorefm_now = getattr(raw_model, "last_scorefm_losses", None) or {}
-            raw_disto = self._scalar(scorefm_now.get("distogram_loss"))
-            valid_pairs = self._scalar(scorefm_now.get("distogram_valid_pairs"))
-            head = getattr(getattr(raw_model, "native_trunk", None), "distogram_head", None)
-            projection = getattr(head, "proj", None)
-            head_parameter_norm = None
-            if isinstance(projection, torch.nn.Module):
-                parameter_energy = [
-                    parameter.detach().float().square().sum()
-                    for parameter in projection.parameters()
-                ]
-                if parameter_energy:
-                    head_parameter_norm = float(
-                        torch.sqrt(torch.stack(parameter_energy).sum()).cpu().item()
-                    )
-            local_cold_start = bool(
-                not self._live_pair_gradient_cold_start_observed
-                and gd_scalar is not None
-                and isfinite(float(gd_scalar))
-                and abs(float(gd_scalar)) <= 1.0e-12
-                and head_parameter_norm is not None
-                and isfinite(float(head_parameter_norm))
-                and float(head_parameter_norm) <= 1.0e-12
-                and raw_disto is not None
-                and isfinite(float(raw_disto))
-                and valid_pairs is not None
-                and isfinite(float(valid_pairs))
-                and float(valid_pairs) > 0.0
-            )
-
-            # Every DDP rank must agree on either LIVE or the single permitted
-            # COLD_START state. Mixed rank states are a real contract failure.
-            if torch.is_tensor(loss):
-                state_tensor = loss.detach().new_tensor(
-                    [1 if local_live else 0, 1 if local_cold_start else 0],
-                    dtype=torch.int32,
-                )
-            else:
-                state_tensor = torch.tensor(
-                    [1 if local_live else 0, 1 if local_cold_start else 0],
-                    dtype=torch.int32,
-                )
-            if dist.is_available() and dist.is_initialized():
-                dist.all_reduce(state_tensor, op=dist.ReduceOp.MIN)
-            states = state_tensor.detach().cpu().tolist()
-            global_live = bool(int(states[0]) == 1)
-            global_cold_start = bool(int(states[1]) == 1)
-
-            if global_live:
-                self._live_pair_gradient_contract_verified = True
-                if self._diag_main_rank:
-                    print(
-                        "[LivePairGradientContract] "
-                        f"epoch={self.epoch} step={self.global_step} PASS "
-                        f"|gD_dz|={self._fmte(gd_scalar, 6)} "
-                        f"head_parameter_norm={self._fmte(head_parameter_norm, 6)} "
-                        "probe=shared_pair_z all_ranks=PASS"
-                    )
-            elif global_cold_start:
-                self._live_pair_gradient_cold_start_observed = True
-                if self._diag_main_rank:
-                    print(
-                        "[DistogramColdStartContract] "
-                        f"epoch={self.epoch} step={self.global_step} PASS "
-                        "donor_final_init=W0 expected_|dL_D/dz|=0 "
-                        f"|gD_dz|={self._fmte(gd_scalar, 6)} "
-                        f"head_parameter_norm={self._fmte(head_parameter_norm, 6)} "
-                        f"raw_loss={self._fmte(raw_disto, 6)} "
-                        f"valid_pairs={self._fmt(valid_pairs, 0)} "
-                        "next_batch_requires_live_pair_z=1"
-                    )
-            else:
-                raise RuntimeError(
-                    "V211_ABX_DISTOGRAM_TWO_STAGE contract failed: the run is "
-                    "neither a valid donor zero-initialized cold start nor a live "
-                    "weighted Distogram -> shared pair-z path. "
-                    f"step={self.global_step}, |gD_dz|={gd_scalar}, "
-                    f"head_parameter_norm={head_parameter_norm}, raw_loss={raw_disto}, "
-                    f"valid_pairs={valid_pairs}, "
-                    f"cold_start_seen={self._live_pair_gradient_cold_start_observed}."
-                )
-
-        # V211 uses an exact parent-preserving zero-start Pair adapter.  Thus
-        # smooth-lDDT is validly connected to final coordinates while dL/dz is
-        # mathematically zero on the first batch (W_z=0).  Admit this state once
-        # only; after the optimizer learns W_z, the next batch must prove a live
-        # weighted smooth-lDDT -> shared z path on every rank.
-        if (
-            probe_grad_now
-            and self._requires_live_smooth_lddt_pair_gradient_contract()
-            and not self._live_smooth_lddt_pair_gradient_contract_verified
-        ):
-            grad_diag = getattr(raw_model, "last_gradient_diagnostics", None) or {}
-            gl_scalar = self._scalar(grad_diag.get("grad_pair_norm_smooth_lddt"))
-            scorefm_now = getattr(raw_model, "last_scorefm_losses", None) or {}
-            raw_lddt = self._scalar(scorefm_now.get("smooth_lddt_loss"))
-            valid_pairs = self._scalar(
-                scorefm_now.get("smooth_lddt_support_weight")
-            )
-            local_live = bool(
-                gl_scalar is not None
-                and isfinite(float(gl_scalar))
-                and float(gl_scalar) > 1.0e-12
-                and raw_lddt is not None
-                and isfinite(float(raw_lddt))
-                and valid_pairs is not None
-                and isfinite(float(valid_pairs))
-                and float(valid_pairs) > 0.0
-            )
-
-            pair_adapter_energy = []
-            for name, parameter in raw_model.named_parameters():
-                if name.endswith("edge_attr_linear.weight"):
-                    pair_adapter_energy.append(
-                        parameter.detach().float().square().sum()
-                    )
-            pair_adapter_norm = (
-                float(torch.sqrt(torch.stack(pair_adapter_energy).sum()).cpu().item())
-                if pair_adapter_energy else None
-            )
-            local_cold_start = bool(
-                not self._live_smooth_lddt_pair_gradient_cold_start_observed
-                and gl_scalar is not None
-                and isfinite(float(gl_scalar))
-                and abs(float(gl_scalar)) <= 1.0e-12
-                and pair_adapter_norm is not None
-                and isfinite(float(pair_adapter_norm))
-                and float(pair_adapter_norm) <= 1.0e-12
-                and raw_lddt is not None
-                and isfinite(float(raw_lddt))
-                and valid_pairs is not None
-                and isfinite(float(valid_pairs))
-                and float(valid_pairs) > 0.0
-            )
-            state_tensor = loss.detach().new_tensor(
-                [1 if local_live else 0, 1 if local_cold_start else 0],
-                dtype=torch.int32,
-            ) if torch.is_tensor(loss) else torch.tensor(
-                [1 if local_live else 0, 1 if local_cold_start else 0],
-                dtype=torch.int32,
-            )
-            if dist.is_available() and dist.is_initialized():
-                dist.all_reduce(state_tensor, op=dist.ReduceOp.MIN)
-            states = state_tensor.detach().cpu().tolist()
-            global_live = bool(int(states[0]) == 1)
-            global_cold_start = bool(int(states[1]) == 1)
-            if global_live:
-                self._live_smooth_lddt_pair_gradient_contract_verified = True
-                if self._diag_main_rank:
-                    print(
-                        "[LiveSmoothLDDTPairGradientContract] "
-                        f"epoch={self.epoch} step={self.global_step} PASS "
-                        f"|gL_dz|={self._fmte(gl_scalar, 6)} "
-                        f"pair_adapter_norm={self._fmte(pair_adapter_norm, 6)} "
-                        f"raw_loss={self._fmte(raw_lddt, 6)} "
-                        f"valid_pairs={self._fmt(valid_pairs, 0)} "
-                        "probe=shared_pair_z all_ranks=PASS"
-                    )
-            elif global_cold_start:
-                self._live_smooth_lddt_pair_gradient_cold_start_observed = True
-                if self._diag_main_rank:
-                    print(
-                        "[SmoothLDDTBridgeColdStartContract] "
-                        f"epoch={self.epoch} step={self.global_step} PASS "
-                        "parent_preserving_Wz0 expected_|dL/dz|=0 "
-                        f"|gL_dz|={self._fmte(gl_scalar, 6)} "
-                        f"pair_adapter_norm={self._fmte(pair_adapter_norm, 6)} "
-                        f"raw_loss={self._fmte(raw_lddt, 6)} "
-                        f"valid_pairs={self._fmt(valid_pairs, 0)} "
-                        "next_batch_requires_live_pair_z=1"
-                    )
-            else:
-                raise RuntimeError(
-                    "V211_MF_SMOOTH_LDDT_TWO_STAGE contract failed: the run is "
-                    "neither the single permitted zero-adapter cold start nor "
-                    "a live weighted smooth-lDDT -> shared Pair z path, or it "
-                    "has no valid resolved design "
-                    f"pairs. step={self.global_step}, |gL_dz|={gl_scalar}, "
-                    f"pair_adapter_norm={pair_adapter_norm}, "
-                    f"raw_loss={raw_lddt}, valid_pairs={valid_pairs}, "
-                    "cold_start_seen="
-                    f"{self._live_smooth_lddt_pair_gradient_cold_start_observed}."
-                )
-
         # Common R28/R29/R30 bridge contract.  Step 0 must be the exact R05
         # function (zero Single and Pair deltas); after one optimizer update,
         # both donor routes must be measurably active.  This makes a detached or
@@ -2121,10 +1743,6 @@ class AbFlowTrainer(Trainer):
         for name, value in abflow_diagnostics.items():
             self.log(f"AbFlowDiag/{name}/{log_type}", value, batch_idx, val)
 
-        grad_diagnostics = getattr(raw_model, "last_gradient_diagnostics", None) or {}
-        for name, value in grad_diagnostics.items():
-            self.log(f"GradientDiag/{name}/{log_type}", value, batch_idx, val)
-
         if not val and (
             int(self.global_step) < self._science_log_first_steps
             or (self._science_log_interval > 0 and int(self.global_step) % self._science_log_interval == 0)
@@ -2176,35 +1794,31 @@ class AbFlowTrainer(Trainer):
                     f"DF={self._fmt(_sf('smooth_lddt_DF'), 5)} "
                     f"DA={self._fmt(_sf('smooth_lddt_DA'), 5)}"
                 )
-        if probe_grad_now:
-            if (not val) and self._diag_main_rank:
-                def _ad(name):
-                    return self._scalar(abflow_diagnostics.get(name))
-                print(
-                    "[SequencePathAudit:Train] "
-                    f"epoch={self.epoch} step={self.global_step} "
-                    f"configured_context={self._fmt(batch.get('context_ratio'), 4)} "
-                    f"exact={self._fmt(_ad('sequence_path_contract_exact'), 0)} "
-                    f"path_design={self._fmt(_ad('sequence_path_participation_rate'), 4)} "
-                    f"external_native={self._fmt(_ad('sequence_external_native_context_rate'), 4)} "
-                    f"noisy_branch={self._fmt(_ad('sequence_noisy_branch_rate'), 4)} "
-                    f"clean_branch={self._fmt(_ad('sequence_clean_branch_rate'), 4)} "
-                    f"state_native={self._fmt(_ad('sequence_state_native_fraction'), 4)} "
-                    f"loss_design={self._fmt(_ad('sequence_loss_coverage_design'), 4)} "
-                    f"loss_on_noisy={self._fmt(_ad('sequence_loss_on_noisy_precision'), 4)}"
-                )
+        if science_step_diag and self._diag_main_rank:
+            def _ad_science(name):
+                return self._scalar(abflow_diagnostics.get(name))
+            print(
+                "[SequencePathAudit:Train] "
+                f"epoch={self.epoch} step={self.global_step} "
+                f"configured_context={self._fmt(batch.get('context_ratio'), 4)} "
+                f"exact={self._fmt(_ad_science('sequence_path_contract_exact'), 0)} "
+                f"path_design={self._fmt(_ad_science('sequence_path_participation_rate'), 4)} "
+                f"external_native={self._fmt(_ad_science('sequence_external_native_context_rate'), 4)} "
+                f"noisy_branch={self._fmt(_ad_science('sequence_noisy_branch_rate'), 4)} "
+                f"clean_branch={self._fmt(_ad_science('sequence_clean_branch_rate'), 4)} "
+                f"state_native={self._fmt(_ad_science('sequence_state_native_fraction'), 4)} "
+                f"loss_design={self._fmt(_ad_science('sequence_loss_coverage_design'), 4)} "
+                f"loss_on_noisy={self._fmt(_ad_science('sequence_loss_on_noisy_precision'), 4)}"
+            )
             module_diag = getattr(raw_model, 'last_r05_module_diagnostics', {})
             if module_diag:
-                print('[R05ModuleAudit:Train] epoch='+str(self.epoch)+' '+
-                      ' '.join(k+'='+self._fmt(self._scalar(v), 5)
-                               for k,v in sorted(module_diag.items())))
-            self._print_loss_authority(grad_diagnostics)
-            # autograd.grad creates temporary per-objective gradient tensors.
-            # They are observational only; release their cached CUDA blocks once
-            # the probe has been materialized/logged so rank-specific diagnostics
-            # do not become a persistent memory asymmetry.
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                print(
+                    '[R05ModuleAudit:Train] epoch=' + str(self.epoch) + ' ' +
+                    ' '.join(
+                        k + '=' + self._fmt(self._scalar(v), 5)
+                        for k, v in sorted(module_diag.items())
+                    )
+                )
 
         lr = None
         if not val:

@@ -176,11 +176,6 @@ export ABFLOW_GEOMETRY_AUTHORITY_BASE_ALERT="${ABFLOW_GEOMETRY_AUTHORITY_BASE_AL
 export ABFLOW_GEOMETRY_AUTHORITY_UPDATE_ALERT="${ABFLOW_GEOMETRY_AUTHORITY_UPDATE_ALERT:-500}"
 export ABFLOW_GEOMETRY_AUTHORITY_ALERT_MAX_PER_EPOCH="${ABFLOW_GEOMETRY_AUTHORITY_ALERT_MAX_PER_EPOCH:-3}"
 
-# Missing causal information in R50/R51/R52: gradient authority.
-# interval=0 is interpreted by trainer as once per epoch after the cold/live
-# connectivity contract is satisfied.
-export ABFLOW_GRAD_CONFLICT_DIAGNOSTICS="${ABFLOW_GRAD_CONFLICT_DIAGNOSTICS:-on}"
-export ABFLOW_GRAD_DIAGNOSTIC_INTERVAL="${ABFLOW_GRAD_DIAGNOSTIC_INTERVAL:-0}"
 
 # Log hygiene.
 export ABFLOW_TQDM="${ABFLOW_TQDM:-off}"
@@ -204,7 +199,7 @@ echo "[RunVersion] fixed_version=$VERSION dir=$RUN_DIR"
 echo "[RunConfig] config=$CONFIG_PATH"
 echo "[RunResources] physical_gpus=$GPU_CSV nproc=$NPROC global_batch=$GLOBAL_BATCH_SIZE local_batch=$LOCAL_BATCH_SIZE master_addr=$MASTER_ADDR port=$MASTER_PORT nnodes=$NNODES omp=$OMP_THREADS"
 echo "[RunResume] checkpoint=${RESUME_CHECKPOINT:-scratch}"
-echo "[Diagnostics] controller_interval=$ABFLOW_COORD_AUDIT_INTERVAL first_steps=$ABFLOW_COORD_AUDIT_FIRST_STEPS grad_authority=$ABFLOW_GRAD_CONFLICT_DIAGNOSTICS geometry_periodic=off geometry_alert_A=$ABFLOW_GEOMETRY_AUTHORITY_UPDATE_ALERT tqdm=$ABFLOW_TQDM"
+echo "[Diagnostics] controller_interval=$ABFLOW_COORD_AUDIT_INTERVAL first_steps=$ABFLOW_COORD_AUDIT_FIRST_STEPS grad_authority=disabled geometry_periodic=off geometry_alert_A=$ABFLOW_GEOMETRY_AUTHORITY_UPDATE_ALERT tqdm=$ABFLOW_TQDM"
 echo "[TrainValTestContract] order=train->validation->test checkpoint_selection=validation test_metrics=observation_only test_steps=10 test_seed=2023 infra_fail_fast=$ABFLOW_EPOCH_TEST_FAIL_FAST model_invalid=$ABFLOW_EPOCH_TEST_MODEL_INVALID_POLICY"
 
 # Fail before GPU training on protocol/provenance regressions.
