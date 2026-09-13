@@ -59,7 +59,6 @@ class AbFlowModel(nn.Module):
         flow_config = r05_config.get("flow", {})
         r3_config = r05_config.get("r3", {})
         representation_config = model_config.get("representation", {}).get("single_pair", {})
-        geometry_config = representation_config.get("geometry", {})
         pair_coord_config = representation_config.get("pair_coordinate", {})
         self.pair_coord_mode = str(
             pair_coord_config.get("mode", "bounded_residual")
@@ -68,18 +67,18 @@ class AbFlowModel(nn.Module):
             pair_coord_config.get("delta_bound", 1.0)
         )
 
-        # V217 geometry semantics. The formal path no longer grants Cartesian
-        # authority to edge coefficients. Pair/single geometry first updates the
-        # invariant residue state; a zero-initialized N-CA-C local-frame actuator
-        # then predicts a coarse rigid pose plus full-atom local internal correction.
-        # Legacy modes remain solely for historical checkpoint/config reproducibility.
+        # V218 formal controller: restore the R05 EGNN Cartesian recurrence and
+        # keep Pair as a first-class edge condition, but separate distance
+        # magnitude from Cartesian action.  Raw distances remain in the radial
+        # representation while the final equivariant basis is a differentiable
+        # unit direction.  The scalar field is not tanh/clamped/rescaled.
         coord_controller = representation_config.get("coordinate_controller", {})
         self.coord_controller_mode = str(
             coord_controller.get("mode", "legacy_unbounded")
         ).strip().lower()
         _coord_controller_modes = {
             "legacy_unbounded", "egnn_tanh", "egnn_tanh_normalized",
-            "local_frame_fullatom_affine", "local_frame_hierarchical_fullatom",
+            "egnn_unit_direction",
         }
         if self.coord_controller_mode not in _coord_controller_modes:
             raise ValueError(
@@ -88,38 +87,14 @@ class AbFlowModel(nn.Module):
                 f"{self.coord_controller_mode!r}."
             )
         self.coord_tanh = self.coord_controller_mode in {"egnn_tanh", "egnn_tanh_normalized"}
-        self.coord_normalize = self.coord_controller_mode == "egnn_tanh_normalized"
-        self.local_frame_actuator = self.coord_controller_mode in {
-            "local_frame_fullatom_affine", "local_frame_hierarchical_fullatom"
+        self.coord_normalize = self.coord_controller_mode in {
+            "egnn_tanh_normalized", "egnn_unit_direction"
         }
-        self.hierarchical_fullatom_actuator = (
-            self.coord_controller_mode == "local_frame_hierarchical_fullatom"
-        )
-        self.local_frame_eps = float(geometry_config.get("frame_eps", 1.0e-6))
-        self.local_coordinate_scale = float(geometry_config.get("local_coordinate_scale", 0.1))
-        if self.local_frame_actuator:
-            if str(geometry_config.get("frame", "")).strip().lower() != "diffab_n_ca_c_local":
-                raise ValueError(
-                    f"{self.coord_controller_mode} requires geometry.frame=diffab_n_ca_c_local"
-                )
-            if self.pair_coord_mode != "representation_only":
-                raise ValueError(
-                    f"{self.coord_controller_mode} requires pair_coordinate.mode=representation_only; "
-                    "Pair may condition invariant state but must not own a direct Cartesian edge head."
-                )
-            if self.hierarchical_fullatom_actuator:
-                expected = {
-                    "coarse_pose": "zero_init_local_rigid",
-                    "internal_coordinates": "all_observed_except_ca",
-                    "internal_conditioning": "residue_state+atom_embedding+current_local_coordinate",
-                    "ca_role": "frame_origin_translation_only",
-                }
-                for key, value in expected.items():
-                    got = str(coord_controller.get(key, "") or "").strip().lower()
-                    if got != value:
-                        raise ValueError(
-                            f"V217 requires coordinate_controller.{key}={value!r}; got {got!r}."
-                        )
+        if self.coord_controller_mode == "egnn_unit_direction" and self.pair_coord_mode != "direct_shared":
+            raise ValueError(
+                "V218 egnn_unit_direction requires pair_coordinate.mode='direct_shared': "
+                "Pair must condition the actual EGNN edge message used by both node and coordinate updates."
+            )
 
         atom_embed_size = embed_size // 4
         self.aa_feature = SeparatedAminoAcidFeature(
@@ -145,8 +120,7 @@ class AbFlowModel(nn.Module):
                 embed_size, hidden_size, hidden_size, self.n_channel,
                 channel_nf=atom_embed_size, radial_nf=hidden_size,
                 in_edge_nf=0, n_layers=n_layers, residual=True,
-                dropout=dropout, dense=False,
-                update_coords=not self.local_frame_actuator)
+                dropout=dropout, dense=False)
 
         if struct_only:
             self.prmsd_ffn = nn.Sequential(
@@ -212,10 +186,7 @@ class AbFlowModel(nn.Module):
             dropout=dropout, dense=False,
             pair_coord_mode=self.pair_coord_mode,
             pair_coord_delta_bound=self.pair_coord_delta_bound,
-            coord_tanh=self.coord_tanh, coord_normalize=self.coord_normalize,
-            coord_controller_mode=self.coord_controller_mode,
-            frame_eps=self.local_frame_eps,
-            coordinate_scale=self.local_coordinate_scale)
+            coord_tanh=self.coord_tanh, coord_normalize=self.coord_normalize)
 
         self.normalizer = SeperatedCoordNormalizer()
         self.batch_constants = {}
@@ -231,14 +202,6 @@ class AbFlowModel(nn.Module):
         )
 
         self.flow_coordinate_scaling = float(r3_config["coordinate_scaling"])
-        if self.local_frame_actuator and not math.isclose(
-                self.local_coordinate_scale, self.flow_coordinate_scaling,
-                rel_tol=0.0, abs_tol=1.0e-12):
-            raise ValueError(
-                "V217 local-frame modes require one coordinate-scale authority: "
-                "representation.geometry.local_coordinate_scale must equal "
-                "model.r05.r3.coordinate_scaling."
-            )
         self.r3_fixed_g_scaled = float(r3_config["fixed_g_scaled"])
         self.f01_hybrid_t_min = float(flow_config["hybrid_t_min"])
         self.proposal_adapter_start_round = int(
@@ -304,10 +267,6 @@ class AbFlowModel(nn.Module):
             'coord_controller_mode': self.coord_controller_mode,
             'coord_tanh': self.coord_tanh,
             'coord_normalize': self.coord_normalize,
-            'local_frame_actuator': self.local_frame_actuator,
-            'hierarchical_fullatom_actuator': self.hierarchical_fullatom_actuator,
-            'local_coordinate_scale': self.local_coordinate_scale,
-            'fixed_context_per_stage': self.local_frame_actuator,
         }
 
     @staticmethod
@@ -321,7 +280,12 @@ class AbFlowModel(nn.Module):
             return float('nan')
 
     def _maybe_log_coordinate_controller_audit(self, round_egnn_diagnostics):
-        """Detached rank-0 audit for legacy and local-frame geometry actions."""
+        """Rank-0 observational audit of the EGNN Cartesian control contract.
+
+        V218 records raw distance, unit-direction norm, full pair-conditioned
+        scalar authority, the direct Pair contribution, and realized coordinate
+        updates.  The audit is detached and never changes the objective.
+        """
         if not self.training or not self.geometry_forensics_enabled:
             return
         call = int(self._coord_audit_train_call)
@@ -331,83 +295,13 @@ class AbFlowModel(nn.Module):
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             if torch.distributed.get_rank() != 0:
                 return
-        fmt=lambda v: 'nan' if not math.isfinite(v) else f'{v:.6g}'
-
-        if self.hierarchical_fullatom_actuator:
-            rows=[]
-            for rec in (round_egnn_diagnostics or []):
-                d=rec.get('coord', {}) or {}
-                rows.append((
-                    int(rec.get('round_idx', len(rows))),
-                    self._coord_diag_scalar(d, 'actuator_translation_norm_A_p99_max'),
-                    self._coord_diag_scalar(d, 'actuator_translation_norm_A_max_max'),
-                    self._coord_diag_scalar(d, 'actuator_rotation_angle_deg_p99_max'),
-                    self._coord_diag_scalar(d, 'actuator_internal_residual_norm_A_p99_max'),
-                    self._coord_diag_scalar(d, 'actuator_backbone_internal_residual_norm_A_p99_max'),
-                    self._coord_diag_scalar(d, 'actuator_sidechain_internal_residual_norm_A_p99_max'),
-                    self._coord_diag_scalar(d, 'actuator_atom_update_norm_A_p99_max'),
-                    self._coord_diag_scalar(d, 'actuator_atom_update_norm_A_max_max'),
-                    self._coord_diag_scalar(d, 'actuator_movable_frame_valid_fraction_min'),
-                    self._coord_diag_scalar(d, 'actuator_fixed_atom_update_absmax_A_max'),
-                    self._coord_diag_scalar(d, 'actuator_ca_internal_update_absmax_A_max'),
-                    self._coord_diag_scalar(d, 'actuator_coarse_rigid_distance_error_max_A_max'),
-                    self._coord_diag_scalar(d, 'actuator_final_backbone_internal_distance_change_A_p99_max'),
-                    self._coord_diag_scalar(d, 'actuator_rigid_head_weight_rms_max'),
-                    self._coord_diag_scalar(d, 'actuator_internal_head_weight_rms_max'),
-                ))
-            payload=';'.join(
-                f'r{r}:trans_p99_A={fmt(tp)} trans_max_A={fmt(tm)} rot_p99_deg={fmt(rp)} '
-                f'int_p99_A={fmt(ip)} bb_int_p99_A={fmt(bp)} sc_int_p99_A={fmt(sp)} '
-                f'atom_p99_A={fmt(ap)} atom_max_A={fmt(am)} frame_valid={fmt(fv)} '
-                f'fixed_update_A={fmt(fx)} ca_internal_A={fmt(ca)} coarse_rigid_err_A={fmt(re)} '
-                f'bb_internal_dchange_p99_A={fmt(bd)} rigid_w={fmt(rw)} internal_w={fmt(iw)}'
-                for r,tp,tm,rp,ip,bp,sp,ap,am,fv,fx,ca,re,bd,rw,iw in rows
-            )
-            print(
-                '[HierarchicalFullAtomActuatorAudit] '
-                f'train_call={call} mode={self.coord_controller_mode} {payload}',
-                flush=True,
-            )
-            return
-
-        if self.local_frame_actuator:
-            rows=[]
-            for rec in (round_egnn_diagnostics or []):
-                d=rec.get('coord', {}) or {}
-                rows.append((
-                    int(rec.get('round_idx', len(rows))),
-                    self._coord_diag_scalar(d, 'actuator_translation_norm_A_p99_max'),
-                    self._coord_diag_scalar(d, 'actuator_translation_norm_A_max_max'),
-                    self._coord_diag_scalar(d, 'actuator_rotation_angle_deg_p99_max'),
-                    self._coord_diag_scalar(d, 'actuator_sidechain_residual_norm_A_p99_max'),
-                    self._coord_diag_scalar(d, 'actuator_atom_update_norm_A_p99_max'),
-                    self._coord_diag_scalar(d, 'actuator_atom_update_norm_A_max_max'),
-                    self._coord_diag_scalar(d, 'actuator_movable_frame_valid_fraction_min'),
-                    self._coord_diag_scalar(d, 'actuator_fixed_atom_update_absmax_A_max'),
-                    self._coord_diag_scalar(d, 'actuator_backbone_rigid_distance_error_max_A_max'),
-                    self._coord_diag_scalar(d, 'actuator_rigid_head_weight_rms_max'),
-                    self._coord_diag_scalar(d, 'actuator_atom_head_weight_rms_max'),
-                ))
-            payload=';'.join(
-                f'r{r}:trans_p99_A={fmt(tp)} trans_max_A={fmt(tm)} rot_p99_deg={fmt(rp)} '
-                f'sc_p99_A={fmt(sp)} atom_p99_A={fmt(ap)} atom_max_A={fmt(am)} '
-                f'frame_valid={fmt(fv)} fixed_update_A={fmt(fx)} bb_rigid_err_A={fmt(be)} '
-                f'rigid_w={fmt(rw)} atom_w={fmt(aw)}'
-                for r,tp,tm,rp,sp,ap,am,fv,fx,be,rw,aw in rows
-            )
-            print(
-                '[LocalFrameActuatorAudit] '
-                f'train_call={call} mode={self.coord_controller_mode} {payload}',
-                flush=True,
-            )
-            return
-
         rows=[]
         for rec in (round_egnn_diagnostics or []):
             d=rec.get('coord', {}) or {}
             rows.append((
                 int(rec.get('round_idx', len(rows))),
-                self._coord_diag_scalar(d, 'coord_base_coeff_raw_absmax_max'),
+                self._coord_diag_scalar(d, 'coord_state_coeff_raw_absmax_max'),
+                self._coord_diag_scalar(d, 'coord_pair_delta_raw_absmax_max'),
                 self._coord_diag_scalar(d, 'coord_coeff_absmax_max'),
                 self._coord_diag_scalar(d, 'coord_diff_norm_absmax_max'),
                 self._coord_diag_scalar(d, 'coord_direction_norm_absmax_max'),
@@ -415,10 +309,12 @@ class AbFlowModel(nn.Module):
                 self._coord_diag_scalar(d, 'coord_update_absmax_max'),
                 self._coord_diag_scalar(d, 'coord_update_to_input_rms_ratio_max'),
             ))
+        fmt=lambda v: 'nan' if not math.isfinite(v) else f'{v:.6g}'
         payload=';'.join(
-            f'r{r}:raw_alpha={fmt(raw)} eff_alpha={fmt(eff)} raw_dnorm={fmt(dn)} '
-            f'dir_norm={fmt(un)} trans={fmt(tr)} update={fmt(up)} upd_in_rms={fmt(ur)}'
-            for r,raw,eff,dn,un,tr,up,ur in rows
+            f'r{r}:raw_alpha={fmt(raw)} pair_delta={fmt(pd)} eff_alpha={fmt(eff)} '
+            f'raw_dnorm={fmt(dn)} dir_norm={fmt(un)} trans={fmt(tr)} '
+            f'update={fmt(up)} upd_in_rms={fmt(ur)}'
+            for r,raw,pd,eff,dn,un,tr,up,ur in rows
         )
         print(
             '[CoordinateControllerAudit] '
@@ -800,8 +696,7 @@ class AbFlowModel(nn.Module):
                 edge_H, dummy_X = self.init_gnn(
                     H_0, X, ctx_edges, channel_attr=atom_embeddings,
                     channel_weights=atom_weights)
-                if not self.local_frame_actuator:
-                    X = X + 0.0 * dummy_X
+                X = X + 0.0 * dummy_X
             else:
                 edge_H = self.edge_H_ffn(memory_H)
 

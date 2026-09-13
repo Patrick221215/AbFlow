@@ -1,0 +1,209 @@
+{
+  "experiment": {
+    "id": "R49_R05_ABX_NATIVE_PAIR_EGNN_UNIT_DIRECTION_DISTOGRAM_LDDT_CARRIER_U02",
+    "parent": "R48_R05_ABX_NATIVE_PAIR_EGNN_UNIT_DIRECTION_DISTOGRAM_U02",
+    "factor": "R48 + design-localized smooth-lDDT 0.1 on exact sampler-carrier-implied endpoint",
+    "protocol": "formal_train_val_test"
+  },
+  "data": {
+    "train": {
+      "set": "./datasets/RAbD/train.json",
+      "pep": "./datasets/RAbD/train.pkl",
+      "surface": "./datasets/RAbD/train_surf.pkl"
+    },
+    "valid": {
+      "set": "./datasets/RAbD/valid.json",
+      "pep": "./datasets/RAbD/valid.pkl",
+      "surface": "./datasets/RAbD/valid_surf.pkl"
+    },
+    "test": {
+      "set": "./datasets/RAbD/test.json",
+      "pep": "./datasets/RAbD/test.pkl",
+      "surface": "./datasets/RAbD/test_surf.pkl"
+    },
+    "task": {
+      "cdr": [
+        "H3"
+      ],
+      "paratope": [
+        "H3"
+      ],
+      "num_verts": 50
+    }
+  },
+  "training": {
+    "output_dir": "./results_module/R49_R05_ABX_NATIVE_PAIR_EGNN_UNIT_DIRECTION_DISTOGRAM_LDDT_CARRIER_U02",
+    "optimizer": {
+      "lr": 0.001,
+      "final_lr": 0.0001,
+      "warmup": 0,
+      "grad_clip": 1.0
+    },
+    "schedule": {
+      "max_epoch": 200,
+      "patience": 1000,
+      "save_topk": 10,
+      "save_interval": 1,
+      "resume_checkpoint": ""
+    },
+    "loader": {
+      "batch_size": 20,
+      "shuffle": true,
+      "num_workers": 8,
+      "prefetch_factor": 4,
+      "valid_num_workers": 2,
+      "valid_prefetch_factor": 2,
+      "valid_persistent_workers": false
+    },
+    "precision": {
+      "amp": true,
+      "amp_dtype": "bf16",
+      "allow_tf32": true
+    },
+    "ema": {
+      "enabled": true,
+      "decay": 0.999
+    },
+    "logging": {
+      "log_interval": 20,
+      "tqdm_mininterval": 5.0,
+      "science_first_steps": 3,
+      "science_interval": 0,
+      "runtime_guard_steps": 2,
+      "train_loss_outlier_threshold": 10000.0
+    },
+    "snapshot": {
+      "enabled": true,
+      "max_mb": 20.0
+    }
+  },
+  "model": {
+    "type": "AbFlow",
+    "architecture": {
+      "embed_dim": 64,
+      "hidden_size": 128,
+      "k_neighbors": 9,
+      "n_layers": 3,
+      "iter_round": 3,
+      "dropout": 0.1,
+      "relative_position": false
+    },
+    "task": {
+      "pep_seq": true,
+      "pep_struct": true,
+      "struct_only": false,
+      "bind_dist_cutoff": 6.6,
+      "pred_edge_dist": true,
+      "backbone_only": false,
+      "fix_channel_weights": false,
+      "keep_memory": true,
+      "seq_warmup": 0
+    },
+    "r05": {
+      "source": {
+        "proposal_adapter_start_round": 1
+      },
+      "flow": {
+        "min_sigma": 0.01,
+        "hybrid_t_min": 0.2
+      },
+      "r3": {
+        "transport_fraction": 0.05,
+        "path_min_sigma": 0.0,
+        "coordinate_scaling": 0.1,
+        "fixed_g_scaled": 0.1
+      }
+    },
+    "representation": {
+      "single_pair": {
+        "blocks": 1,
+        "max_relative_feature": 32,
+        "time_embed": true,
+        "init_seed": 314159,
+        "forward_seed": 271828,
+        "channels": {
+          "single": 256,
+          "pair": 64,
+          "time_index": 16
+        },
+        "attention": {
+          "single_heads": 8,
+          "triangle_heads": 4,
+          "opm_channel": 32,
+          "triangle_hidden": 64
+        },
+        "dropout": {
+          "single_attention": 0.1,
+          "triangle": 0.1
+        },
+        "geometry": {
+          "torsion_norm_eps": 1e-12,
+          "ca_fill_tol2": 1e-12,
+          "frame": "diffab_n_ca_c_local",
+          "local_coordinate_scale": 0.1,
+          "frame_eps": 1e-06
+        },
+        "execution": {
+          "triangle_chunk_size": 64,
+          "activation_checkpoint": true,
+          "pair_distance_chunk_size": 8
+        },
+        "pair_coordinate": {
+          "mode": "direct_shared",
+          "semantics": "zero_init_pair_adapter; pair-conditioned edge message jointly drives node state and EGNN coordinate scalar"
+        },
+        "coordinate_controller": {
+          "mode": "egnn_unit_direction",
+          "direction": "d_ij/max(norm(d_ij),eps)",
+          "normalization_gradient": "differentiable",
+          "distance_features": "raw_preserved_in_radial_message",
+          "scalar_activation": "identity",
+          "scalar_bound": "none",
+          "coordinate_aggregation": "mean",
+          "no_coordinate_clipping": true,
+          "no_trust_radius": true,
+          "no_hand_tuned_step_scale": true
+        }
+      }
+    }
+  },
+  "loss": {
+    "sequence": 1.0,
+    "structure": 1.0,
+    "interface": 1.0,
+    "edge": 1.0,
+    "distogram": {
+      "weight": 0.03,
+      "pair_scope": "all_resolved",
+      "bins": 64,
+      "min_bin": 2.3125,
+      "max_bin": 21.6875
+    },
+    "smooth_lddt": {
+      "weight": 0.1,
+      "cutoff": 15.0,
+      "prediction_source": "carrier_implied_endpoint"
+    }
+  },
+  "runtime": {
+    "ddp": {
+      "cost_balanced": true,
+      "find_unused_parameters": false,
+      "static_graph": true
+    }
+  },
+  "generation": {
+    "checkpoint": "",
+    "save_dir": "./results_generation/R49_R05_ABX_NATIVE_PAIR_EGNN_UNIT_DIRECTION_DISTOGRAM_LDDT_CARRIER_U02",
+    "batch_size": 20,
+    "num_workers": 4,
+    "n_steps": 10,
+    "seed": 2023,
+    "show_sample_progress": false
+  },
+  "evaluation": {
+    "metric_workers": 8,
+    "keep_structures": false,
+    "failure_policy": "record_and_continue"
+  }
+}

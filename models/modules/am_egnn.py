@@ -13,7 +13,7 @@ class AMEGNN(nn.Module):
 
     def __init__(self, in_node_nf, hidden_nf, out_node_nf, n_channel, channel_nf,
                  radial_nf, in_edge_nf=0, act_fn=nn.SiLU(), n_layers=4,
-                 residual=True, dropout=0.1, dense=False, update_coords=True):
+                 residual=True, dropout=0.1, dense=False):
         super().__init__()
         '''
         :param in_node_nf: Number of features for 'h' at the input
@@ -30,7 +30,6 @@ class AMEGNN(nn.Module):
         '''
         self.hidden_nf = hidden_nf
         self.n_layers = n_layers
-        self.update_coords = bool(update_coords)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -45,13 +44,11 @@ class AMEGNN(nn.Module):
         for i in range(0, n_layers):
             self.add_module(f'gcl_{i}', AM_E_GCL(
                 self.hidden_nf, self.hidden_nf, self.hidden_nf, n_channel, channel_nf, radial_nf,
-                edges_in_d=in_edge_nf, act_fn=act_fn, residual=residual, dropout=dropout,
-                update_coords=self.update_coords
+                edges_in_d=in_edge_nf, act_fn=act_fn, residual=residual, dropout=dropout
             ))
         self.out_layer = AM_E_GCL(
             self.hidden_nf, self.hidden_nf, self.hidden_nf, n_channel, channel_nf,
-            radial_nf, edges_in_d=in_edge_nf, act_fn=act_fn, residual=residual,
-            update_coords=self.update_coords
+            radial_nf, edges_in_d=in_edge_nf, act_fn=act_fn, residual=residual
         )
             
     def forward(self, h, x, edges, channel_attr, channel_weights, ctx_edge_attr=None):
@@ -120,8 +117,7 @@ class AM_E_GCL(nn.Module):
     def __init__(self, input_nf, output_nf, hidden_nf, n_channel, channel_nf, radial_nf,
                  edges_in_d=0, node_attr_d=0, act_fn=nn.SiLU(), residual=True, attention=False,
                  normalize=False, coords_agg='mean', tanh=False, dropout=0.1,
-                 pair_coord_mode='bounded_residual', pair_coord_delta_bound=1.0,
-                 update_coords=True):
+                 pair_coord_mode='bounded_residual', pair_coord_delta_bound=1.0):
         super(AM_E_GCL, self).__init__()
 
         input_edge = input_nf * 2
@@ -130,14 +126,13 @@ class AM_E_GCL(nn.Module):
         self.normalize = normalize
         self.coords_agg = coords_agg
         self.tanh = tanh
-        self.update_coords = bool(update_coords)
         self.epsilon = 1e-8
         self.pair_coord_mode = str(pair_coord_mode or 'bounded_residual').strip().lower()
-        if self.pair_coord_mode not in {'bounded_residual', 'legacy_shared', 'representation_only'}:
+        if self.pair_coord_mode not in {'bounded_residual', 'legacy_shared', 'direct_shared'}:
             raise ValueError(f'Unsupported pair_coord_mode={self.pair_coord_mode!r}')
         self.pair_coord_delta_bound = float(pair_coord_delta_bound)
-        if self.pair_coord_delta_bound <= 0.0:
-            raise ValueError('pair_coord_delta_bound must be > 0')
+        if self.pair_coord_mode == 'bounded_residual' and self.pair_coord_delta_bound <= 0.0:
+            raise ValueError('pair_coord_delta_bound must be > 0 for bounded_residual mode')
 
         self.dropout = nn.Dropout(dropout)
 
@@ -172,20 +167,19 @@ class AM_E_GCL(nn.Module):
             act_fn,
             nn.Linear(hidden_nf, output_nf))
 
-        if self.update_coords:
-            layer = nn.Linear(hidden_nf, n_channel, bias=False)
-            torch.nn.init.xavier_uniform_(layer.weight, gain=0.001)
+        layer = nn.Linear(hidden_nf, n_channel, bias=False)
+        torch.nn.init.xavier_uniform_(layer.weight, gain=0.001)
 
-            coord_mlp = []
-            coord_mlp.append(nn.Linear(hidden_nf, hidden_nf))
-            coord_mlp.append(act_fn)
-            coord_mlp.append(layer)
-            # Legacy edge-to-Cartesian actuator. New local-frame mode disables
-            # this branch completely so no unused coordinate-head parameters are
-            # registered under DDP static_graph/find_unused_parameters=False.
-            self.coord_mlp = nn.Sequential(*coord_mlp)
-        else:
-            self.coord_mlp = None
+        coord_mlp = []
+        coord_mlp.append(nn.Linear(hidden_nf, hidden_nf))
+        coord_mlp.append(act_fn)
+        coord_mlp.append(layer)
+        # Keep the pre-activation explicit so diagnostics can distinguish an
+        # upstream gain excursion from the bounded coordinate controller.
+        # When ``self.tanh`` is enabled, the exact EGNN tanh transform is
+        # applied in ``coord_model`` below; for tanh=False this is bitwise the
+        # same computation as the previous implementation.
+        self.coord_mlp = nn.Sequential(*coord_mlp)
 
         if self.attention:
             self.att_mlp = nn.Sequential(
@@ -193,13 +187,12 @@ class AM_E_GCL(nn.Module):
                 nn.Sigmoid())
 
     def edge_model(self, source, target, radial, edge_attr, base_source=None, base_target=None):
-        """Return state and pair-free coordinate messages from one edge path.
+        """Return pair-conditioned and pair-free edge messages.
 
-        ``state_edge`` keeps the full learned pair conditioning.  ``base_edge``
-        removes only the *direct* z_ij adapter before the shared nonlinear edge
-        stack.  A single shared dropout mask is applied to both streams, so the
-        state stream preserves the original stochastic contract while the
-        coordinate stream can measure a clean direct-pair residual.
+        ``state_edge`` receives the zero-start Pair adapter. ``base_edge`` omits
+        that direct adapter and is retained for diagnostics and historical
+        bounded-residual compatibility.  V218 ``direct_shared`` uses
+        ``state_edge`` for both node and coordinate updates.
         """
         radial = radial.reshape(radial.shape[0], -1)
         if base_source is None:
@@ -310,59 +303,63 @@ class AM_E_GCL(nn.Module):
 
     def coord_model(self, coord, edge_index, coord_diff, state_edge_feat,
                     channel_weights, base_edge_feat=None):
-        '''Pair-aware Cartesian update with bounded direct-pair authority.
+        '''Pair-aware Cartesian update with selectable geometry authority.
 
-        The state/message stream may use the full pair-conditioned edge feature.
-        Geometry uses the pair-free base coefficient plus a bounded residual from
-        direct pair conditioning.  With the V215 EGNN controller enabled:
+        V218 formal mode (``direct_shared`` + ``normalize=True`` + ``tanh=False``):
 
-            alpha_base = tanh(alpha_base_raw)
-            alpha_state = tanh(alpha_state_raw)
-            alpha = alpha_base + B * tanh((alpha_state-alpha_base) / B).
+            alpha_ij = phi_x(m_ij(h_i, h_j, radial_ij, z_ij))
+            u_ij     = d_ij / max(||d_ij||, eps)
+            Delta x_i = Mean_j[u_ij * alpha_ij]
 
-        For a zero pair adapter, alpha_state == alpha_base exactly.  Around the
-        origin tanh(z)=z+O(z^3), so the zero-start parent is first-order
-        preserved; only high-gain coordinate authority is saturated.  This is
-        scalar-field bounding plus canonical direction normalization, not coordinate clipping.
+        Raw distances remain available to the invariant radial/message pathway;
+        only the final equivariant Cartesian basis is normalized.  Therefore Pair
+        remains a genuine EGNN edge condition without acquiring the old
+        raw-distance-times-unbounded-scalar multiplicative gain.
         '''
         row, col = edge_index
         n_channel = channel_weights.shape[-1]
         coord_before = coord
 
-        # EGNN coordinate controller.  The official EGNN implementation
-        # exposes ``tanh`` precisely to bound phi_x(m_ij).  We keep the raw
-        # scalar for forensics, then apply tanh before any Cartesian authority
-        # is granted.  This preserves E(n) equivariance because only an
-        # invariant scalar is transformed; coordinate directions are unchanged.
+        # Pair-conditioned EGNN scalar authority.  V218 formal runs use
+        # ``direct_shared``: the same pair-conditioned edge message drives both
+        # representation and the invariant coordinate scalar.  The Pair adapter
+        # itself is zero-initialized in ``edge_model``, so cold-start is still
+        # exactly the pair-free parent.  No tanh/clamp/trust-radius is applied in
+        # the formal V218 controller; legacy bounded modes remain reproducible.
         state_coeff_raw = self.coord_mlp(state_edge_feat)
         state_coeff = torch.tanh(state_coeff_raw) if self.tanh else state_coeff_raw
-        if base_edge_feat is None or self.pair_coord_mode == 'legacy_shared':
+        if base_edge_feat is None:
             base_coeff_raw = state_coeff_raw
             base_coeff = state_coeff
-            pair_coeff_raw = torch.zeros_like(state_coeff)
-            pair_coeff_bounded = pair_coeff_raw
+            pair_coeff_raw = torch.zeros_like(state_coeff_raw)
+            pair_coeff_applied = pair_coeff_raw
             coord_coeff = state_coeff
         else:
             base_coeff_raw = self.coord_mlp(base_edge_feat)
             base_coeff = torch.tanh(base_coeff_raw) if self.tanh else base_coeff_raw
-            # Preserve V212 semantics: direct Pair authority is measured after
-            # the same coordinate controller used by state/base.  Hence zero
-            # Pair still gives exact equality, while the residual remains
-            # independently bounded by ``pair_coord_delta_bound``.
             pair_coeff_raw = state_coeff - base_coeff
-            bound = pair_coeff_raw.new_tensor(self.pair_coord_delta_bound)
-            pair_coeff_bounded = bound * torch.tanh(pair_coeff_raw / bound)
-            coord_coeff = base_coeff + pair_coeff_bounded
+            if self.pair_coord_mode == 'bounded_residual':
+                bound = pair_coeff_raw.new_tensor(self.pair_coord_delta_bound)
+                pair_coeff_applied = bound * torch.tanh(pair_coeff_raw / bound)
+                coord_coeff = base_coeff + pair_coeff_applied
+            else:
+                # ``direct_shared`` / historical ``legacy_shared``: Pair is a
+                # first-class EGNN edge condition.  Its learned contribution is
+                # not artificially rescaled; stability comes from the geometric
+                # basis below, not from saturating the scalar field.
+                pair_coeff_applied = pair_coeff_raw
+                coord_coeff = state_coeff
 
-        # V215 canonical EGNN direction normalization.  Keep the original
-        # distance-dependent radial/message features unchanged; normalize only
-        # the equivariant vector that grants Cartesian authority.  This mirrors
-        # the reference EGNN implementation: the norm is detached so the
-        # denominator is not an auxiliary gradient-control path.
+        # V218 unit-direction Cartesian basis.  Distance magnitude is retained in
+        # ``radial`` and therefore in the edge message, but it is not multiplied
+        # into the final Cartesian action.  This is the standard separation used
+        # by directional equivariant message passing: invariant radial information
+        # controls a scalar magnitude while a normalized relative vector supplies
+        # orientation.  Keep the normalization differentiable (no stop-gradient).
         coord_diff_raw = coord_diff
         coord_diff_norm = torch.norm(coord_diff_raw, dim=-1, keepdim=True)
         if self.normalize:
-            coord_direction = coord_diff_raw / (coord_diff_norm.detach() + self.epsilon)
+            coord_direction = coord_diff_raw / coord_diff_norm.clamp_min(self.epsilon)
         else:
             coord_direction = coord_diff_raw
 
@@ -407,8 +404,8 @@ class AM_E_GCL(nn.Module):
                     'coord_state_coeff_absmax': _amax(state_coeff),
                     'coord_pair_delta_raw_rms': _rms(pair_coeff_raw),
                     'coord_pair_delta_raw_absmax': _amax(pair_coeff_raw),
-                    'coord_pair_delta_bounded_rms': _rms(pair_coeff_bounded),
-                    'coord_pair_delta_bounded_absmax': _amax(pair_coeff_bounded),
+                    'coord_pair_delta_applied_rms': _rms(pair_coeff_applied),
+                    'coord_pair_delta_applied_absmax': _amax(pair_coeff_applied),
                     'coord_coeff_rms': _rms(coord_coeff),
                     'coord_coeff_absmax': _amax(coord_coeff),
                     'coord_trans_rms': _rms(trans),
@@ -440,13 +437,10 @@ class AM_E_GCL(nn.Module):
 
         radial, coord_diff = coord2radial(edge_index, coord, channel_attr, channel_weights, self.radial_linear)
         edge_feat, base_edge_feat = self.edge_model(h[row], h[col], radial, edge_attr)
-        if self.update_coords:
-            coord = self.coord_model(
-                coord, edge_index, coord_diff, edge_feat, channel_weights,
-                base_edge_feat=base_edge_feat,
-            )
-        else:
-            self.last_coord_diagnostics = {}
+        coord = self.coord_model(
+            coord, edge_index, coord_diff, edge_feat, channel_weights,
+            base_edge_feat=base_edge_feat,
+        )
         h, agg = self.node_model(h, edge_index, edge_feat, node_attr)
         return h, coord
 
@@ -468,13 +462,10 @@ class AM_E_GCL(nn.Module):
             h[row], h[col], radial, edge_attr,
             base_source=h_base[row], base_target=h_base[col],
         )
-        if self.update_coords:
-            coord = self.coord_model(
-                coord, edge_index, coord_diff, edge_feat, channel_weights,
-                base_edge_feat=base_edge_feat,
-            )
-        else:
-            self.last_coord_diagnostics = {}
+        coord = self.coord_model(
+            coord, edge_index, coord_diff, edge_feat, channel_weights,
+            base_edge_feat=base_edge_feat,
+        )
         h, h_base = self.node_model_dual(
             h, h_base, edge_index, edge_feat, base_edge_feat, node_attr
         )
@@ -580,8 +571,7 @@ class MS_E_GCL(nn.Module):
     def __init__(self, input_nf, output_nf, hidden_nf, n_channel, channel_nf, radial_nf, surf_nf=50,
                  edges_in_d=0, node_attr_d=0, act_fn=nn.SiLU(), residual=True, attention=False,
                  normalize=False, coords_agg='mean', tanh=False, dropout=0.1,
-                 pair_coord_mode='bounded_residual', pair_coord_delta_bound=1.0,
-                 update_coords=True):
+                 pair_coord_mode='bounded_residual', pair_coord_delta_bound=1.0):
         super(MS_E_GCL, self).__init__()
 
         input_edge = input_nf * 2
@@ -590,14 +580,13 @@ class MS_E_GCL(nn.Module):
         self.normalize = normalize
         self.coords_agg = coords_agg
         self.tanh = tanh
-        self.update_coords = bool(update_coords)
         self.epsilon = 1e-8
         self.pair_coord_mode = str(pair_coord_mode or 'bounded_residual').strip().lower()
-        if self.pair_coord_mode not in {'bounded_residual', 'legacy_shared', 'representation_only'}:
+        if self.pair_coord_mode not in {'bounded_residual', 'legacy_shared', 'direct_shared'}:
             raise ValueError(f'Unsupported pair_coord_mode={self.pair_coord_mode!r}')
         self.pair_coord_delta_bound = float(pair_coord_delta_bound)
-        if self.pair_coord_delta_bound <= 0.0:
-            raise ValueError('pair_coord_delta_bound must be > 0')
+        if self.pair_coord_mode == 'bounded_residual' and self.pair_coord_delta_bound <= 0.0:
+            raise ValueError('pair_coord_delta_bound must be > 0 for bounded_residual mode')
 
         self.dropout = nn.Dropout(dropout)
 
@@ -626,17 +615,19 @@ class MS_E_GCL(nn.Module):
             act_fn,
             nn.Linear(hidden_nf, output_nf))
 
-        if self.update_coords:
-            layer = nn.Linear(hidden_nf, n_channel, bias=False)
-            torch.nn.init.xavier_uniform_(layer.weight, gain=0.001)
+        layer = nn.Linear(hidden_nf, n_channel, bias=False)
+        torch.nn.init.xavier_uniform_(layer.weight, gain=0.001)
 
-            coord_mlp = []
-            coord_mlp.append(nn.Linear(hidden_nf, hidden_nf))
-            coord_mlp.append(act_fn)
-            coord_mlp.append(layer)
-            self.coord_mlp = nn.Sequential(*coord_mlp)
-        else:
-            self.coord_mlp = None
+        coord_mlp = []
+        coord_mlp.append(nn.Linear(hidden_nf, hidden_nf))
+        coord_mlp.append(act_fn)
+        coord_mlp.append(layer)
+        # Keep the pre-activation explicit so diagnostics can distinguish an
+        # upstream gain excursion from the bounded coordinate controller.
+        # When ``self.tanh`` is enabled, the exact EGNN tanh transform is
+        # applied in ``coord_model`` below; for tanh=False this is bitwise the
+        # same computation as the previous implementation.
+        self.coord_mlp = nn.Sequential(*coord_mlp)
 
         if self.attention:
             self.att_mlp = nn.Sequential(
@@ -644,13 +635,11 @@ class MS_E_GCL(nn.Module):
                 nn.Sigmoid())
 
     def edge_model(self, source, target, radial, edge_attr, base_source=None, base_target=None):
-        """Return surface state and pair-free coordinate messages from one edge path.
+        """Return pair-conditioned and pair-free surface edge messages.
 
-        ``state_edge`` keeps the full learned pair conditioning.  ``base_edge``
-        removes only the *direct* z_ij adapter before the shared nonlinear edge
-        stack.  A single shared dropout mask is applied to both streams, so the
-        state stream preserves the original stochastic contract while the
-        coordinate stream can measure a clean direct-pair residual.
+        V218 ``direct_shared`` uses the Pair-conditioned ``state_edge`` as the
+        shared representation/geometry message; ``base_edge`` is diagnostic and
+        historical-compatibility state only.
         """
         radial = radial.reshape(radial.shape[0], -1)
         if base_source is None:
@@ -761,59 +750,63 @@ class MS_E_GCL(nn.Module):
 
     def coord_model(self, coord, edge_index, coord_diff, state_edge_feat,
                     channel_weights, base_edge_feat=None):
-        '''Pair-aware Cartesian update with bounded direct-pair authority.
+        '''Pair-aware Cartesian update with selectable geometry authority.
 
-        The state/message stream may use the full pair-conditioned edge feature.
-        Geometry uses the pair-free base coefficient plus a bounded residual from
-        direct pair conditioning.  With the V215 EGNN controller enabled:
+        V218 formal mode (``direct_shared`` + ``normalize=True`` + ``tanh=False``):
 
-            alpha_base = tanh(alpha_base_raw)
-            alpha_state = tanh(alpha_state_raw)
-            alpha = alpha_base + B * tanh((alpha_state-alpha_base) / B).
+            alpha_ij = phi_x(m_ij(h_i, h_j, radial_ij, z_ij))
+            u_ij     = d_ij / max(||d_ij||, eps)
+            Delta x_i = Mean_j[u_ij * alpha_ij]
 
-        For a zero pair adapter, alpha_state == alpha_base exactly.  Around the
-        origin tanh(z)=z+O(z^3), so the zero-start parent is first-order
-        preserved; only high-gain coordinate authority is saturated.  This is
-        scalar-field bounding plus canonical direction normalization, not coordinate clipping.
+        Raw distances remain available to the invariant radial/message pathway;
+        only the final equivariant Cartesian basis is normalized.  Therefore Pair
+        remains a genuine EGNN edge condition without acquiring the old
+        raw-distance-times-unbounded-scalar multiplicative gain.
         '''
         row, col = edge_index
         n_channel = channel_weights.shape[-1]
         coord_before = coord
 
-        # EGNN coordinate controller.  The official EGNN implementation
-        # exposes ``tanh`` precisely to bound phi_x(m_ij).  We keep the raw
-        # scalar for forensics, then apply tanh before any Cartesian authority
-        # is granted.  This preserves E(n) equivariance because only an
-        # invariant scalar is transformed; coordinate directions are unchanged.
+        # Pair-conditioned EGNN scalar authority.  V218 formal runs use
+        # ``direct_shared``: the same pair-conditioned edge message drives both
+        # representation and the invariant coordinate scalar.  The Pair adapter
+        # itself is zero-initialized in ``edge_model``, so cold-start is still
+        # exactly the pair-free parent.  No tanh/clamp/trust-radius is applied in
+        # the formal V218 controller; legacy bounded modes remain reproducible.
         state_coeff_raw = self.coord_mlp(state_edge_feat)
         state_coeff = torch.tanh(state_coeff_raw) if self.tanh else state_coeff_raw
-        if base_edge_feat is None or self.pair_coord_mode == 'legacy_shared':
+        if base_edge_feat is None:
             base_coeff_raw = state_coeff_raw
             base_coeff = state_coeff
-            pair_coeff_raw = torch.zeros_like(state_coeff)
-            pair_coeff_bounded = pair_coeff_raw
+            pair_coeff_raw = torch.zeros_like(state_coeff_raw)
+            pair_coeff_applied = pair_coeff_raw
             coord_coeff = state_coeff
         else:
             base_coeff_raw = self.coord_mlp(base_edge_feat)
             base_coeff = torch.tanh(base_coeff_raw) if self.tanh else base_coeff_raw
-            # Preserve V212 semantics: direct Pair authority is measured after
-            # the same coordinate controller used by state/base.  Hence zero
-            # Pair still gives exact equality, while the residual remains
-            # independently bounded by ``pair_coord_delta_bound``.
             pair_coeff_raw = state_coeff - base_coeff
-            bound = pair_coeff_raw.new_tensor(self.pair_coord_delta_bound)
-            pair_coeff_bounded = bound * torch.tanh(pair_coeff_raw / bound)
-            coord_coeff = base_coeff + pair_coeff_bounded
+            if self.pair_coord_mode == 'bounded_residual':
+                bound = pair_coeff_raw.new_tensor(self.pair_coord_delta_bound)
+                pair_coeff_applied = bound * torch.tanh(pair_coeff_raw / bound)
+                coord_coeff = base_coeff + pair_coeff_applied
+            else:
+                # ``direct_shared`` / historical ``legacy_shared``: Pair is a
+                # first-class EGNN edge condition.  Its learned contribution is
+                # not artificially rescaled; stability comes from the geometric
+                # basis below, not from saturating the scalar field.
+                pair_coeff_applied = pair_coeff_raw
+                coord_coeff = state_coeff
 
-        # V215 canonical EGNN direction normalization.  Keep the original
-        # distance-dependent radial/message features unchanged; normalize only
-        # the equivariant vector that grants Cartesian authority.  This mirrors
-        # the reference EGNN implementation: the norm is detached so the
-        # denominator is not an auxiliary gradient-control path.
+        # V218 unit-direction Cartesian basis.  Distance magnitude is retained in
+        # ``radial`` and therefore in the edge message, but it is not multiplied
+        # into the final Cartesian action.  This is the standard separation used
+        # by directional equivariant message passing: invariant radial information
+        # controls a scalar magnitude while a normalized relative vector supplies
+        # orientation.  Keep the normalization differentiable (no stop-gradient).
         coord_diff_raw = coord_diff
         coord_diff_norm = torch.norm(coord_diff_raw, dim=-1, keepdim=True)
         if self.normalize:
-            coord_direction = coord_diff_raw / (coord_diff_norm.detach() + self.epsilon)
+            coord_direction = coord_diff_raw / coord_diff_norm.clamp_min(self.epsilon)
         else:
             coord_direction = coord_diff_raw
 
@@ -858,8 +851,8 @@ class MS_E_GCL(nn.Module):
                     'coord_state_coeff_absmax': _amax(state_coeff),
                     'coord_pair_delta_raw_rms': _rms(pair_coeff_raw),
                     'coord_pair_delta_raw_absmax': _amax(pair_coeff_raw),
-                    'coord_pair_delta_bounded_rms': _rms(pair_coeff_bounded),
-                    'coord_pair_delta_bounded_absmax': _amax(pair_coeff_bounded),
+                    'coord_pair_delta_applied_rms': _rms(pair_coeff_applied),
+                    'coord_pair_delta_applied_absmax': _amax(pair_coeff_applied),
                     'coord_coeff_rms': _rms(coord_coeff),
                     'coord_coeff_absmax': _amax(coord_coeff),
                     'coord_trans_rms': _rms(trans),
@@ -914,13 +907,10 @@ class MS_E_GCL(nn.Module):
             self.scale_linear, self.radial_linear
         )
         edge_feat, base_edge_feat = self.edge_model(h[row], h[col], radial, edge_attr)
-        if self.update_coords:
-            coord = self.coord_model(
-                coord, edge_index, abX, edge_feat, channel_weights,
-                base_edge_feat=base_edge_feat,
-            )
-        else:
-            self.last_coord_diagnostics = {}
+        coord = self.coord_model(
+            coord, edge_index, abX, edge_feat, channel_weights,
+            base_edge_feat=base_edge_feat,
+        )
         h, agg = self.node_model(h, edge_index, edge_feat, node_attr)
         return h, coord
 
@@ -951,13 +941,10 @@ class MS_E_GCL(nn.Module):
             h[row], h[col], radial, edge_attr,
             base_source=h_base[row], base_target=h_base[col],
         )
-        if self.update_coords:
-            coord = self.coord_model(
-                coord, edge_index, abX, edge_feat, channel_weights,
-                base_edge_feat=base_edge_feat,
-            )
-        else:
-            self.last_coord_diagnostics = {}
+        coord = self.coord_model(
+            coord, edge_index, abX, edge_feat, channel_weights,
+            base_edge_feat=base_edge_feat,
+        )
         h, h_base = self.node_model_dual(
             h, h_base, edge_index, edge_feat, base_edge_feat, node_attr
         )
