@@ -13,7 +13,7 @@ class AMEGNN(nn.Module):
 
     def __init__(self, in_node_nf, hidden_nf, out_node_nf, n_channel, channel_nf,
                  radial_nf, in_edge_nf=0, act_fn=nn.SiLU(), n_layers=4,
-                 residual=True, dropout=0.1, dense=False):
+                 residual=True, dropout=0.1, dense=False, update_coords=True):
         super().__init__()
         '''
         :param in_node_nf: Number of features for 'h' at the input
@@ -30,6 +30,7 @@ class AMEGNN(nn.Module):
         '''
         self.hidden_nf = hidden_nf
         self.n_layers = n_layers
+        self.update_coords = bool(update_coords)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -44,11 +45,13 @@ class AMEGNN(nn.Module):
         for i in range(0, n_layers):
             self.add_module(f'gcl_{i}', AM_E_GCL(
                 self.hidden_nf, self.hidden_nf, self.hidden_nf, n_channel, channel_nf, radial_nf,
-                edges_in_d=in_edge_nf, act_fn=act_fn, residual=residual, dropout=dropout
+                edges_in_d=in_edge_nf, act_fn=act_fn, residual=residual, dropout=dropout,
+                update_coords=self.update_coords
             ))
         self.out_layer = AM_E_GCL(
             self.hidden_nf, self.hidden_nf, self.hidden_nf, n_channel, channel_nf,
-            radial_nf, edges_in_d=in_edge_nf, act_fn=act_fn, residual=residual
+            radial_nf, edges_in_d=in_edge_nf, act_fn=act_fn, residual=residual,
+            update_coords=self.update_coords
         )
             
     def forward(self, h, x, edges, channel_attr, channel_weights, ctx_edge_attr=None):
@@ -117,7 +120,8 @@ class AM_E_GCL(nn.Module):
     def __init__(self, input_nf, output_nf, hidden_nf, n_channel, channel_nf, radial_nf,
                  edges_in_d=0, node_attr_d=0, act_fn=nn.SiLU(), residual=True, attention=False,
                  normalize=False, coords_agg='mean', tanh=False, dropout=0.1,
-                 pair_coord_mode='bounded_residual', pair_coord_delta_bound=1.0):
+                 pair_coord_mode='bounded_residual', pair_coord_delta_bound=1.0,
+                 update_coords=True):
         super(AM_E_GCL, self).__init__()
 
         input_edge = input_nf * 2
@@ -126,9 +130,10 @@ class AM_E_GCL(nn.Module):
         self.normalize = normalize
         self.coords_agg = coords_agg
         self.tanh = tanh
+        self.update_coords = bool(update_coords)
         self.epsilon = 1e-8
         self.pair_coord_mode = str(pair_coord_mode or 'bounded_residual').strip().lower()
-        if self.pair_coord_mode not in {'bounded_residual', 'legacy_shared'}:
+        if self.pair_coord_mode not in {'bounded_residual', 'legacy_shared', 'representation_only'}:
             raise ValueError(f'Unsupported pair_coord_mode={self.pair_coord_mode!r}')
         self.pair_coord_delta_bound = float(pair_coord_delta_bound)
         if self.pair_coord_delta_bound <= 0.0:
@@ -167,19 +172,20 @@ class AM_E_GCL(nn.Module):
             act_fn,
             nn.Linear(hidden_nf, output_nf))
 
-        layer = nn.Linear(hidden_nf, n_channel, bias=False)
-        torch.nn.init.xavier_uniform_(layer.weight, gain=0.001)
+        if self.update_coords:
+            layer = nn.Linear(hidden_nf, n_channel, bias=False)
+            torch.nn.init.xavier_uniform_(layer.weight, gain=0.001)
 
-        coord_mlp = []
-        coord_mlp.append(nn.Linear(hidden_nf, hidden_nf))
-        coord_mlp.append(act_fn)
-        coord_mlp.append(layer)
-        # Keep the pre-activation explicit so diagnostics can distinguish an
-        # upstream gain excursion from the bounded coordinate controller.
-        # When ``self.tanh`` is enabled, the exact EGNN tanh transform is
-        # applied in ``coord_model`` below; for tanh=False this is bitwise the
-        # same computation as the previous implementation.
-        self.coord_mlp = nn.Sequential(*coord_mlp)
+            coord_mlp = []
+            coord_mlp.append(nn.Linear(hidden_nf, hidden_nf))
+            coord_mlp.append(act_fn)
+            coord_mlp.append(layer)
+            # Legacy edge-to-Cartesian actuator. New local-frame mode disables
+            # this branch completely so no unused coordinate-head parameters are
+            # registered under DDP static_graph/find_unused_parameters=False.
+            self.coord_mlp = nn.Sequential(*coord_mlp)
+        else:
+            self.coord_mlp = None
 
         if self.attention:
             self.att_mlp = nn.Sequential(
@@ -434,10 +440,13 @@ class AM_E_GCL(nn.Module):
 
         radial, coord_diff = coord2radial(edge_index, coord, channel_attr, channel_weights, self.radial_linear)
         edge_feat, base_edge_feat = self.edge_model(h[row], h[col], radial, edge_attr)
-        coord = self.coord_model(
-            coord, edge_index, coord_diff, edge_feat, channel_weights,
-            base_edge_feat=base_edge_feat,
-        )
+        if self.update_coords:
+            coord = self.coord_model(
+                coord, edge_index, coord_diff, edge_feat, channel_weights,
+                base_edge_feat=base_edge_feat,
+            )
+        else:
+            self.last_coord_diagnostics = {}
         h, agg = self.node_model(h, edge_index, edge_feat, node_attr)
         return h, coord
 
@@ -459,10 +468,13 @@ class AM_E_GCL(nn.Module):
             h[row], h[col], radial, edge_attr,
             base_source=h_base[row], base_target=h_base[col],
         )
-        coord = self.coord_model(
-            coord, edge_index, coord_diff, edge_feat, channel_weights,
-            base_edge_feat=base_edge_feat,
-        )
+        if self.update_coords:
+            coord = self.coord_model(
+                coord, edge_index, coord_diff, edge_feat, channel_weights,
+                base_edge_feat=base_edge_feat,
+            )
+        else:
+            self.last_coord_diagnostics = {}
         h, h_base = self.node_model_dual(
             h, h_base, edge_index, edge_feat, base_edge_feat, node_attr
         )
@@ -568,7 +580,8 @@ class MS_E_GCL(nn.Module):
     def __init__(self, input_nf, output_nf, hidden_nf, n_channel, channel_nf, radial_nf, surf_nf=50,
                  edges_in_d=0, node_attr_d=0, act_fn=nn.SiLU(), residual=True, attention=False,
                  normalize=False, coords_agg='mean', tanh=False, dropout=0.1,
-                 pair_coord_mode='bounded_residual', pair_coord_delta_bound=1.0):
+                 pair_coord_mode='bounded_residual', pair_coord_delta_bound=1.0,
+                 update_coords=True):
         super(MS_E_GCL, self).__init__()
 
         input_edge = input_nf * 2
@@ -577,9 +590,10 @@ class MS_E_GCL(nn.Module):
         self.normalize = normalize
         self.coords_agg = coords_agg
         self.tanh = tanh
+        self.update_coords = bool(update_coords)
         self.epsilon = 1e-8
         self.pair_coord_mode = str(pair_coord_mode or 'bounded_residual').strip().lower()
-        if self.pair_coord_mode not in {'bounded_residual', 'legacy_shared'}:
+        if self.pair_coord_mode not in {'bounded_residual', 'legacy_shared', 'representation_only'}:
             raise ValueError(f'Unsupported pair_coord_mode={self.pair_coord_mode!r}')
         self.pair_coord_delta_bound = float(pair_coord_delta_bound)
         if self.pair_coord_delta_bound <= 0.0:
@@ -612,19 +626,17 @@ class MS_E_GCL(nn.Module):
             act_fn,
             nn.Linear(hidden_nf, output_nf))
 
-        layer = nn.Linear(hidden_nf, n_channel, bias=False)
-        torch.nn.init.xavier_uniform_(layer.weight, gain=0.001)
+        if self.update_coords:
+            layer = nn.Linear(hidden_nf, n_channel, bias=False)
+            torch.nn.init.xavier_uniform_(layer.weight, gain=0.001)
 
-        coord_mlp = []
-        coord_mlp.append(nn.Linear(hidden_nf, hidden_nf))
-        coord_mlp.append(act_fn)
-        coord_mlp.append(layer)
-        # Keep the pre-activation explicit so diagnostics can distinguish an
-        # upstream gain excursion from the bounded coordinate controller.
-        # When ``self.tanh`` is enabled, the exact EGNN tanh transform is
-        # applied in ``coord_model`` below; for tanh=False this is bitwise the
-        # same computation as the previous implementation.
-        self.coord_mlp = nn.Sequential(*coord_mlp)
+            coord_mlp = []
+            coord_mlp.append(nn.Linear(hidden_nf, hidden_nf))
+            coord_mlp.append(act_fn)
+            coord_mlp.append(layer)
+            self.coord_mlp = nn.Sequential(*coord_mlp)
+        else:
+            self.coord_mlp = None
 
         if self.attention:
             self.att_mlp = nn.Sequential(
@@ -902,10 +914,13 @@ class MS_E_GCL(nn.Module):
             self.scale_linear, self.radial_linear
         )
         edge_feat, base_edge_feat = self.edge_model(h[row], h[col], radial, edge_attr)
-        coord = self.coord_model(
-            coord, edge_index, abX, edge_feat, channel_weights,
-            base_edge_feat=base_edge_feat,
-        )
+        if self.update_coords:
+            coord = self.coord_model(
+                coord, edge_index, abX, edge_feat, channel_weights,
+                base_edge_feat=base_edge_feat,
+            )
+        else:
+            self.last_coord_diagnostics = {}
         h, agg = self.node_model(h, edge_index, edge_feat, node_attr)
         return h, coord
 
@@ -936,10 +951,13 @@ class MS_E_GCL(nn.Module):
             h[row], h[col], radial, edge_attr,
             base_source=h_base[row], base_target=h_base[col],
         )
-        coord = self.coord_model(
-            coord, edge_index, abX, edge_feat, channel_weights,
-            base_edge_feat=base_edge_feat,
-        )
+        if self.update_coords:
+            coord = self.coord_model(
+                coord, edge_index, abX, edge_feat, channel_weights,
+                base_edge_feat=base_edge_feat,
+            )
+        else:
+            self.last_coord_diagnostics = {}
         h, h_base = self.node_model_dual(
             h, h_base, edge_index, edge_feat, base_edge_feat, node_attr
         )
