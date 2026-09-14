@@ -14,7 +14,7 @@ RESUME_CHECKPOINT=""
 usage() {
   cat >&2 <<'USAGE'
 Usage:
-  bash scripts/train/run_R53_R55_v221.sh <config.json> \
+  bash scripts/train/run_R53_R58_v222.sh <config.json> \
     --gpus 3 --port 29747 [--resume /path/version_N/checkpoint/last_stepXXXX.pt]
   # or: --gpus 2,3 / --gpus 0,2,5,7
 
@@ -63,12 +63,12 @@ runtime = cfg.get('runtime', {})
 training = cfg['training']
 if 'gpus' in runtime:
     raise SystemExit(
-        "runtime.gpus is forbidden in V221 configs; pass physical GPUs with --gpus"
+        "runtime.gpus is forbidden in V222 configs; pass physical GPUs with --gpus"
     )
 output = training['output_dir']
 if not os.path.isabs(output):
     output = os.path.abspath(os.path.join(root, output))
-# Backward-compatible fallback only. Formal V221 configs leave this empty.
+# Backward-compatible fallback only. Formal V222 configs leave this empty.
 resume = training.get('schedule', {}).get('resume_checkpoint', '') or ''
 if resume and not os.path.isabs(resume):
     resume = os.path.abspath(os.path.join(root, resume))
@@ -157,7 +157,7 @@ export OMP_NUM_THREADS="$OMP_THREADS"
 export PYTHONUNBUFFERED=1
 [[ -n "$CUDA_ALLOC" ]] && export PYTORCH_CUDA_ALLOC_CONF="$CUDA_ALLOC"
 
-# V221 compact diagnostics.  These never alter losses, optimizer, sampler,
+# V222 task-localized relational diagnostics.  These never alter losses, optimizer, sampler,
 # checkpoint selection, or Train->Val->Test ordering.
 export ABFLOW_GEOMETRY_FORENSICS="${ABFLOW_GEOMETRY_FORENSICS:-on}"
 export ABFLOW_SAMPLE_FORENSICS="${ABFLOW_SAMPLE_FORENSICS:-on}"
@@ -169,6 +169,11 @@ export ABFLOW_GRAD_OVERFLOW_LOG_LIMIT="${ABFLOW_GRAD_OVERFLOW_LOG_LIMIT:-3}"
 # Compact controller audit: first two calls + every 40 calls.
 export ABFLOW_COORD_AUDIT_INTERVAL="${ABFLOW_COORD_AUDIT_INTERVAL:-40}"
 export ABFLOW_COORD_AUDIT_FIRST_STEPS="${ABFLOW_COORD_AUDIT_FIRST_STEPS:-2}"
+
+# Shared Pair-z gradient authority: once per train epoch by default, never on
+# global_step=0 and never fail-fast.  The probe is best-effort telemetry only.
+export ABFLOW_PAIR_GRAD_AUDIT="${ABFLOW_PAIR_GRAD_AUDIT:-on}"
+export ABFLOW_PAIR_GRAD_AUDIT_INTERVAL="${ABFLOW_PAIR_GRAD_AUDIT_INTERVAL:-0}"
 
 # Disable duplicate periodic GeometryAuthority; retain failure-only alerts.
 export ABFLOW_GEOMETRY_AUTHORITY_INTERVAL=0
@@ -183,7 +188,7 @@ export ABFLOW_SCI_LOG_FIRST_STEPS="${ABFLOW_SCI_LOG_FIRST_STEPS:-2}"
 export ABFLOW_SCI_LOG_INTERVAL="${ABFLOW_SCI_LOG_INTERVAL:-40}"
 export ABFLOW_RUNTIME_GUARD_STEPS="${ABFLOW_RUNTIME_GUARD_STEPS:-1}"
 
-# V221 formal Test failure contract. Infrastructure/protocol failures must abort;
+# V222 formal Test failure contract. Infrastructure/protocol failures must abort;
 # finite model-output invalidity remains observation-only. train.py asserts the same
 # contract again so direct invocation cannot silently diverge.
 export ABFLOW_EPOCH_TEST_FAIL_FAST="on"
@@ -200,7 +205,7 @@ echo "[RunVersion] fixed_version=$VERSION dir=$RUN_DIR"
 echo "[RunConfig] config=$CONFIG_PATH"
 echo "[RunResources] physical_gpus=$GPU_CSV nproc=$NPROC global_batch=$GLOBAL_BATCH_SIZE local_batch=$LOCAL_BATCH_SIZE master_addr=$MASTER_ADDR port=$MASTER_PORT nnodes=$NNODES omp=$OMP_THREADS"
 echo "[RunResume] checkpoint=${RESUME_CHECKPOINT:-scratch}"
-echo "[Logging] train_progress=$ABFLOW_TQDM val_progress=$ABFLOW_TQDM test_progress=$ABFLOW_EPOCH_TEST_SHOW_SAMPLE_PROGRESS controller_interval=$ABFLOW_COORD_AUDIT_INTERVAL diagnostics=compact"
+echo "[Logging] train_progress=$ABFLOW_TQDM val_progress=$ABFLOW_TQDM test_progress=$ABFLOW_EPOCH_TEST_SHOW_SAMPLE_PROGRESS controller_interval=$ABFLOW_COORD_AUDIT_INTERVAL pair_grad_audit=$ABFLOW_PAIR_GRAD_AUDIT diagnostics=compact"
 echo "[TrainValTestContract] order=train->validation->test checkpoint_selection=validation test_metrics=observation_only test_steps=10 test_seed=2023 infra_fail_fast=$ABFLOW_EPOCH_TEST_FAIL_FAST model_invalid=$ABFLOW_EPOCH_TEST_MODEL_INVALID_POLICY"
 
 # Fail before GPU training on protocol/provenance regressions.
@@ -213,10 +218,10 @@ exp_id = str(exp.get('id', '') or '').strip()
 config_stem = os.path.splitext(os.path.basename(config_path))[0]
 output_id = os.path.basename(os.path.normpath(output_root))
 if not exp_id:
-    raise SystemExit('V221 identity preflight failed: experiment.id is missing')
+    raise SystemExit('V222 identity preflight failed: experiment.id is missing')
 if not (exp_id == config_stem == output_id):
     raise SystemExit(
-        'V221 identity preflight failed:\n'
+        'V222 identity preflight failed:\n'
         f'  experiment.id={exp_id}\n'
         f'  config_stem={config_stem}\n'
         f'  output_dir_id={output_id}\n'
@@ -227,7 +232,7 @@ if generation_dir:
     generation_id = os.path.basename(os.path.normpath(generation_dir))
     if generation_id != exp_id:
         raise SystemExit(
-            'V221 generation provenance preflight failed:\n'
+            'V222 generation provenance preflight failed:\n'
             f'  experiment.id={exp_id}\n'
             f'  generation.save_dir basename={generation_id}\n'
             'Generation artifacts must not inherit an older experiment identity.'
@@ -235,12 +240,12 @@ if generation_dir:
 protocol = str(exp.get('protocol', '') or '').strip()
 if protocol != 'formal_train_val_test':
     raise SystemExit(
-        f"V221 requires experiment.protocol='formal_train_val_test'; got {protocol!r}"
+        f"V222 requires experiment.protocol='formal_train_val_test'; got {protocol!r}"
     )
 test_set = str(cfg.get('data', {}).get('test', {}).get('set', '') or '').strip()
 if os.path.basename(test_set) != 'test.json':
     raise SystemExit(
-        f"V221 requires data.test.set to remain held-out test.json; got {test_set!r}"
+        f"V222 requires data.test.set to remain observational test.json; got {test_set!r}"
     )
 print(f'[ExperimentIdentity] PASS id={exp_id} protocol={protocol} test={test_set}')
 PYIDENTITY
@@ -253,7 +258,7 @@ python -m py_compile \
   "$PROJECT_ROOT/trainer/AbFlow_trainer.py" \
   "$PROJECT_ROOT/train.py"
 if ! grep -q "GradientNormOverflowRecovered" "$PROJECT_ROOT/trainer/abs_trainer.py"; then
-  echo "V221 requires the already-installed V10 stable finite-gradient norm fallback in trainer/abs_trainer.py" >&2
+  echo "V222 requires the already-installed V10 stable finite-gradient norm fallback in trainer/abs_trainer.py" >&2
   exit 2
 fi
 echo "[Preflight] py_compile=PASS stable_grad_norm=PASS config_gpu_authority=CLI"
@@ -266,7 +271,7 @@ for rel in [
     'models/modules/am_egnn.py',
     'trainer/AbFlow_trainer.py',
     'train.py',
-    'scripts/train/run_R53_R55_v221.sh',
+    'scripts/train/run_R53_R58_v222.sh',
 ]:
     p=os.path.join(root,rel)
     if os.path.isfile(p):
@@ -281,30 +286,39 @@ sp=cfg['model']['representation']['single_pair']
 pc=sp.get('pair_coordinate', {})
 cc=sp.get('coordinate_controller', {})
 sl=cfg.get('loss', {}).get('smooth_lddt', {})
+disto=cfg.get('loss', {}).get('distogram', {})
 
 pc_mode=str(pc.get('mode','') or '').strip().lower()
 if pc_mode != 'direct_shared':
     raise SystemExit(
-        f"V221 requires pair_coordinate.mode='direct_shared'; got {pc_mode!r}"
+        f"V222 requires pair_coordinate.mode='direct_shared'; got {pc_mode!r}"
     )
 if 'delta_bound' in pc:
     raise SystemExit(
-        'V221 direct_shared must not carry stale pair_coordinate.delta_bound; '
+        'V222 direct_shared must not carry stale pair_coordinate.delta_bound; '
         'there is no bounded Pair residual in the formal controller.'
     )
 
 cc_mode=str(cc.get('mode','') or '').strip().lower()
 if cc_mode != 'egnn_prenorm_raw':
     raise SystemExit(
-        'V221 requires coordinate_controller.mode=egnn_prenorm_raw; '
+        'V222 requires coordinate_controller.mode=egnn_prenorm_raw; '
         f'got {cc_mode!r}'
+    )
+
+disto_weight=float(disto.get('weight', 0.0))
+disto_scope=str(disto.get('pair_scope', 'all_resolved') or 'all_resolved').strip().lower()
+if disto_weight > 0.0 and disto_scope != 'generation_anchored':
+    raise SystemExit(
+        'V222 trainable Distogram must use pair_scope=generation_anchored so every '
+        f'optimized pair touches a generated residue; got weight={disto_weight:g}, scope={disto_scope!r}'
     )
 
 sl_weight=float(sl.get('weight', 0.0))
 sl_source=str(sl.get('prediction_source', sl.get('target', 'pred_design_endpoint')) or 'pred_design_endpoint')
 allowed={'pred_design_endpoint','carrier_implied_endpoint'}
 if sl_source not in allowed:
-    raise SystemExit(f'V221 invalid smooth-lDDT prediction_source={sl_source!r}; allowed={sorted(allowed)}')
+    raise SystemExit(f'V222 invalid smooth-lDDT prediction_source={sl_source!r}; allowed={sorted(allowed)}')
 
 print(
     '[PairCoordinateContract] '
@@ -317,6 +331,13 @@ print(
     'relative_vector=raw_r05_cartesian raw_distance_features=preserved '
     'coordinate_aggregation=mean no_tanh=1 no_coordinate_clipping=1 '
     'no_trust_radius=1 no_hand_tuned_step_scale=1'
+)
+print(
+    '[DistogramLocalizationContract] '
+    f'weight={disto_weight:g} pair_scope={disto_scope} '
+    'information_barrier=cmask aux_task_mask=paratope_mask '
+    'optimized_support=resolved_nonself_and_(G_i_or_G_j) relations=DD+DF+DA '
+    'context_context_optimized=0'
 )
 print(
     '[SmoothLDDTContract] '

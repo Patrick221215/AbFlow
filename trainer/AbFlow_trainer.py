@@ -127,6 +127,21 @@ class AbFlowTrainer(Trainer):
         # Retain only the ordinary-forward zero-start/live representation bridge.
         self._live_bridge_contract_verified = False
         self._bridge_cold_start_observed = False
+        # V222 non-blocking shared-Pair gradient authority.  Unlike V221.1,
+        # this is never a fail-fast contract and is skipped at global_step=0 so
+        # the zero-initialized Distogram projection is not misread as detachment.
+        self._pair_grad_audit_enabled = _env_flag(
+            "ABFLOW_PAIR_GRAD_AUDIT", True
+        )
+        requested_pair_grad_interval = _env_int(
+            "ABFLOW_PAIR_GRAD_AUDIT_INTERVAL", 0
+        )
+        actual_train_steps = max(1, len(self.train_loader))
+        self._pair_grad_audit_interval = (
+            actual_train_steps
+            if requested_pair_grad_interval <= 0
+            else max(1, requested_pair_grad_interval)
+        )
         # V185: diagnostics-only cadence. First few steps verify the new
         # representation/time/edge routing without changing optimization.
         self._science_log_first_steps = max(0, _env_int(
@@ -229,7 +244,7 @@ class AbFlowTrainer(Trainer):
             "ABFLOW_EPOCH_TEST_METRIC_WORKERS", 8
         ))
         self._epoch_test_show_sample_progress = _env_flag(
-            "ABFLOW_EPOCH_TEST_SHOW_SAMPLE_PROGRESS", False
+            "ABFLOW_EPOCH_TEST_SHOW_SAMPLE_PROGRESS", True
         )
         self._epoch_test_keep_structures = _env_flag(
             "ABFLOW_EPOCH_TEST_KEEP_STRUCTURES", False
@@ -738,7 +753,13 @@ class AbFlowTrainer(Trainer):
                             metric = self.valid_step(
                                 batch, start_valid_global_step + local_batch_idx
                             )
-                        metric_arr.append(float(metric.detach().cpu()))
+                        metric_value = float(metric.detach().cpu())
+                        metric_arr.append(metric_value)
+                        if self._is_main_proc() and hasattr(t_iter, "set_postfix"):
+                            t_iter.set_postfix(
+                                val_loss=f"{metric_value:.5f}",
+                                version=self.version,
+                            )
 
                 valid_metric, global_batch_count = self._validation_reduce_metric(
                     metric_arr, device
@@ -1001,6 +1022,13 @@ class AbFlowTrainer(Trainer):
             "distogram_da_ce": m("DTM/distogram_da_ce/Validation"),
             "distogram_da_contact_precision": m("DTM/distogram_da_contact_precision/Validation"),
             "distogram_head_weight_rms": m("DTM/distogram_head_weight_rms/Validation"),
+            "distogram_task_pair_fraction": m("DTM/distogram_task_pair_fraction/Validation"),
+            "distogram_DD_ce": m("DTM/distogram_DD_ce/Validation"),
+            "distogram_DF_ce": m("DTM/distogram_DF_ce/Validation"),
+            "distogram_DA_ce": m("DTM/distogram_DA_ce/Validation"),
+            "distogram_context_context_optimized_pairs": m(
+                "DTM/distogram_context_context_optimized_pairs/Validation"
+            ),
             "r05_parent_static_bio_rms": m("AbFlowDiag/r05_parent_static_bio_rms/Validation"),
             "r05_parent_dynamic_bio_rms": m("AbFlowDiag/r05_parent_dynamic_bio_rms/Validation"),
             "abx_single_bio_rms": m("AbFlowDiag/abx_single_bio_rms/Validation"),
@@ -1327,10 +1355,56 @@ class AbFlowTrainer(Trainer):
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
         return bool(getattr(raw_model, "relational_trunk_enabled", False))
 
+    def _should_pair_grad_audit(self, val):
+        if val or not self._pair_grad_audit_enabled:
+            return False
+        step = int(self.global_step)
+        return step > 0 and step % self._pair_grad_audit_interval == 0
+
+    def _print_pair_gradient_audit(self, raw_model):
+        if not self._diag_main_rank:
+            return
+        diag = getattr(raw_model, "last_pair_gradient_audit", None) or {}
+        error = str(getattr(raw_model, "_pair_gradient_audit_error", "") or "")
+        if not diag:
+            if error:
+                print(
+                    "[PairGradientAudit][UNAVAILABLE] "
+                    f"epoch={self.epoch} step={self.global_step} reason={error}"
+                )
+            return
+
+        def g(name):
+            return self._scalar(diag.get(name))
+
+        gp = g("grad_pair_norm_primary")
+        gd = g("grad_pair_norm_distogram")
+        gl = g("grad_pair_norm_smooth_lddt")
+
+        def ratio(num, den):
+            if num is None or den is None or abs(float(den)) <= 1e-20:
+                return None
+            return float(num) / float(den)
+
+        print(
+            "[PairGradientAudit] "
+            f"epoch={self.epoch} step={self.global_step} probe=shared_pair_z "
+            f"t=({self._fmt(g('t_min'),3)},{self._fmt(g('t_mean'),3)},{self._fmt(g('t_max'),3)}) "
+            f"|gP|={self._fmte(gp,3)} "
+            f"|gT|={self._fmte(g('grad_pair_norm_endpoint'),3)} "
+            f"|gStruct|={self._fmte(g('grad_pair_norm_structure'),3)} "
+            f"|gD|={self._fmte(gd,3)} |gL|={self._fmte(gl,3)} "
+            f"D/P={self._fmt(ratio(gd,gp),4)} L/P={self._fmt(ratio(gl,gp),4)} "
+            f"cos(D,P)={self._fmt(g('grad_pair_cos_distogram_primary'),4)} "
+            f"cos(L,P)={self._fmt(g('grad_pair_cos_smooth_lddt_primary'),4)} "
+            f"cos(D,L)={self._fmt(g('grad_pair_cos_distogram_smooth_lddt'),4)}"
+        )
+
     def share_step(self, batch, batch_idx, val=False):
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
         # Validation captures epoch diagnostics. Training captures diagnostics
         # only at the compact science cadence or for the zero-start bridge check.
+        pair_grad_audit = self._should_pair_grad_audit(val)
         science_step_diag = (not val) and (
             int(self.global_step) < self._science_log_first_steps
             or (self._science_log_interval > 0 and int(self.global_step) % self._science_log_interval == 0)
@@ -1341,16 +1415,26 @@ class AbFlowTrainer(Trainer):
             and not self._live_bridge_contract_verified
         )
         capture_diagnostics = (
-            bool(val) or science_step_diag or bridge_contract_probe
+            bool(val) or science_step_diag or bridge_contract_probe or pair_grad_audit
         )
         raw_model._diagnostic_capture = bool(capture_diagnostics)
         raw_model._diagnostic_validation_mode = bool(val and capture_diagnostics)
+        raw_model._pair_gradient_audit_capture = bool(pair_grad_audit)
 
         loss, seq_detail, structure_detail, dock_detail, pdev_detail = self.model(**batch)
         snll, aar = seq_detail
         struct_loss, xloss, bond_loss, sc_bond_loss = structure_detail
         dock_loss, interface_loss, ed_loss, r_ed_losses = dock_detail
         pdev_loss, prmsd_loss = pdev_detail
+
+        if pair_grad_audit and hasattr(raw_model, "compute_pair_gradient_authority"):
+            # Best-effort only: never raise and never gate training.  The model
+            # method itself catches AMP/autograd incompatibilities and clears
+            # all live graph references before the ordinary backward.
+            raw_model.compute_pair_gradient_authority()
+            self._print_pair_gradient_audit(raw_model)
+        else:
+            raw_model.last_pair_gradient_audit = {}
 
         if not val:
             current_epoch = int(self.epoch)
@@ -1772,10 +1856,18 @@ class AbFlowTrainer(Trainer):
                 print(
                     "[Distogram] "
                     f"epoch={self.epoch} step={self.global_step} "
+                    f"scope={getattr(raw_model, 'distogram_pair_scope', 'NA')} "
                     f"raw={self._fmt(_sf('distogram_loss'), 6)} "
                     f"weighted={self._fmt(_sf('distogram_weighted_loss'), 6)} "
                     f"head_rms={self._fmt(_sf('distogram_head_weight_rms'), 6)} "
-                    f"DA_ce={self._fmt(_sf('distogram_da_ce'), 4)} "
+                    f"task_fraction={self._fmt(_sf('distogram_task_pair_fraction'), 4)} "
+                    f"pairs=DD:{self._fmt(_sf('distogram_DD_pairs'),0)},"
+                    f"DF:{self._fmt(_sf('distogram_DF_pairs'),0)},"
+                    f"DA:{self._fmt(_sf('distogram_DA_pairs'),0)} "
+                    f"ctxctx={self._fmt(_sf('distogram_context_context_optimized_pairs'),0)} "
+                    f"CE=DD:{self._fmt(_sf('distogram_DD_ce'),4)},"
+                    f"DF:{self._fmt(_sf('distogram_DF_ce'),4)},"
+                    f"DA:{self._fmt(_sf('distogram_DA_ce'),4)} "
                     f"DA_contactP={self._fmt(_sf('distogram_da_contact_precision'), 4)}"
                 )
             if bool(getattr(raw_model, "smooth_lddt_enabled", False)):
@@ -1794,32 +1886,6 @@ class AbFlowTrainer(Trainer):
                     f"DF={self._fmt(_sf('smooth_lddt_DF'), 5)} "
                     f"DA={self._fmt(_sf('smooth_lddt_DA'), 5)}"
                 )
-        if science_step_diag and self._diag_main_rank:
-            def _ad_science(name):
-                return self._scalar(abflow_diagnostics.get(name))
-            print(
-                "[SequencePathAudit:Train] "
-                f"epoch={self.epoch} step={self.global_step} "
-                f"configured_context={self._fmt(batch.get('context_ratio'), 4)} "
-                f"exact={self._fmt(_ad_science('sequence_path_contract_exact'), 0)} "
-                f"path_design={self._fmt(_ad_science('sequence_path_participation_rate'), 4)} "
-                f"external_native={self._fmt(_ad_science('sequence_external_native_context_rate'), 4)} "
-                f"noisy_branch={self._fmt(_ad_science('sequence_noisy_branch_rate'), 4)} "
-                f"clean_branch={self._fmt(_ad_science('sequence_clean_branch_rate'), 4)} "
-                f"state_native={self._fmt(_ad_science('sequence_state_native_fraction'), 4)} "
-                f"loss_design={self._fmt(_ad_science('sequence_loss_coverage_design'), 4)} "
-                f"loss_on_noisy={self._fmt(_ad_science('sequence_loss_on_noisy_precision'), 4)}"
-            )
-            module_diag = getattr(raw_model, 'last_r05_module_diagnostics', {})
-            if module_diag:
-                print(
-                    '[R05ModuleAudit:Train] epoch=' + str(self.epoch) + ' ' +
-                    ' '.join(
-                        k + '=' + self._fmt(self._scalar(v), 5)
-                        for k, v in sorted(module_diag.items())
-                    )
-                )
-
         lr = None
         if not val:
             lr = self.config.lr if self.scheduler is None else self.scheduler.get_last_lr()[0]

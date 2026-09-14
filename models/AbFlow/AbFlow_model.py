@@ -135,6 +135,15 @@ class AbFlowModel(nn.Module):
         distogram_config = loss_config.get("distogram", {})
         smooth_lddt_config = loss_config.get("smooth_lddt", {})
         self.loss_distogram_weight = float(distogram_config.get("weight", 0.0))
+        self.distogram_pair_scope = str(
+            distogram_config.get("pair_scope", "all_resolved") or "all_resolved"
+        ).strip().lower()
+        _distogram_scopes = {"all_resolved", "design_anchored", "generation_anchored"}
+        if self.distogram_pair_scope not in _distogram_scopes:
+            raise ValueError(
+                "loss.distogram.pair_scope must be one of "
+                f"{sorted(_distogram_scopes)}, got {self.distogram_pair_scope!r}."
+            )
         self.loss_smooth_lddt_weight = float(
             smooth_lddt_config.get("weight", 0.0)
         )
@@ -240,6 +249,12 @@ class AbFlowModel(nn.Module):
         self._last_trunk_state = {}
         self._last_message_diagnostics = {}
         self._last_round_egnn_diagnostics = []
+        # V222 shared-Pair gradient authority is best-effort telemetry only.
+        # It never writes Parameter.grad and never gates formal training.
+        self.last_pair_gradient_audit = {}
+        self._pair_gradient_audit_state = {}
+        self._pair_gradient_audit_error = ""
+        self._pair_gradient_audit_capture = False
         self.grad_conflict_diagnostics = False
         self._diagnostic_capture = False
         self._diagnostic_validation_mode = False
@@ -1014,7 +1029,10 @@ class AbFlowModel(nn.Module):
             segment_ids=self.batch_constants['segment_ids'],
             residue_pos=residue_pos, batch_id=batch_id,
             valid_mask=biological, is_antigen=self.batch_constants['is_ag'],
-            design_mask=cmask, flow_t=flow_t,
+            # Keep donor structural information barrier (cmask) separate from
+            # task auxiliary support (paratope_mask).  For formal H3 generation
+            # the latter is exactly the generated stochastic degree of freedom.
+            design_mask=cmask, aux_task_mask=paratope_mask, flow_t=flow_t,
             cdr_type=self.cdr_type, residue_feature=self.aa_feature,
             round_idx=-1,
             atom_observed_mask=self.batch_constants.get('xloss_mask'))
@@ -1295,6 +1313,35 @@ class AbFlowModel(nn.Module):
         if pdev_loss is not None:
             loss = loss + pdev_loss
 
+        # V222 optional shared-Pair gradient authority.  This captures references
+        # only on the trainer-selected probe step.  No backward() is called here;
+        # the later audit uses autograd.grad(..., retain_graph=True) on the same
+        # live z that feeds both Distogram and Pair->EGNN.
+        if self.training and bool(getattr(self, "_pair_gradient_audit_capture", False)):
+            pair_z = (
+                self._last_trunk_state.get("pair_dense")
+                if isinstance(self._last_trunk_state, dict) else None
+            )
+            self._pair_gradient_audit_state = {
+                "pair_z": pair_z,
+                "loss_primary": (
+                    self.loss_structure_weight * struct_loss
+                    + self.loss_interface_weight * interface_loss
+                    + self.loss_edge_weight * ed_loss
+                ),
+                "loss_endpoint": self.loss_interface_weight * interface_loss,
+                "loss_structure": self.loss_structure_weight * struct_loss,
+                "loss_distogram": self.loss_distogram_weight * distogram_loss,
+                "loss_smooth_lddt": (
+                    self.loss_smooth_lddt_weight * smooth_lddt_loss
+                ),
+                "t_min": t_graph.min(),
+                "t_mean": t_graph.mean(),
+                "t_max": t_graph.max(),
+            }
+        else:
+            self._pair_gradient_audit_state = {}
+
         # Per-complex geometry diagnostics are computed only when explicitly
         # enabled.  They are detached and never enter the objective.
         if self.geometry_forensics_enabled:
@@ -1417,6 +1464,88 @@ class AbFlowModel(nn.Module):
         return (loss, (snll, aar), (struct_loss, *struct_details),
                 (dock_loss, interface_loss, ed_loss, r_ed_losses),
                 (pdev_loss, prmsd_loss))
+
+    def compute_pair_gradient_authority(self):
+        """Best-effort weighted objective gradients on the shared live Pair z.
+
+        The probe is deliberately non-authoritative: it never changes the loss,
+        optimizer, Parameter.grad, checkpoint selection or Train->Val->Test flow.
+        Any PyTorch/AMP incompatibility is returned as telemetry instead of
+        failing a scientific run.
+        """
+        self.last_pair_gradient_audit = {}
+        self._pair_gradient_audit_error = ""
+        state = getattr(self, "_pair_gradient_audit_state", None) or {}
+        z = state.get("pair_z")
+        if not torch.is_tensor(z) or not bool(z.requires_grad):
+            self._pair_gradient_audit_error = (
+                "shared Pair z unavailable or does not require grad"
+            )
+            self._pair_gradient_audit_state = {}
+            return {}
+
+        names = ("primary", "endpoint", "structure", "distogram", "smooth_lddt")
+        grads = {}
+        try:
+            for name in names:
+                objective = state.get(f"loss_{name}")
+                if not torch.is_tensor(objective) or not bool(objective.requires_grad):
+                    grads[name] = None
+                    continue
+                grads[name] = torch.autograd.grad(
+                    objective, z, retain_graph=True, create_graph=False,
+                    allow_unused=True,
+                )[0]
+
+            def _norm(g):
+                if g is None:
+                    return None
+                x = g.detach().float().reshape(-1)
+                return torch.linalg.vector_norm(x, ord=2) if x.numel() else x.new_zeros(())
+
+            def _cos(a, b):
+                if a is None or b is None:
+                    return None
+                x = a.detach().float().reshape(-1)
+                y = b.detach().float().reshape(-1)
+                if x.numel() == 0 or y.numel() == 0:
+                    return None
+                nx = torch.linalg.vector_norm(x, ord=2)
+                ny = torch.linalg.vector_norm(y, ord=2)
+                if float(nx) <= 1e-20 or float(ny) <= 1e-20:
+                    return None
+                return torch.dot(x, y) / (nx * ny)
+
+            diag = {}
+            for name, grad in grads.items():
+                value = _norm(grad)
+                if value is not None:
+                    diag[f"grad_pair_norm_{name}"] = value
+            for lhs, rhs in (
+                ("distogram", "primary"),
+                ("smooth_lddt", "primary"),
+                ("distogram", "smooth_lddt"),
+                ("distogram", "endpoint"),
+                ("distogram", "structure"),
+                ("smooth_lddt", "endpoint"),
+                ("smooth_lddt", "structure"),
+            ):
+                value = _cos(grads.get(lhs), grads.get(rhs))
+                if value is not None:
+                    diag[f"grad_pair_cos_{lhs}_{rhs}"] = value
+            for key in ("t_min", "t_mean", "t_max"):
+                value = state.get(key)
+                if torch.is_tensor(value):
+                    diag[key] = value.detach()
+            self.last_pair_gradient_audit = diag
+            return diag
+        except Exception as exc:
+            self._pair_gradient_audit_error = f"{type(exc).__name__}: {exc}"
+            self.last_pair_gradient_audit = {}
+            return {}
+        finally:
+            self._pair_gradient_audit_state = {}
+
 
     def _sampling_time_grid(self, n_steps, device, dtype):
         return torch.linspace(0.0, 1.0, max(1, int(n_steps)) + 1,

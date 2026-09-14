@@ -462,7 +462,7 @@ class Trainer:
         if self.train_loader.sampler is not None and self.local_rank != -1:
             self.train_loader.sampler.set_epoch(self.epoch)
 
-        _tqdm_on = str(os.environ.get("ABFLOW_TQDM", "off")).strip().lower() in {
+        _tqdm_on = str(os.environ.get("ABFLOW_TQDM", "on")).strip().lower() in {
             "1", "true", "yes", "y", "on"
         }
         t_iter = tqdm(
@@ -547,7 +547,7 @@ class Trainer:
         self.model.eval()
         with validation_ema(self):
             with torch.no_grad():
-                _tqdm_on = str(os.environ.get("ABFLOW_TQDM", "off")).strip().lower() in {
+                _tqdm_on = str(os.environ.get("ABFLOW_TQDM", "on")).strip().lower() in {
                     "1", "true", "yes", "y", "on"
                 }
                 t_iter = tqdm(

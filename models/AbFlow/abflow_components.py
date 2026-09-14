@@ -61,9 +61,15 @@ class NativeTrunk(nn.Module):
         self.enable_distogram = float(
             distogram_config.get("weight", 0.0)
         ) > 0.0
-        self.distogram_pair_scope = distogram_config.get(
-            "pair_scope", "all_resolved"
-        )
+        self.distogram_pair_scope = str(
+            distogram_config.get("pair_scope", "all_resolved") or "all_resolved"
+        ).strip().lower()
+        _distogram_scopes = {"all_resolved", "design_anchored", "generation_anchored"}
+        if self.distogram_pair_scope not in _distogram_scopes:
+            raise ValueError(
+                "loss.distogram.pair_scope must be one of "
+                f"{sorted(_distogram_scopes)}, got {self.distogram_pair_scope!r}."
+            )
         self.distogram_bins = int(distogram_config.get("bins", 64))
         self.distogram_min = float(distogram_config.get("min_bin", 2.3125))
         self.distogram_max = float(distogram_config.get("max_bin", 21.6875))
@@ -138,7 +144,20 @@ class NativeTrunk(nn.Module):
         return out
 
     def _pack(self, X, S, segment_ids, residue_pos, batch_id, valid_mask,
-              is_antigen, design_mask, flow_t, cdr_type, atom_observed_mask=None):
+              is_antigen, design_mask, flow_t, cdr_type, atom_observed_mask=None,
+              aux_task_mask=None):
+        # ``design_mask`` is the donor information-barrier authority (cmask).
+        # ``aux_task_mask`` is the task-loss authority (generated degrees of
+        # freedom, paratope_mask for formal H3 runs).  Never conflate them:
+        # changing the information barrier to localize an auxiliary objective
+        # can leak native design geometry into the donor trunk.
+        if aux_task_mask is None:
+            aux_task_mask = design_mask
+        if tuple(aux_task_mask.shape) != tuple(design_mask.shape):
+            raise ValueError(
+                f"aux_task_mask shape mismatch: {tuple(aux_task_mask.shape)} "
+                f"vs design_mask {tuple(design_mask.shape)}"
+            )
         nodes, ab_lens, antigen_counts = self._ordered_nodes(
             valid_mask, batch_id, is_antigen,
         )
@@ -158,6 +177,7 @@ class NativeTrunk(nn.Module):
         Rp = torch.zeros((B, L), device=X.device, dtype=torch.long)
         M = torch.zeros((B, L), device=X.device, dtype=torch.bool)
         Design = torch.zeros_like(M)
+        AuxTask = torch.zeros_like(M)
         IsAg = torch.zeros_like(M)
         GI = S.new_full((B, L), -1)
         if atom_observed_mask is not None:
@@ -185,6 +205,7 @@ class NativeTrunk(nn.Module):
             Rp[b, :n] = rp.to(dtype=torch.long)
             M[b, :n] = True
             Design[b, :n] = design_mask[idx].bool()
+            AuxTask[b, :n] = aux_task_mask[idx].bool()
             IsAg[b, :n] = is_antigen[idx].bool()
             GI[b, :n] = idx
 
@@ -225,7 +246,7 @@ class NativeTrunk(nn.Module):
             'atom14_gt_positions': Xp_donor, 'atom14_gt_exists': Exists,
             'torsion_angles_sin_cos': Tors, 't': t.to(Xp.dtype),
             'antibody_len': antibody_len, 'is_recycling': False,
-            '_design_mask': Design, '_is_antigen': IsAg,
+            '_design_mask': Design, '_aux_task_mask': AuxTask, '_is_antigen': IsAg,
         }
         return batch, GI, nodes, antigen_counts
 
@@ -264,11 +285,11 @@ class NativeTrunk(nn.Module):
 
     def forward(self, X, S, segment_ids, residue_pos, batch_id, valid_mask,
                 is_antigen, design_mask, flow_t, cdr_type, residue_feature,
-                round_idx=-1, atom_observed_mask=None):
+                round_idx=-1, atom_observed_mask=None, aux_task_mask=None):
         batch, GI, nodes, antigen_counts = self._pack(
             X, S, segment_ids, residue_pos, batch_id, valid_mask,
             is_antigen, design_mask, flow_t, cdr_type,
-            atom_observed_mask=atom_observed_mask,
+            atom_observed_mask=atom_observed_mask, aux_task_mask=aux_task_mask,
         )
 
         # single/pair donor dropout remains fully active, but it must not advance the
@@ -321,6 +342,7 @@ class NativeTrunk(nn.Module):
             'seq_padded': batch['seq'],
             'atom_exists_padded': batch['atom14_gt_exists'].bool(),
             'design_padded': batch['_design_mask'].bool(),
+            'aux_task_padded': batch['_aux_task_mask'].bool(),
             'is_antigen_padded': batch['_is_antigen'].bool(),
             'distogram_logits': logits,
             'biological_mask': valid_mask.bool(),
@@ -372,17 +394,40 @@ class NativeTrunk(nn.Module):
             target.reshape(-1), reduction='none',
         ).reshape(B, L, L)
 
-        pair_mask = pseudo_beta_mask[:, :, None] & pseudo_beta_mask[:, None, :]
-        pair_mask = pair_mask & (~torch.eye(
+        donor_pair_mask = pseudo_beta_mask[:, :, None] & pseudo_beta_mask[:, None, :]
+        donor_pair_mask = donor_pair_mask & (~torch.eye(
             L, device=logits.device, dtype=torch.bool
         )[None, :, :])
+
+        # Three independent authorities:
+        #   design_padded   -> donor structural information barrier (cmask)
+        #   aux_task_padded -> generated/task DOFs (paratope_mask in H3)
+        #   is_antigen      -> relation decomposition only
+        # The optimized V222 Distogram support is generation-anchored:
+        # every supervised pair must touch at least one generated residue.
         design = state['design_padded'].bool() & pseudo_beta_mask
-        if self.distogram_pair_scope == 'design_anchored':
-            pair_mask = pair_mask & (design[:, :, None] | design[:, None, :])
+        generation = state.get('aux_task_padded', state['design_padded']).bool() & pseudo_beta_mask
+        generation_pair = generation[:, :, None] | generation[:, None, :]
+
+        pair_mask = donor_pair_mask
+        if self.distogram_pair_scope == 'generation_anchored':
+            pair_mask = donor_pair_mask & generation_pair
+        elif self.distogram_pair_scope == 'design_anchored':
+            # Legacy compatibility only.  This scope is anchored to cmask and is
+            # intentionally distinct from V222 generation/task localization.
+            pair_mask = donor_pair_mask & (design[:, :, None] | design[:, None, :])
         elif self.distogram_pair_scope != 'all_resolved':
             raise ValueError(
                 f'unknown distogram pair_scope={self.distogram_pair_scope!r}'
             )
+
+        if self.distogram_pair_scope == 'generation_anchored':
+            leaked_context_pair = pair_mask & (~generation_pair)
+            if bool(leaked_context_pair.any()):
+                raise RuntimeError(
+                    'generation_anchored Distogram contract violated: an optimized '
+                    'pair has no generated endpoint.'
+                )
 
         denom = pair_mask.sum(dim=(-1, -2)).to(ce.dtype).clamp_min(1.0)
         per_graph = (ce * pair_mask.to(ce.dtype)).sum(dim=(-1, -2)) / denom
@@ -392,19 +437,59 @@ class NativeTrunk(nn.Module):
         if collect_audit:
             with torch.no_grad():
                 antigen = state['is_antigen_padded'].bool() & pseudo_beta_mask
-                da = pair_mask & design[:, :, None] & antigen[:, None, :]
-                da_n = da.sum()
-                da_ce = (
-                    (ce * da.to(ce.dtype)).sum() / da_n.clamp_min(1).to(ce.dtype)
+                framework = pseudo_beta_mask & (~generation) & (~antigen)
+
+                gg = pair_mask & generation[:, :, None] & generation[:, None, :]
+                gf = pair_mask & (
+                    (generation[:, :, None] & framework[:, None, :])
+                    | (framework[:, :, None] & generation[:, None, :])
                 )
+                ga = pair_mask & (
+                    (generation[:, :, None] & antigen[:, None, :])
+                    | (antigen[:, :, None] & generation[:, None, :])
+                )
+                context_context = pair_mask & (~generation_pair)
+
+                # Directed generation->antigen view keeps the historical DA
+                # contact-precision diagnostic numerically interpretable.
+                da_direct = pair_mask & generation[:, :, None] & antigen[:, None, :]
+
+                def masked_mean(value, mask):
+                    n = mask.sum()
+                    return (
+                        (value * mask.to(value.dtype)).sum()
+                        / n.clamp_min(1).to(value.dtype)
+                    )
+
+                da_ce = masked_mean(ce, da_direct)
                 probs = torch.softmax(logits.float(), dim=-1)
                 last_contact_bin = int((boundaries < 8.0).sum().item())
                 contact_prob = probs[..., :last_contact_bin + 1].sum(dim=-1)
                 native_contact = d2.squeeze(-1) < (8.0 ** 2)
-                soft_tp = (contact_prob * native_contact.float() * da.float()).sum()
-                soft_pred = (contact_prob * da.float()).sum()
+                soft_tp = (
+                    contact_prob * native_contact.float() * da_direct.float()
+                ).sum()
+                soft_pred = (contact_prob * da_direct.float()).sum()
+                donor_n = donor_pair_mask.sum().clamp_min(1)
                 audit = {
                     'distogram_valid_pairs': pair_mask.sum().to(loss.dtype),
+                    'distogram_donor_valid_pairs': donor_pair_mask.sum().to(loss.dtype),
+                    'distogram_task_pair_fraction': (
+                        pair_mask.sum().to(loss.dtype) / donor_n.to(loss.dtype)
+                    ),
+                    'distogram_scope_generation_anchored': loss.new_tensor(
+                        1.0 if self.distogram_pair_scope == 'generation_anchored' else 0.0
+                    ),
+                    'distogram_generation_rows': generation.sum().to(loss.dtype),
+                    'distogram_DD_pairs': gg.sum().to(loss.dtype),
+                    'distogram_DF_pairs': gf.sum().to(loss.dtype),
+                    'distogram_DA_pairs': ga.sum().to(loss.dtype),
+                    'distogram_context_context_optimized_pairs': (
+                        context_context.sum().to(loss.dtype)
+                    ),
+                    'distogram_DD_ce': masked_mean(ce, gg).to(loss.dtype),
+                    'distogram_DF_ce': masked_mean(ce, gf).to(loss.dtype),
+                    'distogram_DA_ce': masked_mean(ce, ga).to(loss.dtype),
                     'distogram_da_ce': da_ce.to(loss.dtype),
                     'distogram_da_contact_precision': (
                         soft_tp / soft_pred.clamp_min(1e-8)
