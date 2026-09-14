@@ -100,7 +100,7 @@ class AbFlowModel(nn.Module):
         self.coordinate_state_mode = str(
             state_cfg.get("mode", "legacy_dual") or "legacy_dual"
         ).strip().lower()
-        _state_modes = {"legacy_dual", "scoreflow_endpoint_fused"}
+        _state_modes = {"legacy_dual", "scoreflow_endpoint_fused", "scoreflow_single_endpoint"}
         if self.coordinate_state_mode not in _state_modes:
             raise ValueError(
                 "model.representation.single_pair.coordinate_state.mode must be one of "
@@ -167,6 +167,20 @@ class AbFlowModel(nn.Module):
         self.loss_smooth_lddt_weight = float(
             smooth_lddt_config.get("weight", 0.0)
         )
+        coarse_anchor_config = loss_config.get("coarse_anchor_distance", {})
+        self.loss_coarse_anchor_weight = float(
+            coarse_anchor_config.get("weight", 0.0)
+        )
+        self.coarse_anchor_cutoff_A = float(
+            coarse_anchor_config.get("cutoff_A", distogram_config.get("max_bin", 21.6875))
+        )
+        self.coarse_anchor_relation_balance = str(
+            coarse_anchor_config.get("relation_balance", "DF_DA_equal") or "DF_DA_equal"
+        ).strip()
+        if self.coarse_anchor_relation_balance != "DF_DA_equal":
+            raise ValueError(
+                "loss.coarse_anchor_distance.relation_balance must be 'DF_DA_equal'"
+            )
         self.smooth_lddt_cutoff = float(
             smooth_lddt_config.get("cutoff", 15.0)
         )
@@ -194,6 +208,7 @@ class AbFlowModel(nn.Module):
             )
         self.distogram_enabled = self.loss_distogram_weight > 0.0
         self.smooth_lddt_enabled = self.loss_smooth_lddt_weight > 0.0
+        self.coarse_anchor_enabled = self.loss_coarse_anchor_weight > 0.0
         self.relational_trunk_enabled = True
 
         # Representation initialization is isolated from the R05 RNG stream.
@@ -335,26 +350,19 @@ class AbFlowModel(nn.Module):
                 self._coord_diag_scalar(d, 'coord_state_coeff_raw_rms_max'),
                 self._coord_diag_scalar(d, 'coord_state_coeff_raw_absmax_max'),
                 self._coord_diag_scalar(d, 'coord_pair_delta_raw_rms_max'),
-                self._coord_diag_scalar(d, 'coord_pair_delta_raw_absmax_max'),
-                self._coord_diag_scalar(d, 'coord_diff_norm_rms_max'),
-                self._coord_diag_scalar(d, 'coord_diff_norm_absmax_max'),
                 self._coord_diag_scalar(d, 'coord_update_rms_max'),
                 self._coord_diag_scalar(d, 'coord_update_absmax_max'),
-                self._coord_diag_scalar(d, 'coord_update_to_input_rms_ratio_max'),
-                self._coord_diag_scalar(d, 'coord_state_edge_rms_max'),
-                self._coord_diag_scalar(d, 'coord_state_head_input_rms_max'),
             ))
         fmt = lambda v: 'nan' if not math.isfinite(v) else f'{v:.6g}'
         payload = ';'.join(
-            f'r{r}:alpha={fmt(ar)}/{fmt(am)} pair={fmt(pr)}/{fmt(pm)} '
-            f'd={fmt(dr)}/{fmt(dm)} dx={fmt(xr)}/{fmt(xm)} '
-            f'dx_x={fmt(rx)} edge={fmt(er)} head={fmt(hi)}'
-            for r, ar, am, pr, pm, dr, dm, xr, xm, rx, er, hi in rows
+            f'r{r}:alpha={fmt(ar)}/{fmt(am)} pair_rms={fmt(pr)} '
+            f'dx={fmt(xr)}/{fmt(xm)}'
+            for r, ar, am, pr, xr, xm in rows
         )
         print(
             '[ControllerAudit] '
             f'train_call={call} mode={self.coord_controller_mode} '
-            f'prenorm={int(self.coord_prenorm)} fields=rms/max {payload}',
+            f'fields=rms/max {payload}',
             flush=True,
         )
 
@@ -455,8 +463,7 @@ class AbFlowModel(nn.Module):
         ordered = (
             'xt_absmax_A', 'carrier_absmax_A', 'implied_x1_absmax_A',
             'xnext_absmax_A', 'pred_final_absmax_A',
-            'gen_pre_align_absmax_A', 'kabsch_translation_norm_A',
-            'gen_post_align_absmax_A',
+            'gen_pre_align_absmax_A', 'gen_post_align_absmax_A',
         )
         for field in ordered:
             value = row.get(field)
@@ -1122,6 +1129,115 @@ class AbFlowModel(nn.Module):
             }
         return pred_closed, consistent_carrier, audit
 
+    def _carrier_from_single_endpoint(
+            self, pred_X, shadow_carrier, paratope_mask, interface_batch_id,
+            flow_xt_model, flow_x0_model, flow_t):
+        """Derive the recurrent Score--Flow carrier from the sole learned endpoint.
+
+        ``pred_X[paratope_mask]`` is the only learned clean-coordinate authority.
+        The shadow EGNN coordinate is retained only as an intra-round geometric
+        workspace for message passing and is discarded before recurrent feedback.
+        """
+        if flow_xt_model is None or flow_x0_model is None or flow_t is None:
+            raise RuntimeError(
+                "scoreflow_single_endpoint requires flow Xt, source X0 and flow_t"
+            )
+        endpoint = pred_X[paratope_mask]
+        if tuple(endpoint.shape) != tuple(shadow_carrier.shape):
+            raise RuntimeError(
+                f"single-endpoint shape mismatch: endpoint={tuple(endpoint.shape)} "
+                f"shadow={tuple(shadow_carrier.shape)}"
+            )
+        t_int = self._time_for_interface(flow_t, interface_batch_id, endpoint)
+        canonical = self.r3_matcher.canonical_carrier_target_gfree(
+            x_t=flow_xt_model, x0=flow_x0_model, x1=endpoint, t=t_int,
+            boundary_eps=self.f01_hybrid_t_min,
+        )
+        active = torch.as_tensor(
+            t_int, device=endpoint.device, dtype=endpoint.dtype
+        ) >= float(self.f01_hybrid_t_min)
+        while active.dim() < endpoint.dim():
+            active = active.unsqueeze(-1)
+        carrier = torch.where(active, canonical, endpoint)
+
+        with torch.no_grad():
+            shadow_implied = self.r3_matcher.endpoint_from_canonical_carrier_gfree(
+                x_t=flow_xt_model, x0=flow_x0_model, carrier=shadow_carrier, t=t_int,
+                boundary_eps=self.f01_hybrid_t_min,
+            )
+            shadow_implied = torch.where(active, shadow_implied, shadow_carrier)
+            audit = {
+                "single_endpoint_on": endpoint.new_tensor(1.0),
+                "shadow_endpoint_gap_rms": self._rms_tensor(
+                    shadow_implied.detach() - endpoint.detach()
+                ).to(endpoint.dtype),
+            }
+        return carrier, audit
+
+    def _coarse_anchor_distance_loss(
+            self, pred_X, true_X, true_S, paratope_mask, batch_id,
+            is_antigen, xloss_mask):
+        """Non-saturating CA-distance supervision for coarse H3 placement.
+
+        Native DF and DA pairs within the configured support cutoff are supervised
+        by absolute distance error.  Relations are equally averaged per complex,
+        then scaled by the existing R3 coordinate scaling (0.1 in the formal run).
+        """
+        zero = pred_X.sum() * 0.0
+        ca_valid = xloss_mask[:, 1].bool() if xloss_mask.dim() == 2 else xloss_mask.bool()
+        biological = (true_S >= 0) & (true_S < 20) & ca_valid
+        generation = paratope_mask.bool() & biological
+        antigen = is_antigen.bool() & biological
+        framework = biological & (~generation) & (~antigen)
+        pred_ca = true_X[:, 1].clone()
+        pred_ca[generation] = pred_X[generation, 1]
+        true_ca = true_X[:, 1]
+
+        graph_losses = []
+        df_mae_sum = zero.detach().float()
+        da_mae_sum = zero.detach().float()
+        df_graphs = da_graphs = 0
+        df_pairs = da_pairs = 0
+        B = int(batch_id.max().item()) + 1 if batch_id.numel() else 0
+        for gid in range(B):
+            g = batch_id == gid
+            gi = torch.nonzero(g & generation, as_tuple=False).flatten()
+            if gi.numel() == 0:
+                continue
+            relation_losses = []
+            for ctx_mask, relation in ((framework, 'DF'), (antigen, 'DA')):
+                cj = torch.nonzero(g & ctx_mask, as_tuple=False).flatten()
+                if cj.numel() == 0:
+                    continue
+                native_d = torch.cdist(true_ca[gi].float(), true_ca[cj].float())
+                support = native_d <= float(self.coarse_anchor_cutoff_A)
+                if not bool(support.any()):
+                    continue
+                pred_d = torch.cdist(pred_ca[gi].float(), pred_ca[cj].float())
+                mae = (pred_d - native_d).abs()[support].mean()
+                relation_losses.append(mae.to(pred_X.dtype))
+                n = int(support.sum().item())
+                if relation == 'DF':
+                    df_mae_sum = df_mae_sum + mae.detach()
+                    df_graphs += 1
+                    df_pairs += n
+                else:
+                    da_mae_sum = da_mae_sum + mae.detach()
+                    da_graphs += 1
+                    da_pairs += n
+            if relation_losses:
+                graph_losses.append(torch.stack(relation_losses).mean())
+
+        loss_A = torch.stack(graph_losses).mean() if graph_losses else zero
+        loss = loss_A * float(self.flow_coordinate_scaling)
+        audit = {
+            'coarse_anchor_DF_mae_A': (df_mae_sum / max(df_graphs, 1)).to(pred_X.dtype),
+            'coarse_anchor_DA_mae_A': (da_mae_sum / max(da_graphs, 1)).to(pred_X.dtype),
+            'coarse_anchor_DF_pairs': pred_X.new_tensor(float(df_pairs)),
+            'coarse_anchor_DA_pairs': pred_X.new_tensor(float(da_pairs)),
+        }
+        return loss, audit
+
 
     def _forward(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep,
                  surface, residue_pos, template, lengths, init_noise=None,
@@ -1165,15 +1281,15 @@ class AbFlowModel(nn.Module):
             flow_x0_model = self._raw_interface_to_model_frame(
                 flow_source_init, paratope_mask, batch_id
             )
-        if self.coordinate_state_mode == "scoreflow_endpoint_fused":
+        if self.coordinate_state_mode in {"scoreflow_endpoint_fused", "scoreflow_single_endpoint"}:
             if flow_xt_model is None or flow_x0_model is None or flow_t is None:
                 raise RuntimeError(
-                    "V223 state closure requires explicit interface_init, "
+                    "Score--Flow state mode requires explicit interface_init, "
                     "flow_source_init and flow_t."
                 )
             if bool((paratope_mask & (~cmask)).any()):
                 raise RuntimeError(
-                    "V223 requires generated/paratope residues to have coordinate "
+                    "Score--Flow state mode requires generated/paratope residues to have coordinate "
                     "authority: paratope_mask must be a subset of cmask."
                 )
 
@@ -1262,15 +1378,28 @@ class AbFlowModel(nn.Module):
                     f"round{round_idx}_{k}": v for k, v in closure_audit.items()
                 }
                 self._last_state_closure_audit.update(closure_audit)
+            elif self.coordinate_state_mode == "scoreflow_single_endpoint":
+                interface_X, authority_audit = self._carrier_from_single_endpoint(
+                    pred_X=pred_X, shadow_carrier=interface_X,
+                    paratope_mask=paratope_mask,
+                    interface_batch_id=self.batch_constants['interface_batch_id'],
+                    flow_xt_model=flow_xt_model, flow_x0_model=flow_x0_model,
+                    flow_t=flow_t,
+                )
+                authority_audit = {
+                    f"round{round_idx}_{k}": v for k, v in authority_audit.items()
+                }
+                self._last_state_closure_audit.update(authority_audit)
 
             r_interface_X.append(interface_X.clone())
             r_logits.append((pred_logits, smask))
             r_edge_dist.append(edge_dist)
             X = X.clone()
             X[cmask] = pred_X[cmask]
-            # In V223 the generated H3 rows in pred_X have already been projected
-            # to the clean endpoint implied by the carrier, so global/context and
-            # local Score--Flow geometry cannot drift as independent authorities.
+            # Global generated coordinates always follow pred_X.  In the V224
+            # single-endpoint mode the recurrent carrier above is analytically
+            # derived from this same endpoint; the shadow EGNN coordinate is not
+            # a recurrent authority.
             X = self.aa_feature.update_global_coordinates(X, S)
 
             if not self.struct_only:
@@ -1392,6 +1521,15 @@ class AbFlowModel(nn.Module):
                 collect_audit=bool(getattr(self, "_diagnostic_capture", False)),
             )
 
+        coarse_anchor_loss = X.new_zeros(())
+        coarse_anchor_audit = {}
+        if self.loss_coarse_anchor_weight > 0.0:
+            coarse_anchor_loss, coarse_anchor_audit = self._coarse_anchor_distance_loss(
+                pred_X=pred_X, true_X=true_X, true_S=true_S,
+                paratope_mask=paratope_mask, batch_id=batch_id,
+                is_antigen=self.batch_constants['is_ag'], xloss_mask=xloss_mask,
+            )
+
         smooth_lddt_loss = X.new_zeros(())
         smooth_lddt_audit = {}
         if self.loss_smooth_lddt_weight > 0.0:
@@ -1407,10 +1545,10 @@ class AbFlowModel(nn.Module):
                 # this branch because cmask may exceed the generated H3 support.
                 smooth_pred_design = pred_X[cmask]
             elif self.smooth_lddt_prediction_source == "terminal_fused_endpoint":
-                if self.coordinate_state_mode != "scoreflow_endpoint_fused":
+                if self.coordinate_state_mode not in {"scoreflow_endpoint_fused", "scoreflow_single_endpoint"}:
                     raise RuntimeError(
                         "terminal_fused_endpoint smooth-lDDT requires "
-                        "coordinate_state.mode=scoreflow_endpoint_fused"
+                        "coordinate_state.mode in {scoreflow_endpoint_fused, scoreflow_single_endpoint}"
                     )
                 smooth_design_mask = paratope_mask
                 smooth_pred_design = pred_X[paratope_mask]
@@ -1511,6 +1649,7 @@ class AbFlowModel(nn.Module):
             + self.loss_interface_weight * interface_loss
             + self.loss_edge_weight * ed_loss
             + self.loss_distogram_weight * distogram_loss
+            + self.loss_coarse_anchor_weight * coarse_anchor_loss
             + self.loss_smooth_lddt_weight * smooth_lddt_loss
         )
         if pdev_loss is not None:
@@ -1587,6 +1726,11 @@ class AbFlowModel(nn.Module):
                 'distogram_weighted_loss': (
                     self.loss_distogram_weight * distogram_loss
                 ).detach(),
+                'coarse_anchor_loss': coarse_anchor_loss.detach(),
+                'coarse_anchor_weighted_loss': (
+                    self.loss_coarse_anchor_weight * coarse_anchor_loss
+                ).detach(),
+                **{k: v.detach() for k, v in coarse_anchor_audit.items()},
                 'smooth_lddt_loss': smooth_lddt_loss.detach(),
                 'smooth_lddt_weighted_loss': (
                     self.loss_smooth_lddt_weight * smooth_lddt_loss
@@ -1635,6 +1779,9 @@ class AbFlowModel(nn.Module):
                 't_max': t_graph.max().detach(),
                 'coordinate_state_closed': X.new_tensor(
                     1.0 if self.coordinate_state_mode == "scoreflow_endpoint_fused" else 0.0
+                ),
+                'coordinate_single_endpoint': X.new_tensor(
+                    1.0 if self.coordinate_state_mode == "scoreflow_single_endpoint" else 0.0
                 ),
                 **{k: v.detach() if torch.is_tensor(v) else v
                    for k, v in self._last_message_diagnostics.items()},
@@ -1841,8 +1988,8 @@ class AbFlowModel(nn.Module):
                 prmsd_final[interface_cmask], interface_batch_id,
                 dim=0, dim_size=batch_size)
 
-        if self.coordinate_state_mode == "scoreflow_endpoint_fused":
-            # Formal V223 readout: the 10-step integrated Score--Flow endpoint is
+        if self.coordinate_state_mode in {"scoreflow_endpoint_fused", "scoreflow_single_endpoint"}:
+            # Formal Score--Flow readout: the 10-step integrated Score--Flow endpoint is
             # the only generated-coordinate authority.  Fixed framework/antigen
             # coordinates are inherited exactly from the input complex.
             gen_X[paratope_mask] = interface_X_final

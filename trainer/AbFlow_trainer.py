@@ -111,7 +111,7 @@ class AbFlowTrainer(Trainer):
         # epoch table stays compact and directly comparable across R28/R29/R30.
         self._train_component_names = (
             "loss", "seq", "structure", "interface", "edge",
-            "distogram", "smooth_lddt"
+            "distogram", "coarse_anchor", "smooth_lddt"
         )
         self._epoch_train_acc_epoch = -1
         self._epoch_train_sums = {name: 0.0 for name in self._train_component_names}
@@ -303,6 +303,7 @@ class AbFlowTrainer(Trainer):
                 "context=full_antibody+dataset_epitope "
                 "bridge=zero_start_residual "
                 f"distogram={getattr(raw_model, 'loss_distogram_weight', 0.0):.4g} "
+                f"coarse_anchor={getattr(raw_model, 'loss_coarse_anchor_weight', 0.0):.4g} "
                 f"smooth_lddt={getattr(raw_model, 'loss_smooth_lddt_weight', 0.0):.4g} "
                 f"smooth_lddt_source={getattr(raw_model, 'smooth_lddt_prediction_source', 'pred_design_endpoint')}"
             )
@@ -997,6 +998,7 @@ class AbFlowTrainer(Trainer):
             "loss_interface": m("Dock/SPLoss/Validation"),
             "loss_edge": m("Dock/EDLoss/Validation"),
             "distogram_loss": m("DTM/distogram_loss/Validation"),
+            "coarse_anchor_loss": m("DTM/coarse_anchor_loss/Validation"),
             "smooth_lddt_loss": m("DTM/smooth_lddt_loss/Validation"),
             "smooth_lddt_DD": m("DTM/smooth_lddt_DD/Validation"),
             "smooth_lddt_DF": m("DTM/smooth_lddt_DF/Validation"),
@@ -1102,6 +1104,8 @@ class AbFlowTrainer(Trainer):
             "t_min": m("AbFlowDiag/t_min/Validation"),
             "t_max": m("AbFlowDiag/t_max/Validation"),
             "coordinate_state_closed": m("AbFlowDiag/coordinate_state_closed/Validation"),
+            "coordinate_single_endpoint": m("AbFlowDiag/coordinate_single_endpoint/Validation"),
+            "single_endpoint_gap_r2": m("AbFlowDiag/round2_shadow_endpoint_gap_rms/Validation"),
             "state_post_r2": m("AbFlowDiag/round2_state_endpoint_post_rms/Validation"),
             "state_projection_r2": m("AbFlowDiag/round2_state_carrier_projection_rms/Validation"),
             "state_rotation_r2": m("AbFlowDiag/round2_state_rotation_deg/Validation"),
@@ -1176,9 +1180,7 @@ class AbFlowTrainer(Trainer):
         # reported by the mandatory observational Test phase below.
         print(
             "[Validation] "
-            f"epoch={self.epoch} val={self._fmt(summary.get('validation_metric'), 5)} "
-            f"bridge_s={self._fmt(summary.get('bridge_single_delta_to_base_ratio'), 5)} "
-            f"bridge_z={self._fmt(summary.get('bridge_pair_delta_to_base_ratio_mean'), 5)}"
+            f"epoch={self.epoch} val={self._fmt(summary.get('validation_metric'), 5)}"
         )
         print(
             "[ValidationBreakdown] "
@@ -1187,6 +1189,7 @@ class AbFlowTrainer(Trainer):
             f"interface={self._fmt(summary.get('loss_interface'), 5)} "
             f"edge={self._fmt(summary.get('loss_edge'), 5)} "
             f"dist={self._fmt(summary.get('distogram_loss'), 5)} "
+            f"anchor={self._fmt(summary.get('coarse_anchor_loss'), 5)} "
             f"lddt={self._fmt(summary.get('smooth_lddt_loss'), 5)}"
         )
         if float(summary.get('coordinate_state_closed', 0.0) or 0.0) > 0.5:
@@ -1195,6 +1198,11 @@ class AbFlowTrainer(Trainer):
                 f"epoch={self.epoch} r2_post={self._fmt(summary.get('state_post_r2'), 5)} "
                 f"r2_carrier_projection={self._fmt(summary.get('state_projection_r2'), 5)} "
                 f"r2_rotation_deg={self._fmt(summary.get('state_rotation_r2'), 3)}"
+            )
+        if float(summary.get('coordinate_single_endpoint', 0.0) or 0.0) > 0.5:
+            print(
+                "[StateAuthority] "
+                f"epoch={self.epoch} r2_shadow_endpoint_gap={self._fmt(summary.get('single_endpoint_gap_r2'), 5)}"
             )
 
 
@@ -1521,7 +1529,6 @@ class AbFlowTrainer(Trainer):
 
                 for rec in round_egnn:
                     coord_diag = rec.get('coord', {}) or {}
-                    bridge_diag = rec.get('bridge', {}) or {}
                     candidates = []
                     for key, value in coord_diag.items():
                         if key.endswith('.coord_update_absmax'):
@@ -1534,17 +1541,10 @@ class AbFlowTrainer(Trainer):
                         f"epoch={self.epoch} step={self.global_step} rank={rank} "
                         f"physical_round={rec.get('round_idx', 'NA')} "
                         f"coord_update_absmax={self._fmt(_diag_number(coord_diag.get('coord_update_absmax_max')), 6)} "
-                        f"coord_coeff_absmax={self._fmt(_diag_number(coord_diag.get('coord_coeff_absmax_max')), 6)} "
                         f"base_coeff_absmax={self._fmt(_diag_stage_max(coord_diag, '.coord_base_coeff_absmax'), 6)} "
                         f"state_coeff_absmax={self._fmt(_diag_stage_max(coord_diag, '.coord_state_coeff_absmax'), 6)} "
-                        f"pair_raw_absmax={self._fmt(_diag_stage_max(coord_diag, '.coord_pair_delta_raw_absmax'), 6)} "
-                        f"pair_bounded_absmax={self._fmt(_diag_stage_max(coord_diag, '.coord_pair_delta_bounded_absmax'), 6)} "
-                        f"pair_coord_bound={self._fmt(_diag_number(coord_diag.get('pair_coord_delta_bound')), 6)} "
                         f"worst_stage={worst_update[1]} "
-                        f"worst_stage_update_absmax={self._fmt(worst_update[0], 6)} "
-                        f"single_ratio={self._fmt(_diag_number(bridge_diag.get('bridge_single_delta_to_base_ratio')), 6)} "
-                        f"pair_ratio_mean={self._fmt(_diag_number(bridge_diag.get('bridge_pair_delta_to_base_ratio_mean')), 6)} "
-                        f"pair_ratio_max={self._fmt(_diag_number(bridge_diag.get('bridge_pair_delta_to_base_ratio_max')), 6)}"
+                        f"worst_stage_update_absmax={self._fmt(worst_update[0], 6)}"
                     )
 
                 def _safe_preview(value, limit=8):
@@ -1737,15 +1737,13 @@ class AbFlowTrainer(Trainer):
             if allow_alert:
                 self._geometry_authority_alert_count += 1
 
-            if (authority_interval_hit and self._diag_main_rank) or allow_alert:
+            if allow_alert:
                 rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-                tag = 'GeometryAuthorityAlert' if authority_alert else 'GeometryAuthority'
                 print(
-                    f'[{tag}] '
+                    '[GeometryAuthorityAlert] '
                     f'epoch={self.epoch} step={self.global_step} rank={rank} '
                     f"base_coeff_absmax={[None if r['base'] is None else round(r['base'], 6) for r in authority_rows]} "
                     f"state_coeff_absmax={[None if r['state'] is None else round(r['state'], 6) for r in authority_rows]} "
-                    f"pair_bounded_absmax={[None if r['pair_bounded'] is None else round(r['pair_bounded'], 6) for r in authority_rows]} "
                     f"coord_update_absmax={[None if r['update'] is None else round(r['update'], 6) for r in authority_rows]} "
                     f'base_alert={self._geometry_authority_base_alert:g} '
                     f'update_alert={self._geometry_authority_update_alert:g}'
@@ -1794,46 +1792,41 @@ class AbFlowTrainer(Trainer):
                 f"edge={self._fmt(self._scalar(ed_loss), 5)} "
                 f"t={self._fmt(_ad('t_mean'), 3)} "
                 f"s={self._fmt(_sf('relational_single_rms'), 4)} "
-                f"z={self._fmt(_sf('relational_pair_rms'), 4)} "
-                f"edge_z=({self._fmt(_ad('abx_ctx_edge_attr_rms'), 4)},"
-                f"{self._fmt(_ad('abx_inter_edge_attr_rms'), 4)},"
-                f"{self._fmt(_ad('abx_surf_edge_attr_rms'), 4)}) "
-                f"bridge_s={self._fmt(_ad('bridge_single_delta_to_base_ratio'), 6)} "
-                f"bridge_z={self._fmt(_ad('bridge_pair_delta_to_base_ratio_mean'), 6)}"
+                f"z={self._fmt(_sf('relational_pair_rms'), 4)}"
             )
             if bool(getattr(raw_model, "distogram_enabled", False)):
                 print(
                     "[Distogram] "
                     f"epoch={self.epoch} step={self.global_step} "
                     f"scope={getattr(raw_model, 'distogram_pair_scope', 'NA')} "
+                    f"reduction={getattr(getattr(raw_model, 'native_trunk', None), 'distogram_reduction', 'NA')} "
                     f"raw={self._fmt(_sf('distogram_loss'), 6)} "
-                    f"weighted={self._fmt(_sf('distogram_weighted_loss'), 6)} "
-                    f"head_rms={self._fmt(_sf('distogram_head_weight_rms'), 6)} "
-                    f"task_fraction={self._fmt(_sf('distogram_task_pair_fraction'), 4)} "
                     f"pairs=DD:{self._fmt(_sf('distogram_DD_pairs'),0)},"
                     f"DF:{self._fmt(_sf('distogram_DF_pairs'),0)},"
                     f"DA:{self._fmt(_sf('distogram_DA_pairs'),0)} "
-                    f"ctxctx={self._fmt(_sf('distogram_context_context_optimized_pairs'),0)} "
                     f"CE=DD:{self._fmt(_sf('distogram_DD_ce'),4)},"
                     f"DF:{self._fmt(_sf('distogram_DF_ce'),4)},"
-                    f"DA:{self._fmt(_sf('distogram_DA_ce'),4)} "
-                    f"DA_contactP={self._fmt(_sf('distogram_da_contact_precision'), 4)}"
+                    f"DA:{self._fmt(_sf('distogram_DA_ce'),4)}"
+                )
+            if bool(getattr(raw_model, "coarse_anchor_enabled", False)):
+                print(
+                    "[CoarseAnchor] "
+                    f"epoch={self.epoch} step={self.global_step} "
+                    f"raw={self._fmt(_sf('coarse_anchor_loss'), 6)} "
+                    f"DF_mae_A={self._fmt(_sf('coarse_anchor_DF_mae_A'), 4)} "
+                    f"DA_mae_A={self._fmt(_sf('coarse_anchor_DA_mae_A'), 4)} "
+                    f"pairs=DF:{self._fmt(_sf('coarse_anchor_DF_pairs'),0)},"
+                    f"DA:{self._fmt(_sf('coarse_anchor_DA_pairs'),0)}"
                 )
             if bool(getattr(raw_model, "smooth_lddt_enabled", False)):
                 print(
                     "[SmoothLDDT] "
                     f"epoch={self.epoch} step={self.global_step} "
-                    f"source={getattr(raw_model, 'smooth_lddt_prediction_source', 'pred_design_endpoint')} "
                     f"raw={self._fmt(_sf('smooth_lddt_loss'), 6)} "
-                    f"weighted={self._fmt(_sf('smooth_lddt_weighted_loss'), 6)} "
-                    f"endpoint_rms_A={self._fmt(_sf('smooth_lddt_endpoint_rms_A'), 5)} "
-                    f"endpoint_absmax_A={self._fmt(_sf('smooth_lddt_endpoint_absmax_A'), 5)} "
-                    f"design_rows={self._fmt(_sf('smooth_lddt_design_rows'), 0)} "
-                    f"coord_rows={self._fmt(_sf('smooth_lddt_coord_rows'), 0)} "
-                    f"coord_outside_design={self._fmt(_sf('smooth_lddt_coord_outside_design_rows'), 0)} "
-                    f"DD={self._fmt(_sf('smooth_lddt_DD'), 5)} "
-                    f"DF={self._fmt(_sf('smooth_lddt_DF'), 5)} "
-                    f"DA={self._fmt(_sf('smooth_lddt_DA'), 5)}"
+                    f"endpoint_rms_A={self._fmt(_sf('smooth_lddt_endpoint_rms_A'), 4)} "
+                    f"DD={self._fmt(_sf('smooth_lddt_DD'), 4)} "
+                    f"DF={self._fmt(_sf('smooth_lddt_DF'), 4)} "
+                    f"DA={self._fmt(_sf('smooth_lddt_DA'), 4)}"
                 )
         lr = None
         if not val:
@@ -1858,6 +1851,9 @@ class AbFlowTrainer(Trainer):
             self._accumulate_train_component("edge", ed_loss)
             self._accumulate_train_component(
                 "distogram", scorefm_losses.get("distogram_loss")
+            )
+            self._accumulate_train_component(
+                "coarse_anchor", scorefm_losses.get("coarse_anchor_loss")
             )
             self._accumulate_train_component(
                 "smooth_lddt", scorefm_losses.get("smooth_lddt_loss")
