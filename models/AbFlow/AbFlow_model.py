@@ -91,6 +91,26 @@ class AbFlowModel(nn.Module):
             "egnn_tanh_normalized", "egnn_unit_direction"
         }
         self.coord_prenorm = self.coord_controller_mode == "egnn_prenorm_raw"
+
+        # V223: close the recurrent H3 coordinate semantics around ONE clean
+        # endpoint.  The local Score--Flow carrier and the full-atom endpoint
+        # remain two analytic parameterizations of that same endpoint instead
+        # of two independently drifting geometry authorities.
+        state_cfg = representation_config.get("coordinate_state", {})
+        self.coordinate_state_mode = str(
+            state_cfg.get("mode", "legacy_dual") or "legacy_dual"
+        ).strip().lower()
+        _state_modes = {"legacy_dual", "scoreflow_endpoint_fused"}
+        if self.coordinate_state_mode not in _state_modes:
+            raise ValueError(
+                "model.representation.single_pair.coordinate_state.mode must be one of "
+                f"{sorted(_state_modes)}, got {self.coordinate_state_mode!r}."
+            )
+        self.generated_region_only_loss = bool(
+            loss_config.get("generated_region_only", False)
+        )
+        self._last_state_closure_audit = {}
+
         if self.coord_controller_mode in {"egnn_unit_direction", "egnn_prenorm_raw"} and self.pair_coord_mode != "direct_shared":
             raise ValueError(
                 f"{self.coord_controller_mode} requires pair_coordinate.mode='direct_shared': "
@@ -164,6 +184,7 @@ class AbFlowModel(nn.Module):
         _smooth_lddt_sources = {
             "pred_design_endpoint",
             "carrier_implied_endpoint",
+            "terminal_fused_endpoint",
         }
         if self.smooth_lddt_prediction_source not in _smooth_lddt_sources:
             raise ValueError(
@@ -249,12 +270,6 @@ class AbFlowModel(nn.Module):
         self._last_trunk_state = {}
         self._last_message_diagnostics = {}
         self._last_round_egnn_diagnostics = []
-        # V222 shared-Pair gradient authority is best-effort telemetry only.
-        # It never writes Parameter.grad and never gates formal training.
-        self.last_pair_gradient_audit = {}
-        self._pair_gradient_audit_state = {}
-        self._pair_gradient_audit_error = ""
-        self._pair_gradient_audit_capture = False
         self.grad_conflict_diagnostics = False
         self._diagnostic_capture = False
         self._diagnostic_validation_mode = False
@@ -967,10 +982,151 @@ class AbFlowModel(nn.Module):
         loss = per_graph[valid].mean() if bool(valid.any()) else pred.new_zeros(())
         return loss
 
+    @staticmethod
+    def _rms_tensor(x):
+        return torch.sqrt(x.float().square().mean().clamp_min(0.0))
+
+    def _differentiable_design_kabsch(self, moving, target):
+        """Rigidly place ``moving`` onto ``target`` without changing shape.
+
+        Both inputs are [M,3] in the same centered/model frame.  The operation
+        is differentiable through the SVD and contains no clipping, learned
+        scale, trust radius or coordinate normalization heuristic.
+        """
+        if moving.shape != target.shape or moving.dim() != 2 or moving.shape[-1] != 3:
+            raise RuntimeError(
+                f"V223 Kabsch shape mismatch: moving={tuple(moving.shape)} "
+                f"target={tuple(target.shape)}"
+            )
+        if moving.shape[0] < 3:
+            raise RuntimeError(
+                f"V223 Kabsch requires >=3 backbone points, got {moving.shape[0]}"
+            )
+        out_dtype = moving.dtype
+        # torch<=1.11 AMP can route linalg ops through low precision.  The
+        # explicit FP32 island changes only numerical linear algebra precision.
+        with torch.cuda.amp.autocast(enabled=False):
+            p = moving.float()
+            q = target.float()
+            pc = p.mean(dim=0, keepdim=True)
+            qc = q.mean(dim=0, keepdim=True)
+            p0, q0 = p - pc, q - qc
+            cov = p0.transpose(0, 1).matmul(q0)
+            U, _, Vh = torch.linalg.svd(cov, full_matrices=False)
+            V = Vh.transpose(-2, -1)
+            raw_R = V.matmul(U.transpose(-2, -1))
+            sign = torch.where(
+                torch.det(raw_R) < 0,
+                raw_R.new_tensor(-1.0), raw_R.new_tensor(1.0),
+            )
+            diag = torch.stack([
+                raw_R.new_tensor(1.0), raw_R.new_tensor(1.0), sign
+            ])
+            R = V.matmul(torch.diag(diag)).matmul(U.transpose(-2, -1))
+            trans = qc.squeeze(0) - pc.squeeze(0).matmul(R.transpose(0, 1))
+            aligned = p.matmul(R.transpose(0, 1)) + trans
+        return aligned.to(out_dtype), R.to(out_dtype), trans.to(out_dtype)
+
+    def _close_scoreflow_endpoint_state(
+            self, pred_X, carrier, paratope_mask, interface_batch_id,
+            flow_xt_model, flow_x0_model, flow_t):
+        """Project the two R05 coordinate parameterizations onto one endpoint.
+
+        The GNN carrier is first inverted through the exact U02/F01 chart to the
+        clean endpoint it implies.  The full-atom ``pred_X`` contributes only
+        internal H3 shape; its H3 backbone is rigidly placed onto that implied
+        endpoint.  The fused clean endpoint is then mapped analytically back to
+        the carrier chart.  Therefore the next recurrent round sees two *known
+        parameterizations of one endpoint*, not two independent H3 geometries.
+        """
+        if flow_xt_model is None or flow_x0_model is None or flow_t is None:
+            raise RuntimeError(
+                "scoreflow_endpoint_fused requires flow Xt, source X0 and flow_t"
+            )
+        pred_design = pred_X[paratope_mask]
+        if tuple(pred_design.shape) != tuple(carrier.shape):
+            raise RuntimeError(
+                f"V223 generated/carrier shape mismatch: pred={tuple(pred_design.shape)} "
+                f"carrier={tuple(carrier.shape)}"
+            )
+        t_int = self._time_for_interface(flow_t, interface_batch_id, carrier)
+        implied = self.r3_matcher.endpoint_from_canonical_carrier_gfree(
+            x_t=flow_xt_model, x0=flow_x0_model, carrier=carrier, t=t_int,
+            boundary_eps=self.f01_hybrid_t_min,
+        )
+        active = torch.as_tensor(t_int, device=carrier.device, dtype=carrier.dtype) >= float(self.f01_hybrid_t_min)
+        while active.dim() < carrier.dim():
+            active = active.unsqueeze(-1)
+        implied = torch.where(active, implied, carrier)
+
+        fused = pred_design.clone()
+        centroid_gaps, aligned_shape_rms, rotation_deg = [], [], []
+        for gid in range(int(interface_batch_id.max().item()) + 1 if interface_batch_id.numel() else 0):
+            idx = interface_batch_id == gid
+            if not bool(idx.any()):
+                continue
+            moving_bb = pred_design[idx, :4].reshape(-1, 3)
+            target_bb = implied[idx, :4].reshape(-1, 3)
+            aligned_bb, R, trans = self._differentiable_design_kabsch(
+                moving_bb, target_bb
+            )
+            # Apply the same rigid placement to all atom14 coordinates.
+            p = pred_design[idx].float()
+            fused[idx] = (
+                p.matmul(R.float().transpose(0, 1)) + trans.float()
+            ).to(fused.dtype)
+            with torch.no_grad():
+                centroid_gaps.append((
+                    moving_bb.detach().float().mean(0)
+                    - target_bb.detach().float().mean(0)
+                ).norm())
+                aligned_shape_rms.append(self._rms_tensor(
+                    aligned_bb.detach().float() - target_bb.detach().float()
+                ))
+                tr = torch.trace(R.detach().float())
+                cosang = ((tr - 1.0) * 0.5).clamp(-1.0, 1.0)
+                rotation_deg.append(torch.acos(cosang) * (180.0 / math.pi))
+
+        canonical = self.r3_matcher.canonical_carrier_target_gfree(
+            x_t=flow_xt_model, x0=flow_x0_model, x1=fused, t=t_int,
+            boundary_eps=self.f01_hybrid_t_min,
+        )
+        consistent_carrier = torch.where(active, canonical, fused)
+        pred_closed = pred_X.clone()
+        pred_closed[paratope_mask] = fused
+
+        with torch.no_grad():
+            audit = {
+                "state_closure_on": carrier.new_tensor(1.0),
+                "state_endpoint_pre_rms": self._rms_tensor(
+                    pred_design.detach() - implied.detach()
+                ).to(carrier.dtype),
+                "state_endpoint_post_rms": self._rms_tensor(
+                    fused.detach() - implied.detach()
+                ).to(carrier.dtype),
+                "state_carrier_projection_rms": self._rms_tensor(
+                    consistent_carrier.detach() - carrier.detach()
+                ).to(carrier.dtype),
+                "state_centroid_gap_A_model": (
+                    torch.stack(centroid_gaps).mean().to(carrier.dtype)
+                    if centroid_gaps else carrier.new_zeros(())
+                ),
+                "state_aligned_shape_rms_model": (
+                    torch.stack(aligned_shape_rms).mean().to(carrier.dtype)
+                    if aligned_shape_rms else carrier.new_zeros(())
+                ),
+                "state_rotation_deg": (
+                    torch.stack(rotation_deg).mean().to(carrier.dtype)
+                    if rotation_deg else carrier.new_zeros(())
+                ),
+            }
+        return pred_closed, consistent_carrier, audit
+
 
     def _forward(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep,
                  surface, residue_pos, template, lengths, init_noise=None,
-                 interface_init=None, sequence_init=None, flow_t=None):
+                 interface_init=None, sequence_init=None, flow_t=None,
+                 flow_source_init=None):
         """R05 predictor at one transport state."""
         batch_id = self.batch_constants['batch_id']
         # V10.1: `_forward` owns its diagnostic-capture scope.  The same flag is
@@ -1002,6 +1158,24 @@ class AbFlowModel(nn.Module):
             interface_S = (
                 sequence_init.to(device=S.device, dtype=torch.long).clone()
                 if sequence_init is not None else S[paratope_mask].clone())
+
+        flow_xt_model = interface_X.clone() if interface_init is not None else None
+        flow_x0_model = None
+        if flow_source_init is not None:
+            flow_x0_model = self._raw_interface_to_model_frame(
+                flow_source_init, paratope_mask, batch_id
+            )
+        if self.coordinate_state_mode == "scoreflow_endpoint_fused":
+            if flow_xt_model is None or flow_x0_model is None or flow_t is None:
+                raise RuntimeError(
+                    "V223 state closure requires explicit interface_init, "
+                    "flow_source_init and flow_t."
+                )
+            if bool((paratope_mask & (~cmask)).any()):
+                raise RuntimeError(
+                    "V223 requires generated/paratope residues to have coordinate "
+                    "authority: paratope_mask must be a subset of cmask."
+                )
 
         pep_X_model, pep_coord_valid = None, None
         if X_pep is not None and X_pep.shape == interface_X.shape:
@@ -1040,6 +1214,7 @@ class AbFlowModel(nn.Module):
 
         r_logits, r_interface_X, r_edge_dist = [], [interface_X.clone()], []
         pred_S_dist, memory_H = None, None
+        self._last_state_closure_audit = {}
         round_egnn_diagnostics = []
         for round_idx in range(self.round):
             if round_idx >= self.proposal_adapter_start_round:
@@ -1074,11 +1249,28 @@ class AbFlowModel(nn.Module):
                 })
 
             memory_H = H
+
+            if self.coordinate_state_mode == "scoreflow_endpoint_fused":
+                pred_X, interface_X, closure_audit = self._close_scoreflow_endpoint_state(
+                    pred_X=pred_X, carrier=interface_X,
+                    paratope_mask=paratope_mask,
+                    interface_batch_id=self.batch_constants['interface_batch_id'],
+                    flow_xt_model=flow_xt_model, flow_x0_model=flow_x0_model,
+                    flow_t=flow_t,
+                )
+                closure_audit = {
+                    f"round{round_idx}_{k}": v for k, v in closure_audit.items()
+                }
+                self._last_state_closure_audit.update(closure_audit)
+
             r_interface_X.append(interface_X.clone())
             r_logits.append((pred_logits, smask))
             r_edge_dist.append(edge_dist)
             X = X.clone()
             X[cmask] = pred_X[cmask]
+            # In V223 the generated H3 rows in pred_X have already been projected
+            # to the clean endpoint implied by the carrier, so global/context and
+            # local Score--Flow geometry cannot drift as independent authorities.
             X = self.aa_feature.update_global_coordinates(X, S)
 
             if not self.struct_only:
@@ -1157,7 +1349,7 @@ class AbFlowModel(nn.Module):
             X, S, cmask, smask, paratope_mask, X_pep, S_pep,
             surface, residue_pos, template, lengths,
             interface_init=Xt, sequence_init=sequence_state,
-            flow_t=t_graph)
+            flow_t=t_graph, flow_source_init=interface_X)
 
         snll = X.new_zeros(())
         count = X.new_zeros(())
@@ -1170,8 +1362,11 @@ class AbFlowModel(nn.Module):
                     count = count + sequence_loss_mask.sum()
             snll = snll / count.clamp_min(1.0)
 
+        structure_loss_mask = (
+            paratope_mask if self.generated_region_only_loss else cmask
+        )
         struct_loss, struct_details, bb_rmsd, _ = self.protein_feature.structure_loss(
-            pred_X, true_X, true_S, cmask, batch_id, xloss_mask,
+            pred_X, true_X, true_S, structure_loss_mask, batch_id, xloss_mask,
             self.aa_feature)
 
         atom_pos = self.aa_feature._construct_atom_pos(true_S[paratope_mask])
@@ -1208,9 +1403,17 @@ class AbFlowModel(nn.Module):
             smooth_design_mask = cmask
 
             if self.smooth_lddt_prediction_source == "pred_design_endpoint":
-                # Historical R33 semantics: auxiliary gradients flow through the
-                # full/native pred_X branch, including AMEncoder.out_layer.
+                # Historical R33 semantics.  V223 formal experiments do not use
+                # this branch because cmask may exceed the generated H3 support.
                 smooth_pred_design = pred_X[cmask]
+            elif self.smooth_lddt_prediction_source == "terminal_fused_endpoint":
+                if self.coordinate_state_mode != "scoreflow_endpoint_fused":
+                    raise RuntimeError(
+                        "terminal_fused_endpoint smooth-lDDT requires "
+                        "coordinate_state.mode=scoreflow_endpoint_fused"
+                    )
+                smooth_design_mask = paratope_mask
+                smooth_pred_design = pred_X[paratope_mask]
             elif self.smooth_lddt_prediction_source == "carrier_implied_endpoint":
                 # The shadow/interface carrier has one row per JSON-defined
                 # paratope residue.  ``cmask`` is a different coordinate/template
@@ -1313,46 +1516,20 @@ class AbFlowModel(nn.Module):
         if pdev_loss is not None:
             loss = loss + pdev_loss
 
-        # V222 optional shared-Pair gradient authority.  This captures references
-        # only on the trainer-selected probe step.  No backward() is called here;
-        # the later audit uses autograd.grad(..., retain_graph=True) on the same
-        # live z that feeds both Distogram and Pair->EGNN.
-        if self.training and bool(getattr(self, "_pair_gradient_audit_capture", False)):
-            pair_z = (
-                self._last_trunk_state.get("pair_dense")
-                if isinstance(self._last_trunk_state, dict) else None
-            )
-            self._pair_gradient_audit_state = {
-                "pair_z": pair_z,
-                "loss_primary": (
-                    self.loss_structure_weight * struct_loss
-                    + self.loss_interface_weight * interface_loss
-                    + self.loss_edge_weight * ed_loss
-                ),
-                "loss_endpoint": self.loss_interface_weight * interface_loss,
-                "loss_structure": self.loss_structure_weight * struct_loss,
-                "loss_distogram": self.loss_distogram_weight * distogram_loss,
-                "loss_smooth_lddt": (
-                    self.loss_smooth_lddt_weight * smooth_lddt_loss
-                ),
-                "t_min": t_graph.min(),
-                "t_mean": t_graph.mean(),
-                "t_max": t_graph.max(),
-            }
-        else:
-            self._pair_gradient_audit_state = {}
-
         # Per-complex geometry diagnostics are computed only when explicitly
         # enabled.  They are detached and never enter the objective.
         if self.geometry_forensics_enabled:
             with torch.no_grad():
-                design_gid = batch_id[cmask]
-                design_atom_mask = xloss_mask[cmask].bool()
+                forensic_mask = (
+                    paratope_mask if self.generated_region_only_loss else cmask
+                )
+                design_gid = batch_id[forensic_mask]
+                design_atom_mask = xloss_mask[forensic_mask].bool()
                 pred_design_rms = self._per_graph_coord_rms(
-                    pred_X[cmask], true_X[cmask], design_atom_mask,
+                    pred_X[forensic_mask], true_X[forensic_mask], design_atom_mask,
                     design_gid, batch_size)
                 pred_design_absmax = self._per_graph_absmax(
-                    pred_X[cmask], design_gid, batch_size)
+                    pred_X[forensic_mask], design_gid, batch_size)
                 carrier_target_rms = self._per_graph_coord_rms(
                     r_interface_X[-1], coord_target, atom_mask,
                     interface_batch_id, batch_size)
@@ -1456,96 +1633,19 @@ class AbFlowModel(nn.Module):
                 't_min': t_graph.min().detach(),
                 't_mean': t_graph.mean().detach(),
                 't_max': t_graph.max().detach(),
+                'coordinate_state_closed': X.new_tensor(
+                    1.0 if self.coordinate_state_mode == "scoreflow_endpoint_fused" else 0.0
+                ),
                 **{k: v.detach() if torch.is_tensor(v) else v
                    for k, v in self._last_message_diagnostics.items()},
+                **{k: v.detach() if torch.is_tensor(v) else v
+                   for k, v in self._last_state_closure_audit.items()},
             }
 
         self._clean_batch_constants()
         return (loss, (snll, aar), (struct_loss, *struct_details),
                 (dock_loss, interface_loss, ed_loss, r_ed_losses),
                 (pdev_loss, prmsd_loss))
-
-    def compute_pair_gradient_authority(self):
-        """Best-effort weighted objective gradients on the shared live Pair z.
-
-        The probe is deliberately non-authoritative: it never changes the loss,
-        optimizer, Parameter.grad, checkpoint selection or Train->Val->Test flow.
-        Any PyTorch/AMP incompatibility is returned as telemetry instead of
-        failing a scientific run.
-        """
-        self.last_pair_gradient_audit = {}
-        self._pair_gradient_audit_error = ""
-        state = getattr(self, "_pair_gradient_audit_state", None) or {}
-        z = state.get("pair_z")
-        if not torch.is_tensor(z) or not bool(z.requires_grad):
-            self._pair_gradient_audit_error = (
-                "shared Pair z unavailable or does not require grad"
-            )
-            self._pair_gradient_audit_state = {}
-            return {}
-
-        names = ("primary", "endpoint", "structure", "distogram", "smooth_lddt")
-        grads = {}
-        try:
-            for name in names:
-                objective = state.get(f"loss_{name}")
-                if not torch.is_tensor(objective) or not bool(objective.requires_grad):
-                    grads[name] = None
-                    continue
-                grads[name] = torch.autograd.grad(
-                    objective, z, retain_graph=True, create_graph=False,
-                    allow_unused=True,
-                )[0]
-
-            def _norm(g):
-                if g is None:
-                    return None
-                x = g.detach().float().reshape(-1)
-                return torch.linalg.vector_norm(x, ord=2) if x.numel() else x.new_zeros(())
-
-            def _cos(a, b):
-                if a is None or b is None:
-                    return None
-                x = a.detach().float().reshape(-1)
-                y = b.detach().float().reshape(-1)
-                if x.numel() == 0 or y.numel() == 0:
-                    return None
-                nx = torch.linalg.vector_norm(x, ord=2)
-                ny = torch.linalg.vector_norm(y, ord=2)
-                if float(nx) <= 1e-20 or float(ny) <= 1e-20:
-                    return None
-                return torch.dot(x, y) / (nx * ny)
-
-            diag = {}
-            for name, grad in grads.items():
-                value = _norm(grad)
-                if value is not None:
-                    diag[f"grad_pair_norm_{name}"] = value
-            for lhs, rhs in (
-                ("distogram", "primary"),
-                ("smooth_lddt", "primary"),
-                ("distogram", "smooth_lddt"),
-                ("distogram", "endpoint"),
-                ("distogram", "structure"),
-                ("smooth_lddt", "endpoint"),
-                ("smooth_lddt", "structure"),
-            ):
-                value = _cos(grads.get(lhs), grads.get(rhs))
-                if value is not None:
-                    diag[f"grad_pair_cos_{lhs}_{rhs}"] = value
-            for key in ("t_min", "t_mean", "t_max"):
-                value = state.get(key)
-                if torch.is_tensor(value):
-                    diag[key] = value.detach()
-            self.last_pair_gradient_audit = diag
-            return diag
-        except Exception as exc:
-            self._pair_gradient_audit_error = f"{type(exc).__name__}: {exc}"
-            self.last_pair_gradient_audit = {}
-            return {}
-        finally:
-            self._pair_gradient_audit_state = {}
-
 
     def _sampling_time_grid(self, n_steps, device, dtype):
         return torch.linspace(0.0, 1.0, max(1, int(n_steps)) + 1,
@@ -1613,7 +1713,7 @@ class AbFlowModel(nn.Module):
                     surface, residue_pos, template, lengths,
                     interface_init=Xt,
                     sequence_init=None if self.struct_only else St,
-                    flow_t=flow_t)
+                    flow_t=flow_t, flow_source_init=source_X0)
                 bridge_diag = dict(self._last_message_diagnostics or {})
             finally:
                 self._diagnostic_capture = prev_diag_capture
@@ -1741,71 +1841,47 @@ class AbFlowModel(nn.Module):
                 prmsd_final[interface_cmask], interface_batch_id,
                 dim=0, dim_size=batch_size)
 
-        gen_X[cmask] = pred_X_final[cmask]
-        if not self.struct_only:
-            gen_S[smask] = pred_S_final[smask]
-
-        for b in range(batch_size):
-            graph = batch_id == b
-            design = graph & paratope_mask
-            ori = gen_X[design][:, :4]
-            pred = interface_X_final[interface_batch_id == b][:, :4]
-            ab = graph & is_ab
-
+        if self.coordinate_state_mode == "scoreflow_endpoint_fused":
+            # Formal V223 readout: the 10-step integrated Score--Flow endpoint is
+            # the only generated-coordinate authority.  Fixed framework/antigen
+            # coordinates are inherited exactly from the input complex.
+            gen_X[paratope_mask] = interface_X_final
             if self.sample_forensics_enabled:
-                pre = {
-                    **self._sample_forensic_identity(b),
-                    'stage': 'terminal_pre_kabsch',
-                    'step': int(n_steps),
-                    't': 1.0,
-                    'finite': bool(
-                        torch.isfinite(ori).all().item()
-                        and torch.isfinite(pred).all().item()
-                        and torch.isfinite(gen_X[ab]).all().item()
-                    ),
-                    'pred_final_absmax_A': (
-                        float(ori.detach().float().abs().amax().item())
-                        if ori.numel() else 0.0
-                    ),
-                    'implied_x1_absmax_A': (
-                        float(pred.detach().float().abs().amax().item())
-                        if pred.numel() else 0.0
-                    ),
-                    'gen_pre_align_absmax_A': (
-                        float(gen_X[ab].detach().float().abs().amax().item())
-                        if bool(ab.any().item()) else 0.0
-                    ),
-                }
-                self._append_sample_forensic_record(pre)
-
-            try:
-                _, R, trans = kabsch_torch(ori.reshape(-1, 3), pred.reshape(-1, 3))
-            except Exception as exc:
-                if self.sample_forensics_enabled:
-                    self._sample_forensic_records.append({
+                pred_design = pred_X_final[paratope_mask].detach().float()
+                integrated = interface_X_final.detach().float()
+                for b in range(batch_size):
+                    idx = interface_batch_id == b
+                    if not bool(idx.any()):
+                        continue
+                    delta = pred_design[idx] - integrated[idx]
+                    self._append_sample_forensic_record({
                         **self._sample_forensic_identity(b),
-                        'stage': 'terminal_kabsch_exception',
+                        'stage': 'terminal_integrated_endpoint',
                         'step': int(n_steps),
                         't': 1.0,
-                        'error': f'{type(exc).__name__}: {exc}',
+                        'finite': bool(torch.isfinite(integrated[idx]).all().item()),
+                        'terminal_pred_vs_integrated_rms_A': float(
+                            delta.square().mean().sqrt().item()
+                        ),
+                        'integrated_endpoint_absmax_A': float(
+                            integrated[idx].abs().amax().item()
+                        ),
+                        'fixed_context_transform_applied': False,
                     })
-                raise
-            gen_X[ab] = torch.matmul(gen_X[ab], R.T) + trans
+        else:
+            # Historical readout retained only for backward-compatible configs.
+            gen_X[cmask] = pred_X_final[cmask]
+            for b in range(batch_size):
+                graph = batch_id == b
+                design = graph & paratope_mask
+                ori = gen_X[design][:, :4]
+                pred = interface_X_final[interface_batch_id == b][:, :4]
+                ab = graph & is_ab
+                _, R, trans = kabsch_torch(ori.reshape(-1, 3), pred.reshape(-1, 3))
+                gen_X[ab] = torch.matmul(gen_X[ab], R.T) + trans
 
-            if self.sample_forensics_enabled:
-                post = gen_X[ab].detach().float()
-                self._append_sample_forensic_record({
-                    **self._sample_forensic_identity(b),
-                    'stage': 'terminal_post_kabsch',
-                    'step': int(n_steps),
-                    't': 1.0,
-                    'finite': bool(torch.isfinite(post).all().item()),
-                    'kabsch_translation_norm_A': float(
-                        trans.detach().float().norm().item()),
-                    'gen_post_align_absmax_A': (
-                        float(post.abs().amax().item()) if post.numel() else 0.0
-                    ),
-                })
+        if not self.struct_only:
+            gen_S[smask] = pred_S_final[smask]
 
         self._clean_batch_constants()
         if return_hidden:
