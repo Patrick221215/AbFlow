@@ -1,8 +1,8 @@
 {
   "experiment": {
-    "id": "R64_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_SINGLE_ENDPOINT_TVT_U02",
-    "parent": "R60_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_STATECLOSED_TVT_U02",
-    "factor": "V224 true single learned endpoint; recurrent canonical carrier is analytic from pred_X; no auxiliary geometry loss",
+    "id": "R67_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_RECURRENT_CARRIER_TVT_U02",
+    "parent": "R53_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_TVT_U02",
+    "factor": "restore exact R05 three-round cross-round geometric recurrence; integrated recurrent carrier is generated H3 authority; no auxiliary geometry loss",
     "protocol": "formal_train_val_test"
   },
   "data": {
@@ -32,7 +32,7 @@
     }
   },
   "training": {
-    "output_dir": "./results_module/R64_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_SINGLE_ENDPOINT_TVT_U02",
+    "output_dir": "./results_module/R67_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_RECURRENT_CARRIER_TVT_U02",
     "optimizer": {
       "lr": 0.001,
       "final_lr": 0.0001,
@@ -165,13 +165,14 @@
           "no_hand_tuned_step_scale": true
         },
         "coordinate_state": {
-          "mode": "scoreflow_single_endpoint",
-          "clean_endpoint_authority": "pred_X_only",
-          "carrier_parameterization": "exact_u02_f01_chart_derived_from_pred_X",
-          "intra_round_shadow_geometry": "latent_only_not_recurrent_authority",
-          "recurrent_feedback": "endpoint_derived_carrier",
+          "mode": "r05_recurrent_carrier",
+          "carrier_recurrence": "egnn_output_exact_cross_round",
+          "structural_recurrence": "pred_X_cross_round",
+          "role_semantics": "carrier=scoreflow_transport_and_terminal_H3; pred_X=full_atom_structural_proposal",
           "terminal_readout": "integrated_endpoint_generated_region_only",
-          "fixed_context": "unchanged_exactly"
+          "fixed_context": "unchanged_exactly",
+          "no_projection": true,
+          "no_kabsch_fusion": true
         }
       }
     }
@@ -192,15 +193,9 @@
     "smooth_lddt": {
       "weight": 0.0,
       "cutoff": 15.0,
-      "prediction_source": "terminal_fused_endpoint"
+      "prediction_source": "carrier_implied_endpoint"
     },
-    "generated_region_only": true,
-    "coarse_anchor_distance": {
-      "weight": 0.0,
-      "cutoff_A": 21.6875,
-      "relation_balance": "DF_DA_equal",
-      "distance_scale": "r3_coordinate_scaling"
-    }
+    "generated_region_only": true
   },
   "runtime": {
     "ddp": {
@@ -211,7 +206,7 @@
   },
   "generation": {
     "checkpoint": "",
-    "save_dir": "./results_generation/R64_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_SINGLE_ENDPOINT_TVT_U02",
+    "save_dir": "./results_generation/R67_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_RECURRENT_CARRIER_TVT_U02",
     "batch_size": 20,
     "num_workers": 4,
     "n_steps": 10,

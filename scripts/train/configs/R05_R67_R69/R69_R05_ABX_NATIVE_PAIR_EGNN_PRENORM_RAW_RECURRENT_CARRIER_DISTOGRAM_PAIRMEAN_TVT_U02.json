@@ -1,8 +1,8 @@
 {
   "experiment": {
-    "id": "R33_R05_ABX_NATIVE_PAIR_EGNN_DISTOGRAM_LDDT_BOUNDED_GEOM_U02",
-    "parent": "R32_R05_ABX_NATIVE_PAIR_EGNN_DISTOGRAM_BOUNDED_GEOM_U02",
-    "factor": "R32 + design-localized smooth-lDDT supervision (0.1)",
+    "id": "R69_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_RECURRENT_CARRIER_DISTOGRAM_PAIRMEAN_TVT_U02",
+    "parent": "R67_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_RECURRENT_CARRIER_TVT_U02",
+    "factor": "R67 + generation-anchored Distogram at weight 0.03 with pair_mean reduction; matched reduction control for R68 relation_balanced",
     "protocol": "formal_train_val_test"
   },
   "data": {
@@ -32,7 +32,7 @@
     }
   },
   "training": {
-    "output_dir": "./results_module/R33_R05_ABX_NATIVE_PAIR_EGNN_DISTOGRAM_LDDT_BOUNDED_GEOM_U02",
+    "output_dir": "./results_module/R69_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_RECURRENT_CARRIER_DISTOGRAM_PAIRMEAN_TVT_U02",
     "optimizer": {
       "lr": 0.001,
       "final_lr": 0.0001,
@@ -40,7 +40,7 @@
       "grad_clip": 1.0
     },
     "schedule": {
-      "max_epoch": 200,
+      "max_epoch": 60,
       "patience": 1000,
       "save_topk": 10,
       "save_interval": 1,
@@ -65,11 +65,11 @@
       "decay": 0.999
     },
     "logging": {
-      "log_interval": 20,
-      "tqdm_mininterval": 5.0,
-      "science_first_steps": 3,
-      "science_interval": 0,
-      "runtime_guard_steps": 2,
+      "log_interval": 40,
+      "tqdm_mininterval": 60.0,
+      "science_first_steps": 2,
+      "science_interval": 40,
+      "runtime_guard_steps": 1,
       "train_loss_outlier_threshold": 10000.0
     },
     "snapshot": {
@@ -149,9 +149,30 @@
           "pair_distance_chunk_size": 8
         },
         "pair_coordinate": {
-          "mode": "bounded_residual",
-          "delta_bound": 1.0,
-          "semantics": "dual_state_geometry_stream; full relational state, bounded Cartesian residual"
+          "mode": "direct_shared",
+          "semantics": "zero_init_pair_adapter; pair-conditioned edge message jointly drives node state and pre-normalized EGNN coordinate scalar"
+        },
+        "coordinate_controller": {
+          "mode": "egnn_prenorm_raw",
+          "action_input_normalization": "layer_norm",
+          "direction": "raw_relative_vector_d_ij",
+          "distance_features": "raw_preserved_in_radial_message_and_cartesian_operator",
+          "scalar_activation": "identity",
+          "scalar_bound": "none",
+          "coordinate_aggregation": "mean",
+          "no_coordinate_clipping": true,
+          "no_trust_radius": true,
+          "no_hand_tuned_step_scale": true
+        },
+        "coordinate_state": {
+          "mode": "r05_recurrent_carrier",
+          "carrier_recurrence": "egnn_output_exact_cross_round",
+          "structural_recurrence": "pred_X_cross_round",
+          "role_semantics": "carrier=scoreflow_transport_and_terminal_H3; pred_X=full_atom_structural_proposal",
+          "terminal_readout": "integrated_endpoint_generated_region_only",
+          "fixed_context": "unchanged_exactly",
+          "no_projection": true,
+          "no_kabsch_fusion": true
         }
       }
     }
@@ -163,16 +184,18 @@
     "edge": 1.0,
     "distogram": {
       "weight": 0.03,
-      "pair_scope": "all_resolved",
+      "pair_scope": "generation_anchored",
       "bins": 64,
       "min_bin": 2.3125,
-      "max_bin": 21.6875
+      "max_bin": 21.6875,
+      "reduction": "pair_mean"
     },
     "smooth_lddt": {
-      "weight": 0.1,
+      "weight": 0.0,
       "cutoff": 15.0,
-      "prediction_source": "pred_design_endpoint"
-    }
+      "prediction_source": "carrier_implied_endpoint"
+    },
+    "generated_region_only": true
   },
   "runtime": {
     "ddp": {
@@ -183,7 +206,7 @@
   },
   "generation": {
     "checkpoint": "",
-    "save_dir": "./results_generation/R33_R05_ABX_NATIVE_PAIR_EGNN_DISTOGRAM_LDDT_BOUNDED_GEOM_U02",
+    "save_dir": "./results_generation/R69_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_RECURRENT_CARRIER_DISTOGRAM_PAIRMEAN_TVT_U02",
     "batch_size": 20,
     "num_workers": 4,
     "n_steps": 10,

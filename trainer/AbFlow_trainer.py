@@ -160,7 +160,10 @@ class AbFlowTrainer(Trainer):
             "ABFLOW_GEOMETRY_AUTHORITY_BASE_ALERT", 64.0
         )
         self._geometry_authority_update_alert = _env_float(
-            "ABFLOW_GEOMETRY_AUTHORITY_UPDATE_ALERT", 1.0e4
+            "ABFLOW_GEOMETRY_AUTHORITY_UPDATE_ALERT", 200.0
+        )
+        self._geometry_authority_rms_alert = _env_float(
+            "ABFLOW_GEOMETRY_AUTHORITY_RMS_ALERT", 5.0
         )
         self._geometry_authority_alert_max_per_epoch = max(1, _env_int(
             "ABFLOW_GEOMETRY_AUTHORITY_ALERT_MAX_PER_EPOCH", 3
@@ -1105,6 +1108,10 @@ class AbFlowTrainer(Trainer):
             "t_max": m("AbFlowDiag/t_max/Validation"),
             "coordinate_state_closed": m("AbFlowDiag/coordinate_state_closed/Validation"),
             "coordinate_single_endpoint": m("AbFlowDiag/coordinate_single_endpoint/Validation"),
+            "coordinate_recurrent_carrier": m("AbFlowDiag/coordinate_recurrent_carrier/Validation"),
+            "role_raw_gap_A": m("AbFlowDiag/role_raw_gap_A/Validation"),
+            "role_ca_centroid_gap_A": m("AbFlowDiag/role_ca_centroid_gap_A/Validation"),
+            "role_ca_pairdist_gap_A": m("AbFlowDiag/role_ca_pairdist_gap_A/Validation"),
             "single_endpoint_gap_r2": m("AbFlowDiag/round2_shadow_endpoint_gap_rms/Validation"),
             "state_post_r2": m("AbFlowDiag/round2_state_endpoint_post_rms/Validation"),
             "state_projection_r2": m("AbFlowDiag/round2_state_carrier_projection_rms/Validation"),
@@ -1182,16 +1189,17 @@ class AbFlowTrainer(Trainer):
             "[Validation] "
             f"epoch={self.epoch} val={self._fmt(summary.get('validation_metric'), 5)}"
         )
-        print(
+        line = (
             "[ValidationBreakdown] "
             f"epoch={self.epoch} seq={self._fmt(summary.get('loss_seq'), 5)} "
             f"struct={self._fmt(summary.get('loss_structure'), 5)} "
             f"interface={self._fmt(summary.get('loss_interface'), 5)} "
-            f"edge={self._fmt(summary.get('loss_edge'), 5)} "
-            f"dist={self._fmt(summary.get('distogram_loss'), 5)} "
-            f"anchor={self._fmt(summary.get('coarse_anchor_loss'), 5)} "
-            f"lddt={self._fmt(summary.get('smooth_lddt_loss'), 5)}"
+            f"edge={self._fmt(summary.get('loss_edge'), 5)}"
         )
+        raw_model = self.model.module if hasattr(self.model, "module") else self.model
+        if bool(getattr(raw_model, "distogram_enabled", False)):
+            line += f" dist={self._fmt(summary.get('distogram_loss'), 5)}"
+        print(line)
         if float(summary.get('coordinate_state_closed', 0.0) or 0.0) > 0.5:
             print(
                 "[StateClosure] "
@@ -1203,6 +1211,14 @@ class AbFlowTrainer(Trainer):
             print(
                 "[StateAuthority] "
                 f"epoch={self.epoch} r2_shadow_endpoint_gap={self._fmt(summary.get('single_endpoint_gap_r2'), 5)}"
+            )
+
+        if float(summary.get('coordinate_recurrent_carrier', 0.0) or 0.0) > 0.5:
+            print(
+                "[RecurrentRole] "
+                f"epoch={self.epoch} raw_gap_A={self._fmt(summary.get('role_raw_gap_A'), 4)} "
+                f"centroid_gap_A={self._fmt(summary.get('role_ca_centroid_gap_A'), 4)} "
+                f"ca_pairdist_gap_A={self._fmt(summary.get('role_ca_pairdist_gap_A'), 4)}"
             )
 
 
@@ -1707,6 +1723,7 @@ class AbFlowTrainer(Trainer):
                     'state': _auth_stage_max(cd, '.coord_state_coeff_absmax'),
                     'pair_bounded': _auth_stage_max(cd, '.coord_pair_delta_bounded_absmax'),
                     'update': _auth_num(cd.get('coord_update_absmax_max')),
+                    'update_rms': _auth_num(cd.get('coord_update_rms_max')),
                 })
 
             max_base = max(
@@ -1717,12 +1734,16 @@ class AbFlowTrainer(Trainer):
                 [r['update'] for r in authority_rows if r['update'] is not None],
                 default=None,
             )
+            max_update_rms = max(
+                [r['update_rms'] for r in authority_rows if r['update_rms'] is not None],
+                default=None,
+            )
             authority_interval_hit = bool(
                 self._geometry_authority_interval > 0
                 and int(self.global_step) % self._geometry_authority_interval == 0
             )
             authority_alert = bool(
-                (max_base is not None and max_base >= self._geometry_authority_base_alert)
+                (max_update_rms is not None and max_update_rms >= self._geometry_authority_rms_alert)
                 or (max_update is not None and max_update >= self._geometry_authority_update_alert)
             )
             current_epoch = int(self.epoch)
@@ -1740,13 +1761,12 @@ class AbFlowTrainer(Trainer):
             if allow_alert:
                 rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
                 print(
-                    '[GeometryAuthorityAlert] '
+                    '[GeometryDriftAlert] '
                     f'epoch={self.epoch} step={self.global_step} rank={rank} '
-                    f"base_coeff_absmax={[None if r['base'] is None else round(r['base'], 6) for r in authority_rows]} "
-                    f"state_coeff_absmax={[None if r['state'] is None else round(r['state'], 6) for r in authority_rows]} "
-                    f"coord_update_absmax={[None if r['update'] is None else round(r['update'], 6) for r in authority_rows]} "
-                    f'base_alert={self._geometry_authority_base_alert:g} '
-                    f'update_alert={self._geometry_authority_update_alert:g}'
+                    f"dx_rms={[None if r['update_rms'] is None else round(r['update_rms'], 6) for r in authority_rows]} "
+                    f"dx_max={[None if r['update'] is None else round(r['update'], 6) for r in authority_rows]} "
+                    f'rms_alert={self._geometry_authority_rms_alert:g} '
+                    f'max_alert={self._geometry_authority_update_alert:g}'
                 )
 
         log_type = 'Validation' if val else 'Train'
@@ -1807,16 +1827,6 @@ class AbFlowTrainer(Trainer):
                     f"CE=DD:{self._fmt(_sf('distogram_DD_ce'),4)},"
                     f"DF:{self._fmt(_sf('distogram_DF_ce'),4)},"
                     f"DA:{self._fmt(_sf('distogram_DA_ce'),4)}"
-                )
-            if bool(getattr(raw_model, "coarse_anchor_enabled", False)):
-                print(
-                    "[CoarseAnchor] "
-                    f"epoch={self.epoch} step={self.global_step} "
-                    f"raw={self._fmt(_sf('coarse_anchor_loss'), 6)} "
-                    f"DF_mae_A={self._fmt(_sf('coarse_anchor_DF_mae_A'), 4)} "
-                    f"DA_mae_A={self._fmt(_sf('coarse_anchor_DA_mae_A'), 4)} "
-                    f"pairs=DF:{self._fmt(_sf('coarse_anchor_DF_pairs'),0)},"
-                    f"DA:{self._fmt(_sf('coarse_anchor_DA_pairs'),0)}"
                 )
             if bool(getattr(raw_model, "smooth_lddt_enabled", False)):
                 print(
