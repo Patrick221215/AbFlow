@@ -68,7 +68,7 @@
     },
     "logging": {
       "log_interval": 100,
-      "tqdm_mininterval": 120.0,
+      "tqdm_mininterval": 5.0,
       "science_first_steps": 0,
       "science_interval": 0,
       "runtime_guard_steps": 1,
@@ -214,7 +214,7 @@
     "num_workers": 4,
     "n_steps": 10,
     "seed": 2023,
-    "show_sample_progress": false,
+    "show_sample_progress": true,
     "terminal_coordinate_authority": "integrated_carrier_direct_h3",
     "fixed_context": "unchanged_exactly",
     "terminal_kabsch_fusion": false,

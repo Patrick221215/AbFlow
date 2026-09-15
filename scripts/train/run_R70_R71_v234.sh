@@ -148,7 +148,7 @@ export ABFLOW_EPOCH_TEST_BASE_SEED="$TEST_SEED"
 export ABFLOW_EPOCH_TEST_METRIC_WORKERS="$METRIC_WORKERS"
 export ABFLOW_EPOCH_TEST_FAIL_FAST=on
 export ABFLOW_EPOCH_TEST_MODEL_INVALID_POLICY=record_and_continue
-export ABFLOW_EPOCH_TEST_SHOW_SAMPLE_PROGRESS="${ABFLOW_EPOCH_TEST_SHOW_SAMPLE_PROGRESS:-off}"
+export ABFLOW_EPOCH_TEST_SHOW_SAMPLE_PROGRESS="${ABFLOW_EPOCH_TEST_SHOW_SAMPLE_PROGRESS:-on}"
 
 # Exact diagnostics from the ordinary forward only. PairGradientAudit was removed
 # rather than patched because it never produced valid information under AMP.
@@ -160,7 +160,7 @@ export ABFLOW_COORD_AUDIT_FIRST_STEPS="${ABFLOW_COORD_AUDIT_FIRST_STEPS:-0}"
 export ABFLOW_GEOMETRY_AUTHORITY_INTERVAL=0
 export ABFLOW_TRAIN_LOSS_OUTLIER_THRESHOLD="${ABFLOW_TRAIN_LOSS_OUTLIER_THRESHOLD:-$OUTLIER_THRESHOLD}"
 export ABFLOW_TRAIN_LOSS_OUTLIER_MAX_PER_EPOCH="${ABFLOW_TRAIN_LOSS_OUTLIER_MAX_PER_EPOCH:-3}"
-export ABFLOW_TQDM="${ABFLOW_TQDM:-off}"
+export ABFLOW_TQDM="${ABFLOW_TQDM:-on}"
 export ABFLOW_SCI_LOG_FIRST_STEPS="${ABFLOW_SCI_LOG_FIRST_STEPS:-$SCI_FIRST}"
 export ABFLOW_SCI_LOG_INTERVAL="${ABFLOW_SCI_LOG_INTERVAL:-$SCI_INTERVAL}"
 export ABFLOW_RUNTIME_GUARD_STEPS="${ABFLOW_RUNTIME_GUARD_STEPS:-1}"
@@ -218,7 +218,7 @@ print('[TimeAuthorityContract] R05_explicit=1 AbX_explicit=1 explicit_routes=2 m
 print(f'[SingleCartesianContract] physical_dof=1 primary=carrier endpoint=analytic strict_intra_round={int(strict)} frame_aware=AG_to_raw_to_AB rounds=3')
 print('[AuthorityContract] structure=analytic_endpoint_chart transport=analytic_carrier_chart sample_terminal=integrated_carrier fixed_context=exact')
 print('[CoordinateControllerContract] pair=direct_shared controller=egnn_prenorm_raw raw_R05_vector=1 no_tanh=1 no_clipping=1 no_trust_radius=1')
-print('[DiagnosticsContract] startup_authority_contract=on epoch_geometry_summary=on latent_gap_summary=on routine_stage_trace=off routine_step_trace=off progress=off')
+print('[DiagnosticsContract] startup_authority_contract=on epoch_geometry_summary=on latent_gap_summary=on routine_stage_trace=off routine_step_trace=off progress=train+validation+test:on')
 print('[EvaluationContract] train_val_test=unchanged valgen=0 test=observation_only')
 PY
 
