@@ -796,6 +796,7 @@ class AbFlowTrainer(Trainer):
             if self.writer is not None:
                 self.writer.flush()
             self._print_validation_audits(validation_summary)
+            self._print_train_validation_gap(train_summary, validation_summary)
         self.writer_buffer = {}
 
         # V203 fixed third phase: every epoch performs formal EMA rollout Test.
@@ -1050,6 +1051,13 @@ class AbFlowTrainer(Trainer):
             "aar_r2": m("AbFlowDiag/val_proxy_round2_aar/Validation"),
             "refinement_raw_delta": m("AbFlowDiag/val_proxy_refinement_raw_rmsd_delta/Validation"),
             "refinement_aligned_delta": m("AbFlowDiag/val_proxy_refinement_aligned_rmsd_delta/Validation"),
+            "raw_gain_01": m("AbFlowDiag/val_proxy_raw_gain_01/Validation"),
+            "raw_gain_12": m("AbFlowDiag/val_proxy_raw_gain_12/Validation"),
+            "aligned_gain_01": m("AbFlowDiag/val_proxy_aligned_gain_01/Validation"),
+            "aligned_gain_12": m("AbFlowDiag/val_proxy_aligned_gain_12/Validation"),
+            "aligned_improve_01_fraction": m("AbFlowDiag/val_proxy_aligned_improve_01_fraction/Validation"),
+            "aligned_improve_12_fraction": m("AbFlowDiag/val_proxy_aligned_improve_12_fraction/Validation"),
+            "aligned_improve_02_fraction": m("AbFlowDiag/val_proxy_aligned_improve_02_fraction/Validation"),
             "contact_f1": m("AbFlowDiag/val_proxy_native_contact_f1/Validation"),
             "caar": m("AbFlowDiag/val_proxy_caar/Validation"),
             "seq_entropy": m("AbFlowDiag/val_proxy_seq_entropy/Validation"),
@@ -1113,6 +1121,30 @@ class AbFlowTrainer(Trainer):
             "t_min": m("AbFlowDiag/t_min/Validation"),
             "t_max": m("AbFlowDiag/t_max/Validation"),
         }
+        for ridx in range(3):
+            op_prefix = f"AbFlowDiag/op_round{ridx}_"
+            summary[f"op_r{ridx}_sequential"] = m(
+                op_prefix + "sequential_single_state/Validation"
+            )
+            summary[f"op_r{ridx}_local_mean_A"] = m(
+                op_prefix + "sequential_local_update_rms_mean_A/Validation"
+            )
+            summary[f"op_r{ridx}_local_max_A"] = m(
+                op_prefix + "sequential_local_update_rms_max_A/Validation"
+            )
+            summary[f"op_r{ridx}_transport_mean_A"] = m(
+                op_prefix + "sequential_transport_update_rms_mean_A/Validation"
+            )
+            summary[f"op_r{ridx}_transport_max_A"] = m(
+                op_prefix + "sequential_transport_update_rms_max_A/Validation"
+            )
+            summary[f"op_r{ridx}_local_sync_gap_A"] = m(
+                op_prefix + "sequential_local_to_carrier_sync_gap_rms_max_A/Validation"
+            )
+            summary[f"op_r{ridx}_transport_sync_gap_A"] = m(
+                op_prefix + "sequential_carrier_to_endpoint_sync_gap_rms_max_A/Validation"
+            )
+
         for ridx in range(3):
             for name in (
                 "mf_single_rms", "mf_pair_rms", "mf_base_residual_rms",
@@ -1201,15 +1233,57 @@ class AbFlowTrainer(Trainer):
             f"{self._fmt(summary.get('h3ca_aligned_r2'),4)}] "
             f"refine_raw_A={self._fmt(summary.get('refinement_raw_delta'),4)} "
             f"refine_aligned_A={self._fmt(summary.get('refinement_aligned_delta'),4)} "
+            f"gain_raw=[{self._fmt(summary.get('raw_gain_01'),4)},"
+            f"{self._fmt(summary.get('raw_gain_12'),4)}] "
+            f"gain_aligned=[{self._fmt(summary.get('aligned_gain_01'),4)},"
+            f"{self._fmt(summary.get('aligned_gain_12'),4)}] "
+            f"aligned_improve_frac=[{self._fmt(summary.get('aligned_improve_01_fraction'),3)},"
+            f"{self._fmt(summary.get('aligned_improve_12_fraction'),3)},"
+            f"{self._fmt(summary.get('aligned_improve_02_fraction'),3)}] "
             f"caar={self._fmt(summary.get('caar'),5)} "
             f"contact_f1={self._fmt(summary.get('contact_f1'),5)} "
             f"bridge_s={self._fmt(summary.get('bridge_single_delta_to_base_ratio'),4)} "
             f"bridge_z={self._fmt(summary.get('bridge_pair_delta_to_base_ratio_mean'),4)} "
-            f"chart_gap_A={self._fmt(summary.get('sf_chart_gap_A'),6)} "
-            f"latent_gap_A=[{self._fmt(summary.get('sf_latent_gap_r0_A'),3)},"
-            f"{self._fmt(summary.get('sf_latent_gap_r1_A'),3)},"
-            f"{self._fmt(summary.get('sf_latent_gap_r2_A'),3)}]"
+            f"chart_gap_A={self._fmt(summary.get('sf_chart_gap_A'),6)}"
         )
+        op_parts = []
+        for ridx in range(3):
+            op_parts.append(
+                f"r{ridx}:local={self._fmt(summary.get(f'op_r{ridx}_local_mean_A'),4)}A"
+                f"/transport={self._fmt(summary.get(f'op_r{ridx}_transport_mean_A'),4)}A"
+                f" sync=[{self._fmt(summary.get(f'op_r{ridx}_local_sync_gap_A'),6)},"
+                f"{self._fmt(summary.get(f'op_r{ridx}_transport_sync_gap_A'),6)}]A"
+            )
+        print(
+            "[SequentialOperatorValidation] "
+            f"epoch={self.epoch} " + " ".join(op_parts)
+        )
+
+
+    def _print_train_validation_gap(self, train_summary, validation_summary):
+        """Print already-computed epoch means; execute no extra forward pass."""
+        if not self._is_main_proc():
+            return
+        pairs = (
+            ('total', 'loss', 'loss_overall'),
+            ('seq', 'seq', 'loss_seq'),
+            ('structure', 'structure', 'loss_structure'),
+            ('interface', 'interface', 'loss_interface'),
+            ('edge', 'edge', 'loss_edge'),
+        )
+        fields = []
+        for label, train_key, val_key in pairs:
+            tr = train_summary.get(train_key, float('nan'))
+            va = validation_summary.get(val_key, float('nan'))
+            try:
+                trf, vaf = float(tr), float(va)
+                gap = vaf - trf if isfinite(vaf) and isfinite(trf) else float('nan')
+            except Exception:
+                gap = float('nan')
+            fields.append(
+                f"{label}=({self._fmt(tr,5)}->{self._fmt(va,5)};gap={self._fmt(gap,5)})"
+            )
+        print(f"[TrainValidationGap] epoch={int(self.epoch)} " + ' '.join(fields))
 
 
     def _accumulate_train_component(self, name, value):
