@@ -15,7 +15,6 @@ from utils.nn_utils import (
     SeperatedCoordNormalizer, _knn_edges, get_timestep_embedding,
     _abflow_ca_fill_observed_mask,
 )
-from evaluation.rmsd import kabsch_torch
 
 from ..modules.am_enc import AMEncoder
 from ..modules.am_egnn import AMEGNN
@@ -92,25 +91,24 @@ class AbFlowModel(nn.Module):
         }
         self.coord_prenorm = self.coord_controller_mode == "egnn_prenorm_raw"
 
-        # Coordinate-state policy.  V225 formal runs restore the validated R05
-        # cross-round geometric recurrence: the EGNN-produced interface carrier
-        # is fed directly into the next physical round.  pred_X remains the
-        # recurrent full-atom structural proposal/context state.  The two states
-        # have distinct roles; neither is overwritten by an analytic projection.
-        state_cfg = representation_config.get("coordinate_state", {})
-        self.coordinate_state_mode = str(
-            state_cfg.get("mode", "legacy_dual") or "legacy_dual"
+        # V235: one physical coordinate field, two analytically equivalent charts.
+        # The primary chart is the only learned/recurrent physical authority; the
+        # other chart is derived deterministically at every R05 refinement round.
+        authority_config = representation_config.get("physical_authority", {})
+        self.physical_authority_mode = str(
+            authority_config.get("mode", "legacy_split") or "legacy_split"
         ).strip().lower()
-        _state_modes = {"legacy_dual", "scoreflow_endpoint_fused", "scoreflow_single_endpoint", "r05_recurrent_carrier"}
-        if self.coordinate_state_mode not in _state_modes:
+        _authority_modes = {
+            "legacy_split",
+            "carrier_primary_analytic",
+            "endpoint_primary_analytic",
+        }
+        if self.physical_authority_mode not in _authority_modes:
             raise ValueError(
-                "model.representation.single_pair.coordinate_state.mode must be one of "
-                f"{sorted(_state_modes)}, got {self.coordinate_state_mode!r}."
+                "model.representation.single_pair.physical_authority.mode must be one of "
+                f"{sorted(_authority_modes)}, got {self.physical_authority_mode!r}."
             )
-        self.generated_region_only_loss = bool(
-            loss_config.get("generated_region_only", False)
-        )
-        self._last_state_closure_audit = {}
+        self.single_physical_field = self.physical_authority_mode != "legacy_split"
 
         if self.coord_controller_mode in {"egnn_unit_direction", "egnn_prenorm_raw"} and self.pair_coord_mode != "direct_shared":
             raise ValueError(
@@ -168,20 +166,6 @@ class AbFlowModel(nn.Module):
         self.loss_smooth_lddt_weight = float(
             smooth_lddt_config.get("weight", 0.0)
         )
-        coarse_anchor_config = loss_config.get("coarse_anchor_distance", {})
-        self.loss_coarse_anchor_weight = float(
-            coarse_anchor_config.get("weight", 0.0)
-        )
-        self.coarse_anchor_cutoff_A = float(
-            coarse_anchor_config.get("cutoff_A", distogram_config.get("max_bin", 21.6875))
-        )
-        self.coarse_anchor_relation_balance = str(
-            coarse_anchor_config.get("relation_balance", "DF_DA_equal") or "DF_DA_equal"
-        ).strip()
-        if self.coarse_anchor_relation_balance != "DF_DA_equal":
-            raise ValueError(
-                "loss.coarse_anchor_distance.relation_balance must be 'DF_DA_equal'"
-            )
         self.smooth_lddt_cutoff = float(
             smooth_lddt_config.get("cutoff", 15.0)
         )
@@ -199,7 +183,6 @@ class AbFlowModel(nn.Module):
         _smooth_lddt_sources = {
             "pred_design_endpoint",
             "carrier_implied_endpoint",
-            "terminal_fused_endpoint",
         }
         if self.smooth_lddt_prediction_source not in _smooth_lddt_sources:
             raise ValueError(
@@ -209,7 +192,6 @@ class AbFlowModel(nn.Module):
             )
         self.distogram_enabled = self.loss_distogram_weight > 0.0
         self.smooth_lddt_enabled = self.loss_smooth_lddt_weight > 0.0
-        self.coarse_anchor_enabled = self.loss_coarse_anchor_weight > 0.0
         self.relational_trunk_enabled = True
 
         # Representation initialization is isolated from the R05 RNG stream.
@@ -286,6 +268,13 @@ class AbFlowModel(nn.Module):
         self._last_trunk_state = {}
         self._last_message_diagnostics = {}
         self._last_round_egnn_diagnostics = []
+        # V235 single-field authority diagnostics.  Runtime-only: no Parameter,
+        # buffer, objective, or checkpoint-state change.
+        self.last_singlefield_diagnostics = {}
+        self._last_round_authority_endpoints_raw = []
+        self._last_round_authority_carriers_raw = []
+        self._last_round_proposal_endpoints_raw = []
+        self._last_round_proposal_carriers_raw = []
         self.grad_conflict_diagnostics = False
         self._diagnostic_capture = False
         self._diagnostic_validation_mode = False
@@ -297,8 +286,8 @@ class AbFlowModel(nn.Module):
         self.geometry_forensics_enabled = _gf in {"1", "true", "yes", "y", "on"}
         _sf = str(os.environ.get("ABFLOW_SAMPLE_FORENSICS", "off") or "off").strip().lower()
         self.sample_forensics_enabled = _sf in {"1", "true", "yes", "y", "on"}
-        self.sample_step_rms_alert_A = float(
-            os.environ.get("ABFLOW_SAMPLE_STEP_RMS_ALERT_A", "10") or 10.0
+        self.sample_forensics_threshold_A = float(
+            os.environ.get("ABFLOW_SAMPLE_FORENSICS_THRESHOLD_A", "500") or 500.0
         )
         self.last_geometry_forensics = {}
         self._coord_audit_train_call = 0
@@ -315,6 +304,8 @@ class AbFlowModel(nn.Module):
             'coord_controller_mode': self.coord_controller_mode,
             'coord_tanh': self.coord_tanh,
             'coord_normalize': self.coord_normalize,
+            'physical_authority_mode': self.physical_authority_mode,
+            'single_physical_field': self.single_physical_field,
         }
 
     @staticmethod
@@ -328,10 +319,11 @@ class AbFlowModel(nn.Module):
             return float('nan')
 
     def _maybe_log_coordinate_controller_audit(self, round_egnn_diagnostics):
-        """Compact V221 controller audit (diagnostic-only).
+        """V235 exact stage-wise Cartesian actuator audit (diagnostic-only).
 
-        Scientific controller is unchanged from V219.  RMS/max pairs distinguish
-        distribution-wide gain drift from sparse extreme actions.
+        Every printed quantity is read from the current AMEncoder/EGNN diagnostic
+        keys.  There are no legacy aliases and therefore no synthetic ``nan`` for
+        quantities that are actually available.
         """
         if not self.training or not self.geometry_forensics_enabled:
             return
@@ -343,29 +335,49 @@ class AbFlowModel(nn.Module):
             if torch.distributed.get_rank() != 0:
                 return
 
-        rows = []
+        def fmt(v):
+            try:
+                x = float(v.detach().float().item()) if torch.is_tensor(v) else float(v)
+            except Exception:
+                return 'NA'
+            return 'NA' if not math.isfinite(x) else f'{x:.6g}'
+
+        def stage_payload(d, stage, stream):
+            p = stage + '.'
+            return (
+                f'{stage}['
+                f'a={fmt(d.get(p+"coord_state_coeff_raw_rms"))}/'
+                f'{fmt(d.get(p+"coord_state_coeff_raw_absmax"))} '
+                f'base={fmt(d.get(p+"coord_base_coeff_raw_rms"))} '
+                f'dpair={fmt(d.get(p+"coord_direct_pair_coeff_delta_rms"))} '
+                f'lever={fmt(d.get(p+"coord_diff_norm_rms"))}/'
+                f'{fmt(d.get(p+"coord_diff_norm_absmax"))} '
+                f'dx={fmt(d.get(p+stream+"_design_update_rms"))}/'
+                f'{fmt(d.get(p+stream+"_design_update_absmax"))} '
+                f'w={fmt(d.get(p+"coord_head_w1_opnorm"))}/'
+                f'{fmt(d.get(p+"coord_head_w2_opnorm"))}]'
+            )
+
         for rec in (round_egnn_diagnostics or []):
+            ridx = int(rec.get('round_idx', -1))
             d = rec.get('coord', {}) or {}
-            rows.append((
-                int(rec.get('round_idx', len(rows))),
-                self._coord_diag_scalar(d, 'coord_state_coeff_raw_rms_max'),
-                self._coord_diag_scalar(d, 'coord_state_coeff_raw_absmax_max'),
-                self._coord_diag_scalar(d, 'coord_pair_delta_raw_rms_max'),
-                self._coord_diag_scalar(d, 'coord_update_rms_max'),
-                self._coord_diag_scalar(d, 'coord_update_absmax_max'),
-            ))
-        fmt = lambda v: 'nan' if not math.isfinite(v) else f'{v:.6g}'
-        payload = ';'.join(
-            f'r{r}:alpha={fmt(ar)}/{fmt(am)} pair_rms={fmt(pr)} '
-            f'dx={fmt(xr)}/{fmt(xm)}'
-            for r, ar, am, pr, xr, xm in rows
-        )
-        print(
-            '[ControllerAudit] '
-            f'train_call={call} mode={self.coord_controller_mode} '
-            f'fields=rms/max {payload}',
-            flush=True,
-        )
+            b = rec.get('bridge', {}) or {}
+            native_stages = [f'ctx_{i}' for i in range(getattr(self.gnn, 'n_layers', 0))] + ['out']
+            carrier_stages = []
+            for i in range(getattr(self.gnn, 'n_layers', 0)):
+                carrier_stages.extend([f'inter_{i}', f'surf_{i}'])
+            native = ';'.join(stage_payload(d, st, 'native') for st in native_stages)
+            carrier = ';'.join(stage_payload(d, st, 'carrier') for st in carrier_stages)
+            print(
+                '[StageActuator] '
+                f'train_call={call} round={ridx} mode={self.coord_controller_mode} '
+                f'authority={self.physical_authority_mode} '
+                f'single_ratio={fmt(b.get("bridge_single_delta_to_base_ratio"))} '
+                f'pair_sem_ratio={fmt(b.get("bridge_pair_delta_to_base_ratio_mean"))} '
+                f'pair_coord_ratio={fmt(b.get("bridge_pair_coordinate_delta_to_base_ratio_mean"))} '
+                f'native={native} carrier={carrier}',
+                flush=True,
+            )
 
     def set_sample_forensic_context(self, logical_batch_id=None, global_indices=None, names=None):
         """Attach evaluation identity to the next ``sample`` call.
@@ -453,12 +465,6 @@ class AbFlowModel(nn.Module):
         }
 
     def _append_sample_forensic_record(self, row):
-        """Failure-only sampler telemetry using gauge-invariant step motion.
-
-        Absolute coordinate magnitudes depend on the arbitrary global origin and
-        therefore cannot diagnose sampler divergence.  V225 alerts only on
-        non-finite values or a large per-step RMS displacement.
-        """
         if not self.sample_forensics_enabled:
             return
         self._sample_forensic_records.append(dict(row))
@@ -467,28 +473,40 @@ class AbFlowModel(nn.Module):
 
         bad_field = None
         bad_value = None
-        if row.get('finite') is False:
-            bad_field, bad_value = 'nonfinite', float('nan')
-        step_rms = row.get('step_delta_rms_A')
-        if bad_field is None and step_rms is not None:
+        ordered = (
+            'xt_absmax_A', 'carrier_absmax_A', 'implied_x1_absmax_A',
+            'xnext_absmax_A', 'pred_final_absmax_A',
+            'gen_pre_align_absmax_A', 'kabsch_translation_norm_A',
+            'gen_post_align_absmax_A',
+        )
+        for field in ordered:
+            value = row.get(field)
+            if value is None:
+                continue
             try:
-                fv = float(step_rms)
+                fv = float(value)
             except Exception:
-                fv = float('nan')
-            if (not math.isfinite(fv)) or fv > float(self.sample_step_rms_alert_A):
-                bad_field, bad_value = 'step_delta_rms_A', fv
+                continue
+            if (not math.isfinite(fv)) or abs(fv) > float(self.sample_forensics_threshold_A):
+                bad_field, bad_value = field, fv
+                break
+        if row.get('finite') is False and bad_field is None:
+            bad_field, bad_value = 'nonfinite', float('nan')
 
         if bad_field is not None:
             self._sample_forensic_alerted = True
             print(
-                '[SampleDynamicsAlert] '
+                '[SampleGeometryOutlier] '
                 f"logical_batch_id={row.get('logical_batch_id')} "
                 f"global_index={row.get('global_index')} name={row.get('name', '')!r} "
                 f"stage={row.get('stage')} step={row.get('step')} "
                 f"t={row.get('t')} field={bad_field} value_A={bad_value:.6g} "
-                f"step_rms_alert_A={float(self.sample_step_rms_alert_A):.6g}",
+                f"threshold_A={float(self.sample_forensics_threshold_A):.6g}",
                 flush=True,
             )
+
+            # Failure-only trajectory: all preceding sampler steps for exactly
+            # this sample.  No extra forward/RNG call is introduced.
             gid = row.get('global_index')
             name = row.get('name', '')
             trace = [
@@ -509,9 +527,14 @@ class AbFlowModel(nn.Module):
                             vals.append('nan')
                     return '(' + ','.join(vals) + ')'
                 print(
-                    '[SampleDynamicsTrajectory] '
+                    '[SampleOutlierTrajectory] '
                     f'global_index={gid} name={name!r} '
-                    f't={arr("t", 3)} step_rms={arr("step_delta_rms_A", 4)}',
+                    f't={arr("t", 3)} '
+                    f'xt={arr("xt_absmax_A", 4)} '
+                    f'carrier={arr("carrier_absmax_A", 4)} '
+                    f'x1={arr("implied_x1_absmax_A", 4)} '
+                    f'xnext={arr("xnext_absmax_A", 4)} '
+                    f'step_rms={arr("step_delta_rms_A", 4)}',
                     flush=True,
                 )
 
@@ -980,323 +1003,81 @@ class AbFlowModel(nn.Module):
         loss = per_graph[valid].mean() if bool(valid.any()) else pred.new_zeros(())
         return loss
 
-    @staticmethod
-    def _rms_tensor(x):
-        return torch.sqrt(x.float().square().mean().clamp_min(0.0))
+    def _carrier_to_endpoint_chart(self, x_t, x0, carrier, t_int):
+        """Carrier -> clean endpoint in one common coordinate frame.
 
-    @torch.no_grad()
-    def _recurrent_role_audit(self, pred_X, carrier, source_X0, Xt, t_int,
-                              paratope_mask, atom_mask, interface_batch_id):
-        """Observe, but never force, the two validated R05 recurrent roles.
-
-        ``carrier`` is the recurrent Score--Flow transport state produced by the
-        EGNN.  ``pred_X`` is the recurrent full-atom structural proposal.  The
-        audit converts the carrier to its implied clean endpoint and reports:
-          * raw atom14 RMS disagreement;
-          * CA centroid separation (pose translation proxy);
-          * CA pair-distance RMS disagreement (SE(3)-invariant shape proxy).
-        No term enters the training objective.
+        Canonical region:
+            X1 = 2Y - [Xt-(1-t)X0]/t
+        Boundary region t<t_min:
+            Y is already trained as the clean endpoint.
         """
-        canonical_x1 = self.r3_matcher.endpoint_from_canonical_carrier_gfree(
-            x_t=Xt, x0=source_X0, carrier=carrier, t=t_int,
-            boundary_eps=self.f01_hybrid_t_min,
-        )
-        active = torch.as_tensor(t_int, device=carrier.device, dtype=carrier.dtype) >= float(self.f01_hybrid_t_min)
-        while active.dim() < carrier.dim():
-            active = active.unsqueeze(-1)
-        carrier_x1 = torch.where(active, canonical_x1, carrier)
-        pred_design = pred_X[paratope_mask]
-        valid = atom_mask.bool()
-        if bool(valid.any()):
-            diff = (pred_design.detach().float() - carrier_x1.detach().float())[valid]
-            raw_rms = diff.square().mean().sqrt().to(pred_X.dtype)
-        else:
-            raw_rms = pred_X.new_zeros(())
+        canonical = self.r3_matcher.endpoint_from_canonical_carrier_gfree(
+            x_t=x_t, x0=x0, carrier=carrier, t=t_int,
+            boundary_eps=self.f01_hybrid_t_min)
+        t = torch.as_tensor(t_int, device=carrier.device, dtype=carrier.dtype)
+        while t.dim() < carrier.dim():
+            t = t.unsqueeze(-1)
+        active = t >= float(self.f01_hybrid_t_min)
+        return torch.where(active, canonical, carrier)
 
-        centroid_vals, pair_vals = [], []
-        pca = pred_design.detach().float()[:, 1]
-        cca = carrier_x1.detach().float()[:, 1]
-        n_graph = int(interface_batch_id.max().item()) + 1 if interface_batch_id.numel() else 0
-        for gid in range(n_graph):
-            idx = interface_batch_id == gid
-            if not bool(idx.any()):
-                continue
-            pp, cc = pca[idx], cca[idx]
-            centroid_vals.append(torch.norm(pp.mean(0) - cc.mean(0), p=2))
-            if pp.shape[0] >= 2:
-                dp = torch.cdist(pp, pp)
-                dc = torch.cdist(cc, cc)
-                pair_vals.append((dp - dc).square().mean().sqrt())
-        centroid_gap = (
-            torch.stack(centroid_vals).mean().to(pred_X.dtype)
-            if centroid_vals else pred_X.new_zeros(())
-        )
-        pair_gap = (
-            torch.stack(pair_vals).mean().to(pred_X.dtype)
-            if pair_vals else pred_X.new_zeros(())
-        )
-        return {
-            'role_raw_gap_A': raw_rms,
-            'role_ca_centroid_gap_A': centroid_gap,
-            'role_ca_pairdist_gap_A': pair_gap,
-        }
-
-    def _differentiable_design_kabsch(self, moving, target):
-        """Rigidly place ``moving`` onto ``target`` without changing shape.
-
-        Both inputs are [M,3] in the same centered/model frame.  The operation
-        is differentiable through the SVD and contains no clipping, learned
-        scale, trust radius or coordinate normalization heuristic.
-        """
-        if moving.shape != target.shape or moving.dim() != 2 or moving.shape[-1] != 3:
-            raise RuntimeError(
-                f"V223 Kabsch shape mismatch: moving={tuple(moving.shape)} "
-                f"target={tuple(target.shape)}"
-            )
-        if moving.shape[0] < 3:
-            raise RuntimeError(
-                f"V223 Kabsch requires >=3 backbone points, got {moving.shape[0]}"
-            )
-        out_dtype = moving.dtype
-        # torch<=1.11 AMP can route linalg ops through low precision.  The
-        # explicit FP32 island changes only numerical linear algebra precision.
-        with torch.cuda.amp.autocast(enabled=False):
-            p = moving.float()
-            q = target.float()
-            pc = p.mean(dim=0, keepdim=True)
-            qc = q.mean(dim=0, keepdim=True)
-            p0, q0 = p - pc, q - qc
-            cov = p0.transpose(0, 1).matmul(q0)
-            U, _, Vh = torch.linalg.svd(cov, full_matrices=False)
-            V = Vh.transpose(-2, -1)
-            raw_R = V.matmul(U.transpose(-2, -1))
-            sign = torch.where(
-                torch.det(raw_R) < 0,
-                raw_R.new_tensor(-1.0), raw_R.new_tensor(1.0),
-            )
-            diag = torch.stack([
-                raw_R.new_tensor(1.0), raw_R.new_tensor(1.0), sign
-            ])
-            R = V.matmul(torch.diag(diag)).matmul(U.transpose(-2, -1))
-            trans = qc.squeeze(0) - pc.squeeze(0).matmul(R.transpose(0, 1))
-            aligned = p.matmul(R.transpose(0, 1)) + trans
-        return aligned.to(out_dtype), R.to(out_dtype), trans.to(out_dtype)
-
-    def _close_scoreflow_endpoint_state(
-            self, pred_X, carrier, paratope_mask, interface_batch_id,
-            flow_xt_model, flow_x0_model, flow_t):
-        """Project the two R05 coordinate parameterizations onto one endpoint.
-
-        The GNN carrier is first inverted through the exact U02/F01 chart to the
-        clean endpoint it implies.  The full-atom ``pred_X`` contributes only
-        internal H3 shape; its H3 backbone is rigidly placed onto that implied
-        endpoint.  The fused clean endpoint is then mapped analytically back to
-        the carrier chart.  Therefore the next recurrent round sees two *known
-        parameterizations of one endpoint*, not two independent H3 geometries.
-        """
-        if flow_xt_model is None or flow_x0_model is None or flow_t is None:
-            raise RuntimeError(
-                "scoreflow_endpoint_fused requires flow Xt, source X0 and flow_t"
-            )
-        pred_design = pred_X[paratope_mask]
-        if tuple(pred_design.shape) != tuple(carrier.shape):
-            raise RuntimeError(
-                f"V223 generated/carrier shape mismatch: pred={tuple(pred_design.shape)} "
-                f"carrier={tuple(carrier.shape)}"
-            )
-        t_int = self._time_for_interface(flow_t, interface_batch_id, carrier)
-        implied = self.r3_matcher.endpoint_from_canonical_carrier_gfree(
-            x_t=flow_xt_model, x0=flow_x0_model, carrier=carrier, t=t_int,
-            boundary_eps=self.f01_hybrid_t_min,
-        )
-        active = torch.as_tensor(t_int, device=carrier.device, dtype=carrier.dtype) >= float(self.f01_hybrid_t_min)
-        while active.dim() < carrier.dim():
-            active = active.unsqueeze(-1)
-        implied = torch.where(active, implied, carrier)
-
-        fused = pred_design.clone()
-        centroid_gaps, aligned_shape_rms, rotation_deg = [], [], []
-        for gid in range(int(interface_batch_id.max().item()) + 1 if interface_batch_id.numel() else 0):
-            idx = interface_batch_id == gid
-            if not bool(idx.any()):
-                continue
-            moving_bb = pred_design[idx, :4].reshape(-1, 3)
-            target_bb = implied[idx, :4].reshape(-1, 3)
-            aligned_bb, R, trans = self._differentiable_design_kabsch(
-                moving_bb, target_bb
-            )
-            # Apply the same rigid placement to all atom14 coordinates.
-            p = pred_design[idx].float()
-            fused[idx] = (
-                p.matmul(R.float().transpose(0, 1)) + trans.float()
-            ).to(fused.dtype)
-            with torch.no_grad():
-                centroid_gaps.append((
-                    moving_bb.detach().float().mean(0)
-                    - target_bb.detach().float().mean(0)
-                ).norm())
-                aligned_shape_rms.append(self._rms_tensor(
-                    aligned_bb.detach().float() - target_bb.detach().float()
-                ))
-                tr = torch.trace(R.detach().float())
-                cosang = ((tr - 1.0) * 0.5).clamp(-1.0, 1.0)
-                rotation_deg.append(torch.acos(cosang) * (180.0 / math.pi))
-
+    def _endpoint_to_carrier_chart(self, x_t, x0, endpoint, t_int):
+        """Clean endpoint -> carrier in one common coordinate frame."""
         canonical = self.r3_matcher.canonical_carrier_target_gfree(
-            x_t=flow_xt_model, x0=flow_x0_model, x1=fused, t=t_int,
-            boundary_eps=self.f01_hybrid_t_min,
-        )
-        consistent_carrier = torch.where(active, canonical, fused)
-        pred_closed = pred_X.clone()
-        pred_closed[paratope_mask] = fused
+            x_t=x_t, x0=x0, x1=endpoint, t=t_int,
+            boundary_eps=self.f01_hybrid_t_min)
+        t = torch.as_tensor(t_int, device=endpoint.device, dtype=endpoint.dtype)
+        while t.dim() < endpoint.dim():
+            t = t.unsqueeze(-1)
+        active = t >= float(self.f01_hybrid_t_min)
+        return torch.where(active, canonical, endpoint)
 
-        with torch.no_grad():
-            audit = {
-                "state_closure_on": carrier.new_tensor(1.0),
-                "state_endpoint_pre_rms": self._rms_tensor(
-                    pred_design.detach() - implied.detach()
-                ).to(carrier.dtype),
-                "state_endpoint_post_rms": self._rms_tensor(
-                    fused.detach() - implied.detach()
-                ).to(carrier.dtype),
-                "state_carrier_projection_rms": self._rms_tensor(
-                    consistent_carrier.detach() - carrier.detach()
-                ).to(carrier.dtype),
-                "state_centroid_gap_A_model": (
-                    torch.stack(centroid_gaps).mean().to(carrier.dtype)
-                    if centroid_gaps else carrier.new_zeros(())
-                ),
-                "state_aligned_shape_rms_model": (
-                    torch.stack(aligned_shape_rms).mean().to(carrier.dtype)
-                    if aligned_shape_rms else carrier.new_zeros(())
-                ),
-                "state_rotation_deg": (
-                    torch.stack(rotation_deg).mean().to(carrier.dtype)
-                    if rotation_deg else carrier.new_zeros(())
-                ),
-            }
-        return pred_closed, consistent_carrier, audit
+    def _native_paratope_model_to_raw(self, native_x, paratope_mask, batch_id):
+        """AB-centered native model frame -> raw physical H3 coordinates."""
+        gid = batch_id[paratope_mask]
+        ab = self.normalizer.ab_centers[gid].to(native_x)
+        return self.normalizer.unnormalize(native_x) + ab.unsqueeze(1)
 
-    def _carrier_from_single_endpoint(
-            self, pred_X, shadow_carrier, paratope_mask, interface_batch_id,
-            flow_xt_model, flow_x0_model, flow_t):
-        """Derive the recurrent Score--Flow carrier from the sole learned endpoint.
+    def _raw_paratope_to_native_model(self, raw_x, paratope_mask, batch_id):
+        """Raw physical H3 coordinates -> AB-centered native model frame."""
+        gid = batch_id[paratope_mask]
+        ab = self.normalizer.ab_centers[gid].to(raw_x)
+        return self.normalizer.normalize(raw_x - ab.unsqueeze(1))
 
-        ``pred_X[paratope_mask]`` is the only learned clean-coordinate authority.
-        The shadow EGNN coordinate is retained only as an intra-round geometric
-        workspace for message passing and is discarded before recurrent feedback.
-        """
-        if flow_xt_model is None or flow_x0_model is None or flow_t is None:
-            raise RuntimeError(
-                "scoreflow_single_endpoint requires flow Xt, source X0 and flow_t"
-            )
-        endpoint = pred_X[paratope_mask]
-        if tuple(endpoint.shape) != tuple(shadow_carrier.shape):
-            raise RuntimeError(
-                f"single-endpoint shape mismatch: endpoint={tuple(endpoint.shape)} "
-                f"shadow={tuple(shadow_carrier.shape)}"
-            )
-        t_int = self._time_for_interface(flow_t, interface_batch_id, endpoint)
-        canonical = self.r3_matcher.canonical_carrier_target_gfree(
-            x_t=flow_xt_model, x0=flow_x0_model, x1=endpoint, t=t_int,
-            boundary_eps=self.f01_hybrid_t_min,
-        )
-        active = torch.as_tensor(
-            t_int, device=endpoint.device, dtype=endpoint.dtype
-        ) >= float(self.f01_hybrid_t_min)
-        while active.dim() < endpoint.dim():
-            active = active.unsqueeze(-1)
-        carrier = torch.where(active, canonical, endpoint)
+    def _interface_model_to_raw(self, interface_x, interface_batch_id):
+        """AG-centered interface model frame -> raw physical H3 coordinates."""
+        ag = self.normalizer.ag_centers[interface_batch_id].to(interface_x)
+        return self.normalizer.unnormalize(interface_x) + ag.unsqueeze(1)
 
-        with torch.no_grad():
-            shadow_implied = self.r3_matcher.endpoint_from_canonical_carrier_gfree(
-                x_t=flow_xt_model, x0=flow_x0_model, carrier=shadow_carrier, t=t_int,
-                boundary_eps=self.f01_hybrid_t_min,
-            )
-            shadow_implied = torch.where(active, shadow_implied, shadow_carrier)
-            audit = {
-                "single_endpoint_on": endpoint.new_tensor(1.0),
-                "shadow_endpoint_gap_rms": self._rms_tensor(
-                    shadow_implied.detach() - endpoint.detach()
-                ).to(endpoint.dtype),
-            }
-        return carrier, audit
+    def _raw_to_interface_model(self, raw_x, interface_batch_id):
+        """Raw physical H3 coordinates -> AG-centered interface model frame."""
+        ag = self.normalizer.ag_centers[interface_batch_id].to(raw_x)
+        return self.normalizer.normalize(raw_x - ag.unsqueeze(1))
 
-    def _coarse_anchor_distance_loss(
-            self, pred_X, true_X, true_S, paratope_mask, batch_id,
-            is_antigen, xloss_mask):
-        """Non-saturating CA-distance supervision for coarse H3 placement.
+    def _native_to_interface_model(self, native_x, paratope_mask, batch_id,
+                                   interface_batch_id):
+        raw = self._native_paratope_model_to_raw(native_x, paratope_mask, batch_id)
+        return self._raw_to_interface_model(raw, interface_batch_id)
 
-        Native DF and DA pairs within the configured support cutoff are supervised
-        by absolute distance error.  Relations are equally averaged per complex,
-        then scaled by the existing R3 coordinate scaling (0.1 in the formal run).
-        """
-        zero = pred_X.sum() * 0.0
-        ca_valid = xloss_mask[:, 1].bool() if xloss_mask.dim() == 2 else xloss_mask.bool()
-        biological = (true_S >= 0) & (true_S < 20) & ca_valid
-        generation = paratope_mask.bool() & biological
-        antigen = is_antigen.bool() & biological
-        framework = biological & (~generation) & (~antigen)
-        pred_ca = true_X[:, 1].clone()
-        pred_ca[generation] = pred_X[generation, 1]
-        true_ca = true_X[:, 1]
-
-        graph_losses = []
-        df_mae_sum = zero.detach().float()
-        da_mae_sum = zero.detach().float()
-        df_graphs = da_graphs = 0
-        df_pairs = da_pairs = 0
-        B = int(batch_id.max().item()) + 1 if batch_id.numel() else 0
-        for gid in range(B):
-            g = batch_id == gid
-            gi = torch.nonzero(g & generation, as_tuple=False).flatten()
-            if gi.numel() == 0:
-                continue
-            relation_losses = []
-            for ctx_mask, relation in ((framework, 'DF'), (antigen, 'DA')):
-                cj = torch.nonzero(g & ctx_mask, as_tuple=False).flatten()
-                if cj.numel() == 0:
-                    continue
-                native_d = torch.cdist(true_ca[gi].float(), true_ca[cj].float())
-                support = native_d <= float(self.coarse_anchor_cutoff_A)
-                if not bool(support.any()):
-                    continue
-                pred_d = torch.cdist(pred_ca[gi].float(), pred_ca[cj].float())
-                mae = (pred_d - native_d).abs()[support].mean()
-                relation_losses.append(mae.to(pred_X.dtype))
-                n = int(support.sum().item())
-                if relation == 'DF':
-                    df_mae_sum = df_mae_sum + mae.detach()
-                    df_graphs += 1
-                    df_pairs += n
-                else:
-                    da_mae_sum = da_mae_sum + mae.detach()
-                    da_graphs += 1
-                    da_pairs += n
-            if relation_losses:
-                graph_losses.append(torch.stack(relation_losses).mean())
-
-        loss_A = torch.stack(graph_losses).mean() if graph_losses else zero
-        loss = loss_A * float(self.flow_coordinate_scaling)
-        audit = {
-            'coarse_anchor_DF_mae_A': (df_mae_sum / max(df_graphs, 1)).to(pred_X.dtype),
-            'coarse_anchor_DA_mae_A': (da_mae_sum / max(da_graphs, 1)).to(pred_X.dtype),
-            'coarse_anchor_DF_pairs': pred_X.new_tensor(float(df_pairs)),
-            'coarse_anchor_DA_pairs': pred_X.new_tensor(float(da_pairs)),
-        }
-        return loss, audit
+    def _interface_to_native_model(self, interface_x, paratope_mask, batch_id,
+                                   interface_batch_id):
+        raw = self._interface_model_to_raw(interface_x, interface_batch_id)
+        return self._raw_paratope_to_native_model(raw, paratope_mask, batch_id)
 
 
     def _forward(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep,
                  surface, residue_pos, template, lengths, init_noise=None,
                  interface_init=None, sequence_init=None, flow_t=None,
                  flow_source_init=None):
-        """R05 predictor at one transport state."""
+        """R05 predictor at one outer transport state.
+
+        V235 preserves three physical refinement rounds but enforces one learned
+        physical degree of freedom.  Carrier-primary and endpoint-primary are two
+        analytically equivalent chart choices; the non-primary coordinate proposal
+        remains only an internal message-passing scratch state and is overwritten
+        before recurrence/loss authority.
+        """
         batch_id = self.batch_constants['batch_id']
-        # V10.1: `_forward` owns its diagnostic-capture scope.  The same flag is
-        # also evaluated inside `message_passing`, but that local variable is not
-        # visible here.  Keep the predicates identical so round-level EGNN
-        # diagnostics are collected exactly when message-level diagnostics are.
+        interface_batch_id = self.batch_constants['interface_batch_id']
         capture_diag = bool(
             getattr(self, '_diagnostic_capture', False)
             or getattr(self, 'geometry_forensics_enabled', False)
@@ -1316,30 +1097,32 @@ class AbFlowModel(nn.Module):
                 X, S, paratope_mask, batch_id, init_noise)
             interface_X, interface_S = self._condition_initial_interface(
                 interface_X, interface_S, X_pep, S_pep)
+            transport_Xt = interface_X.clone()
         else:
             interface_X = self._raw_interface_to_model_frame(
                 interface_init, paratope_mask, batch_id)
+            transport_Xt = interface_X.clone()
             interface_S = (
                 sequence_init.to(device=S.device, dtype=torch.long).clone()
                 if sequence_init is not None else S[paratope_mask].clone())
 
-        flow_xt_model = interface_X.clone() if interface_init is not None else None
-        flow_x0_model = None
-        if flow_source_init is not None:
-            flow_x0_model = self._raw_interface_to_model_frame(
-                flow_source_init, paratope_mask, batch_id
-            )
-        if self.coordinate_state_mode in {"scoreflow_endpoint_fused", "scoreflow_single_endpoint", "r05_recurrent_carrier"}:
-            if flow_xt_model is None or flow_x0_model is None or flow_t is None:
+        if self.single_physical_field:
+            if flow_source_init is None:
                 raise RuntimeError(
-                    "Score--Flow state mode requires explicit interface_init, "
-                    "flow_source_init and flow_t."
+                    f'{self.physical_authority_mode} requires flow_source_init so '
+                    'carrier<->endpoint conversion uses the same outer X0 as the sampler.'
                 )
-            if bool((paratope_mask & (~cmask)).any()):
+            source_X0_model = self._raw_interface_to_model_frame(
+                flow_source_init, paratope_mask, batch_id)
+            t_int_model = self._time_for_interface(
+                flow_t, interface_batch_id, interface_X)
+            if t_int_model is None:
                 raise RuntimeError(
-                    "Score--Flow state mode requires generated/paratope residues to have coordinate "
-                    "authority: paratope_mask must be a subset of cmask."
+                    f'{self.physical_authority_mode} requires explicit outer flow_t.'
                 )
+        else:
+            source_X0_model = None
+            t_int_model = None
 
         pep_X_model, pep_coord_valid = None, None
         if X_pep is not None and X_pep.shape == interface_X.shape:
@@ -1358,18 +1141,12 @@ class AbFlowModel(nn.Module):
         biological = paratope_mask.bool() | ((trunk_S >= 0) & (trunk_S < self.num_classes))
         trunk_X = X.clone()
         trunk_X[paratope_mask] = interface_X.to(trunk_X.dtype)
-        # R05 coordinates are normalized by 10 for physical refinement.  The
-        # compact relational trunk keeps AbX/DiffAb geometry conventions in
-        # Angstrom, so restore scale without undoing the harmless centering.
         relational_X = self.normalizer.unnormalize(trunk_X)
         trunk_state = self.native_trunk(
             X=relational_X, S=trunk_S,
             segment_ids=self.batch_constants['segment_ids'],
             residue_pos=residue_pos, batch_id=batch_id,
             valid_mask=biological, is_antigen=self.batch_constants['is_ag'],
-            # Keep donor structural information barrier (cmask) separate from
-            # task auxiliary support (paratope_mask).  For formal H3 generation
-            # the latter is exactly the generated stochastic degree of freedom.
             design_mask=cmask, aux_task_mask=paratope_mask, flow_t=flow_t,
             cdr_type=self.cdr_type, residue_feature=self.aa_feature,
             round_idx=-1,
@@ -1378,9 +1155,13 @@ class AbFlowModel(nn.Module):
 
         r_logits, r_interface_X, r_edge_dist = [], [interface_X.clone()], []
         pred_S_dist, memory_H = None, None
-        self._last_state_closure_audit = {}
-        self._last_recurrent_role_audit = {}
         round_egnn_diagnostics = []
+        authority_endpoints_native = []
+        authority_carriers_interface = []
+        proposal_endpoints_native = []
+        proposal_carriers_interface = []
+        round_chart_diag = []
+
         for round_idx in range(self.round):
             if round_idx >= self.proposal_adapter_start_round:
                 coord_cond, coord_mask = self._build_coord_pep_condition_for_residues(
@@ -1390,7 +1171,7 @@ class AbFlowModel(nn.Module):
             else:
                 coord_cond = coord_mask = seq_this = seq_mask_this = None
 
-            pred_logits, pred_X, interface_X, H, edge_dist = self.message_passing(
+            pred_logits, pred_X_proposal, carrier_proposal, H, edge_dist = self.message_passing(
                 X, S, residue_pos, interface_X, surface, paratope_mask,
                 batch_id, memory_H=memory_H, smooth_prob=pred_S_dist,
                 smooth_mask=smask, flow_t=flow_t,
@@ -1399,6 +1180,42 @@ class AbFlowModel(nn.Module):
                 seq_pep_condition=seq_this,
                 seq_pep_condition_mask=seq_mask_this,
                 trunk_state=trunk_state)
+
+            endpoint_proposal_native = pred_X_proposal[paratope_mask]
+            if self.physical_authority_mode == 'carrier_primary_analytic':
+                authority_carrier = carrier_proposal
+                endpoint_interface = self._carrier_to_endpoint_chart(
+                    transport_Xt, source_X0_model, authority_carrier, t_int_model)
+                authority_endpoint_native = self._interface_to_native_model(
+                    endpoint_interface, paratope_mask, batch_id, interface_batch_id)
+                # Keep non-authoritative native coordinate heads in the DDP graph
+                # with exactly zero physical/gradient authority.
+                authority_endpoint_native = (
+                    authority_endpoint_native + 0.0 * endpoint_proposal_native
+                )
+            elif self.physical_authority_mode == 'endpoint_primary_analytic':
+                authority_endpoint_native = endpoint_proposal_native
+                endpoint_interface = self._native_to_interface_model(
+                    authority_endpoint_native, paratope_mask, batch_id,
+                    interface_batch_id)
+                authority_carrier = self._endpoint_to_carrier_chart(
+                    transport_Xt, source_X0_model, endpoint_interface, t_int_model)
+                # Same graph-preserving zero anchor for the discarded learned
+                # shadow-coordinate proposal.
+                authority_carrier = authority_carrier + 0.0 * carrier_proposal
+            else:
+                authority_endpoint_native = endpoint_proposal_native
+                authority_carrier = carrier_proposal
+                endpoint_interface = self._native_to_interface_model(
+                    authority_endpoint_native, paratope_mask, batch_id,
+                    interface_batch_id)
+
+            pred_X = pred_X_proposal.clone()
+            if self.single_physical_field:
+                pred_X[paratope_mask] = authority_endpoint_native
+                interface_X = authority_carrier
+            else:
+                interface_X = carrier_proposal
 
             if capture_diag:
                 round_egnn_diagnostics.append({
@@ -1413,48 +1230,42 @@ class AbFlowModel(nn.Module):
                     },
                 })
 
+            if self.single_physical_field:
+                # Algebraic closure in the common AG-centered interface frame.
+                endpoint_from_carrier = self._carrier_to_endpoint_chart(
+                    transport_Xt, source_X0_model, authority_carrier, t_int_model)
+                carrier_from_endpoint = self._endpoint_to_carrier_chart(
+                    transport_Xt, source_X0_model, endpoint_interface, t_int_model)
+                carrier_roundtrip = self._endpoint_to_carrier_chart(
+                    transport_Xt, source_X0_model, endpoint_from_carrier, t_int_model)
+                endpoint_roundtrip = self._carrier_to_endpoint_chart(
+                    transport_Xt, source_X0_model, carrier_from_endpoint, t_int_model)
+                with torch.no_grad():
+                    def _rms(v):
+                        vf = v.detach().float()
+                        return vf.square().mean().sqrt().to(interface_X.dtype) if vf.numel() else interface_X.new_zeros(())
+                    round_chart_diag.append({
+                        'round_idx': int(round_idx),
+                        'carrier_roundtrip_rms_model': _rms(carrier_roundtrip - authority_carrier),
+                        'endpoint_roundtrip_rms_model': _rms(endpoint_roundtrip - endpoint_interface),
+                        'endpoint_chart_disagreement_rms_model': _rms(endpoint_from_carrier - endpoint_interface),
+                        'carrier_chart_disagreement_rms_model': _rms(carrier_from_endpoint - authority_carrier),
+                    })
+
             memory_H = H
-
-            if self.coordinate_state_mode == "scoreflow_endpoint_fused":
-                pred_X, interface_X, closure_audit = self._close_scoreflow_endpoint_state(
-                    pred_X=pred_X, carrier=interface_X,
-                    paratope_mask=paratope_mask,
-                    interface_batch_id=self.batch_constants['interface_batch_id'],
-                    flow_xt_model=flow_xt_model, flow_x0_model=flow_x0_model,
-                    flow_t=flow_t,
-                )
-                closure_audit = {
-                    f"round{round_idx}_{k}": v for k, v in closure_audit.items()
-                }
-                self._last_state_closure_audit.update(closure_audit)
-            elif self.coordinate_state_mode == "scoreflow_single_endpoint":
-                interface_X, authority_audit = self._carrier_from_single_endpoint(
-                    pred_X=pred_X, shadow_carrier=interface_X,
-                    paratope_mask=paratope_mask,
-                    interface_batch_id=self.batch_constants['interface_batch_id'],
-                    flow_xt_model=flow_xt_model, flow_x0_model=flow_x0_model,
-                    flow_t=flow_t,
-                )
-                authority_audit = {
-                    f"round{round_idx}_{k}": v for k, v in authority_audit.items()
-                }
-                self._last_state_closure_audit.update(authority_audit)
-            elif self.coordinate_state_mode == "r05_recurrent_carrier":
-                # V225 formal path: preserve the R05 recurrent geometry exactly.
-                # The EGNN-produced carrier remains the next round's carrier;
-                # pred_X remains the next round's structural proposal/context.
-                # No projection, Kabsch fusion, detach or analytic overwrite.
-                pass
-
             r_interface_X.append(interface_X.clone())
             r_logits.append((pred_logits, smask))
             r_edge_dist.append(edge_dist)
+            authority_endpoints_native.append(authority_endpoint_native)
+            authority_carriers_interface.append(interface_X)
+            proposal_endpoints_native.append(endpoint_proposal_native)
+            proposal_carriers_interface.append(carrier_proposal)
+
+            # Three-round physical refinement is preserved.  The next native/full
+            # context receives the endpoint chart of the SAME single physical
+            # field; the next shadow/interface recurrence receives its carrier chart.
             X = X.clone()
             X[cmask] = pred_X[cmask]
-            # Global generated coordinates always follow pred_X.  In the V224
-            # single-endpoint mode the recurrent carrier above is analytically
-            # derived from this same endpoint; the shadow EGNN coordinate is not
-            # a recurrent authority.
             X = self.aa_feature.update_global_coordinates(X, S)
 
             if not self.struct_only:
@@ -1464,8 +1275,29 @@ class AbFlowModel(nn.Module):
                 else:
                     pred_S_dist = torch.softmax(pred_logits[smask], dim=-1)
 
-        interface_batch_id = self.batch_constants['interface_batch_id']
         prmsd = self.prmsd_ffn(H[cmask]).squeeze() if self.struct_only else None
+
+        # Convert the exact authority/proposal histories to raw Angstrom BEFORE
+        # clearing the centering cache.  They are detached diagnostics only.
+        with torch.no_grad():
+            self._last_round_authority_endpoints_raw = [
+                self._native_paratope_model_to_raw(v, paratope_mask, batch_id).detach()
+                for v in authority_endpoints_native
+            ]
+            self._last_round_authority_carriers_raw = [
+                self._interface_model_to_raw(v, interface_batch_id).detach()
+                for v in authority_carriers_interface
+            ]
+            self._last_round_proposal_endpoints_raw = [
+                self._native_paratope_model_to_raw(v, paratope_mask, batch_id).detach()
+                for v in proposal_endpoints_native
+            ]
+            self._last_round_proposal_carriers_raw = [
+                self._interface_model_to_raw(v, interface_batch_id).detach()
+                for v in proposal_carriers_interface
+            ]
+            self._last_round_chart_diagnostics = round_chart_diag
+
         pred_X = self.normalizer.uncentering(
             self.normalizer.unnormalize(pred_X), batch_id)
         for i, value in enumerate(r_interface_X):
@@ -1546,11 +1378,8 @@ class AbFlowModel(nn.Module):
                     count = count + sequence_loss_mask.sum()
             snll = snll / count.clamp_min(1.0)
 
-        structure_loss_mask = (
-            paratope_mask if self.generated_region_only_loss else cmask
-        )
         struct_loss, struct_details, bb_rmsd, _ = self.protein_feature.structure_loss(
-            pred_X, true_X, true_S, structure_loss_mask, batch_id, xloss_mask,
+            pred_X, true_X, true_S, cmask, batch_id, xloss_mask,
             self.aa_feature)
 
         atom_pos = self.aa_feature._construct_atom_pos(true_S[paratope_mask])
@@ -1558,14 +1387,85 @@ class AbFlowModel(nn.Module):
         interface_loss = self._coordinate_training_objective(
             r_interface_X[-1], coord_target, atom_mask, interface_batch_id)
 
-        recurrent_role_audit = {}
-        if self.coordinate_state_mode == "r05_recurrent_carrier":
-            recurrent_role_audit = self._recurrent_role_audit(
-                pred_X=pred_X, carrier=r_interface_X[-1], source_X0=interface_X,
-                Xt=Xt, t_int=t_int, paratope_mask=paratope_mask,
-                atom_mask=atom_mask, interface_batch_id=interface_batch_id,
-            )
-            self._last_recurrent_role_audit = recurrent_role_audit
+        # V235 authority closure: structure and transport supervision must act on
+        # two charts of the SAME physical H3 state, never two free coordinate fields.
+        self.last_singlefield_diagnostics = {}
+        if self.single_physical_field:
+            with torch.no_grad():
+                final_carrier_x1 = self._carrier_to_endpoint_chart(
+                    Xt, interface_X, r_interface_X[-1], t_int)
+                pred_endpoint = pred_X[paratope_mask]
+                final_chart_gap = pred_endpoint.detach().float() - final_carrier_x1.detach().float()
+                carrier_rt = self._endpoint_to_carrier_chart(
+                    Xt, interface_X, final_carrier_x1, t_int)
+                endpoint_rt = self._carrier_to_endpoint_chart(
+                    Xt, interface_X,
+                    self._endpoint_to_carrier_chart(
+                        Xt, interface_X, pred_endpoint, t_int),
+                    t_int)
+
+                def _masked_rms_A(v, mask=None):
+                    vv = v.detach().float()
+                    if mask is not None:
+                        vv = vv[mask]
+                    return vv.square().mean().sqrt().to(X.dtype) if vv.numel() else X.new_zeros(())
+
+                round_gt = []
+                round_step = []
+                round_carrier_target = []
+                prev = None
+                for ep_raw, car_raw in zip(
+                        self._last_round_authority_endpoints_raw,
+                        self._last_round_authority_carriers_raw):
+                    round_gt.append(_masked_rms_A(ep_raw - gt_interface_X, atom_mask))
+                    round_carrier_target.append(_masked_rms_A(car_raw - coord_target, atom_mask))
+                    if prev is None:
+                        round_step.append(X.new_zeros(()))
+                    else:
+                        round_step.append(_masked_rms_A(ep_raw - prev, atom_mask))
+                    prev = ep_raw
+
+                proposal_endpoint_gap = []
+                proposal_carrier_gap = []
+                for ep_auth, car_auth, ep_prop, car_prop in zip(
+                        self._last_round_authority_endpoints_raw,
+                        self._last_round_authority_carriers_raw,
+                        self._last_round_proposal_endpoints_raw,
+                        self._last_round_proposal_carriers_raw):
+                    proposal_endpoint_gap.append(_masked_rms_A(ep_prop - ep_auth, atom_mask))
+                    proposal_carrier_gap.append(_masked_rms_A(car_prop - car_auth, atom_mask))
+
+                chart_roundtrip = []
+                endpoint_roundtrip = []
+                chart_disagree = []
+                carrier_disagree = []
+                for rec in getattr(self, '_last_round_chart_diagnostics', []) or []:
+                    # Stored values are in normalized model units; multiply by
+                    # normalizer std to report physical Angstrom-equivalent scale.
+                    scale = float(self.normalizer.std.detach().float().cpu().item())
+                    chart_roundtrip.append(rec['carrier_roundtrip_rms_model'].float() * scale)
+                    endpoint_roundtrip.append(rec['endpoint_roundtrip_rms_model'].float() * scale)
+                    chart_disagree.append(rec['endpoint_chart_disagreement_rms_model'].float() * scale)
+                    carrier_disagree.append(rec['carrier_chart_disagreement_rms_model'].float() * scale)
+
+                self.last_singlefield_diagnostics = {
+                    'physical_dof': X.new_tensor(1.0),
+                    'carrier_primary': X.new_tensor(1.0 if self.physical_authority_mode == 'carrier_primary_analytic' else 0.0),
+                    'endpoint_primary': X.new_tensor(1.0 if self.physical_authority_mode == 'endpoint_primary_analytic' else 0.0),
+                    'canonical_active_rate': target_info.get('r3_canonical_active_rate', X.new_zeros(())).detach(),
+                    'final_pred_vs_carrier_x1_rms_A': _masked_rms_A(final_chart_gap, atom_mask),
+                    'final_carrier_roundtrip_rms_A': _masked_rms_A(carrier_rt - r_interface_X[-1], atom_mask),
+                    'final_endpoint_roundtrip_rms_A': _masked_rms_A(endpoint_rt - pred_endpoint, atom_mask),
+                    'round_endpoint_gt_rms_A': torch.stack(round_gt) if round_gt else X.new_zeros((0,)),
+                    'round_endpoint_step_rms_A': torch.stack(round_step) if round_step else X.new_zeros((0,)),
+                    'round_carrier_target_rms_A': torch.stack(round_carrier_target) if round_carrier_target else X.new_zeros((0,)),
+                    'round_discarded_endpoint_proposal_gap_rms_A': torch.stack(proposal_endpoint_gap) if proposal_endpoint_gap else X.new_zeros((0,)),
+                    'round_discarded_carrier_proposal_gap_rms_A': torch.stack(proposal_carrier_gap) if proposal_carrier_gap else X.new_zeros((0,)),
+                    'round_carrier_chart_roundtrip_rms_A': torch.stack(chart_roundtrip) if chart_roundtrip else X.new_zeros((0,)),
+                    'round_endpoint_chart_roundtrip_rms_A': torch.stack(endpoint_roundtrip) if endpoint_roundtrip else X.new_zeros((0,)),
+                    'round_endpoint_chart_disagreement_rms_A': torch.stack(chart_disagree) if chart_disagree else X.new_zeros((0,)),
+                    'round_carrier_chart_disagreement_rms_A': torch.stack(carrier_disagree) if carrier_disagree else X.new_zeros((0,)),
+                }
 
         if self.pred_edge_dist:
             gt_edge_dist = self._get_inter_edge_dist(
@@ -1585,15 +1485,6 @@ class AbFlowModel(nn.Module):
                 collect_audit=bool(getattr(self, "_diagnostic_capture", False)),
             )
 
-        coarse_anchor_loss = X.new_zeros(())
-        coarse_anchor_audit = {}
-        if self.loss_coarse_anchor_weight > 0.0:
-            coarse_anchor_loss, coarse_anchor_audit = self._coarse_anchor_distance_loss(
-                pred_X=pred_X, true_X=true_X, true_S=true_S,
-                paratope_mask=paratope_mask, batch_id=batch_id,
-                is_antigen=self.batch_constants['is_ag'], xloss_mask=xloss_mask,
-            )
-
         smooth_lddt_loss = X.new_zeros(())
         smooth_lddt_audit = {}
         if self.loss_smooth_lddt_weight > 0.0:
@@ -1605,17 +1496,9 @@ class AbFlowModel(nn.Module):
             smooth_design_mask = cmask
 
             if self.smooth_lddt_prediction_source == "pred_design_endpoint":
-                # Historical R33 semantics.  V223 formal experiments do not use
-                # this branch because cmask may exceed the generated H3 support.
+                # Historical R33 semantics: auxiliary gradients flow through the
+                # full/native pred_X branch, including AMEncoder.out_layer.
                 smooth_pred_design = pred_X[cmask]
-            elif self.smooth_lddt_prediction_source == "terminal_fused_endpoint":
-                if self.coordinate_state_mode not in {"scoreflow_endpoint_fused", "scoreflow_single_endpoint"}:
-                    raise RuntimeError(
-                        "terminal_fused_endpoint smooth-lDDT requires "
-                        "coordinate_state.mode in {scoreflow_endpoint_fused, scoreflow_single_endpoint}"
-                    )
-                smooth_design_mask = paratope_mask
-                smooth_pred_design = pred_X[paratope_mask]
             elif self.smooth_lddt_prediction_source == "carrier_implied_endpoint":
                 # The shadow/interface carrier has one row per JSON-defined
                 # paratope residue.  ``cmask`` is a different coordinate/template
@@ -1713,7 +1596,6 @@ class AbFlowModel(nn.Module):
             + self.loss_interface_weight * interface_loss
             + self.loss_edge_weight * ed_loss
             + self.loss_distogram_weight * distogram_loss
-            + self.loss_coarse_anchor_weight * coarse_anchor_loss
             + self.loss_smooth_lddt_weight * smooth_lddt_loss
         )
         if pdev_loss is not None:
@@ -1723,21 +1605,43 @@ class AbFlowModel(nn.Module):
         # enabled.  They are detached and never enter the objective.
         if self.geometry_forensics_enabled:
             with torch.no_grad():
-                forensic_mask = (
-                    paratope_mask if self.generated_region_only_loss else cmask
-                )
-                design_gid = batch_id[forensic_mask]
-                design_atom_mask = xloss_mask[forensic_mask].bool()
+                design_gid = batch_id[cmask]
+                design_atom_mask = xloss_mask[cmask].bool()
                 pred_design_rms = self._per_graph_coord_rms(
-                    pred_X[forensic_mask], true_X[forensic_mask], design_atom_mask,
+                    pred_X[cmask], true_X[cmask], design_atom_mask,
                     design_gid, batch_size)
                 pred_design_absmax = self._per_graph_absmax(
-                    pred_X[forensic_mask], design_gid, batch_size)
+                    pred_X[cmask], design_gid, batch_size)
                 carrier_target_rms = self._per_graph_coord_rms(
                     r_interface_X[-1], coord_target, atom_mask,
                     interface_batch_id, batch_size)
                 carrier_absmax = self._per_graph_absmax(
                     r_interface_X[-1], interface_batch_id, batch_size)
+
+                authority_round_rms = []
+                authority_round_absmax = []
+                authority_carrier_target_rms = []
+                discarded_endpoint_gap_rms = []
+                discarded_carrier_gap_rms = []
+                for ep_auth, car_auth, ep_prop, car_prop in zip(
+                        self._last_round_authority_endpoints_raw,
+                        self._last_round_authority_carriers_raw,
+                        self._last_round_proposal_endpoints_raw,
+                        self._last_round_proposal_carriers_raw):
+                    authority_round_rms.append(self._per_graph_coord_rms(
+                        ep_auth, gt_interface_X, atom_mask, interface_batch_id, batch_size))
+                    authority_round_absmax.append(self._per_graph_absmax(
+                        ep_auth, interface_batch_id, batch_size))
+                    authority_carrier_target_rms.append(self._per_graph_coord_rms(
+                        car_auth, coord_target, atom_mask, interface_batch_id, batch_size))
+                    discarded_endpoint_gap_rms.append(self._per_graph_coord_rms(
+                        ep_prop, ep_auth, atom_mask, interface_batch_id, batch_size))
+                    discarded_carrier_gap_rms.append(self._per_graph_coord_rms(
+                        car_prop, car_auth, atom_mask, interface_batch_id, batch_size))
+
+                def _stack_round(values):
+                    return (torch.stack(values, dim=0) if values
+                            else pred_design_rms.new_zeros((0, batch_size)))
 
                 # Physical refinement-round growth in Angstrom.  r_interface_X
                 # is already unnormalized/uncentered at this point, so these
@@ -1766,6 +1670,11 @@ class AbFlowModel(nn.Module):
                     'per_graph_pred_design_absmax_A': pred_design_absmax.detach(),
                     'per_graph_carrier_target_rms_A': carrier_target_rms.detach(),
                     'per_graph_carrier_absmax_A': carrier_absmax.detach(),
+                    'per_round_authority_endpoint_rms_A': _stack_round(authority_round_rms).detach(),
+                    'per_round_authority_endpoint_absmax_A': _stack_round(authority_round_absmax).detach(),
+                    'per_round_authority_carrier_target_rms_A': _stack_round(authority_carrier_target_rms).detach(),
+                    'per_round_discarded_endpoint_gap_rms_A': _stack_round(discarded_endpoint_gap_rms).detach(),
+                    'per_round_discarded_carrier_gap_rms_A': _stack_round(discarded_carrier_gap_rms).detach(),
                     'per_round_graph_delta_rms_A': round_delta_rms.detach(),
                     'per_round_graph_absmax_A': round_absmax.detach(),
                     'per_graph_t': t_graph.detach().float(),
@@ -1790,11 +1699,6 @@ class AbFlowModel(nn.Module):
                 'distogram_weighted_loss': (
                     self.loss_distogram_weight * distogram_loss
                 ).detach(),
-                'coarse_anchor_loss': coarse_anchor_loss.detach(),
-                'coarse_anchor_weighted_loss': (
-                    self.loss_coarse_anchor_weight * coarse_anchor_loss
-                ).detach(),
-                **{k: v.detach() for k, v in coarse_anchor_audit.items()},
                 'smooth_lddt_loss': smooth_lddt_loss.detach(),
                 'smooth_lddt_weighted_loss': (
                     self.loss_smooth_lddt_weight * smooth_lddt_loss
@@ -1835,27 +1739,32 @@ class AbFlowModel(nn.Module):
                 **{k: v.detach() for k, v in distogram_audit.items()},
                 **{k: v.detach() for k, v in path_info.items()},
                 **{k: v.detach() for k, v in target_info.items()},
+                **{('singlefield_' + k): (v.detach() if torch.is_tensor(v) else v)
+                   for k, v in self.last_singlefield_diagnostics.items()
+                   if torch.is_tensor(v) and v.numel() == 1},
             }
 
+            # Explicit flow-time authority audit.  R05 always receives the
+            # outer Score-Flow time through ``flow_time_mlp``.  The donor
+            # Single/Pair trunk may independently embed the same scalar time;
+            # expose both routes explicitly so logs cannot collapse them into
+            # one ambiguous ``time=1`` flag.  This is observation-only.
+            donor_trunk = getattr(self.native_trunk, 'trunk', None)
+            r05_time_on = 1.0 if t_graph is not None else 0.0
+            abx_time_on = 1.0 if bool(
+                getattr(donor_trunk, 'use_time_embedding', False)
+            ) else 0.0
             self.last_abflow_diagnostics = {
                 't_min': t_graph.min().detach(),
                 't_mean': t_graph.mean().detach(),
                 't_max': t_graph.max().detach(),
-                'coordinate_state_closed': X.new_tensor(
-                    1.0 if self.coordinate_state_mode == "scoreflow_endpoint_fused" else 0.0
+                'r05_time_embed_on': X.new_tensor(r05_time_on),
+                'abx_time_embed_on': X.new_tensor(abx_time_on),
+                'explicit_time_authority_count': X.new_tensor(
+                    r05_time_on + abx_time_on
                 ),
-                'coordinate_single_endpoint': X.new_tensor(
-                    1.0 if self.coordinate_state_mode == "scoreflow_single_endpoint" else 0.0
-                ),
-                'coordinate_recurrent_carrier': X.new_tensor(
-                    1.0 if self.coordinate_state_mode == "r05_recurrent_carrier" else 0.0
-                ),
-                **{k: v.detach() if torch.is_tensor(v) else v
-                   for k, v in recurrent_role_audit.items()},
                 **{k: v.detach() if torch.is_tensor(v) else v
                    for k, v in self._last_message_diagnostics.items()},
-                **{k: v.detach() if torch.is_tensor(v) else v
-                   for k, v in self._last_state_closure_audit.items()},
             }
 
         self._clean_batch_constants()
@@ -1975,9 +1884,9 @@ class AbFlowModel(nn.Module):
                 for rec in (self._last_round_egnn_diagnostics or []):
                     coord_diag = rec.get('coord', {}) or {}
                     round_coord_update_absmax.append(self._diag_float(
-                        coord_diag, 'coord_update_absmax_max'))
+                        coord_diag, 'native_design_update_absmax_max'))
                     round_coord_coeff_absmax.append(self._diag_float(
-                        coord_diag, 'coord_coeff_absmax_max'))
+                        coord_diag, 'native_alpha_absmax_max'))
                     candidates = []
                     for key, value in coord_diag.items():
                         if key.endswith('.coord_update_absmax'):
@@ -1999,6 +1908,7 @@ class AbFlowModel(nn.Module):
                         't': t_value,
                         't_next': t_next_value,
                         'carrier_mode': carrier_mode,
+                        'physical_authority_mode': self.physical_authority_mode,
                         'finite': bool(
                             xt_stats[gid]['finite'] and carrier_stats[gid]['finite']
                             and x1_stats[gid]['finite'] and next_stats[gid]['finite']
@@ -2057,48 +1967,64 @@ class AbFlowModel(nn.Module):
                 prmsd_final[interface_cmask], interface_batch_id,
                 dim=0, dim_size=batch_size)
 
-        if self.coordinate_state_mode in {"scoreflow_endpoint_fused", "scoreflow_single_endpoint", "r05_recurrent_carrier"}:
-            # Formal Score--Flow readout: the 10-step integrated recurrent
-            # carrier reaches the clean endpoint at t=1 and is the generated H3
-            # coordinate authority. Fixed framework/antigen coordinates remain
-            # exactly inherited from the input complex.
-            gen_X[paratope_mask] = interface_X_final
-            if self.sample_forensics_enabled:
-                pred_design = pred_X_final[paratope_mask].detach().float()
-                integrated = interface_X_final.detach().float()
-                for b in range(batch_size):
-                    idx = interface_batch_id == b
-                    if not bool(idx.any()):
-                        continue
-                    delta = pred_design[idx] - integrated[idx]
-                    self._append_sample_forensic_record({
-                        **self._sample_forensic_identity(b),
-                        'stage': 'terminal_integrated_endpoint',
-                        'step': int(n_steps),
-                        't': 1.0,
-                        'finite': bool(torch.isfinite(integrated[idx]).all().item()),
-                        'terminal_pred_vs_integrated_rms_A': float(
-                            delta.square().mean().sqrt().item()
-                        ),
-                        'integrated_endpoint_absmax_A': float(
-                            integrated[idx].abs().amax().item()
-                        ),
-                        'fixed_context_transform_applied': False,
-                    })
-        else:
-            # Historical readout retained only for backward-compatible configs.
-            gen_X[cmask] = pred_X_final[cmask]
-            for b in range(batch_size):
-                graph = batch_id == b
-                design = graph & paratope_mask
-                ori = gen_X[design][:, :4]
-                pred = interface_X_final[interface_batch_id == b][:, :4]
-                ab = graph & is_ab
-                _, R, trans = kabsch_torch(ori.reshape(-1, 3), pred.reshape(-1, 3))
-                gen_X[ab] = torch.matmul(gen_X[ab], R.T) + trans
-
+        # Formal terminal coordinate authority: the generated H3 is the
+        # integrated Score-Flow carrier itself.  ``pred_X`` is the endpoint chart of the same single physical field;
+        # it is used for recurrent structural context and structure supervision,
+        # while the integrated carrier remains the transport/terminal authority.
+        #
+        # Crucially, fixed framework/antigen coordinates remain bitwise equal
+        # to the input ``X``: no terminal Kabsch/procrustes transform is applied
+        # to the antibody or to any fixed-context residue.
+        expected_carrier_shape = gen_X[paratope_mask].shape
+        if tuple(interface_X_final.shape) != tuple(expected_carrier_shape):
+            raise RuntimeError(
+                'terminal carrier/paratope shape mismatch: '
+                f'carrier={tuple(interface_X_final.shape)} '
+                f'paratope={tuple(expected_carrier_shape)}'
+            )
+        gen_X[paratope_mask] = interface_X_final
         if not self.struct_only:
             gen_S[smask] = pred_S_final[smask]
+
+        if self.sample_forensics_enabled:
+            fixed_mask = ~paratope_mask
+            fixed_delta = (
+                gen_X[fixed_mask].detach().float()
+                - X[fixed_mask].detach().float()
+            )
+            fixed_rms = (
+                float(fixed_delta.square().mean().sqrt().item())
+                if fixed_delta.numel() else 0.0
+            )
+            fixed_absmax = (
+                float(fixed_delta.abs().amax().item())
+                if fixed_delta.numel() else 0.0
+            )
+            for b in range(batch_size):
+                design = (batch_id == b) & paratope_mask
+                pred_design = pred_X_final[design].detach().float()
+                carrier_design = interface_X_final[
+                    interface_batch_id == b
+                ].detach().float()
+                if pred_design.numel() and tuple(pred_design.shape) == tuple(carrier_design.shape):
+                    proposal_carrier_rms = float(
+                        (pred_design - carrier_design).square().mean().sqrt().item()
+                    )
+                else:
+                    proposal_carrier_rms = float('nan')
+                self._append_sample_forensic_record({
+                    **self._sample_forensic_identity(b),
+                    'stage': 'terminal_singlefield_integrated_carrier',
+                    'physical_authority_mode': self.physical_authority_mode,
+                    'step': int(n_steps),
+                    't': 1.0,
+                    'finite': bool(torch.isfinite(gen_X[batch_id == b]).all().item()),
+                    'terminal_source_carrier': 1.0,
+                    'terminal_kabsch_applied': 0.0,
+                    'proposal_carrier_rms_A': proposal_carrier_rms,
+                    'fixed_context_rms_A': fixed_rms,
+                    'fixed_context_absmax_A': fixed_absmax,
+                })
 
         self._clean_batch_constants()
         if return_hidden:

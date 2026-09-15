@@ -1,9 +1,11 @@
 {
   "experiment": {
-    "id": "R69_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_RECURRENT_CARRIER_DISTOGRAM_PAIRMEAN_TVT_U02",
-    "parent": "R67_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_RECURRENT_CARRIER_TVT_U02",
-    "factor": "R67 + generation-anchored Distogram at weight 0.03 with pair_mean reduction; matched reduction control for R68 relation_balanced",
-    "protocol": "formal_train_val_test"
+    "id": "R73_R05_ABX_SINGLEFIELD_ENDPOINT_AUTHORITY_ANALYTIC3R_TVT_U02",
+    "parent": "R70_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_CARRIER_TERMINAL_DUALTIME_CTRL_TVT_U02",
+    "factor": "V235 arm B: single physical coordinate field with endpoint-primary analytic chart closure; each of three R05 refinement rounds maps clean endpoint -> canonical carrier frame-aware, uses endpoint for structure authority and derived carrier for transport loss/next-round carrier/sample; no independent carrier physical authority",
+    "protocol": "formal_train_val_test",
+    "diagnostic_role": "r73_singlefield_endpoint_primary_analytic3r",
+    "causal_question": "Which analytic chart should parameterize the same single recurrent physical H3 field when training and generation authorities are forced to agree?"
   },
   "data": {
     "train": {
@@ -32,7 +34,7 @@
     }
   },
   "training": {
-    "output_dir": "./results_module/R69_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_RECURRENT_CARRIER_DISTOGRAM_PAIRMEAN_TVT_U02",
+    "output_dir": "./results_module/R73_R05_ABX_SINGLEFIELD_ENDPOINT_AUTHORITY_ANALYTIC3R_TVT_U02",
     "optimizer": {
       "lr": 0.001,
       "final_lr": 0.0001,
@@ -40,14 +42,14 @@
       "grad_clip": 1.0
     },
     "schedule": {
-      "max_epoch": 60,
+      "max_epoch": 200,
       "patience": 1000,
       "save_topk": 10,
       "save_interval": 1,
       "resume_checkpoint": ""
     },
     "loader": {
-      "batch_size": 20,
+      "per_gpu_batch_size": 5,
       "shuffle": true,
       "num_workers": 8,
       "prefetch_factor": 4,
@@ -65,12 +67,12 @@
       "decay": 0.999
     },
     "logging": {
-      "log_interval": 40,
+      "log_interval": 20,
       "tqdm_mininterval": 60.0,
-      "science_first_steps": 2,
-      "science_interval": 40,
+      "science_first_steps": 3,
+      "science_interval": 20,
       "runtime_guard_steps": 1,
-      "train_loss_outlier_threshold": 10000.0
+      "train_loss_outlier_threshold": 1000.0
     },
     "snapshot": {
       "enabled": true,
@@ -164,15 +166,17 @@
           "no_trust_radius": true,
           "no_hand_tuned_step_scale": true
         },
-        "coordinate_state": {
-          "mode": "r05_recurrent_carrier",
-          "carrier_recurrence": "egnn_output_exact_cross_round",
-          "structural_recurrence": "pred_X_cross_round",
-          "role_semantics": "carrier=scoreflow_transport_and_terminal_H3; pred_X=full_atom_structural_proposal",
-          "terminal_readout": "integrated_endpoint_generated_region_only",
-          "fixed_context": "unchanged_exactly",
-          "no_projection": true,
-          "no_kabsch_fusion": true
+        "physical_authority": {
+          "mode": "endpoint_primary_analytic",
+          "physical_dof": 1,
+          "rounds": 3,
+          "carrier_endpoint_relation": "analytic_f01_gfree_hybrid",
+          "frame_conversion": "AG_centered_carrier <-> raw_physical <-> AB_centered_native_endpoint",
+          "non_primary_coordinate_output": "message_passing_scratch_only_zero_physical_authority",
+          "structure_authority": "analytic_endpoint_chart",
+          "transport_authority": "analytic_carrier_chart",
+          "terminal_authority": "integrated_carrier",
+          "round_recurrence": "endpoint_chart_to_native_context + carrier_chart_to_interface_context"
         }
       }
     }
@@ -183,19 +187,17 @@
     "interface": 1.0,
     "edge": 1.0,
     "distogram": {
-      "weight": 0.03,
-      "pair_scope": "generation_anchored",
+      "weight": 0.0,
+      "pair_scope": "all_resolved",
       "bins": 64,
       "min_bin": 2.3125,
-      "max_bin": 21.6875,
-      "reduction": "pair_mean"
+      "max_bin": 21.6875
     },
     "smooth_lddt": {
       "weight": 0.0,
       "cutoff": 15.0,
-      "prediction_source": "carrier_implied_endpoint"
-    },
-    "generated_region_only": true
+      "prediction_source": "pred_design_endpoint"
+    }
   },
   "runtime": {
     "ddp": {
@@ -206,12 +208,18 @@
   },
   "generation": {
     "checkpoint": "",
-    "save_dir": "./results_generation/R69_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_RECURRENT_CARRIER_DISTOGRAM_PAIRMEAN_TVT_U02",
+    "save_dir": "./results_generation/R73_R05_ABX_SINGLEFIELD_ENDPOINT_AUTHORITY_ANALYTIC3R_TVT_U02",
     "batch_size": 20,
     "num_workers": 4,
     "n_steps": 10,
     "seed": 2023,
-    "show_sample_progress": false
+    "show_sample_progress": false,
+    "terminal_coordinate_authority": "integrated_carrier_direct_h3",
+    "fixed_context": "unchanged_exactly",
+    "terminal_kabsch_fusion": false,
+    "single_physical_field": true,
+    "primary_chart": "endpoint",
+    "derived_chart": "carrier"
   },
   "evaluation": {
     "metric_workers": 8,

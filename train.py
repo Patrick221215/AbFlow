@@ -50,18 +50,20 @@ class CostBalancedDistributedSampler(Sampler):
     Ordinary ``DistributedSampler`` shuffles globally and then takes every
     ``world_size``-th sample per rank.  With variable-length antibody complexes
     this can put the same expensive samples on local-rank 0 every epoch/run.
-    Here we keep the *same shuffled global sample multiset* and the same number
-    of samples per optimizer step, but repartition each global batch between
-    ranks using a deterministic cost proxy.  Therefore the DDP-averaged gradient
-    sees the same global batch; only device ownership changes.
+
+    V236 uses a *per-GPU/local batch* contract.  ``local_batch_size`` is fixed by
+    JSON and the effective global optimizer batch is therefore
+    ``local_batch_size * world_size``.  This keeps the memory/sample count of
+    each rank invariant when the number of GPUs changes, while still balancing
+    each optimizer-step sample set across the active ranks.
 
     For R28-R30, dense Triangle operations scale approximately as O(L_rel^3),
     where L_rel is the complete antibody plus the dataset-defined epitope.
     The cost proxy is whole_residue_count + relational_token_count^3.
     """
-    def __init__(self, dataset, global_batch_size, num_replicas, rank, shuffle=True, seed=0):
+    def __init__(self, dataset, local_batch_size, num_replicas, rank, shuffle=True, seed=0):
         self.dataset = dataset
-        self.global_batch_size = int(global_batch_size)
+        self.local_batch_size = int(local_batch_size)
         self.num_replicas = int(num_replicas)
         self.rank = int(rank)
         self.shuffle = bool(shuffle)
@@ -69,11 +71,9 @@ class CostBalancedDistributedSampler(Sampler):
         self.epoch = 0
         if self.num_replicas <= 0 or not (0 <= self.rank < self.num_replicas):
             raise ValueError('invalid distributed sampler rank/world_size')
-        if self.global_batch_size <= 0:
-            raise ValueError('global_batch_size must be positive')
-        if self.global_batch_size % self.num_replicas != 0:
-            raise ValueError('global_batch_size must be divisible by world_size')
-        self.local_batch_size = self.global_batch_size // self.num_replicas
+        if self.local_batch_size <= 0:
+            raise ValueError('local_batch_size must be positive')
+        self.global_batch_size = self.local_batch_size * self.num_replicas
         self.num_samples = (len(dataset) + self.num_replicas - 1) // self.num_replicas
         self.total_size = self.num_samples * self.num_replicas
         self.costs = self._estimate_costs()
@@ -730,7 +730,10 @@ def _namespace_from_config(config_path):
         max_epoch=sched["max_epoch"],
         grad_clip=opt["grad_clip"],
         save_dir=tr["output_dir"],
-        batch_size=loader["batch_size"],
+        # V236: train/validation batch size is per GPU/rank.  Keep a legacy
+        # fallback so old configs remain readable, but formal R72/R73 configs
+        # use ``per_gpu_batch_size`` explicitly.
+        batch_size=loader.get("per_gpu_batch_size", loader.get("batch_size")),
         patience=sched["patience"],
         save_topk=sched["save_topk"],
         shuffle=loader["shuffle"],
@@ -854,7 +857,8 @@ def main(args):
             f"train={args.train_set} valid={args.valid_set} "
             f"test={os.environ['ABFLOW_EPOCH_TEST_JSON']} "
             f"cdr={','.join(args.cdr)} paratope={','.join(args.paratope)} "
-            f"global_batch={args.batch_size} "
+            f"per_gpu_train_val_batch={args.batch_size} "
+            f"effective_global_train_batch={int(args.batch_size) * int(world_size)} "
             f"epochs={args.max_epoch} ckpt=validation test=observation_only"
         )
 
@@ -913,20 +917,24 @@ def main(args):
     else:
         raise NotImplementedError(f'model {args.model_type} not implemented')
 
-    # Runtime batch-size contract: JSON ``training.loader.batch_size`` is the
-    # global optimizer batch for every world size.  Define it before the DDP
-    # branch so single-GPU torchrun (WORLD_SIZE=1) follows the same semantics.
-    global_batch_size = int(args.batch_size)
-    if global_batch_size <= 0:
-        raise ValueError(f"global batch size must be positive, got {global_batch_size}")
-    if global_batch_size % max(1, world_size) != 0:
-        raise RuntimeError(
-            "formal global batch must be divisible by world_size: "
-            f"global_batch={global_batch_size}, world_size={world_size}"
-        )
+    # V236 batch-size contract:
+    #   JSON training.loader.per_gpu_batch_size = samples owned by each GPU/rank.
+    # GPU count is a runtime resource choice supplied by torchrun/launcher and is
+    # NOT constrained by the scientific config.  Therefore:
+    #   effective_global_train_batch = per_gpu_batch_size * world_size.
+    # Validation keeps the same per-rank/logical batch size, while formal Test
+    # remains controlled independently by generation.batch_size.
+    local_batch_size = int(args.batch_size)
+    if local_batch_size <= 0:
+        raise ValueError(f"per-GPU batch size must be positive, got {local_batch_size}")
+    effective_global_batch_size = local_batch_size * max(1, world_size)
 
-    step_per_epoch = (len(train_set) + global_batch_size - 1) // global_batch_size
+    # One optimizer step consumes one local batch on every active rank.
+    step_per_epoch = (
+        len(train_set) + effective_global_batch_size - 1
+    ) // effective_global_batch_size
     config.add_parameter(step_per_epoch=step_per_epoch)
+    config.add_parameter(effective_global_batch_size=effective_global_batch_size)
 
     if is_ddp:
         use_cost_balance = bool(
@@ -934,23 +942,20 @@ def main(args):
         )
         if use_cost_balance:
             train_sampler = CostBalancedDistributedSampler(
-                train_set, global_batch_size=global_batch_size,
+                train_set, local_batch_size=local_batch_size,
                 num_replicas=world_size, rank=rank, shuffle=args.shuffle,
                 seed=0,
             )
         else:
-            train_sampler = torch.utils.data.distributed.DistributedSampler(train_set, shuffle=args.shuffle)
-        # Keep old AbFlow behavior: input batch_size is global, split across GPUs.
-        args.batch_size = max(1, int(global_batch_size / max(1, world_size)))
-        # TrainConfig was already built from original args; keep it consistent.
-        config.batch_size = args.batch_size
+            train_sampler = torch.utils.data.distributed.DistributedSampler(
+                train_set, shuffle=args.shuffle
+            )
     else:
         train_sampler = None
-        # Single GPU owns the complete global batch.  TrainConfig was created
-        # before runtime sharding, so keep both objects explicitly synchronized.
-        args.batch_size = global_batch_size
-        config.batch_size = global_batch_size
 
+    # TrainConfig and both DataLoaders use the exact same per-GPU batch size.
+    args.batch_size = local_batch_size
+    config.batch_size = local_batch_size
     config.local_rank = args.local_rank
 
 
@@ -992,8 +997,9 @@ def main(args):
     if _is_main_rank(args.local_rank):
         print_log(
             "[DDPData] "
-            f"world={world_size} global_batch={global_batch_size} "
-            f"local_batch={args.batch_size} steps_per_epoch={step_per_epoch} "
+            f"world={world_size} per_gpu_batch={args.batch_size} "
+            f"effective_global_train_batch={effective_global_batch_size} "
+            f"steps_per_epoch={step_per_epoch} "
             f"cost_balanced={int(bool(is_ddp and args.runtime.get('ddp', {}).get('cost_balanced', False)))} "
             f"workers=train:{args.num_workers}/valid:{args.valid_num_workers}"
         )

@@ -1,9 +1,10 @@
 {
   "experiment": {
-    "id": "R68_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_RECURRENT_CARRIER_DISTOGRAM_RELBAL_TVT_U02",
-    "parent": "R53_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_TVT_U02",
-    "factor": "R67 + generation-anchored relation-balanced DD/DF/DA Distogram at weight 0.03",
-    "protocol": "formal_train_val_test"
+    "id": "R71_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_CARRIER_TERMINAL_R05TIME_TVT_U02",
+    "parent": "R70_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_CARRIER_TERMINAL_DUALTIME_CTRL_TVT_U02",
+    "factor": "V234 causal arm B: same direct carrier terminal as R70, but remove duplicated donor explicit time embedding so R05 flow_time_mlp is the sole explicit outer-time authority; donor Single/Pair remains state-conditioned through Xt/St; context_ratio and Train->Val->Test unchanged",
+    "protocol": "formal_train_val_test",
+    "diagnostic_role": "r71_carrier_terminal_r05time_only"
   },
   "data": {
     "train": {
@@ -32,7 +33,7 @@
     }
   },
   "training": {
-    "output_dir": "./results_module/R68_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_RECURRENT_CARRIER_DISTOGRAM_RELBAL_TVT_U02",
+    "output_dir": "./results_module/R71_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_CARRIER_TERMINAL_R05TIME_TVT_U02",
     "optimizer": {
       "lr": 0.001,
       "final_lr": 0.0001,
@@ -118,7 +119,7 @@
       "single_pair": {
         "blocks": 1,
         "max_relative_feature": 32,
-        "time_embed": true,
+        "time_embed": false,
         "init_seed": 314159,
         "forward_seed": 271828,
         "channels": {
@@ -163,16 +164,6 @@
           "no_coordinate_clipping": true,
           "no_trust_radius": true,
           "no_hand_tuned_step_scale": true
-        },
-        "coordinate_state": {
-          "mode": "r05_recurrent_carrier",
-          "carrier_recurrence": "egnn_output_exact_cross_round",
-          "structural_recurrence": "pred_X_cross_round",
-          "role_semantics": "carrier=scoreflow_transport_and_terminal_H3; pred_X=full_atom_structural_proposal",
-          "terminal_readout": "integrated_endpoint_generated_region_only",
-          "fixed_context": "unchanged_exactly",
-          "no_projection": true,
-          "no_kabsch_fusion": true
         }
       }
     }
@@ -183,19 +174,17 @@
     "interface": 1.0,
     "edge": 1.0,
     "distogram": {
-      "weight": 0.03,
-      "pair_scope": "generation_anchored",
+      "weight": 0.0,
+      "pair_scope": "all_resolved",
       "bins": 64,
       "min_bin": 2.3125,
-      "max_bin": 21.6875,
-      "reduction": "relation_balanced"
+      "max_bin": 21.6875
     },
     "smooth_lddt": {
       "weight": 0.0,
       "cutoff": 15.0,
-      "prediction_source": "carrier_implied_endpoint"
-    },
-    "generated_region_only": true
+      "prediction_source": "pred_design_endpoint"
+    }
   },
   "runtime": {
     "ddp": {
@@ -206,12 +195,15 @@
   },
   "generation": {
     "checkpoint": "",
-    "save_dir": "./results_generation/R68_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_RECURRENT_CARRIER_DISTOGRAM_RELBAL_TVT_U02",
+    "save_dir": "./results_generation/R71_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_CARRIER_TERMINAL_R05TIME_TVT_U02",
     "batch_size": 20,
     "num_workers": 4,
     "n_steps": 10,
     "seed": 2023,
-    "show_sample_progress": false
+    "show_sample_progress": false,
+    "terminal_coordinate_authority": "integrated_carrier_direct_h3",
+    "fixed_context": "unchanged_exactly",
+    "terminal_kabsch_fusion": false
   },
   "evaluation": {
     "metric_workers": 8,

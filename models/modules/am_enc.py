@@ -15,6 +15,7 @@ class AMEncoder(nn.Module):
         act_fn=nn.SiLU(), n_layers=4, residual=True, dropout=0.1, dense=False,
         pair_coord_mode='bounded_residual', pair_coord_delta_bound=1.0,
         coord_tanh=False, coord_normalize=False, coord_prenorm=False,
+        pair_adapter_prenorm=False, pair_semantic_gate=False,
     ):
         super().__init__()
         self.hidden_nf = hidden_nf
@@ -25,6 +26,8 @@ class AMEncoder(nn.Module):
         self.coord_tanh = bool(coord_tanh)
         self.coord_normalize = bool(coord_normalize)
         self.coord_prenorm = bool(coord_prenorm)
+        self.pair_adapter_prenorm = bool(pair_adapter_prenorm)
+        self.pair_semantic_gate = bool(pair_semantic_gate)
 
         self.linear_in = nn.Linear(in_node_nf, hidden_nf)
         self.single_linear = None
@@ -55,6 +58,8 @@ class AMEncoder(nn.Module):
                     pair_coord_delta_bound=self.pair_coord_delta_bound,
                     tanh=self.coord_tanh, normalize=self.coord_normalize,
                     coord_prenorm=self.coord_prenorm,
+                    pair_adapter_prenorm=self.pair_adapter_prenorm,
+                    pair_semantic_gate=self.pair_semantic_gate,
                 ),
             )
             self.add_module(
@@ -67,6 +72,8 @@ class AMEncoder(nn.Module):
                     pair_coord_delta_bound=self.pair_coord_delta_bound,
                     tanh=self.coord_tanh, normalize=self.coord_normalize,
                     coord_prenorm=self.coord_prenorm,
+                    pair_adapter_prenorm=self.pair_adapter_prenorm,
+                    pair_semantic_gate=self.pair_semantic_gate,
                 ),
             )
             self.add_module(
@@ -80,6 +87,8 @@ class AMEncoder(nn.Module):
                     pair_coord_delta_bound=self.pair_coord_delta_bound,
                     tanh=self.coord_tanh, normalize=self.coord_normalize,
                     coord_prenorm=self.coord_prenorm,
+                    pair_adapter_prenorm=self.pair_adapter_prenorm,
+                    pair_semantic_gate=self.pair_semantic_gate,
                 ),
             )
 
@@ -91,6 +100,8 @@ class AMEncoder(nn.Module):
             pair_coord_delta_bound=self.pair_coord_delta_bound,
             tanh=self.coord_tanh, normalize=self.coord_normalize,
             coord_prenorm=self.coord_prenorm,
+            pair_adapter_prenorm=self.pair_adapter_prenorm,
+            pair_semantic_gate=self.pair_semantic_gate,
         )
 
     def forward(
@@ -102,13 +113,16 @@ class AMEncoder(nn.Module):
     ):
         """Run the R05 physical recurrence with optional Single/Pair conditioning.
 
-        V219 formal mode is ``pair_coord_mode='direct_shared'`` with coordinate-head PreNorm.  In that mode
-        there is exactly one hidden stream: Single/Pair-conditioned edge messages
-        update node state and the same message drives the EGNN coordinate scalar.
-        The Pair adapter is zero-initialized, so Pair itself is an exact zero perturbation at cold start; V219 intentionally changes only the coordinate-action boundary via PreNorm.
+        Formal R67 modes keep Pair-state PreNorm and coordinate-head PreNorm.
+        Semantic Pair context enters through a zero-start hidden adapter.  Direct
+        Pair geometry can either use historical ``factorized_direct`` hidden-message
+        routing or the preferred ``gated_action_residual``
+        scalar-action residual, which preserves the mature R05 coordinate actuator.
+        No clipping, tanh controller, trust radius, or manual physical step scale is
+        introduced.
 
-        Historical ``bounded_residual`` keeps the V212 dual state/base stream for
-        reproducibility only; V219 does not use it.
+        Historical ``direct_shared`` and ``bounded_residual`` remain available for
+        reproducibility only.
         """
         use_dual = self.pair_coord_mode == 'bounded_residual'
 
@@ -149,39 +163,68 @@ class AMEncoder(nn.Module):
                     ).to(base_pre.dtype),
                 })
 
+        pair_input_raw_rms = []
+        pair_input_prenorm_rms = []
         pair_ratios = []
-        pair_weights = []
-        coord_updates = []
+        pair_coord_ratios = []
+        pair_semantic_gate_rms = []
         coord_update_rms = []
-        coord_coeffs = []
-        coord_coeff_rms = []
-        coord_base_raw_coeffs = []
-        coord_state_raw_coeffs = []
         coord_state_raw_rms = []
-        coord_pair_raw_coeffs = []
-        coord_pair_raw_rms = []
-        coord_pair_applied_coeffs = []
-        coord_diff_norms = []
         coord_diff_norm_rms = []
-        coord_direction_norms = []
-        coord_trans = []
-        coord_update_input_ratios = []
-        coord_state_edge_rms = []
         coord_head_input_rms = []
-        coord_head_hidden_rms = []
-        coord_head_w1_rms = []
-        coord_head_w2_rms = []
+
+        # Path-authority diagnostics are deliberately computed outside the EGNN
+        # layer itself, where AMEncoder knows which coordinate stream is being
+        # updated.  This separates the native/full pred_X path (ctx/out) from
+        # the shadow recurrent-carrier path (inter/surf) without changing either
+        # computation.
+        def _masked_rms(delta, mask=None):
+            if not capture_bridge_diagnostics:
+                return None
+            with torch.no_grad():
+                part = delta if mask is None else delta[mask]
+                if part.numel() == 0:
+                    return delta.new_zeros(())
+                return part.detach().float().square().mean().sqrt().to(delta.dtype)
+
+        def _masked_absmax(delta, mask=None):
+            if not capture_bridge_diagnostics:
+                return None
+            with torch.no_grad():
+                part = delta if mask is None else delta[mask]
+                if part.numel() == 0:
+                    return delta.new_zeros(())
+                return part.detach().float().abs().amax().to(delta.dtype)
+
+        def record_path_delta(stage, stream, before, after, design_mask):
+            if not capture_bridge_diagnostics:
+                return
+            delta = after - before
+            self.last_coord_diagnostics[f'{stage}.{stream}_all_update_rms'] = _masked_rms(delta)
+            self.last_coord_diagnostics[f'{stage}.{stream}_all_update_absmax'] = _masked_absmax(delta)
+            self.last_coord_diagnostics[f'{stage}.{stream}_design_update_rms'] = _masked_rms(delta, design_mask)
+            self.last_coord_diagnostics[f'{stage}.{stream}_design_update_absmax'] = _masked_absmax(delta, design_mask)
+
 
         def collect_pair(module):
             if not capture_bridge_diagnostics:
                 return
             diag = getattr(module, 'last_bridge_diagnostics', {}) or {}
-            ratio = diag.get('pair_delta_to_base_ratio')
-            weight = diag.get('pair_adapter_weight_rms')
+            raw_pair = diag.get('pair_input_raw_rms')
+            norm_pair = diag.get('pair_input_prenorm_rms')
+            ratio = diag.get('pair_semantic_delta_to_base_ratio', diag.get('pair_delta_to_base_ratio'))
+            coord_ratio = diag.get('pair_coordinate_delta_to_base_ratio')
+            sem_gate = diag.get('pair_semantic_gate_rms')
+            if raw_pair is not None:
+                pair_input_raw_rms.append(raw_pair)
+            if norm_pair is not None:
+                pair_input_prenorm_rms.append(norm_pair)
             if ratio is not None:
                 pair_ratios.append(ratio)
-            if weight is not None:
-                pair_weights.append(weight)
+            if coord_ratio is not None:
+                pair_coord_ratios.append(coord_ratio)
+            if sem_gate is not None:
+                pair_semantic_gate_rms.append(sem_gate)
 
         def collect_coord(module, stage):
             if not capture_bridge_diagnostics:
@@ -190,26 +233,10 @@ class AMEncoder(nn.Module):
             for key, value in diag.items():
                 self.last_coord_diagnostics[f'{stage}.{key}'] = value
             mapping = [
-                ('coord_update_absmax', coord_updates),
                 ('coord_update_rms', coord_update_rms),
-                ('coord_coeff_absmax', coord_coeffs),
-                ('coord_coeff_rms', coord_coeff_rms),
-                ('coord_base_coeff_raw_absmax', coord_base_raw_coeffs),
-                ('coord_state_coeff_raw_absmax', coord_state_raw_coeffs),
                 ('coord_state_coeff_raw_rms', coord_state_raw_rms),
-                ('coord_pair_delta_raw_absmax', coord_pair_raw_coeffs),
-                ('coord_pair_delta_raw_rms', coord_pair_raw_rms),
-                ('coord_pair_delta_applied_absmax', coord_pair_applied_coeffs),
-                ('coord_diff_norm_absmax', coord_diff_norms),
                 ('coord_diff_norm_rms', coord_diff_norm_rms),
-                ('coord_direction_norm_absmax', coord_direction_norms),
-                ('coord_trans_absmax', coord_trans),
-                ('coord_update_to_input_rms_ratio', coord_update_input_ratios),
-                ('coord_state_edge_rms', coord_state_edge_rms),
                 ('coord_state_head_input_rms', coord_head_input_rms),
-                ('coord_state_head_hidden_rms', coord_head_hidden_rms),
-                ('coord_head_w1_rms', coord_head_w1_rms),
-                ('coord_head_w2_rms', coord_head_w2_rms),
             ]
             for key, bucket in mapping:
                 value = diag.get(key)
@@ -224,6 +251,7 @@ class AMEncoder(nn.Module):
         ctx_states, ctx_coords, inter_coords = [], [], []
         for i in range(self.n_layers):
             ctx_layer = self._modules[f'ctx_gcl_{i}']
+            native_before = x
             if use_dual:
                 h, h_base, x = ctx_layer.forward_dual(
                     h, h_base, ctx_edges, x, channel_attr, channel_weights,
@@ -238,6 +266,7 @@ class AMEncoder(nn.Module):
                 )
             collect_pair(ctx_layer)
             collect_coord(ctx_layer, f'ctx_{i}')
+            record_path_delta(f'ctx_{i}', 'native', native_before, x, update_mask)
 
             # Native R05 shadow interface: native -> shadow.
             inter_h = inter_h.clone()
@@ -247,6 +276,7 @@ class AMEncoder(nn.Module):
                 inter_h_base[inter_update_mask] = h_base[update_mask]
 
             inter_layer = self._modules[f'inter_gcl_{i}']
+            carrier_before_inter = inter_x
             if use_dual:
                 inter_h, inter_h_base, inter_x = inter_layer.forward_dual(
                     inter_h, inter_h_base, inter_edges, inter_x,
@@ -263,8 +293,10 @@ class AMEncoder(nn.Module):
                 )
             collect_pair(inter_layer)
             collect_coord(inter_layer, f'inter_{i}')
+            record_path_delta(f'inter_{i}', 'carrier', carrier_before_inter, inter_x, inter_update_mask)
 
             surf_layer = self._modules[f'surf_gcl_{i}']
+            carrier_before_surf = inter_x
             if use_dual:
                 inter_h, inter_h_base, inter_x = surf_layer.forward_dual(
                     inter_h, inter_h_base, aligned_edges, epi_index,
@@ -281,6 +313,7 @@ class AMEncoder(nn.Module):
                 )
             collect_pair(surf_layer)
             collect_coord(surf_layer, f'surf_{i}')
+            record_path_delta(f'surf_{i}', 'carrier', carrier_before_surf, inter_x, inter_update_mask)
 
             # Shadow -> native.
             h = h.clone()
@@ -292,6 +325,7 @@ class AMEncoder(nn.Module):
             ctx_coords.append(x)
             inter_coords.append(inter_x)
 
+        native_before_out = x
         if use_dual:
             h, h_base, x = self.out_layer.forward_dual(
                 h, h_base, ctx_edges, x, channel_attr, channel_weights,
@@ -306,6 +340,7 @@ class AMEncoder(nn.Module):
             )
         collect_pair(self.out_layer)
         collect_coord(self.out_layer, 'out')
+        record_path_delta('out', 'native', native_before_out, x, update_mask)
         ctx_states.append(h)
         ctx_coords.append(x)
 
@@ -322,7 +357,16 @@ class AMEncoder(nn.Module):
                 self.pair_coord_delta_bound if use_dual else float('nan')
             )
             self.last_coord_diagnostics['pair_direct_shared'] = x.new_tensor(
-                0.0 if use_dual else 1.0
+                1.0 if self.pair_coord_mode == 'direct_shared' else 0.0
+            )
+            self.last_coord_diagnostics['pair_factorized_direct'] = x.new_tensor(
+                1.0 if self.pair_coord_mode == 'factorized_direct' else 0.0
+            )
+            self.last_coord_diagnostics['pair_gated_action_residual'] = x.new_tensor(
+                1.0 if self.pair_coord_mode == 'gated_action_residual' else 0.0
+            )
+            self.last_coord_diagnostics['pair_semantic_gate_enabled'] = x.new_tensor(
+                1.0 if self.pair_semantic_gate else 0.0
             )
             self.last_coord_diagnostics['coord_tanh'] = x.new_tensor(
                 1.0 if self.coord_tanh else 0.0
@@ -333,54 +377,78 @@ class AMEncoder(nn.Module):
             self.last_coord_diagnostics['coord_prenorm'] = x.new_tensor(
                 1.0 if self.coord_prenorm else 0.0
             )
+            if pair_input_raw_rms:
+                self.last_bridge_diagnostics['bridge_pair_input_raw_rms_mean'] = torch.stack(pair_input_raw_rms).mean()
+            if pair_input_prenorm_rms:
+                self.last_bridge_diagnostics['bridge_pair_input_prenorm_rms_mean'] = torch.stack(pair_input_prenorm_rms).mean()
             if pair_ratios:
-                stacked = torch.stack(pair_ratios)
-                self.last_bridge_diagnostics['bridge_pair_delta_to_base_ratio_mean'] = stacked.mean()
-                self.last_bridge_diagnostics['bridge_pair_delta_to_base_ratio_max'] = stacked.max()
-            if pair_weights:
-                self.last_bridge_diagnostics['bridge_pair_adapter_weight_rms_mean'] = torch.stack(pair_weights).mean()
-            if coord_updates:
-                self.last_coord_diagnostics['coord_update_absmax_max'] = torch.stack(coord_updates).max()
-                self.last_coord_diagnostics['coord_update_absmax_mean'] = torch.stack(coord_updates).mean()
+                self.last_bridge_diagnostics['bridge_pair_delta_to_base_ratio_mean'] = torch.stack(pair_ratios).mean()
+            if pair_coord_ratios:
+                self.last_bridge_diagnostics['bridge_pair_coordinate_delta_to_base_ratio_mean'] = torch.stack(pair_coord_ratios).mean()
+            if pair_semantic_gate_rms:
+                self.last_bridge_diagnostics['bridge_pair_semantic_gate_rms_mean'] = torch.stack(pair_semantic_gate_rms).mean()
             if coord_update_rms:
                 self.last_coord_diagnostics['coord_update_rms_max'] = torch.stack(coord_update_rms).max()
-                self.last_coord_diagnostics['coord_update_rms_mean'] = torch.stack(coord_update_rms).mean()
-            if coord_coeffs:
-                self.last_coord_diagnostics['coord_coeff_absmax_max'] = torch.stack(coord_coeffs).max()
-                self.last_coord_diagnostics['coord_coeff_absmax_mean'] = torch.stack(coord_coeffs).mean()
-            if coord_coeff_rms:
-                self.last_coord_diagnostics['coord_coeff_rms_max'] = torch.stack(coord_coeff_rms).max()
-                self.last_coord_diagnostics['coord_coeff_rms_mean'] = torch.stack(coord_coeff_rms).mean()
-            if coord_base_raw_coeffs:
-                self.last_coord_diagnostics['coord_base_coeff_raw_absmax_max'] = torch.stack(coord_base_raw_coeffs).max()
-            if coord_state_raw_coeffs:
-                self.last_coord_diagnostics['coord_state_coeff_raw_absmax_max'] = torch.stack(coord_state_raw_coeffs).max()
             if coord_state_raw_rms:
                 self.last_coord_diagnostics['coord_state_coeff_raw_rms_max'] = torch.stack(coord_state_raw_rms).max()
-            if coord_pair_raw_coeffs:
-                self.last_coord_diagnostics['coord_pair_delta_raw_absmax_max'] = torch.stack(coord_pair_raw_coeffs).max()
-            if coord_pair_raw_rms:
-                self.last_coord_diagnostics['coord_pair_delta_raw_rms_max'] = torch.stack(coord_pair_raw_rms).max()
-            if coord_pair_applied_coeffs:
-                self.last_coord_diagnostics['coord_pair_delta_applied_absmax_max'] = torch.stack(coord_pair_applied_coeffs).max()
-            if coord_diff_norms:
-                self.last_coord_diagnostics['coord_diff_norm_absmax_max'] = torch.stack(coord_diff_norms).max()
             if coord_diff_norm_rms:
                 self.last_coord_diagnostics['coord_diff_norm_rms_max'] = torch.stack(coord_diff_norm_rms).max()
-            if coord_direction_norms:
-                self.last_coord_diagnostics['coord_direction_norm_absmax_max'] = torch.stack(coord_direction_norms).max()
-            if coord_trans:
-                self.last_coord_diagnostics['coord_trans_absmax_max'] = torch.stack(coord_trans).max()
-            if coord_update_input_ratios:
-                self.last_coord_diagnostics['coord_update_to_input_rms_ratio_max'] = torch.stack(coord_update_input_ratios).max()
-            if coord_state_edge_rms:
-                self.last_coord_diagnostics['coord_state_edge_rms_max'] = torch.stack(coord_state_edge_rms).max()
             if coord_head_input_rms:
                 self.last_coord_diagnostics['coord_state_head_input_rms_max'] = torch.stack(coord_head_input_rms).max()
-            if coord_head_hidden_rms:
-                self.last_coord_diagnostics['coord_state_head_hidden_rms_max'] = torch.stack(coord_head_hidden_rms).max()
-            if coord_head_w1_rms:
-                self.last_coord_diagnostics['coord_head_w1_rms_max'] = torch.stack(coord_head_w1_rms).max()
-            if coord_head_w2_rms:
-                self.last_coord_diagnostics['coord_head_w2_rms_max'] = torch.stack(coord_head_w2_rms).max()
+
+            # Aggregate only the stream-specific quantities that answer the
+            # current scientific question: which coordinate path first becomes
+            # unstable?  Stage-level entries remain available for sparse
+            # outlier forensics.
+            def _stage_values(prefixes, suffix):
+                vals = []
+                for key, value in self.last_coord_diagnostics.items():
+                    stage = key.split('.', 1)[0]
+                    if stage.startswith(prefixes) and key.endswith(suffix) and torch.is_tensor(value):
+                        vals.append(value)
+                return vals
+
+            native_dx = _stage_values(('ctx_', 'out'), '.native_design_update_rms')
+            carrier_dx = _stage_values(('inter_', 'surf_'), '.carrier_design_update_rms')
+            native_dx_max = _stage_values(('ctx_', 'out'), '.native_design_update_absmax')
+            carrier_dx_max = _stage_values(('inter_', 'surf_'), '.carrier_design_update_absmax')
+            native_alpha = _stage_values(('ctx_', 'out'), '.coord_state_coeff_raw_rms')
+            carrier_alpha = _stage_values(('inter_', 'surf_'), '.coord_state_coeff_raw_rms')
+            native_alpha_max = _stage_values(('ctx_', 'out'), '.coord_state_coeff_raw_absmax')
+            carrier_alpha_max = _stage_values(('inter_', 'surf_'), '.coord_state_coeff_raw_absmax')
+            native_lever = _stage_values(('ctx_', 'out'), '.coord_diff_norm_rms')
+            carrier_lever = _stage_values(('inter_', 'surf_'), '.coord_diff_norm_rms')
+            native_lever_max = _stage_values(('ctx_', 'out'), '.coord_diff_norm_absmax')
+            carrier_lever_max = _stage_values(('inter_', 'surf_'), '.coord_diff_norm_absmax')
+            native_basis = _stage_values(('ctx_', 'out'), '.coord_direction_norm_rms')
+            native_mech = _stage_values(('ctx_', 'out'), '.coord_update_to_alpha_rms_ratio')
+            if native_dx:
+                self.last_coord_diagnostics['native_design_update_rms_max'] = torch.stack(native_dx).max()
+            if carrier_dx:
+                self.last_coord_diagnostics['carrier_design_update_rms_max'] = torch.stack(carrier_dx).max()
+            if native_dx_max:
+                self.last_coord_diagnostics['native_design_update_absmax_max'] = torch.stack(native_dx_max).max()
+            if carrier_dx_max:
+                self.last_coord_diagnostics['carrier_design_update_absmax_max'] = torch.stack(carrier_dx_max).max()
+            if native_alpha:
+                self.last_coord_diagnostics['native_alpha_rms_max'] = torch.stack(native_alpha).max()
+            if carrier_alpha:
+                self.last_coord_diagnostics['carrier_alpha_rms_max'] = torch.stack(carrier_alpha).max()
+            if native_alpha_max:
+                self.last_coord_diagnostics['native_alpha_absmax_max'] = torch.stack(native_alpha_max).max()
+            if carrier_alpha_max:
+                self.last_coord_diagnostics['carrier_alpha_absmax_max'] = torch.stack(carrier_alpha_max).max()
+            if native_lever:
+                self.last_coord_diagnostics['native_lever_rms_max'] = torch.stack(native_lever).max()
+            if carrier_lever:
+                self.last_coord_diagnostics['carrier_lever_rms_max'] = torch.stack(carrier_lever).max()
+            if native_lever_max:
+                self.last_coord_diagnostics['native_lever_absmax_max'] = torch.stack(native_lever_max).max()
+            if carrier_lever_max:
+                self.last_coord_diagnostics['carrier_lever_absmax_max'] = torch.stack(carrier_lever_max).max()
+            if native_basis:
+                self.last_coord_diagnostics['native_basis_norm_rms_max'] = torch.stack(native_basis).max()
+            if native_mech:
+                self.last_coord_diagnostics['native_update_to_alpha_rms_ratio_max'] = torch.stack(native_mech).max()
+
         return h, x, inter_x

@@ -117,7 +117,8 @@ class AM_E_GCL(nn.Module):
     def __init__(self, input_nf, output_nf, hidden_nf, n_channel, channel_nf, radial_nf,
                  edges_in_d=0, node_attr_d=0, act_fn=nn.SiLU(), residual=True, attention=False,
                  normalize=False, coords_agg='mean', tanh=False, dropout=0.1,
-                 pair_coord_mode='bounded_residual', pair_coord_delta_bound=1.0, coord_prenorm=False):
+                 pair_coord_mode='bounded_residual', pair_coord_delta_bound=1.0, coord_prenorm=False,
+                 pair_adapter_prenorm=False, pair_semantic_gate=False):
         super(AM_E_GCL, self).__init__()
 
         input_edge = input_nf * 2
@@ -128,12 +129,15 @@ class AM_E_GCL(nn.Module):
         self.tanh = tanh
         self.epsilon = 1e-8
         self.pair_coord_mode = str(pair_coord_mode or 'bounded_residual').strip().lower()
-        if self.pair_coord_mode not in {'bounded_residual', 'legacy_shared', 'direct_shared'}:
+        if self.pair_coord_mode not in {'bounded_residual', 'legacy_shared', 'direct_shared', 'factorized_direct', 'gated_action_residual'}:
             raise ValueError(f'Unsupported pair_coord_mode={self.pair_coord_mode!r}')
         self.pair_coord_delta_bound = float(pair_coord_delta_bound)
         if self.pair_coord_mode == 'bounded_residual' and self.pair_coord_delta_bound <= 0.0:
             raise ValueError('pair_coord_delta_bound must be > 0 for bounded_residual mode')
         self.coord_prenorm = bool(coord_prenorm)
+        self.pair_adapter_prenorm = bool(pair_adapter_prenorm)
+        self.pair_semantic_gate_enabled = bool(pair_semantic_gate)
+        self.n_channel = int(n_channel)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -149,15 +153,51 @@ class AM_E_GCL(nn.Module):
             nn.Linear(hidden_nf, hidden_nf),
             act_fn)
         self.edge_attr_linear = None
+        self.edge_attr_coord_linear = None
+        self.pair_semantic_gate = None
+        self.pair_action_linear = None
+        self.pair_action_gate = None
+        self.pair_input_norm = (
+            nn.LayerNorm(self.edges_in_d)
+            if self.edges_in_d > 0 and self.pair_adapter_prenorm
+            else nn.Identity()
+        )
         if self.edges_in_d > 0:
-            # nn.Linear initializes before it can be zeroed.  Isolating that
-            # draw is necessary for identical shared initialization across
-            # R28/R29/R30 and against the R05 parent.
+            # Parent-preserving Pair routing. Semantic Pair information enters
+            # through a zero-start hidden adapter. Historical factorized_direct
+            # also injects a hidden coordinate adapter. The gated action-residual mode
+            # instead map normalized invariant Pair state directly to the EGNN
+            # scalar action, leaving the mature R05 edge-message actuator intact.
             with torch.random.fork_rng(devices=[]):
                 self.edge_attr_linear = nn.Linear(
                     self.edges_in_d, hidden_nf, bias=False
                 )
-            nn.init.zeros_(self.edge_attr_linear.weight)
+                if self.pair_coord_mode == 'factorized_direct':
+                    self.edge_attr_coord_linear = nn.Linear(
+                        self.edges_in_d, hidden_nf, bias=False
+                    )
+                if self.pair_coord_mode == 'gated_action_residual':
+                    self.pair_action_linear = nn.Linear(
+                        self.edges_in_d, self.n_channel, bias=False
+                    )
+            if self.pair_semantic_gate_enabled:
+                # Staged semantic route: projection is live at initialization but
+                # a zero-start gate preserves the exact parent function.  This
+                # avoids a zero-times-zero gradient deadlock while letting data
+                # decide how quickly Pair semantics enter the native state path.
+                nn.init.xavier_uniform_(self.edge_attr_linear.weight)
+                self.pair_semantic_gate = nn.Parameter(torch.zeros(hidden_nf))
+            else:
+                # Stable R67 reference: semantic Pair residual itself is zero-init.
+                nn.init.zeros_(self.edge_attr_linear.weight)
+            if self.edge_attr_coord_linear is not None:
+                nn.init.zeros_(self.edge_attr_coord_linear.weight)
+            if self.pair_action_linear is not None:
+                # Direct Pair geometry always uses the empirically validated
+                # staged route.  The ungated action-residual path was falsified
+                # by the V226 logs and is intentionally removed.
+                nn.init.xavier_uniform_(self.pair_action_linear.weight)
+                self.pair_action_gate = nn.Parameter(torch.zeros(self.n_channel))
         self.last_bridge_diagnostics = {}
         self.last_coord_diagnostics = {}
         self.capture_bridge_diagnostics = False
@@ -194,12 +234,13 @@ class AM_E_GCL(nn.Module):
                 nn.Sigmoid())
 
     def edge_model(self, source, target, radial, edge_attr, base_source=None, base_target=None):
-        """Return pair-conditioned and pair-free edge messages.
+        """Build semantic, coordinate-action, and pair-free edge messages.
 
-        ``state_edge`` receives the zero-start Pair adapter. ``base_edge`` omits
-        that direct adapter and is retained for diagnostics and historical
-        bounded-residual compatibility.  V219 ``direct_shared`` uses
-        ``state_edge`` for both node and coordinate updates.
+        Pair-state PreNorm feeds a zero-start semantic adapter. Historical
+        ``factorized_direct`` also learns a zero-start hidden coordinate adapter.
+        The preferred gated action-residual mode instead keep the parent coordinate
+        edge message intact and inject Pair only at the invariant EGNN scalar
+        action. Cold start is therefore exactly the parent function.
         """
         radial = radial.reshape(radial.shape[0], -1)
         if base_source is None:
@@ -210,54 +251,104 @@ class AM_E_GCL(nn.Module):
         base_input = torch.cat([base_source, base_target, radial], dim=1)
         base_pre = self.edge_mlp[0](base_input)
         state_parent_pre = self.edge_mlp[0](state_input)
+
+        if edge_attr is None and self.edges_in_d > 0:
+            edge_attr = base_pre.new_zeros((base_pre.shape[0], self.edges_in_d))
+        pair_input_raw = edge_attr
+        pair_input = self.pair_input_norm(edge_attr) if edge_attr is not None else edge_attr
         if self.edge_attr_linear is None:
-            pair_delta = torch.zeros_like(base_pre)
+            pair_sem_delta = torch.zeros_like(base_pre)
         else:
-            if edge_attr is None:
-                edge_attr = base_pre.new_zeros((base_pre.shape[0], self.edges_in_d))
-            pair_delta = self.edge_attr_linear(edge_attr)
-        state_pre = state_parent_pre + pair_delta
+            pair_sem_raw = self.edge_attr_linear(pair_input)
+            if self.pair_semantic_gate is not None:
+                pair_sem_delta = pair_sem_raw * self.pair_semantic_gate.view(1, -1)
+            else:
+                pair_sem_delta = pair_sem_raw
+        if self.pair_coord_mode == 'factorized_direct':
+            if self.edge_attr_coord_linear is None:
+                pair_coord_delta = torch.zeros_like(base_pre)
+            else:
+                pair_coord_delta = self.edge_attr_coord_linear(pair_input)
+        elif self.pair_coord_mode == 'gated_action_residual':
+            # Direct Pair geometry no longer perturbs the hidden parent edge
+            # message. It is injected later at the invariant scalar action.
+            pair_coord_delta = torch.zeros_like(base_pre)
+        else:
+            pair_coord_delta = pair_sem_delta
+
+        if self.pair_action_linear is None or pair_input is None:
+            pair_action_delta = base_pre.new_zeros((base_pre.shape[0], self.n_channel))
+        else:
+            pair_action_raw = self.pair_action_linear(pair_input)
+            pair_action_delta = pair_action_raw * self.pair_action_gate.view(1, -1)
+
+        semantic_pre = state_parent_pre + pair_sem_delta
+        coordinate_pre = state_parent_pre + pair_coord_delta
 
         if self.capture_bridge_diagnostics:
             with torch.no_grad():
                 base_f = state_parent_pre.detach().float()
-                delta_f = pair_delta.detach().float()
-                combined_f = state_pre.detach().float()
+                sem_f = pair_sem_delta.detach().float()
+                coord_f = (
+                    pair_action_delta.detach().float()
+                    if self.pair_coord_mode == 'gated_action_residual'
+                    else pair_coord_delta.detach().float()
+                )
                 base_rms = base_f.square().mean().sqrt()
-                delta_rms = delta_f.square().mean().sqrt()
+                sem_rms = sem_f.square().mean().sqrt()
+                coord_rms = coord_f.square().mean().sqrt()
+                zero = base_rms.new_zeros(())
+                pair_raw_rms = (
+                    zero if pair_input_raw is None
+                    else pair_input_raw.detach().float().square().mean().sqrt()
+                )
+                pair_norm_rms = (
+                    zero if pair_input is None
+                    else pair_input.detach().float().square().mean().sqrt()
+                )
+                sem_ratio = (sem_rms / base_rms.clamp_min(1.0e-8)).to(base_pre.dtype)
+                coord_ratio = (coord_rms / base_rms.clamp_min(1.0e-8)).to(base_pre.dtype)
                 self.last_bridge_diagnostics = {
-                    'pair_base_preact_rms': base_rms.to(base_pre.dtype),
-                    'pair_delta_rms': delta_rms.to(base_pre.dtype),
-                    'pair_delta_absmax': delta_f.abs().amax().to(base_pre.dtype),
-                    'pair_combined_preact_rms': combined_f.square().mean().sqrt().to(base_pre.dtype),
-                    'pair_delta_to_base_ratio': (
-                        delta_rms / base_rms.clamp_min(1.0e-8)
-                    ).to(base_pre.dtype),
-                    'pair_adapter_weight_rms': (
-                        base_rms.new_zeros(()) if self.edge_attr_linear is None
-                        else self.edge_attr_linear.weight.detach().float().square().mean().sqrt()
-                    ).to(base_pre.dtype),
+                    # Minimal Pair-routing telemetry.  Keep the historical
+                    # pair_delta alias for the bridge contract, but remove
+                    # routine absmax/weight diagnostics with no decision value.
+                    'pair_input_raw_rms': pair_raw_rms.to(base_pre.dtype),
+                    'pair_input_prenorm_rms': pair_norm_rms.to(base_pre.dtype),
+                    'pair_delta_to_base_ratio': sem_ratio,
+                    'pair_semantic_delta_to_base_ratio': sem_ratio,
+                    'pair_coordinate_delta_to_base_ratio': coord_ratio,
+                    'pair_action_delta_rms': (
+                        pair_action_delta.detach().float().square().mean().sqrt().to(base_pre.dtype)
+                        if pair_action_delta.numel() else zero.to(base_pre.dtype)
+                    ),
+                    'pair_semantic_gate_rms': (
+                        zero.to(base_pre.dtype) if self.pair_semantic_gate is None
+                        else self.pair_semantic_gate.detach().float().square().mean().sqrt().to(base_pre.dtype)
+                    ),
                 }
         else:
             self.last_bridge_diagnostics = {}
 
         base_edge = base_pre
-        state_edge = state_pre
+        semantic_edge = semantic_pre
+        coordinate_edge = coordinate_pre
         for layer in self.edge_mlp[1:]:
             base_edge = layer(base_edge)
-            state_edge = layer(state_edge)
+            semantic_edge = layer(semantic_edge)
+            coordinate_edge = layer(coordinate_edge)
 
-        # One Bernoulli mask, shared by both streams.  At zero pair adapter the
-        # two values are exactly identical, preserving the R05 parent value.
+        # Share the same dropout mask so zero-start remains an exact value match.
         if self.training and self.dropout.p > 0.0:
-            dropout_scale = self.dropout(torch.ones_like(state_edge))
+            dropout_scale = self.dropout(torch.ones_like(semantic_edge))
             base_edge = base_edge * dropout_scale
-            state_edge = state_edge * dropout_scale
+            semantic_edge = semantic_edge * dropout_scale
+            coordinate_edge = coordinate_edge * dropout_scale
 
         if self.attention:
             base_edge = base_edge * self.att_mlp(base_edge)
-            state_edge = state_edge * self.att_mlp(state_edge)
-        return state_edge, base_edge
+            semantic_edge = semantic_edge * self.att_mlp(semantic_edge)
+            coordinate_edge = coordinate_edge * self.att_mlp(coordinate_edge)
+        return semantic_edge, coordinate_edge, base_edge, pair_action_delta
 
     def node_model(self, x, edge_index, edge_attr, node_attr):
         '''
@@ -322,10 +413,10 @@ class AM_E_GCL(nn.Module):
         return out, head_input, hidden
 
     def coord_model(self, coord, edge_index, coord_diff, state_edge_feat,
-                    channel_weights, base_edge_feat=None):
+                    channel_weights, base_edge_feat=None, pair_action_delta=None):
         '''Pair-aware Cartesian update with selectable geometry authority.
 
-        V219 formal mode (``direct_shared`` + ``coord_prenorm=True`` + ``normalize=False``):
+        Formal raw-Cartesian modes use ``coord_prenorm=True`` + ``normalize=False``; gated action-residual mode preserve the parent head and add only an invariant Pair scalar residual:
 
             mbar_ij  = LayerNorm(m_ij(h_i, h_j, radial_ij, z_ij))
             alpha_ij = phi_x(mbar_ij)
@@ -340,37 +431,57 @@ class AM_E_GCL(nn.Module):
         n_channel = channel_weights.shape[-1]
         coord_before = coord
 
-        # Pair-conditioned EGNN scalar authority.  V219 formal runs use
-        # ``direct_shared``: the same pair-conditioned edge message drives both
-        # representation and the invariant coordinate scalar.  Before the scalar
+        # Pair-conditioned EGNN scalar authority.  ``factorized_direct`` keeps
+        # the same Pair state but supplies an independently learned coordinate
+        # edge message, while ``direct_shared`` reuses the semantic message.  Before the scalar
         # action head only, LayerNorm removes uncontrolled representation amplitude.
         # The Pair adapter remains zero-initialized.  No tanh/clamp/trust-radius is
         # applied; historical bounded modes remain reproducible.
-        state_coeff_raw, state_head_input, state_head_hidden = self._coord_head_forward(state_edge_feat)
-        state_coeff = torch.tanh(state_coeff_raw) if self.tanh else state_coeff_raw
-        if base_edge_feat is None:
-            base_coeff_raw = state_coeff_raw
-            base_head_input = state_head_input
-            base_head_hidden = state_head_hidden
-            base_coeff = state_coeff
-            pair_coeff_raw = torch.zeros_like(state_coeff_raw)
-            pair_coeff_applied = pair_coeff_raw
-            coord_coeff = state_coeff
-        else:
-            base_coeff_raw, base_head_input, base_head_hidden = self._coord_head_forward(base_edge_feat)
-            base_coeff = torch.tanh(base_coeff_raw) if self.tanh else base_coeff_raw
-            pair_coeff_raw = state_coeff - base_coeff
-            if self.pair_coord_mode == 'bounded_residual':
-                bound = pair_coeff_raw.new_tensor(self.pair_coord_delta_bound)
-                pair_coeff_applied = bound * torch.tanh(pair_coeff_raw / bound)
-                coord_coeff = base_coeff + pair_coeff_applied
+        state_head_coeff_raw, state_head_input, state_head_hidden = self._coord_head_forward(state_edge_feat)
+        state_head_coeff = torch.tanh(state_head_coeff_raw) if self.tanh else state_head_coeff_raw
+        if self.pair_coord_mode == 'gated_action_residual':
+            # Mature parent actuator + direct invariant Pair scalar residual:
+            #   alpha_ij = phi_R05(LN(m_parent_ij)) + Delta alpha_pair(zbar_ij).
+            # Pair-state PreNorm occurs before pair_action_linear. No residual-LN,
+            # tanh/clipping/trust radius or hand-tuned physical step scale is used.
+            if base_edge_feat is None:
+                base_coeff_raw = state_head_coeff_raw
+                base_head_input = state_head_input
+                base_head_hidden = state_head_hidden
+                base_coeff = state_head_coeff
             else:
-                # ``direct_shared`` / historical ``legacy_shared``: Pair is a
-                # first-class EGNN edge condition.  Its learned contribution is
-                # not artificially rescaled; stability comes from the geometric
-                # basis below, not from saturating the scalar field.
+                base_coeff_raw, base_head_input, base_head_hidden = self._coord_head_forward(base_edge_feat)
+                base_coeff = torch.tanh(base_coeff_raw) if self.tanh else base_coeff_raw
+            pair_coeff_raw = (
+                torch.zeros_like(base_coeff_raw)
+                if pair_action_delta is None else pair_action_delta
+            )
+            pair_coeff_applied = pair_coeff_raw
+            coord_coeff = base_coeff + pair_coeff_applied
+            state_coeff_raw = base_coeff_raw + pair_coeff_raw
+            state_coeff = coord_coeff
+        else:
+            state_coeff_raw = state_head_coeff_raw
+            state_coeff = state_head_coeff
+            if base_edge_feat is None:
+                base_coeff_raw = state_coeff_raw
+                base_head_input = state_head_input
+                base_head_hidden = state_head_hidden
+                base_coeff = state_coeff
+                pair_coeff_raw = torch.zeros_like(state_coeff_raw)
                 pair_coeff_applied = pair_coeff_raw
                 coord_coeff = state_coeff
+            else:
+                base_coeff_raw, base_head_input, base_head_hidden = self._coord_head_forward(base_edge_feat)
+                base_coeff = torch.tanh(base_coeff_raw) if self.tanh else base_coeff_raw
+                pair_coeff_raw = state_coeff - base_coeff
+                if self.pair_coord_mode == 'bounded_residual':
+                    bound = pair_coeff_raw.new_tensor(self.pair_coord_delta_bound)
+                    pair_coeff_applied = bound * torch.tanh(pair_coeff_raw / bound)
+                    coord_coeff = base_coeff + pair_coeff_applied
+                else:
+                    pair_coeff_applied = pair_coeff_raw
+                    coord_coeff = state_coeff
 
         # V219 restores the original R05 raw Cartesian relative-vector basis.  The
         # stability intervention is upstream at representation->action pre-normalization,
@@ -403,51 +514,46 @@ class AM_E_GCL(nn.Module):
                 def _amax(v):
                     vf = v.detach().float()
                     return vf.abs().amax().to(coord_before.dtype) if vf.numel() else coord_before.new_zeros(())
+                def _opnorm(v):
+                    vf = v.detach().float()
+                    if vf.ndim != 2 or vf.numel() == 0:
+                        return coord_before.new_zeros(())
+                    return torch.linalg.matrix_norm(vf, ord=2).to(coord_before.dtype)
                 self.last_coord_diagnostics = {
-                    'coord_input_rms': _rms(coord_before),
-                    'coord_input_absmax': _amax(coord_before),
-                    'coord_diff_rms': _rms(coord_diff_raw),
-                    'coord_diff_absmax': _amax(coord_diff_raw),
-                    'coord_diff_norm_rms': _rms(coord_diff_norm),
-                    'coord_diff_norm_absmax': _amax(coord_diff_norm),
-                    'coord_direction_rms': _rms(coord_direction),
-                    'coord_direction_absmax': _amax(coord_direction),
-                    'coord_direction_norm_absmax': _amax(torch.norm(coord_direction, dim=-1)),
-                    'coord_normalize': coord_before.new_tensor(1.0 if self.normalize else 0.0),
+                    # Causal action telemetry.  ``base`` and ``state`` share the
+                    # same hidden/node stream and coordinate head; their only
+                    # same-stage difference is the direct Pair-coordinate edge
+                    # adapter.  Therefore state-base isolates direct Pair action
+                    # without introducing a new controller or changing forward.
                     'coord_prenorm': coord_before.new_tensor(1.0 if self.coord_prenorm else 0.0),
-                    'coord_state_edge_rms': _rms(state_edge_feat),
-                    'coord_state_edge_absmax': _amax(state_edge_feat),
                     'coord_state_head_input_rms': _rms(state_head_input),
                     'coord_state_head_input_absmax': _amax(state_head_input),
-                    'coord_state_head_hidden_rms': _rms(state_head_hidden),
-                    'coord_state_head_hidden_absmax': _amax(state_head_hidden),
-                    'coord_head_w1_rms': _rms(self.coord_mlp[0].weight),
-                    'coord_head_w1_absmax': _amax(self.coord_mlp[0].weight),
-                    'coord_head_w2_rms': _rms(self.coord_mlp[2].weight),
-                    'coord_head_w2_absmax': _amax(self.coord_mlp[2].weight),
-                    'coord_base_coeff_raw_rms': _rms(base_coeff_raw),
-                    'coord_base_coeff_raw_absmax': _amax(base_coeff_raw),
+                    'coord_base_head_input_rms': _rms(base_head_input),
+                    'coord_base_head_input_absmax': _amax(base_head_input),
                     'coord_state_coeff_raw_rms': _rms(state_coeff_raw),
                     'coord_state_coeff_raw_absmax': _amax(state_coeff_raw),
-                    'coord_base_coeff_rms': _rms(base_coeff),
-                    'coord_base_coeff_absmax': _amax(base_coeff),
-                    'coord_state_coeff_rms': _rms(state_coeff),
-                    'coord_state_coeff_absmax': _amax(state_coeff),
-                    'coord_pair_delta_raw_rms': _rms(pair_coeff_raw),
-                    'coord_pair_delta_raw_absmax': _amax(pair_coeff_raw),
-                    'coord_pair_delta_applied_rms': _rms(pair_coeff_applied),
-                    'coord_pair_delta_applied_absmax': _amax(pair_coeff_applied),
-                    'coord_coeff_rms': _rms(coord_coeff),
-                    'coord_coeff_absmax': _amax(coord_coeff),
-                    'coord_trans_rms': _rms(trans),
-                    'coord_trans_absmax': _amax(trans),
+                    'coord_base_coeff_raw_rms': _rms(base_coeff_raw),
+                    'coord_base_coeff_raw_absmax': _amax(base_coeff_raw),
+                    'coord_direct_pair_coeff_delta_rms': _rms(pair_coeff_raw),
+                    'coord_direct_pair_coeff_delta_absmax': _amax(pair_coeff_raw),
+                    'coord_head_w1_rms': _rms(self.coord_mlp[0].weight),
+                    'coord_head_w1_absmax': _amax(self.coord_mlp[0].weight),
+                    'coord_head_w1_opnorm': _opnorm(self.coord_mlp[0].weight),
+                    'coord_head_w2_rms': _rms(self.coord_mlp[2].weight),
+                    'coord_head_w2_absmax': _amax(self.coord_mlp[2].weight),
+                    'coord_head_w2_opnorm': _opnorm(self.coord_mlp[2].weight),
+                    'coord_pair_action_gate_rms': (
+                        _rms(self.pair_action_gate) if self.pair_action_gate is not None else coord_before.new_zeros(())
+                    ),
+                    'coord_diff_norm_rms': _rms(coord_diff_norm),
+                    'coord_diff_norm_absmax': _amax(coord_diff_norm),
+                    'coord_direction_norm_rms': _rms(torch.norm(coord_direction, dim=-1)),
+                    'coord_direction_norm_absmax': _amax(torch.norm(coord_direction, dim=-1)),
+                    'coord_update_to_alpha_rms_ratio': (
+                        _rms(agg).float() / _rms(state_coeff_raw).float().clamp_min(1.0e-8)
+                    ).to(coord_before.dtype),
                     'coord_update_rms': _rms(agg),
                     'coord_update_absmax': _amax(agg),
-                    'coord_update_to_input_rms_ratio': (
-                        _rms(agg).float() / _rms(coord_before).float().clamp_min(1.0e-8)
-                    ).to(coord_before.dtype),
-                    'coord_output_rms': _rms(coord),
-                    'coord_output_absmax': _amax(coord),
                 }
         else:
             self.last_coord_diagnostics = {}
@@ -467,10 +573,10 @@ class AM_E_GCL(nn.Module):
         # print('row, col : ', row, col)
 
         radial, coord_diff = coord2radial(edge_index, coord, channel_attr, channel_weights, self.radial_linear)
-        edge_feat, base_edge_feat = self.edge_model(h[row], h[col], radial, edge_attr)
+        edge_feat, coord_edge_feat, base_edge_feat, pair_action_delta = self.edge_model(h[row], h[col], radial, edge_attr)
         coord = self.coord_model(
-            coord, edge_index, coord_diff, edge_feat, channel_weights,
-            base_edge_feat=base_edge_feat,
+            coord, edge_index, coord_diff, coord_edge_feat, channel_weights,
+            base_edge_feat=base_edge_feat, pair_action_delta=pair_action_delta,
         )
         h, agg = self.node_model(h, edge_index, edge_feat, node_attr)
         return h, coord
@@ -489,13 +595,13 @@ class AM_E_GCL(nn.Module):
         radial, coord_diff = coord2radial(
             edge_index, coord, channel_attr, channel_weights, self.radial_linear
         )
-        edge_feat, base_edge_feat = self.edge_model(
+        edge_feat, coord_edge_feat, base_edge_feat, pair_action_delta = self.edge_model(
             h[row], h[col], radial, edge_attr,
             base_source=h_base[row], base_target=h_base[col],
         )
         coord = self.coord_model(
-            coord, edge_index, coord_diff, edge_feat, channel_weights,
-            base_edge_feat=base_edge_feat,
+            coord, edge_index, coord_diff, coord_edge_feat, channel_weights,
+            base_edge_feat=base_edge_feat, pair_action_delta=pair_action_delta,
         )
         h, h_base = self.node_model_dual(
             h, h_base, edge_index, edge_feat, base_edge_feat, node_attr
@@ -602,7 +708,8 @@ class MS_E_GCL(nn.Module):
     def __init__(self, input_nf, output_nf, hidden_nf, n_channel, channel_nf, radial_nf, surf_nf=50,
                  edges_in_d=0, node_attr_d=0, act_fn=nn.SiLU(), residual=True, attention=False,
                  normalize=False, coords_agg='mean', tanh=False, dropout=0.1,
-                 pair_coord_mode='bounded_residual', pair_coord_delta_bound=1.0, coord_prenorm=False):
+                 pair_coord_mode='bounded_residual', pair_coord_delta_bound=1.0, coord_prenorm=False,
+                 pair_adapter_prenorm=False, pair_semantic_gate=False):
         super(MS_E_GCL, self).__init__()
 
         input_edge = input_nf * 2
@@ -613,12 +720,15 @@ class MS_E_GCL(nn.Module):
         self.tanh = tanh
         self.epsilon = 1e-8
         self.pair_coord_mode = str(pair_coord_mode or 'bounded_residual').strip().lower()
-        if self.pair_coord_mode not in {'bounded_residual', 'legacy_shared', 'direct_shared'}:
+        if self.pair_coord_mode not in {'bounded_residual', 'legacy_shared', 'direct_shared', 'factorized_direct', 'gated_action_residual'}:
             raise ValueError(f'Unsupported pair_coord_mode={self.pair_coord_mode!r}')
         self.pair_coord_delta_bound = float(pair_coord_delta_bound)
         if self.pair_coord_mode == 'bounded_residual' and self.pair_coord_delta_bound <= 0.0:
             raise ValueError('pair_coord_delta_bound must be > 0 for bounded_residual mode')
         self.coord_prenorm = bool(coord_prenorm)
+        self.pair_adapter_prenorm = bool(pair_adapter_prenorm)
+        self.pair_semantic_gate_enabled = bool(pair_semantic_gate)
+        self.n_channel = int(n_channel)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -630,12 +740,51 @@ class MS_E_GCL(nn.Module):
             nn.Linear(hidden_nf, hidden_nf),
             act_fn)
         self.edge_attr_linear = None
+        self.edge_attr_coord_linear = None
+        self.pair_semantic_gate = None
+        self.pair_action_linear = None
+        self.pair_action_gate = None
+        self.pair_input_norm = (
+            nn.LayerNorm(self.edges_in_d)
+            if self.edges_in_d > 0 and self.pair_adapter_prenorm
+            else nn.Identity()
+        )
         if self.edges_in_d > 0:
+            # Parent-preserving Pair routing. Semantic Pair information enters
+            # through a zero-start hidden adapter. Historical factorized_direct
+            # also injects a hidden coordinate adapter. The gated action-residual mode
+            # instead map normalized invariant Pair state directly to the EGNN
+            # scalar action, leaving the mature R05 edge-message actuator intact.
             with torch.random.fork_rng(devices=[]):
                 self.edge_attr_linear = nn.Linear(
                     self.edges_in_d, hidden_nf, bias=False
                 )
-            nn.init.zeros_(self.edge_attr_linear.weight)
+                if self.pair_coord_mode == 'factorized_direct':
+                    self.edge_attr_coord_linear = nn.Linear(
+                        self.edges_in_d, hidden_nf, bias=False
+                    )
+                if self.pair_coord_mode == 'gated_action_residual':
+                    self.pair_action_linear = nn.Linear(
+                        self.edges_in_d, self.n_channel, bias=False
+                    )
+            if self.pair_semantic_gate_enabled:
+                # Staged semantic route: projection is live at initialization but
+                # a zero-start gate preserves the exact parent function.  This
+                # avoids a zero-times-zero gradient deadlock while letting data
+                # decide how quickly Pair semantics enter the native state path.
+                nn.init.xavier_uniform_(self.edge_attr_linear.weight)
+                self.pair_semantic_gate = nn.Parameter(torch.zeros(hidden_nf))
+            else:
+                # Stable R67 reference: semantic Pair residual itself is zero-init.
+                nn.init.zeros_(self.edge_attr_linear.weight)
+            if self.edge_attr_coord_linear is not None:
+                nn.init.zeros_(self.edge_attr_coord_linear.weight)
+            if self.pair_action_linear is not None:
+                # Direct Pair geometry always uses the empirically validated
+                # staged route.  The ungated action-residual path was falsified
+                # by the V226 logs and is intentionally removed.
+                nn.init.xavier_uniform_(self.pair_action_linear.weight)
+                self.pair_action_gate = nn.Parameter(torch.zeros(self.n_channel))
         self.last_bridge_diagnostics = {}
         self.last_coord_diagnostics = {}
         self.capture_bridge_diagnostics = False
@@ -673,11 +822,13 @@ class MS_E_GCL(nn.Module):
                 nn.Sigmoid())
 
     def edge_model(self, source, target, radial, edge_attr, base_source=None, base_target=None):
-        """Return pair-conditioned and pair-free surface edge messages.
+        """Build semantic, coordinate-action, and pair-free edge messages.
 
-        V219 ``direct_shared`` uses the Pair-conditioned ``state_edge`` as the
-        shared representation/geometry message; ``base_edge`` is diagnostic and
-        historical-compatibility state only.
+        Pair-state PreNorm feeds a zero-start semantic adapter. Historical
+        ``factorized_direct`` also learns a zero-start hidden coordinate adapter.
+        The preferred gated action-residual mode instead keep the parent coordinate
+        edge message intact and inject Pair only at the invariant EGNN scalar
+        action. Cold start is therefore exactly the parent function.
         """
         radial = radial.reshape(radial.shape[0], -1)
         if base_source is None:
@@ -688,54 +839,104 @@ class MS_E_GCL(nn.Module):
         base_input = torch.cat([base_source, base_target, radial], dim=1)
         base_pre = self.edge_mlp[0](base_input)
         state_parent_pre = self.edge_mlp[0](state_input)
+
+        if edge_attr is None and self.edges_in_d > 0:
+            edge_attr = base_pre.new_zeros((base_pre.shape[0], self.edges_in_d))
+        pair_input_raw = edge_attr
+        pair_input = self.pair_input_norm(edge_attr) if edge_attr is not None else edge_attr
         if self.edge_attr_linear is None:
-            pair_delta = torch.zeros_like(base_pre)
+            pair_sem_delta = torch.zeros_like(base_pre)
         else:
-            if edge_attr is None:
-                edge_attr = base_pre.new_zeros((base_pre.shape[0], self.edges_in_d))
-            pair_delta = self.edge_attr_linear(edge_attr)
-        state_pre = state_parent_pre + pair_delta
+            pair_sem_raw = self.edge_attr_linear(pair_input)
+            if self.pair_semantic_gate is not None:
+                pair_sem_delta = pair_sem_raw * self.pair_semantic_gate.view(1, -1)
+            else:
+                pair_sem_delta = pair_sem_raw
+        if self.pair_coord_mode == 'factorized_direct':
+            if self.edge_attr_coord_linear is None:
+                pair_coord_delta = torch.zeros_like(base_pre)
+            else:
+                pair_coord_delta = self.edge_attr_coord_linear(pair_input)
+        elif self.pair_coord_mode == 'gated_action_residual':
+            # Direct Pair geometry no longer perturbs the hidden parent edge
+            # message. It is injected later at the invariant scalar action.
+            pair_coord_delta = torch.zeros_like(base_pre)
+        else:
+            pair_coord_delta = pair_sem_delta
+
+        if self.pair_action_linear is None or pair_input is None:
+            pair_action_delta = base_pre.new_zeros((base_pre.shape[0], self.n_channel))
+        else:
+            pair_action_raw = self.pair_action_linear(pair_input)
+            pair_action_delta = pair_action_raw * self.pair_action_gate.view(1, -1)
+
+        semantic_pre = state_parent_pre + pair_sem_delta
+        coordinate_pre = state_parent_pre + pair_coord_delta
 
         if self.capture_bridge_diagnostics:
             with torch.no_grad():
                 base_f = state_parent_pre.detach().float()
-                delta_f = pair_delta.detach().float()
-                combined_f = state_pre.detach().float()
+                sem_f = pair_sem_delta.detach().float()
+                coord_f = (
+                    pair_action_delta.detach().float()
+                    if self.pair_coord_mode == 'gated_action_residual'
+                    else pair_coord_delta.detach().float()
+                )
                 base_rms = base_f.square().mean().sqrt()
-                delta_rms = delta_f.square().mean().sqrt()
+                sem_rms = sem_f.square().mean().sqrt()
+                coord_rms = coord_f.square().mean().sqrt()
+                zero = base_rms.new_zeros(())
+                pair_raw_rms = (
+                    zero if pair_input_raw is None
+                    else pair_input_raw.detach().float().square().mean().sqrt()
+                )
+                pair_norm_rms = (
+                    zero if pair_input is None
+                    else pair_input.detach().float().square().mean().sqrt()
+                )
+                sem_ratio = (sem_rms / base_rms.clamp_min(1.0e-8)).to(base_pre.dtype)
+                coord_ratio = (coord_rms / base_rms.clamp_min(1.0e-8)).to(base_pre.dtype)
                 self.last_bridge_diagnostics = {
-                    'pair_base_preact_rms': base_rms.to(base_pre.dtype),
-                    'pair_delta_rms': delta_rms.to(base_pre.dtype),
-                    'pair_delta_absmax': delta_f.abs().amax().to(base_pre.dtype),
-                    'pair_combined_preact_rms': combined_f.square().mean().sqrt().to(base_pre.dtype),
-                    'pair_delta_to_base_ratio': (
-                        delta_rms / base_rms.clamp_min(1.0e-8)
-                    ).to(base_pre.dtype),
-                    'pair_adapter_weight_rms': (
-                        base_rms.new_zeros(()) if self.edge_attr_linear is None
-                        else self.edge_attr_linear.weight.detach().float().square().mean().sqrt()
-                    ).to(base_pre.dtype),
+                    # Minimal Pair-routing telemetry.  Keep the historical
+                    # pair_delta alias for the bridge contract, but remove
+                    # routine absmax/weight diagnostics with no decision value.
+                    'pair_input_raw_rms': pair_raw_rms.to(base_pre.dtype),
+                    'pair_input_prenorm_rms': pair_norm_rms.to(base_pre.dtype),
+                    'pair_delta_to_base_ratio': sem_ratio,
+                    'pair_semantic_delta_to_base_ratio': sem_ratio,
+                    'pair_coordinate_delta_to_base_ratio': coord_ratio,
+                    'pair_action_delta_rms': (
+                        pair_action_delta.detach().float().square().mean().sqrt().to(base_pre.dtype)
+                        if pair_action_delta.numel() else zero.to(base_pre.dtype)
+                    ),
+                    'pair_semantic_gate_rms': (
+                        zero.to(base_pre.dtype) if self.pair_semantic_gate is None
+                        else self.pair_semantic_gate.detach().float().square().mean().sqrt().to(base_pre.dtype)
+                    ),
                 }
         else:
             self.last_bridge_diagnostics = {}
 
         base_edge = base_pre
-        state_edge = state_pre
+        semantic_edge = semantic_pre
+        coordinate_edge = coordinate_pre
         for layer in self.edge_mlp[1:]:
             base_edge = layer(base_edge)
-            state_edge = layer(state_edge)
+            semantic_edge = layer(semantic_edge)
+            coordinate_edge = layer(coordinate_edge)
 
-        # One Bernoulli mask, shared by both streams.  At zero pair adapter the
-        # two values are exactly identical, preserving the R05 parent value.
+        # Share the same dropout mask so zero-start remains an exact value match.
         if self.training and self.dropout.p > 0.0:
-            dropout_scale = self.dropout(torch.ones_like(state_edge))
+            dropout_scale = self.dropout(torch.ones_like(semantic_edge))
             base_edge = base_edge * dropout_scale
-            state_edge = state_edge * dropout_scale
+            semantic_edge = semantic_edge * dropout_scale
+            coordinate_edge = coordinate_edge * dropout_scale
 
         if self.attention:
             base_edge = base_edge * self.att_mlp(base_edge)
-            state_edge = state_edge * self.att_mlp(state_edge)
-        return state_edge, base_edge
+            semantic_edge = semantic_edge * self.att_mlp(semantic_edge)
+            coordinate_edge = coordinate_edge * self.att_mlp(coordinate_edge)
+        return semantic_edge, coordinate_edge, base_edge, pair_action_delta
 
     def node_model(self, x, edge_index, edge_attr, node_attr):
         '''
@@ -800,10 +1001,10 @@ class MS_E_GCL(nn.Module):
         return out, head_input, hidden
 
     def coord_model(self, coord, edge_index, coord_diff, state_edge_feat,
-                    channel_weights, base_edge_feat=None):
+                    channel_weights, base_edge_feat=None, pair_action_delta=None):
         '''Pair-aware Cartesian update with selectable geometry authority.
 
-        V219 formal mode (``direct_shared`` + ``coord_prenorm=True`` + ``normalize=False``):
+        Formal raw-Cartesian modes use ``coord_prenorm=True`` + ``normalize=False``; gated action-residual mode preserve the parent head and add only an invariant Pair scalar residual:
 
             mbar_ij  = LayerNorm(m_ij(h_i, h_j, radial_ij, z_ij))
             alpha_ij = phi_x(mbar_ij)
@@ -818,37 +1019,57 @@ class MS_E_GCL(nn.Module):
         n_channel = channel_weights.shape[-1]
         coord_before = coord
 
-        # Pair-conditioned EGNN scalar authority.  V219 formal runs use
-        # ``direct_shared``: the same pair-conditioned edge message drives both
-        # representation and the invariant coordinate scalar.  Before the scalar
+        # Pair-conditioned EGNN scalar authority.  ``factorized_direct`` keeps
+        # the same Pair state but supplies an independently learned coordinate
+        # edge message, while ``direct_shared`` reuses the semantic message.  Before the scalar
         # action head only, LayerNorm removes uncontrolled representation amplitude.
         # The Pair adapter remains zero-initialized.  No tanh/clamp/trust-radius is
         # applied; historical bounded modes remain reproducible.
-        state_coeff_raw, state_head_input, state_head_hidden = self._coord_head_forward(state_edge_feat)
-        state_coeff = torch.tanh(state_coeff_raw) if self.tanh else state_coeff_raw
-        if base_edge_feat is None:
-            base_coeff_raw = state_coeff_raw
-            base_head_input = state_head_input
-            base_head_hidden = state_head_hidden
-            base_coeff = state_coeff
-            pair_coeff_raw = torch.zeros_like(state_coeff_raw)
-            pair_coeff_applied = pair_coeff_raw
-            coord_coeff = state_coeff
-        else:
-            base_coeff_raw, base_head_input, base_head_hidden = self._coord_head_forward(base_edge_feat)
-            base_coeff = torch.tanh(base_coeff_raw) if self.tanh else base_coeff_raw
-            pair_coeff_raw = state_coeff - base_coeff
-            if self.pair_coord_mode == 'bounded_residual':
-                bound = pair_coeff_raw.new_tensor(self.pair_coord_delta_bound)
-                pair_coeff_applied = bound * torch.tanh(pair_coeff_raw / bound)
-                coord_coeff = base_coeff + pair_coeff_applied
+        state_head_coeff_raw, state_head_input, state_head_hidden = self._coord_head_forward(state_edge_feat)
+        state_head_coeff = torch.tanh(state_head_coeff_raw) if self.tanh else state_head_coeff_raw
+        if self.pair_coord_mode == 'gated_action_residual':
+            # Mature parent actuator + direct invariant Pair scalar residual:
+            #   alpha_ij = phi_R05(LN(m_parent_ij)) + Delta alpha_pair(zbar_ij).
+            # Pair-state PreNorm occurs before pair_action_linear. No residual-LN,
+            # tanh/clipping/trust radius or hand-tuned physical step scale is used.
+            if base_edge_feat is None:
+                base_coeff_raw = state_head_coeff_raw
+                base_head_input = state_head_input
+                base_head_hidden = state_head_hidden
+                base_coeff = state_head_coeff
             else:
-                # ``direct_shared`` / historical ``legacy_shared``: Pair is a
-                # first-class EGNN edge condition.  Its learned contribution is
-                # not artificially rescaled; stability comes from the geometric
-                # basis below, not from saturating the scalar field.
+                base_coeff_raw, base_head_input, base_head_hidden = self._coord_head_forward(base_edge_feat)
+                base_coeff = torch.tanh(base_coeff_raw) if self.tanh else base_coeff_raw
+            pair_coeff_raw = (
+                torch.zeros_like(base_coeff_raw)
+                if pair_action_delta is None else pair_action_delta
+            )
+            pair_coeff_applied = pair_coeff_raw
+            coord_coeff = base_coeff + pair_coeff_applied
+            state_coeff_raw = base_coeff_raw + pair_coeff_raw
+            state_coeff = coord_coeff
+        else:
+            state_coeff_raw = state_head_coeff_raw
+            state_coeff = state_head_coeff
+            if base_edge_feat is None:
+                base_coeff_raw = state_coeff_raw
+                base_head_input = state_head_input
+                base_head_hidden = state_head_hidden
+                base_coeff = state_coeff
+                pair_coeff_raw = torch.zeros_like(state_coeff_raw)
                 pair_coeff_applied = pair_coeff_raw
                 coord_coeff = state_coeff
+            else:
+                base_coeff_raw, base_head_input, base_head_hidden = self._coord_head_forward(base_edge_feat)
+                base_coeff = torch.tanh(base_coeff_raw) if self.tanh else base_coeff_raw
+                pair_coeff_raw = state_coeff - base_coeff
+                if self.pair_coord_mode == 'bounded_residual':
+                    bound = pair_coeff_raw.new_tensor(self.pair_coord_delta_bound)
+                    pair_coeff_applied = bound * torch.tanh(pair_coeff_raw / bound)
+                    coord_coeff = base_coeff + pair_coeff_applied
+                else:
+                    pair_coeff_applied = pair_coeff_raw
+                    coord_coeff = state_coeff
 
         # V219 restores the original R05 raw Cartesian relative-vector basis.  The
         # stability intervention is upstream at representation->action pre-normalization,
@@ -881,51 +1102,46 @@ class MS_E_GCL(nn.Module):
                 def _amax(v):
                     vf = v.detach().float()
                     return vf.abs().amax().to(coord_before.dtype) if vf.numel() else coord_before.new_zeros(())
+                def _opnorm(v):
+                    vf = v.detach().float()
+                    if vf.ndim != 2 or vf.numel() == 0:
+                        return coord_before.new_zeros(())
+                    return torch.linalg.matrix_norm(vf, ord=2).to(coord_before.dtype)
                 self.last_coord_diagnostics = {
-                    'coord_input_rms': _rms(coord_before),
-                    'coord_input_absmax': _amax(coord_before),
-                    'coord_diff_rms': _rms(coord_diff_raw),
-                    'coord_diff_absmax': _amax(coord_diff_raw),
-                    'coord_diff_norm_rms': _rms(coord_diff_norm),
-                    'coord_diff_norm_absmax': _amax(coord_diff_norm),
-                    'coord_direction_rms': _rms(coord_direction),
-                    'coord_direction_absmax': _amax(coord_direction),
-                    'coord_direction_norm_absmax': _amax(torch.norm(coord_direction, dim=-1)),
-                    'coord_normalize': coord_before.new_tensor(1.0 if self.normalize else 0.0),
+                    # Causal action telemetry.  ``base`` and ``state`` share the
+                    # same hidden/node stream and coordinate head; their only
+                    # same-stage difference is the direct Pair-coordinate edge
+                    # adapter.  Therefore state-base isolates direct Pair action
+                    # without introducing a new controller or changing forward.
                     'coord_prenorm': coord_before.new_tensor(1.0 if self.coord_prenorm else 0.0),
-                    'coord_state_edge_rms': _rms(state_edge_feat),
-                    'coord_state_edge_absmax': _amax(state_edge_feat),
                     'coord_state_head_input_rms': _rms(state_head_input),
                     'coord_state_head_input_absmax': _amax(state_head_input),
-                    'coord_state_head_hidden_rms': _rms(state_head_hidden),
-                    'coord_state_head_hidden_absmax': _amax(state_head_hidden),
-                    'coord_head_w1_rms': _rms(self.coord_mlp[0].weight),
-                    'coord_head_w1_absmax': _amax(self.coord_mlp[0].weight),
-                    'coord_head_w2_rms': _rms(self.coord_mlp[2].weight),
-                    'coord_head_w2_absmax': _amax(self.coord_mlp[2].weight),
-                    'coord_base_coeff_raw_rms': _rms(base_coeff_raw),
-                    'coord_base_coeff_raw_absmax': _amax(base_coeff_raw),
+                    'coord_base_head_input_rms': _rms(base_head_input),
+                    'coord_base_head_input_absmax': _amax(base_head_input),
                     'coord_state_coeff_raw_rms': _rms(state_coeff_raw),
                     'coord_state_coeff_raw_absmax': _amax(state_coeff_raw),
-                    'coord_base_coeff_rms': _rms(base_coeff),
-                    'coord_base_coeff_absmax': _amax(base_coeff),
-                    'coord_state_coeff_rms': _rms(state_coeff),
-                    'coord_state_coeff_absmax': _amax(state_coeff),
-                    'coord_pair_delta_raw_rms': _rms(pair_coeff_raw),
-                    'coord_pair_delta_raw_absmax': _amax(pair_coeff_raw),
-                    'coord_pair_delta_applied_rms': _rms(pair_coeff_applied),
-                    'coord_pair_delta_applied_absmax': _amax(pair_coeff_applied),
-                    'coord_coeff_rms': _rms(coord_coeff),
-                    'coord_coeff_absmax': _amax(coord_coeff),
-                    'coord_trans_rms': _rms(trans),
-                    'coord_trans_absmax': _amax(trans),
+                    'coord_base_coeff_raw_rms': _rms(base_coeff_raw),
+                    'coord_base_coeff_raw_absmax': _amax(base_coeff_raw),
+                    'coord_direct_pair_coeff_delta_rms': _rms(pair_coeff_raw),
+                    'coord_direct_pair_coeff_delta_absmax': _amax(pair_coeff_raw),
+                    'coord_head_w1_rms': _rms(self.coord_mlp[0].weight),
+                    'coord_head_w1_absmax': _amax(self.coord_mlp[0].weight),
+                    'coord_head_w1_opnorm': _opnorm(self.coord_mlp[0].weight),
+                    'coord_head_w2_rms': _rms(self.coord_mlp[2].weight),
+                    'coord_head_w2_absmax': _amax(self.coord_mlp[2].weight),
+                    'coord_head_w2_opnorm': _opnorm(self.coord_mlp[2].weight),
+                    'coord_pair_action_gate_rms': (
+                        _rms(self.pair_action_gate) if self.pair_action_gate is not None else coord_before.new_zeros(())
+                    ),
+                    'coord_diff_norm_rms': _rms(coord_diff_norm),
+                    'coord_diff_norm_absmax': _amax(coord_diff_norm),
+                    'coord_direction_norm_rms': _rms(torch.norm(coord_direction, dim=-1)),
+                    'coord_direction_norm_absmax': _amax(torch.norm(coord_direction, dim=-1)),
+                    'coord_update_to_alpha_rms_ratio': (
+                        _rms(agg).float() / _rms(state_coeff_raw).float().clamp_min(1.0e-8)
+                    ).to(coord_before.dtype),
                     'coord_update_rms': _rms(agg),
                     'coord_update_absmax': _amax(agg),
-                    'coord_update_to_input_rms_ratio': (
-                        _rms(agg).float() / _rms(coord_before).float().clamp_min(1.0e-8)
-                    ).to(coord_before.dtype),
-                    'coord_output_rms': _rms(coord),
-                    'coord_output_absmax': _amax(coord),
                 }
         else:
             self.last_coord_diagnostics = {}
@@ -968,10 +1184,10 @@ class MS_E_GCL(nn.Module):
             edge_index, epi_index, coord, surf_verts, channel_attr,
             self.scale_linear, self.radial_linear
         )
-        edge_feat, base_edge_feat = self.edge_model(h[row], h[col], radial, edge_attr)
+        edge_feat, coord_edge_feat, base_edge_feat, pair_action_delta = self.edge_model(h[row], h[col], radial, edge_attr)
         coord = self.coord_model(
-            coord, edge_index, abX, edge_feat, channel_weights,
-            base_edge_feat=base_edge_feat,
+            coord, edge_index, abX, coord_edge_feat, channel_weights,
+            base_edge_feat=base_edge_feat, pair_action_delta=pair_action_delta,
         )
         h, agg = self.node_model(h, edge_index, edge_feat, node_attr)
         return h, coord
@@ -999,13 +1215,13 @@ class MS_E_GCL(nn.Module):
             edge_index, epi_index, coord, surf_verts, channel_attr,
             self.scale_linear, self.radial_linear
         )
-        edge_feat, base_edge_feat = self.edge_model(
+        edge_feat, coord_edge_feat, base_edge_feat, pair_action_delta = self.edge_model(
             h[row], h[col], radial, edge_attr,
             base_source=h_base[row], base_target=h_base[col],
         )
         coord = self.coord_model(
-            coord, edge_index, abX, edge_feat, channel_weights,
-            base_edge_feat=base_edge_feat,
+            coord, edge_index, abX, coord_edge_feat, channel_weights,
+            base_edge_feat=base_edge_feat, pair_action_delta=pair_action_delta,
         )
         h, h_base = self.node_model_dual(
             h, h_base, edge_index, edge_feat, base_edge_feat, node_attr

@@ -111,7 +111,7 @@ class AbFlowTrainer(Trainer):
         # epoch table stays compact and directly comparable across R28/R29/R30.
         self._train_component_names = (
             "loss", "seq", "structure", "interface", "edge",
-            "distogram", "coarse_anchor", "smooth_lddt"
+            "distogram", "smooth_lddt"
         )
         self._epoch_train_acc_epoch = -1
         self._epoch_train_sums = {name: 0.0 for name in self._train_component_names}
@@ -127,6 +127,9 @@ class AbFlowTrainer(Trainer):
         # Retain only the ordinary-forward zero-start/live representation bridge.
         self._live_bridge_contract_verified = False
         self._bridge_cold_start_observed = False
+        # V235: failed AMP PairGradientAudit removed.  Diagnostics below use only
+        # quantities produced by the ordinary scientific forward.
+        self._singlefield_contract_verified = False
         # V185: diagnostics-only cadence. First few steps verify the new
         # representation/time/edge routing without changing optimization.
         self._science_log_first_steps = max(0, _env_int(
@@ -160,10 +163,7 @@ class AbFlowTrainer(Trainer):
             "ABFLOW_GEOMETRY_AUTHORITY_BASE_ALERT", 64.0
         )
         self._geometry_authority_update_alert = _env_float(
-            "ABFLOW_GEOMETRY_AUTHORITY_UPDATE_ALERT", 200.0
-        )
-        self._geometry_authority_rms_alert = _env_float(
-            "ABFLOW_GEOMETRY_AUTHORITY_RMS_ALERT", 5.0
+            "ABFLOW_GEOMETRY_AUTHORITY_UPDATE_ALERT", 1.0e4
         )
         self._geometry_authority_alert_max_per_epoch = max(1, _env_int(
             "ABFLOW_GEOMETRY_AUTHORITY_ALERT_MAX_PER_EPOCH", 3
@@ -300,13 +300,12 @@ class AbFlowTrainer(Trainer):
                 f"rounds={getattr(raw_model, 'round', 'NA')} "
                 f"single={getattr(trunk_cfg, 'seq_channel', 'NA')} "
                 f"pair={getattr(trunk_cfg, 'pair_channel', 'NA')} "
-                f"time={int(bool(getattr(trunk_cfg, 'time_embed', False)))} "
+                f"time=R05:1/AbX:{int(bool(getattr(trunk_cfg, 'time_embed', False)))} "
                 "recycling=0 "
                 f"frame={geom_cfg.get('frame', 'NA')} "
                 "context=full_antibody+dataset_epitope "
                 "bridge=zero_start_residual "
                 f"distogram={getattr(raw_model, 'loss_distogram_weight', 0.0):.4g} "
-                f"coarse_anchor={getattr(raw_model, 'loss_coarse_anchor_weight', 0.0):.4g} "
                 f"smooth_lddt={getattr(raw_model, 'loss_smooth_lddt_weight', 0.0):.4g} "
                 f"smooth_lddt_source={getattr(raw_model, 'smooth_lddt_prediction_source', 'pred_design_endpoint')}"
             )
@@ -1001,7 +1000,6 @@ class AbFlowTrainer(Trainer):
             "loss_interface": m("Dock/SPLoss/Validation"),
             "loss_edge": m("Dock/EDLoss/Validation"),
             "distogram_loss": m("DTM/distogram_loss/Validation"),
-            "coarse_anchor_loss": m("DTM/coarse_anchor_loss/Validation"),
             "smooth_lddt_loss": m("DTM/smooth_lddt_loss/Validation"),
             "smooth_lddt_DD": m("DTM/smooth_lddt_DD/Validation"),
             "smooth_lddt_DF": m("DTM/smooth_lddt_DF/Validation"),
@@ -1024,6 +1022,9 @@ class AbFlowTrainer(Trainer):
             "abx_single_bio_rms": m("AbFlowDiag/abx_single_bio_rms/Validation"),
             "r05_time_embed_on": m("AbFlowDiag/r05_time_embed_on/Validation"),
             "abx_time_embed_on": m("AbFlowDiag/abx_time_embed_on/Validation"),
+            "explicit_time_authority_count": m(
+                "AbFlowDiag/explicit_time_authority_count/Validation"
+            ),
             "abx_ctx_edge_attr_rms": m("AbFlowDiag/abx_ctx_edge_attr_rms/Validation"),
             "abx_inter_edge_attr_rms": m("AbFlowDiag/abx_inter_edge_attr_rms/Validation"),
             "abx_surf_edge_attr_rms": m("AbFlowDiag/abx_surf_edge_attr_rms/Validation"),
@@ -1106,16 +1107,6 @@ class AbFlowTrainer(Trainer):
             "t_mean": m("AbFlowDiag/t_mean/Validation"),
             "t_min": m("AbFlowDiag/t_min/Validation"),
             "t_max": m("AbFlowDiag/t_max/Validation"),
-            "coordinate_state_closed": m("AbFlowDiag/coordinate_state_closed/Validation"),
-            "coordinate_single_endpoint": m("AbFlowDiag/coordinate_single_endpoint/Validation"),
-            "coordinate_recurrent_carrier": m("AbFlowDiag/coordinate_recurrent_carrier/Validation"),
-            "role_raw_gap_A": m("AbFlowDiag/role_raw_gap_A/Validation"),
-            "role_ca_centroid_gap_A": m("AbFlowDiag/role_ca_centroid_gap_A/Validation"),
-            "role_ca_pairdist_gap_A": m("AbFlowDiag/role_ca_pairdist_gap_A/Validation"),
-            "single_endpoint_gap_r2": m("AbFlowDiag/round2_shadow_endpoint_gap_rms/Validation"),
-            "state_post_r2": m("AbFlowDiag/round2_state_endpoint_post_rms/Validation"),
-            "state_projection_r2": m("AbFlowDiag/round2_state_carrier_projection_rms/Validation"),
-            "state_rotation_r2": m("AbFlowDiag/round2_state_rotation_deg/Validation"),
         }
         for ridx in range(3):
             for name in (
@@ -1187,39 +1178,18 @@ class AbFlowTrainer(Trainer):
         # reported by the mandatory observational Test phase below.
         print(
             "[Validation] "
-            f"epoch={self.epoch} val={self._fmt(summary.get('validation_metric'), 5)}"
+            f"epoch={self.epoch} val={self._fmt(summary.get('validation_metric'), 5)} "
+            f"bridge_s={self._fmt(summary.get('bridge_single_delta_to_base_ratio'), 5)} "
+            f"bridge_z={self._fmt(summary.get('bridge_pair_delta_to_base_ratio_mean'), 5)}"
         )
-        line = (
-            "[ValidationBreakdown] "
-            f"epoch={self.epoch} seq={self._fmt(summary.get('loss_seq'), 5)} "
-            f"struct={self._fmt(summary.get('loss_structure'), 5)} "
-            f"interface={self._fmt(summary.get('loss_interface'), 5)} "
-            f"edge={self._fmt(summary.get('loss_edge'), 5)}"
+        print(
+            "[TimeAuthorityAudit] "
+            f"epoch={self.epoch} "
+            f"R05={self._fmt(summary.get('r05_time_embed_on'), 0)} "
+            f"AbX={self._fmt(summary.get('abx_time_embed_on'), 0)} "
+            f"explicit_routes={self._fmt(summary.get('explicit_time_authority_count'), 0)} "
+            "outer_t_shared_across_three_physical_rounds=1"
         )
-        raw_model = self.model.module if hasattr(self.model, "module") else self.model
-        if bool(getattr(raw_model, "distogram_enabled", False)):
-            line += f" dist={self._fmt(summary.get('distogram_loss'), 5)}"
-        print(line)
-        if float(summary.get('coordinate_state_closed', 0.0) or 0.0) > 0.5:
-            print(
-                "[StateClosure] "
-                f"epoch={self.epoch} r2_post={self._fmt(summary.get('state_post_r2'), 5)} "
-                f"r2_carrier_projection={self._fmt(summary.get('state_projection_r2'), 5)} "
-                f"r2_rotation_deg={self._fmt(summary.get('state_rotation_r2'), 3)}"
-            )
-        if float(summary.get('coordinate_single_endpoint', 0.0) or 0.0) > 0.5:
-            print(
-                "[StateAuthority] "
-                f"epoch={self.epoch} r2_shadow_endpoint_gap={self._fmt(summary.get('single_endpoint_gap_r2'), 5)}"
-            )
-
-        if float(summary.get('coordinate_recurrent_carrier', 0.0) or 0.0) > 0.5:
-            print(
-                "[RecurrentRole] "
-                f"epoch={self.epoch} raw_gap_A={self._fmt(summary.get('role_raw_gap_A'), 4)} "
-                f"centroid_gap_A={self._fmt(summary.get('role_ca_centroid_gap_A'), 4)} "
-                f"ca_pairdist_gap_A={self._fmt(summary.get('role_ca_pairdist_gap_A'), 4)}"
-            )
 
 
     def _accumulate_train_component(self, name, value):
@@ -1384,10 +1354,74 @@ class AbFlowTrainer(Trainer):
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
         return bool(getattr(raw_model, "relational_trunk_enabled", False))
 
+    def _print_singlefield_authority_audit(self, raw_model, val=False):
+        diag = getattr(raw_model, 'last_singlefield_diagnostics', None) or {}
+        mode = str(getattr(raw_model, 'physical_authority_mode', 'legacy_split'))
+        if mode == 'legacy_split' or not diag:
+            return
+
+        def scalar(name):
+            return self._scalar(diag.get(name))
+        def arr(name):
+            v = diag.get(name)
+            if not torch.is_tensor(v):
+                return '[]'
+            vals = v.detach().float().reshape(-1).cpu().tolist()
+            return '[' + ','.join('NA' if not isfinite(float(x)) else f'{float(x):.5f}' for x in vals) + ']'
+
+        final_gap = scalar('final_pred_vs_carrier_x1_rms_A')
+        carrier_rt = scalar('final_carrier_roundtrip_rms_A')
+        endpoint_rt = scalar('final_endpoint_roundtrip_rms_A')
+        phase = 'val' if val else 'train'
+        if self._diag_main_rank:
+            print(
+                '[SingleFieldAuthorityAudit] '
+                f'phase={phase} epoch={self.epoch} step={self.global_step} '
+                f'mode={mode} physical_dof=1 rounds=3 '
+                f'structure_authority=analytic_endpoint_chart '
+                f'transport_authority=analytic_carrier_chart '
+                f'sample_terminal=integrated_carrier '
+                f'final_chart_gap_A={self._fmt(final_gap,6)} '
+                f'carrier_roundtrip_A={self._fmt(carrier_rt,6)} '
+                f'endpoint_roundtrip_A={self._fmt(endpoint_rt,6)} '
+                f'active={self._fmt(scalar("canonical_active_rate"),4)} '
+                f'round_gt_A={arr("round_endpoint_gt_rms_A")} '
+                f'round_step_A={arr("round_endpoint_step_rms_A")} '
+                f'round_carrier_target_A={arr("round_carrier_target_rms_A")} '
+                f'discard_endpoint_A={arr("round_discarded_endpoint_proposal_gap_rms_A")} '
+                f'discard_carrier_A={arr("round_discarded_carrier_proposal_gap_rms_A")}',
+                flush=True,
+            )
+
+        # First ordinary training forward is a distributed fail-fast semantic
+        # contract.  Tolerance is deliberately physical (0.5 A) to accommodate
+        # BF16 arithmetic while still catching a wrong frame/chart by orders of
+        # magnitude.  This check never alters the forward/loss.
+        if (not val) and not self._singlefield_contract_verified:
+            vals = [final_gap, carrier_rt, endpoint_rt]
+            local_ok = all(v is not None and isfinite(float(v)) and abs(float(v)) <= 0.5 for v in vals)
+            device = next(raw_model.parameters()).device
+            status = torch.tensor(1 if local_ok else 0, dtype=torch.int32, device=device)
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(status, op=dist.ReduceOp.MIN)
+            if int(status.item()) != 1:
+                raise RuntimeError(
+                    'Single-field analytic authority contract failed: '
+                    f'mode={mode} final_gap={final_gap} carrier_rt={carrier_rt} endpoint_rt={endpoint_rt}'
+                )
+            self._singlefield_contract_verified = True
+            if self._diag_main_rank:
+                print(
+                    '[SingleFieldContract] PASS '
+                    f'mode={mode} physical_dof=1 frame_aware=1 analytic_roundtrip=PASS '
+                    f'tolerance_A=0.5 all_ranks=PASS',
+                    flush=True,
+                )
+
     def share_step(self, batch, batch_idx, val=False):
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
         # Validation captures epoch diagnostics. Training captures diagnostics
-        # only at the compact science cadence or for the zero-start bridge check.
+        # only at compact science cadence or for the zero-start bridge check.
         science_step_diag = (not val) and (
             int(self.global_step) < self._science_log_first_steps
             or (self._science_log_interval > 0 and int(self.global_step) % self._science_log_interval == 0)
@@ -1397,9 +1431,7 @@ class AbFlowTrainer(Trainer):
             and self._requires_live_bridge_contract()
             and not self._live_bridge_contract_verified
         )
-        capture_diagnostics = (
-            bool(val) or science_step_diag or bridge_contract_probe
-        )
+        capture_diagnostics = bool(val) or science_step_diag or bridge_contract_probe
         raw_model._diagnostic_capture = bool(capture_diagnostics)
         raw_model._diagnostic_validation_mode = bool(val and capture_diagnostics)
 
@@ -1408,6 +1440,9 @@ class AbFlowTrainer(Trainer):
         struct_loss, xloss, bond_loss, sc_bond_loss = structure_detail
         dock_loss, interface_loss, ed_loss, r_ed_losses = dock_detail
         pdev_loss, prmsd_loss = pdev_detail
+
+        if capture_diagnostics and ((not val) or int(batch_idx) == 0):
+            self._print_singlefield_authority_audit(raw_model, val=val)
 
         if not val:
             current_epoch = int(self.epoch)
@@ -1523,8 +1558,28 @@ class AbFlowTrainer(Trainer):
                         f"absmax_A={[round(v, 5) for v in round_absmax]}"
                     )
 
-                # Relational-message -> coordinate-head causal trace from the
-                # exact physical forwards already used to compute this loss.
+                auth_rms = _round_graph_values('per_round_authority_endpoint_rms_A')
+                auth_abs = _round_graph_values('per_round_authority_endpoint_absmax_A')
+                auth_car = _round_graph_values('per_round_authority_carrier_target_rms_A')
+                disc_ep = _round_graph_values('per_round_discarded_endpoint_gap_rms_A')
+                disc_car = _round_graph_values('per_round_discarded_carrier_gap_rms_A')
+                if auth_rms or auth_car:
+                    sf = getattr(raw_model, 'last_singlefield_diagnostics', None) or {}
+                    print(
+                        "[TrainAuthorityRounds] "
+                        f"epoch={self.epoch} step={self.global_step} rank={rank} "
+                        f"mode={getattr(raw_model, 'physical_authority_mode', 'NA')} "
+                        f"worst_graph={worst_idx} "
+                        f"endpoint_gt_rms_A={[round(v, 5) for v in auth_rms]} "
+                        f"endpoint_absmax_A={[round(v, 5) for v in auth_abs]} "
+                        f"carrier_target_rms_A={[round(v, 5) for v in auth_car]} "
+                        f"discard_endpoint_gap_A={[round(v, 5) for v in disc_ep]} "
+                        f"discard_carrier_gap_A={[round(v, 5) for v in disc_car]} "
+                        f"final_chart_gap_A={self._fmt(self._scalar(sf.get('final_pred_vs_carrier_x1_rms_A')), 6)}"
+                    )
+
+                # Exact stage-wise actuator trace from the SAME forward that
+                # produced the outlier.  No legacy key aliases are used.
                 round_egnn = getattr(raw_model, '_last_round_egnn_diagnostics', None) or []
                 def _diag_number(value):
                     try:
@@ -1533,34 +1588,58 @@ class AbFlowTrainer(Trainer):
                         return float(value)
                     except Exception:
                         return None
-                def _diag_stage_max(diag, suffix):
-                    vals = []
-                    for key, value in diag.items():
-                        if not key.endswith(suffix):
-                            continue
-                        val = _diag_number(value)
-                        if val is not None and isfinite(val):
-                            vals.append(val)
-                    return max(vals) if vals else None
+                def _stage(coord_diag, stage, stream):
+                    p = stage + '.'
+                    return {
+                        'a_rms': _diag_number(coord_diag.get(p+'coord_state_coeff_raw_rms')),
+                        'a_max': _diag_number(coord_diag.get(p+'coord_state_coeff_raw_absmax')),
+                        'base_rms': _diag_number(coord_diag.get(p+'coord_base_coeff_raw_rms')),
+                        'base_max': _diag_number(coord_diag.get(p+'coord_base_coeff_raw_absmax')),
+                        'dpair_rms': _diag_number(coord_diag.get(p+'coord_direct_pair_coeff_delta_rms')),
+                        'dpair_max': _diag_number(coord_diag.get(p+'coord_direct_pair_coeff_delta_absmax')),
+                        'lever_rms': _diag_number(coord_diag.get(p+'coord_diff_norm_rms')),
+                        'lever_max': _diag_number(coord_diag.get(p+'coord_diff_norm_absmax')),
+                        'dx_rms': _diag_number(coord_diag.get(p+stream+'_design_update_rms')),
+                        'dx_max': _diag_number(coord_diag.get(p+stream+'_design_update_absmax')),
+                        'w1': _diag_number(coord_diag.get(p+'coord_head_w1_opnorm')),
+                        'w2': _diag_number(coord_diag.get(p+'coord_head_w2_opnorm')),
+                    }
+                def _stage_text(name, vals):
+                    return (
+                        f'{name}[a={self._fmt(vals["a_rms"],5)}/{self._fmt(vals["a_max"],5)} '
+                        f'base={self._fmt(vals["base_rms"],5)}/{self._fmt(vals["base_max"],5)} '
+                        f'dpair={self._fmt(vals["dpair_rms"],5)}/{self._fmt(vals["dpair_max"],5)} '
+                        f'lever={self._fmt(vals["lever_rms"],5)}/{self._fmt(vals["lever_max"],5)} '
+                        f'dx={self._fmt(vals["dx_rms"],5)}/{self._fmt(vals["dx_max"],5)} '
+                        f'w={self._fmt(vals["w1"],5)}/{self._fmt(vals["w2"],5)}]'
+                    )
 
+                n_layers = int(getattr(getattr(raw_model, 'gnn', None), 'n_layers', 0))
                 for rec in round_egnn:
                     coord_diag = rec.get('coord', {}) or {}
-                    candidates = []
-                    for key, value in coord_diag.items():
-                        if key.endswith('.coord_update_absmax'):
-                            val = _diag_number(value)
-                            if val is not None and isfinite(val):
-                                candidates.append((val, key.rsplit('.', 1)[0]))
-                    worst_update = max(candidates, default=(None, 'NA'))
+                    bridge_diag = rec.get('bridge', {}) or {}
+                    native_names = [f'ctx_{i}' for i in range(n_layers)] + ['out']
+                    carrier_names = []
+                    for i in range(n_layers):
+                        carrier_names.extend([f'inter_{i}', f'surf_{i}'])
+                    native_vals = [(st, _stage(coord_diag, st, 'native')) for st in native_names]
+                    carrier_vals = [(st, _stage(coord_diag, st, 'carrier')) for st in carrier_names]
+                    finite_dx = [
+                        (v['dx_max'], st) for st, v in native_vals + carrier_vals
+                        if v['dx_max'] is not None and isfinite(v['dx_max'])
+                    ]
+                    worst = max(finite_dx, default=(None, 'NA'))
                     print(
-                        "[TrainEGNNOutlier] "
+                        "[TrainStageOutlier] "
                         f"epoch={self.epoch} step={self.global_step} rank={rank} "
                         f"physical_round={rec.get('round_idx', 'NA')} "
-                        f"coord_update_absmax={self._fmt(_diag_number(coord_diag.get('coord_update_absmax_max')), 6)} "
-                        f"base_coeff_absmax={self._fmt(_diag_stage_max(coord_diag, '.coord_base_coeff_absmax'), 6)} "
-                        f"state_coeff_absmax={self._fmt(_diag_stage_max(coord_diag, '.coord_state_coeff_absmax'), 6)} "
-                        f"worst_stage={worst_update[1]} "
-                        f"worst_stage_update_absmax={self._fmt(worst_update[0], 6)}"
+                        f"authority={getattr(raw_model, 'physical_authority_mode', 'NA')} "
+                        f"worst_stage={worst[1]} worst_dx_absmax={self._fmt(worst[0],6)} "
+                        f"single_ratio={self._fmt(_diag_number(bridge_diag.get('bridge_single_delta_to_base_ratio')),6)} "
+                        f"pair_sem_ratio={self._fmt(_diag_number(bridge_diag.get('bridge_pair_delta_to_base_ratio_mean')),6)} "
+                        f"pair_coord_ratio={self._fmt(_diag_number(bridge_diag.get('bridge_pair_coordinate_delta_to_base_ratio_mean')),6)} "
+                        "native=" + ';'.join(_stage_text(st,v) for st,v in native_vals) + " "
+                        "carrier=" + ';'.join(_stage_text(st,v) for st,v in carrier_vals)
                     )
 
                 def _safe_preview(value, limit=8):
@@ -1723,7 +1802,6 @@ class AbFlowTrainer(Trainer):
                     'state': _auth_stage_max(cd, '.coord_state_coeff_absmax'),
                     'pair_bounded': _auth_stage_max(cd, '.coord_pair_delta_bounded_absmax'),
                     'update': _auth_num(cd.get('coord_update_absmax_max')),
-                    'update_rms': _auth_num(cd.get('coord_update_rms_max')),
                 })
 
             max_base = max(
@@ -1734,16 +1812,12 @@ class AbFlowTrainer(Trainer):
                 [r['update'] for r in authority_rows if r['update'] is not None],
                 default=None,
             )
-            max_update_rms = max(
-                [r['update_rms'] for r in authority_rows if r['update_rms'] is not None],
-                default=None,
-            )
             authority_interval_hit = bool(
                 self._geometry_authority_interval > 0
                 and int(self.global_step) % self._geometry_authority_interval == 0
             )
             authority_alert = bool(
-                (max_update_rms is not None and max_update_rms >= self._geometry_authority_rms_alert)
+                (max_base is not None and max_base >= self._geometry_authority_base_alert)
                 or (max_update is not None and max_update >= self._geometry_authority_update_alert)
             )
             current_epoch = int(self.epoch)
@@ -1758,15 +1832,18 @@ class AbFlowTrainer(Trainer):
             if allow_alert:
                 self._geometry_authority_alert_count += 1
 
-            if allow_alert:
+            if (authority_interval_hit and self._diag_main_rank) or allow_alert:
                 rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+                tag = 'GeometryAuthorityAlert' if authority_alert else 'GeometryAuthority'
                 print(
-                    '[GeometryDriftAlert] '
+                    f'[{tag}] '
                     f'epoch={self.epoch} step={self.global_step} rank={rank} '
-                    f"dx_rms={[None if r['update_rms'] is None else round(r['update_rms'], 6) for r in authority_rows]} "
-                    f"dx_max={[None if r['update'] is None else round(r['update'], 6) for r in authority_rows]} "
-                    f'rms_alert={self._geometry_authority_rms_alert:g} '
-                    f'max_alert={self._geometry_authority_update_alert:g}'
+                    f"base_coeff_absmax={[None if r['base'] is None else round(r['base'], 6) for r in authority_rows]} "
+                    f"state_coeff_absmax={[None if r['state'] is None else round(r['state'], 6) for r in authority_rows]} "
+                    f"pair_bounded_absmax={[None if r['pair_bounded'] is None else round(r['pair_bounded'], 6) for r in authority_rows]} "
+                    f"coord_update_absmax={[None if r['update'] is None else round(r['update'], 6) for r in authority_rows]} "
+                    f'base_alert={self._geometry_authority_base_alert:g} '
+                    f'update_alert={self._geometry_authority_update_alert:g}'
                 )
 
         log_type = 'Validation' if val else 'Train'
@@ -1812,31 +1889,46 @@ class AbFlowTrainer(Trainer):
                 f"edge={self._fmt(self._scalar(ed_loss), 5)} "
                 f"t={self._fmt(_ad('t_mean'), 3)} "
                 f"s={self._fmt(_sf('relational_single_rms'), 4)} "
-                f"z={self._fmt(_sf('relational_pair_rms'), 4)}"
+                f"z={self._fmt(_sf('relational_pair_rms'), 4)} "
+                f"edge_z=({self._fmt(_ad('abx_ctx_edge_attr_rms'), 4)},"
+                f"{self._fmt(_ad('abx_inter_edge_attr_rms'), 4)},"
+                f"{self._fmt(_ad('abx_surf_edge_attr_rms'), 4)}) "
+                f"bridge_s={self._fmt(_ad('bridge_single_delta_to_base_ratio'), 6)} "
+                f"bridge_z={self._fmt(_ad('bridge_pair_delta_to_base_ratio_mean'), 6)}"
             )
             if bool(getattr(raw_model, "distogram_enabled", False)):
                 print(
                     "[Distogram] "
                     f"epoch={self.epoch} step={self.global_step} "
                     f"scope={getattr(raw_model, 'distogram_pair_scope', 'NA')} "
-                    f"reduction={getattr(getattr(raw_model, 'native_trunk', None), 'distogram_reduction', 'NA')} "
                     f"raw={self._fmt(_sf('distogram_loss'), 6)} "
+                    f"weighted={self._fmt(_sf('distogram_weighted_loss'), 6)} "
+                    f"head_rms={self._fmt(_sf('distogram_head_weight_rms'), 6)} "
+                    f"task_fraction={self._fmt(_sf('distogram_task_pair_fraction'), 4)} "
                     f"pairs=DD:{self._fmt(_sf('distogram_DD_pairs'),0)},"
                     f"DF:{self._fmt(_sf('distogram_DF_pairs'),0)},"
                     f"DA:{self._fmt(_sf('distogram_DA_pairs'),0)} "
+                    f"ctxctx={self._fmt(_sf('distogram_context_context_optimized_pairs'),0)} "
                     f"CE=DD:{self._fmt(_sf('distogram_DD_ce'),4)},"
                     f"DF:{self._fmt(_sf('distogram_DF_ce'),4)},"
-                    f"DA:{self._fmt(_sf('distogram_DA_ce'),4)}"
+                    f"DA:{self._fmt(_sf('distogram_DA_ce'),4)} "
+                    f"DA_contactP={self._fmt(_sf('distogram_da_contact_precision'), 4)}"
                 )
             if bool(getattr(raw_model, "smooth_lddt_enabled", False)):
                 print(
                     "[SmoothLDDT] "
                     f"epoch={self.epoch} step={self.global_step} "
+                    f"source={getattr(raw_model, 'smooth_lddt_prediction_source', 'pred_design_endpoint')} "
                     f"raw={self._fmt(_sf('smooth_lddt_loss'), 6)} "
-                    f"endpoint_rms_A={self._fmt(_sf('smooth_lddt_endpoint_rms_A'), 4)} "
-                    f"DD={self._fmt(_sf('smooth_lddt_DD'), 4)} "
-                    f"DF={self._fmt(_sf('smooth_lddt_DF'), 4)} "
-                    f"DA={self._fmt(_sf('smooth_lddt_DA'), 4)}"
+                    f"weighted={self._fmt(_sf('smooth_lddt_weighted_loss'), 6)} "
+                    f"endpoint_rms_A={self._fmt(_sf('smooth_lddt_endpoint_rms_A'), 5)} "
+                    f"endpoint_absmax_A={self._fmt(_sf('smooth_lddt_endpoint_absmax_A'), 5)} "
+                    f"design_rows={self._fmt(_sf('smooth_lddt_design_rows'), 0)} "
+                    f"coord_rows={self._fmt(_sf('smooth_lddt_coord_rows'), 0)} "
+                    f"coord_outside_design={self._fmt(_sf('smooth_lddt_coord_outside_design_rows'), 0)} "
+                    f"DD={self._fmt(_sf('smooth_lddt_DD'), 5)} "
+                    f"DF={self._fmt(_sf('smooth_lddt_DF'), 5)} "
+                    f"DA={self._fmt(_sf('smooth_lddt_DA'), 5)}"
                 )
         lr = None
         if not val:
@@ -1861,9 +1953,6 @@ class AbFlowTrainer(Trainer):
             self._accumulate_train_component("edge", ed_loss)
             self._accumulate_train_component(
                 "distogram", scorefm_losses.get("distogram_loss")
-            )
-            self._accumulate_train_component(
-                "coarse_anchor", scorefm_losses.get("coarse_anchor_loss")
             )
             self._accumulate_train_component(
                 "smooth_lddt", scorefm_losses.get("smooth_lddt_loss")
