@@ -1040,6 +1040,14 @@ def main(args):
 
     trainer.train(args.gpus, args.local_rank)
 
+    if rank == 0:
+        print(
+            f"[TrainerComplete] epoch={getattr(trainer, 'epoch', 'NA')} "
+            f"global_step={getattr(trainer, 'global_step', 'NA')} "
+            "reason=train_loop_returned",
+            flush=True,
+        )
+
     if is_ddp and torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
 

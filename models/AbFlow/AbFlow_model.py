@@ -91,24 +91,29 @@ class AbFlowModel(nn.Module):
         }
         self.coord_prenorm = self.coord_controller_mode == "egnn_prenorm_raw"
 
-        # V235: one physical coordinate field, two analytically equivalent charts.
-        # The primary chart is the only learned/recurrent physical authority; the
-        # other chart is derived deterministically at every R05 refinement round.
+        # V237: the carrier is the only learned/recurrent H3 Cartesian authority.
+        # The clean endpoint is an analytic chart of that same field.  R73's
+        # endpoint-primary mode was falsified and is deliberately removed from the
+        # formal path instead of being accumulated as another dormant branch.
         authority_config = representation_config.get("physical_authority", {})
         self.physical_authority_mode = str(
             authority_config.get("mode", "legacy_split") or "legacy_split"
         ).strip().lower()
-        _authority_modes = {
-            "legacy_split",
-            "carrier_primary_analytic",
-            "endpoint_primary_analytic",
-        }
+        _authority_modes = {"legacy_split", "carrier_primary_analytic"}
         if self.physical_authority_mode not in _authority_modes:
             raise ValueError(
                 "model.representation.single_pair.physical_authority.mode must be one of "
-                f"{sorted(_authority_modes)}, got {self.physical_authority_mode!r}."
+                f"{sorted(_authority_modes)}, got {self.physical_authority_mode!r}. "
+                "endpoint_primary_analytic was rejected by R73 and is no longer a formal mode."
             )
         self.single_physical_field = self.physical_authority_mode != "legacy_split"
+        self.strict_single_cartesian = bool(
+            authority_config.get("strict_single_cartesian", False)
+        )
+        if self.strict_single_cartesian and self.physical_authority_mode != "carrier_primary_analytic":
+            raise ValueError(
+                "strict_single_cartesian requires physical_authority.mode='carrier_primary_analytic'."
+            )
 
         if self.coord_controller_mode in {"egnn_unit_direction", "egnn_prenorm_raw"} and self.pair_coord_mode != "direct_shared":
             raise ValueError(
@@ -306,6 +311,7 @@ class AbFlowModel(nn.Module):
             'coord_normalize': self.coord_normalize,
             'physical_authority_mode': self.physical_authority_mode,
             'single_physical_field': self.single_physical_field,
+            'strict_single_cartesian': self.strict_single_cartesian,
         }
 
     @staticmethod
@@ -748,7 +754,8 @@ class AbFlowModel(nn.Module):
                         batch_id, memory_H=None, smooth_prob=None, smooth_mask=None,
                         flow_t=None, coord_pep_condition=None,
                         coord_pep_condition_mask=None, seq_pep_condition=None,
-                        seq_pep_condition_mask=None, trunk_state=None):
+                        seq_pep_condition_mask=None, trunk_state=None,
+                        native_design_sync_fn=None):
         H_0, (ctx_edges, _), (atom_embeddings, atom_weights) = self.aa_feature(
             X, S, batch_id, self.k_neighbors, residue_pos,
             smooth_prob=smooth_prob, smooth_mask=smooth_mask)
@@ -846,7 +853,8 @@ class AbFlowModel(nn.Module):
             channel_attr=atom_embeddings, channel_weights=atom_weights,
             ctx_edge_attr=ctx_pair_attr, inter_edge_attr=inter_pair_attr,
             surf_edge_attr=surf_pair_attr, single_attr=trunk_single,
-            capture_bridge_diagnostics=capture_diag)
+            capture_bridge_diagnostics=capture_diag,
+            native_design_sync_fn=native_design_sync_fn)
         if capture_diag:
             def _rms(value):
                 if value is None or value.numel() == 0:
@@ -1070,11 +1078,11 @@ class AbFlowModel(nn.Module):
                  flow_source_init=None):
         """R05 predictor at one outer transport state.
 
-        V235 preserves three physical refinement rounds but enforces one learned
-        physical degree of freedom.  Carrier-primary and endpoint-primary are two
-        analytically equivalent chart choices; the non-primary coordinate proposal
-        remains only an internal message-passing scratch state and is overwritten
-        before recurrence/loss authority.
+        V237 preserves three physical refinement rounds and one learned H3
+        Cartesian degree of freedom.  The carrier is primary; the endpoint is an
+        analytic chart.  With strict_single_cartesian enabled, the native H3 EGNN
+        coordinate proposal is prevented from becoming an intra-round recurrent
+        state, so later ctx layers consume the carrier-consistent endpoint chart.
         """
         batch_id = self.batch_constants['batch_id']
         interface_batch_id = self.batch_constants['interface_batch_id']
@@ -1171,6 +1179,18 @@ class AbFlowModel(nn.Module):
             else:
                 coord_cond = coord_mask = seq_this = seq_mask_this = None
 
+            native_design_sync_fn = None
+            if self.strict_single_cartesian:
+                # Intra-round closure: after every carrier inter/surface update,
+                # map the H3 carrier to its clean-endpoint chart before the next
+                # native ctx layer.  This removes the free shadow H3 Cartesian
+                # recurrence while preserving the mature R05 hidden/message stack.
+                def native_design_sync_fn(carrier_design):
+                    endpoint_interface_sync = self._carrier_to_endpoint_chart(
+                        transport_Xt, source_X0_model, carrier_design, t_int_model)
+                    return self._interface_to_native_model(
+                        endpoint_interface_sync, paratope_mask, batch_id, interface_batch_id)
+
             pred_logits, pred_X_proposal, carrier_proposal, H, edge_dist = self.message_passing(
                 X, S, residue_pos, interface_X, surface, paratope_mask,
                 batch_id, memory_H=memory_H, smooth_prob=pred_S_dist,
@@ -1179,7 +1199,8 @@ class AbFlowModel(nn.Module):
                 coord_pep_condition_mask=coord_mask,
                 seq_pep_condition=seq_this,
                 seq_pep_condition_mask=seq_mask_this,
-                trunk_state=trunk_state)
+                trunk_state=trunk_state,
+                native_design_sync_fn=native_design_sync_fn)
 
             endpoint_proposal_native = pred_X_proposal[paratope_mask]
             if self.physical_authority_mode == 'carrier_primary_analytic':
@@ -1188,21 +1209,11 @@ class AbFlowModel(nn.Module):
                     transport_Xt, source_X0_model, authority_carrier, t_int_model)
                 authority_endpoint_native = self._interface_to_native_model(
                     endpoint_interface, paratope_mask, batch_id, interface_batch_id)
-                # Keep non-authoritative native coordinate heads in the DDP graph
-                # with exactly zero physical/gradient authority.
+                # The native coordinate head remains in the parameter graph for
+                # exact checkpoint/DDP compatibility, but has zero H3 authority.
                 authority_endpoint_native = (
                     authority_endpoint_native + 0.0 * endpoint_proposal_native
                 )
-            elif self.physical_authority_mode == 'endpoint_primary_analytic':
-                authority_endpoint_native = endpoint_proposal_native
-                endpoint_interface = self._native_to_interface_model(
-                    authority_endpoint_native, paratope_mask, batch_id,
-                    interface_batch_id)
-                authority_carrier = self._endpoint_to_carrier_chart(
-                    transport_Xt, source_X0_model, endpoint_interface, t_int_model)
-                # Same graph-preserving zero anchor for the discarded learned
-                # shadow-coordinate proposal.
-                authority_carrier = authority_carrier + 0.0 * carrier_proposal
             else:
                 authority_endpoint_native = endpoint_proposal_native
                 authority_carrier = carrier_proposal
@@ -1261,9 +1272,9 @@ class AbFlowModel(nn.Module):
             proposal_endpoints_native.append(endpoint_proposal_native)
             proposal_carriers_interface.append(carrier_proposal)
 
-            # Three-round physical refinement is preserved.  The next native/full
-            # context receives the endpoint chart of the SAME single physical
-            # field; the next shadow/interface recurrence receives its carrier chart.
+            # Three-round physical refinement is preserved.  Across rounds the
+            # native/full context receives the analytic endpoint chart of the SAME
+            # carrier field; the interface recurrence receives the carrier chart.
             X = X.clone()
             X[cmask] = pred_X[cmask]
             X = self.aa_feature.update_global_coordinates(X, S)
@@ -1451,7 +1462,7 @@ class AbFlowModel(nn.Module):
                 self.last_singlefield_diagnostics = {
                     'physical_dof': X.new_tensor(1.0),
                     'carrier_primary': X.new_tensor(1.0 if self.physical_authority_mode == 'carrier_primary_analytic' else 0.0),
-                    'endpoint_primary': X.new_tensor(1.0 if self.physical_authority_mode == 'endpoint_primary_analytic' else 0.0),
+                    'strict_single_cartesian': X.new_tensor(1.0 if self.strict_single_cartesian else 0.0),
                     'canonical_active_rate': target_info.get('r3_canonical_active_rate', X.new_zeros(())).detach(),
                     'final_pred_vs_carrier_x1_rms_A': _masked_rms_A(final_chart_gap, atom_mask),
                     'final_carrier_roundtrip_rms_A': _masked_rms_A(carrier_rt - r_interface_X[-1], atom_mask),

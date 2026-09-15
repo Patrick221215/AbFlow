@@ -1034,6 +1034,11 @@ class AbFlowTrainer(Trainer):
             "bridge_single_delta_to_base_ratio": m("AbFlowDiag/bridge_single_delta_to_base_ratio/Validation"),
             "bridge_pair_delta_to_base_ratio_mean": m("AbFlowDiag/bridge_pair_delta_to_base_ratio_mean/Validation"),
             "bridge_pair_delta_to_base_ratio_max": m("AbFlowDiag/bridge_pair_delta_to_base_ratio_max/Validation"),
+            "sf_chart_gap_A": m("AbFlowSF/final_chart_gap_A/Validation"),
+            "sf_canonical_active_rate": m("AbFlowSF/canonical_active_rate/Validation"),
+            "sf_latent_gap_r0_A": m("AbFlowSF/latent_native_gap_r0_A/Validation"),
+            "sf_latent_gap_r1_A": m("AbFlowSF/latent_native_gap_r1_A/Validation"),
+            "sf_latent_gap_r2_A": m("AbFlowSF/latent_native_gap_r2_A/Validation"),
             "h3ca_raw_r0": m("AbFlowDiag/val_proxy_round0_h3_ca_rmsd/Validation"),
             "h3ca_raw_r1": m("AbFlowDiag/val_proxy_round1_h3_ca_rmsd/Validation"),
             "h3ca_raw_r2": m("AbFlowDiag/val_proxy_round2_h3_ca_rmsd/Validation"),
@@ -1179,16 +1184,31 @@ class AbFlowTrainer(Trainer):
         print(
             "[Validation] "
             f"epoch={self.epoch} val={self._fmt(summary.get('validation_metric'), 5)} "
-            f"bridge_s={self._fmt(summary.get('bridge_single_delta_to_base_ratio'), 5)} "
-            f"bridge_z={self._fmt(summary.get('bridge_pair_delta_to_base_ratio_mean'), 5)}"
+            f"seq={self._fmt(summary.get('loss_seq'), 5)} "
+            f"struct={self._fmt(summary.get('loss_structure'), 5)} "
+            f"interface={self._fmt(summary.get('loss_interface'), 5)} "
+            f"edge={self._fmt(summary.get('loss_edge'), 5)} "
+            f"aar={self._fmt(summary.get('aar'), 5)}"
         )
         print(
-            "[TimeAuthorityAudit] "
+            "[GeometryValidation] "
             f"epoch={self.epoch} "
-            f"R05={self._fmt(summary.get('r05_time_embed_on'), 0)} "
-            f"AbX={self._fmt(summary.get('abx_time_embed_on'), 0)} "
-            f"explicit_routes={self._fmt(summary.get('explicit_time_authority_count'), 0)} "
-            "outer_t_shared_across_three_physical_rounds=1"
+            f"raw_A=[{self._fmt(summary.get('h3ca_raw_r0'),4)},"
+            f"{self._fmt(summary.get('h3ca_raw_r1'),4)},"
+            f"{self._fmt(summary.get('h3ca_raw_r2'),4)}] "
+            f"aligned_A=[{self._fmt(summary.get('h3ca_aligned_r0'),4)},"
+            f"{self._fmt(summary.get('h3ca_aligned_r1'),4)},"
+            f"{self._fmt(summary.get('h3ca_aligned_r2'),4)}] "
+            f"refine_raw_A={self._fmt(summary.get('refinement_raw_delta'),4)} "
+            f"refine_aligned_A={self._fmt(summary.get('refinement_aligned_delta'),4)} "
+            f"caar={self._fmt(summary.get('caar'),5)} "
+            f"contact_f1={self._fmt(summary.get('contact_f1'),5)} "
+            f"bridge_s={self._fmt(summary.get('bridge_single_delta_to_base_ratio'),4)} "
+            f"bridge_z={self._fmt(summary.get('bridge_pair_delta_to_base_ratio_mean'),4)} "
+            f"chart_gap_A={self._fmt(summary.get('sf_chart_gap_A'),6)} "
+            f"latent_gap_A=[{self._fmt(summary.get('sf_latent_gap_r0_A'),3)},"
+            f"{self._fmt(summary.get('sf_latent_gap_r1_A'),3)},"
+            f"{self._fmt(summary.get('sf_latent_gap_r2_A'),3)}]"
         )
 
 
@@ -1373,7 +1393,10 @@ class AbFlowTrainer(Trainer):
         carrier_rt = scalar('final_carrier_roundtrip_rms_A')
         endpoint_rt = scalar('final_endpoint_roundtrip_rms_A')
         phase = 'val' if val else 'train'
-        if self._diag_main_rank:
+        # V238: the detailed authority line is a startup semantic contract, not a
+        # routine training trace. Long-run mechanism tracking is aggregated in
+        # [GeometryValidation] instead.
+        if (not val) and (not self._singlefield_contract_verified) and self._diag_main_rank:
             print(
                 '[SingleFieldAuthorityAudit] '
                 f'phase={phase} epoch={self.epoch} step={self.global_step} '
@@ -1388,8 +1411,7 @@ class AbFlowTrainer(Trainer):
                 f'round_gt_A={arr("round_endpoint_gt_rms_A")} '
                 f'round_step_A={arr("round_endpoint_step_rms_A")} '
                 f'round_carrier_target_A={arr("round_carrier_target_rms_A")} '
-                f'discard_endpoint_A={arr("round_discarded_endpoint_proposal_gap_rms_A")} '
-                f'discard_carrier_A={arr("round_discarded_carrier_proposal_gap_rms_A")}',
+                f'latent_native_gap_A={arr("round_discarded_endpoint_proposal_gap_rms_A")}',
                 flush=True,
             )
 
@@ -1870,6 +1892,26 @@ class AbFlowTrainer(Trainer):
         abflow_diagnostics = getattr(raw_model, "last_abflow_diagnostics", None) or {}
         for name, value in abflow_diagnostics.items():
             self.log(f"AbFlowDiag/{name}/{log_type}", value, batch_idx, val)
+
+        # V238 compact single-field validation observers. These are detached
+        # diagnostics only; they never enter the objective or checkpoint rule.
+        if val:
+            sf_diag = getattr(raw_model, "last_singlefield_diagnostics", None) or {}
+            for src, dst in (
+                ("final_pred_vs_carrier_x1_rms_A", "final_chart_gap_A"),
+                ("canonical_active_rate", "canonical_active_rate"),
+            ):
+                value = sf_diag.get(src)
+                if value is not None:
+                    self.log(f"AbFlowSF/{dst}/Validation", value, batch_idx, True)
+            latent = sf_diag.get("round_discarded_endpoint_proposal_gap_rms_A")
+            if torch.is_tensor(latent):
+                flat = latent.reshape(-1)
+                for ridx in range(min(3, int(flat.numel()))):
+                    self.log(
+                        f"AbFlowSF/latent_native_gap_r{ridx}_A/Validation",
+                        flat[ridx], batch_idx, True
+                    )
 
         if not val and (
             int(self.global_step) < self._science_log_first_steps

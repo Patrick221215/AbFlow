@@ -1,11 +1,11 @@
 {
   "experiment": {
-    "id": "R72_R05_ABX_SINGLEFIELD_CARRIER_AUTHORITY_ANALYTIC3R_TVT_U02",
-    "parent": "R70_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_CARRIER_TERMINAL_DUALTIME_CTRL_TVT_U02",
-    "factor": "V238 long-run control: validated R72 carrier-primary single physical authority. Formal training horizon is 200 epochs; no short experimental cap. The latent native Cartesian workspace remains non-authoritative and is compared against R74 without changing Pair, dual-time, three-round refinement, losses, sampler, or test protocol.",
+    "id": "R74_R05_ABX_STRICT_SINGLE_CARTESIAN_CARRIER_ANALYTIC3R_TVT_U02",
+    "parent": "R72_R05_ABX_SINGLEFIELD_CARRIER_AUTHORITY_ANALYTIC3R_TVT_U02",
+    "factor": "V238 long-run strict-single-Cartesian arm: carrier remains the only recurrent H3 Cartesian state inside and across all three refinement rounds. Formal training horizon is 200 epochs; no short experimental cap. All R72 Pair, dual-time, loss, sampler and Train->Validation->Test settings remain matched.",
     "protocol": "formal_train_val_test",
-    "diagnostic_role": "r72_singlefield_carrier_primary_analytic3r",
-    "causal_question": "Over a sufficiently long matched training horizon, does retaining a non-authoritative native Cartesian workspace improve or harm H3 local geometry relative to strict single-Cartesian R74?"
+    "diagnostic_role": "r74_strict_single_cartesian_carrier_analytic3r",
+    "causal_question": "After allowing sufficient optimization time, can strict carrier-only Cartesian recurrence match or exceed R72 and mature R05 geometry without a latent native Cartesian workspace?"
   },
   "data": {
     "train": {
@@ -34,7 +34,7 @@
     }
   },
   "training": {
-    "output_dir": "./results_module/R72_R05_ABX_SINGLEFIELD_CARRIER_AUTHORITY_ANALYTIC3R_TVT_U02",
+    "output_dir": "./results_module/R74_R05_ABX_STRICT_SINGLE_CARTESIAN_CARRIER_ANALYTIC3R_TVT_U02",
     "optimizer": {
       "lr": 0.001,
       "final_lr": 0.0001,
@@ -172,12 +172,12 @@
           "rounds": 3,
           "carrier_endpoint_relation": "analytic_f01_gfree_hybrid",
           "frame_conversion": "AG_centered_carrier <-> raw_physical <-> AB_centered_native_endpoint",
-          "non_primary_coordinate_output": "latent_native_geometry_workspace_zero_physical_authority",
+          "non_primary_coordinate_output": "computed_for_checkpoint_compatibility_but_never_recurrent_H3_state",
           "structure_authority": "analytic_endpoint_chart",
           "transport_authority": "analytic_carrier_chart",
           "terminal_authority": "integrated_carrier",
-          "round_recurrence": "carrier_authoritative_across_rounds + analytic_endpoint_view; latent native Cartesian workspace retained inside AMEncoder",
-          "strict_single_cartesian": false
+          "round_recurrence": "carrier_recurrent + endpoint_analytic_view; no free native H3 Cartesian recurrence inside AMEncoder",
+          "strict_single_cartesian": true
         }
       }
     }
@@ -209,7 +209,7 @@
   },
   "generation": {
     "checkpoint": "",
-    "save_dir": "./results_generation/R72_R05_ABX_SINGLEFIELD_CARRIER_AUTHORITY_ANALYTIC3R_TVT_U02",
+    "save_dir": "./results_generation/R74_R05_ABX_STRICT_SINGLE_CARTESIAN_CARRIER_ANALYTIC3R_TVT_U02",
     "batch_size": 20,
     "num_workers": 4,
     "n_steps": 10,
@@ -220,8 +220,8 @@
     "terminal_kabsch_fusion": false,
     "single_physical_field": true,
     "primary_chart": "carrier",
-    "derived_chart": "endpoint",
-    "strict_single_cartesian": false
+    "derived_chart": "analytic_endpoint",
+    "strict_single_cartesian": true
   },
   "evaluation": {
     "metric_workers": 8,

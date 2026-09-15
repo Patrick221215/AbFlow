@@ -109,7 +109,7 @@ class AMEncoder(nn.Module):
         inter_edges, update_mask, inter_update_mask, aligned_edges,
         epi_index, channel_attr, channel_weights, ctx_edge_attr=None,
         inter_edge_attr=None, surf_edge_attr=None, single_attr=None,
-        capture_bridge_diagnostics=False,
+        capture_bridge_diagnostics=False, native_design_sync_fn=None,
     ):
         """Run the R05 physical recurrence with optional Single/Pair conditioning.
 
@@ -119,7 +119,9 @@ class AMEncoder(nn.Module):
         routing or the preferred ``gated_action_residual``
         scalar-action residual, which preserves the mature R05 coordinate actuator.
         No clipping, tanh controller, trust radius, or manual physical step scale is
-        introduced.
+        introduced.  When ``native_design_sync_fn`` is supplied, H3 has exactly one
+        recurrent Cartesian state: carrier updates are authoritative and the native
+        H3 coordinates seen by later ctx layers are an analytic endpoint view.
 
         Historical ``direct_shared`` and ``bounded_residual`` remain available for
         reproducibility only.
@@ -253,20 +255,39 @@ class AMEncoder(nn.Module):
             ctx_layer = self._modules[f'ctx_gcl_{i}']
             native_before = x
             if use_dual:
-                h, h_base, x = ctx_layer.forward_dual(
+                h, h_base, native_candidate = ctx_layer.forward_dual(
                     h, h_base, ctx_edges, x, channel_attr, channel_weights,
                     edge_attr=ctx_edge_attr,
                     capture_bridge_diagnostics=capture_bridge_diagnostics,
                 )
             else:
-                h, x = ctx_layer(
+                h, native_candidate = ctx_layer(
                     h, ctx_edges, x, channel_attr, channel_weights,
                     edge_attr=ctx_edge_attr,
                     capture_bridge_diagnostics=capture_bridge_diagnostics,
                 )
+            if native_design_sync_fn is None:
+                x = native_candidate
+            else:
+                # Keep the original R05 coordinate computation in the graph for
+                # exact checkpoint/DDP compatibility, but do not let its H3 output
+                # become a second recurrent Cartesian state.  Non-H3 context keeps
+                # the mature R05 workspace behavior.
+                x = native_candidate.clone()
+                x[update_mask] = (
+                    native_before[update_mask] + 0.0 * native_candidate[update_mask]
+                )
             collect_pair(ctx_layer)
             collect_coord(ctx_layer, f'ctx_{i}')
             record_path_delta(f'ctx_{i}', 'native', native_before, x, update_mask)
+            if capture_bridge_diagnostics and native_design_sync_fn is not None:
+                candidate_delta = native_candidate - native_before
+                self.last_coord_diagnostics[
+                    f'ctx_{i}.suppressed_native_candidate_design_update_rms'
+                ] = _masked_rms(candidate_delta, update_mask)
+                self.last_coord_diagnostics[
+                    f'ctx_{i}.suppressed_native_candidate_design_update_absmax'
+                ] = _masked_absmax(candidate_delta, update_mask)
 
             # Native R05 shadow interface: native -> shadow.
             inter_h = inter_h.clone()
@@ -315,7 +336,20 @@ class AMEncoder(nn.Module):
             collect_coord(surf_layer, f'surf_{i}')
             record_path_delta(f'surf_{i}', 'carrier', carrier_before_surf, inter_x, inter_update_mask)
 
-            # Shadow -> native.
+            if native_design_sync_fn is not None:
+                # Close the two coordinate views immediately inside the EGNN stack,
+                # not only after the whole AMEncoder call.  Therefore ctx_{i+1}
+                # computes radial features from the carrier-consistent endpoint.
+                synced_design = native_design_sync_fn(inter_x[inter_update_mask])
+                if tuple(synced_design.shape) != tuple(x[update_mask].shape):
+                    raise RuntimeError(
+                        'native_design_sync_fn shape mismatch: '
+                        f'synced={tuple(synced_design.shape)} expected={tuple(x[update_mask].shape)}'
+                    )
+                x = x.clone()
+                x[update_mask] = synced_design + 0.0 * x[update_mask]
+
+            # Carrier hidden state -> native hidden state.
             h = h.clone()
             h[inter_mask] = inter_h
             if use_dual:
@@ -327,20 +361,37 @@ class AMEncoder(nn.Module):
 
         native_before_out = x
         if use_dual:
-            h, h_base, x = self.out_layer.forward_dual(
+            h, h_base, native_candidate = self.out_layer.forward_dual(
                 h, h_base, ctx_edges, x, channel_attr, channel_weights,
                 edge_attr=ctx_edge_attr,
                 capture_bridge_diagnostics=capture_bridge_diagnostics,
             )
         else:
-            h, x = self.out_layer(
+            h, native_candidate = self.out_layer(
                 h, ctx_edges, x, channel_attr, channel_weights,
                 edge_attr=ctx_edge_attr,
                 capture_bridge_diagnostics=capture_bridge_diagnostics,
             )
+        if native_design_sync_fn is None:
+            x = native_candidate
+        else:
+            x = native_candidate.clone()
+            # native_before_out is already synchronized to the final carrier from
+            # the last inter/surface layer.  Keep that endpoint chart authoritative.
+            x[update_mask] = (
+                native_before_out[update_mask] + 0.0 * native_candidate[update_mask]
+            )
         collect_pair(self.out_layer)
         collect_coord(self.out_layer, 'out')
         record_path_delta('out', 'native', native_before_out, x, update_mask)
+        if capture_bridge_diagnostics and native_design_sync_fn is not None:
+            candidate_delta = native_candidate - native_before_out
+            self.last_coord_diagnostics[
+                'out.suppressed_native_candidate_design_update_rms'
+            ] = _masked_rms(candidate_delta, update_mask)
+            self.last_coord_diagnostics[
+                'out.suppressed_native_candidate_design_update_absmax'
+            ] = _masked_absmax(candidate_delta, update_mask)
         ctx_states.append(h)
         ctx_coords.append(x)
 
