@@ -110,47 +110,17 @@ class AMEncoder(nn.Module):
         epi_index, channel_attr, channel_weights, ctx_edge_attr=None,
         inter_edge_attr=None, surf_edge_attr=None, single_attr=None,
         capture_bridge_diagnostics=False,
-        endpoint_to_carrier_sync_fn=None, carrier_to_endpoint_sync_fn=None,
     ):
-        """Run the R05 physical recurrence with optional Single/Pair conditioning.
+        """Run the R72 latent-native / carrier-authoritative recurrence.
 
-        Formal R67 modes keep Pair-state PreNorm and coordinate-head PreNorm.
-        Semantic Pair context enters through a zero-start hidden adapter.  Direct
-        Pair geometry can either use historical ``factorized_direct`` hidden-message
-        routing or the preferred ``gated_action_residual``
-        scalar-action residual, which preserves the mature R05 coordinate actuator.
-        No clipping, tanh controller, trust radius, or manual physical step scale is
-        introduced.
-
-        V242 single-state sequential-operator mode supplies BOTH analytic chart
-        callbacks.  The H3 state then follows one physical trajectory:
-
-            carrier C_i
-              -> endpoint E_i = Phi(C_i)
-              -> R05 local operator: E_i^L = L(E_i)
-              -> carrier chart C_i^L = Phi^{-1}(E_i^L)
-              -> interface/transport operator: C_i^T = T(C_i^L)
-              -> endpoint chart E_{i+1} = Phi(C_i^T).
-
-        Therefore native ctx/out coordinates are no longer a discarded shadow state:
-        their H3 update is immediately written back into the SAME carrier state before
-        the transport operator runs.  Conversely, transport updates are immediately
-        mapped back to the endpoint chart before the next local operator.  There are
-        two sequential geometric operators but only one physical Cartesian state.
+        The native ctx/out coordinate stream is a message-passing workspace only.
+        It can shape hidden features, but it never writes Cartesian coordinates into
+        the physical H3 state.  The inter/surface carrier stream is the sole recurrent
+        Cartesian authority.  This is the exact R72 semantic boundary we want to
+        diagnose against the mature R05 parent; no clipping, tanh controller, trust
+        radius, manual step scale, or second physical coordinate authority is added.
         """
         use_dual = self.pair_coord_mode == 'bounded_residual'
-        sequential_single_state = (
-            endpoint_to_carrier_sync_fn is not None
-            or carrier_to_endpoint_sync_fn is not None
-        )
-        if sequential_single_state and (
-            endpoint_to_carrier_sync_fn is None
-            or carrier_to_endpoint_sync_fn is None
-        ):
-            raise RuntimeError(
-                'sequential single-state geometry requires both endpoint->carrier '
-                'and carrier->endpoint analytic sync callbacks'
-            )
 
         # Parent-preserving Single bridge:
         # h0 = W_parent h + W_single s, W_single(0)=0.
@@ -198,10 +168,6 @@ class AMEncoder(nn.Module):
         coord_state_raw_rms = []
         coord_diff_norm_rms = []
         coord_head_input_rms = []
-        local_to_carrier_sync_gap_rms = []
-        carrier_to_endpoint_sync_gap_rms = []
-        sequential_local_design_update_rms = []
-        sequential_transport_design_update_rms = []
 
         # Path-authority diagnostics are deliberately computed outside the EGNN
         # layer itself, where AMEncoder knows which coordinate stream is being
@@ -294,45 +260,18 @@ class AMEncoder(nn.Module):
                     edge_attr=ctx_edge_attr,
                     capture_bridge_diagnostics=capture_bridge_diagnostics,
                 )
-            # Operator 1: mature R05 local/intrinsic geometry update.
-            # In sequential-single-state mode this H3 update is PHYSICAL: it is
-            # immediately converted into the carrier chart before the transport
-            # operator, rather than becoming a discarded second coordinate field.
+            # Native R05 coordinate workspace: informative for message passing,
+            # but deliberately zero Cartesian authority in R72.
             x = native_candidate
             collect_pair(ctx_layer)
             collect_coord(ctx_layer, f'ctx_{i}')
-            record_path_delta(f'ctx_{i}', 'local', native_before, x, update_mask)
-            if capture_bridge_diagnostics and sequential_single_state:
-                dlocal = x[update_mask] - native_before[update_mask]
-                sequential_local_design_update_rms.append(_masked_rms(dlocal))
-
+            record_path_delta(f'ctx_{i}', 'native', native_before, x, update_mask)
             # Shared hidden state flows from local reasoning into interface reasoning.
             inter_h = inter_h.clone()
             inter_h[inter_update_mask] = h[update_mask]
             if use_dual:
                 inter_h_base = inter_h_base.clone()
                 inter_h_base[inter_update_mask] = h_base[update_mask]
-
-            if sequential_single_state:
-                # Close the SAME physical state after the local operator:
-                # endpoint view -> analytic carrier view.  Only H3 rows change;
-                # antigen/context coordinates in inter_x remain fixed.
-                synced_carrier = endpoint_to_carrier_sync_fn(x[update_mask])
-                if tuple(synced_carrier.shape) != tuple(inter_x[inter_update_mask].shape):
-                    raise RuntimeError(
-                        'endpoint_to_carrier_sync_fn shape mismatch: '
-                        f'synced={tuple(synced_carrier.shape)} '
-                        f'expected={tuple(inter_x[inter_update_mask].shape)}'
-                    )
-                inter_x = inter_x.clone()
-                inter_x[inter_update_mask] = synced_carrier
-                if capture_bridge_diagnostics:
-                    endpoint_rt = carrier_to_endpoint_sync_fn(
-                        inter_x[inter_update_mask]
-                    )
-                    local_to_carrier_sync_gap_rms.append(
-                        _masked_rms(endpoint_rt - x[update_mask])
-                    )
 
             inter_layer = self._modules[f'inter_gcl_{i}']
             carrier_before_inter = inter_x
@@ -352,7 +291,7 @@ class AMEncoder(nn.Module):
                 )
             collect_pair(inter_layer)
             collect_coord(inter_layer, f'inter_{i}')
-            record_path_delta(f'inter_{i}', 'transport', carrier_before_inter, inter_x, inter_update_mask)
+            record_path_delta(f'inter_{i}', 'carrier', carrier_before_inter, inter_x, inter_update_mask)
 
             surf_layer = self._modules[f'surf_gcl_{i}']
             carrier_before_surf = inter_x
@@ -372,31 +311,7 @@ class AMEncoder(nn.Module):
                 )
             collect_pair(surf_layer)
             collect_coord(surf_layer, f'surf_{i}')
-            record_path_delta(f'surf_{i}', 'transport', carrier_before_surf, inter_x, inter_update_mask)
-
-            if sequential_single_state:
-                # Operator 2 has now moved the carrier state.  Convert it back to
-                # the endpoint/native chart before the next local operator.
-                transport_before = x[update_mask]
-                synced_design = carrier_to_endpoint_sync_fn(
-                    inter_x[inter_update_mask]
-                )
-                if tuple(synced_design.shape) != tuple(x[update_mask].shape):
-                    raise RuntimeError(
-                        'carrier_to_endpoint_sync_fn shape mismatch: '
-                        f'synced={tuple(synced_design.shape)} '
-                        f'expected={tuple(x[update_mask].shape)}'
-                    )
-                x = x.clone()
-                x[update_mask] = synced_design
-                if capture_bridge_diagnostics:
-                    sequential_transport_design_update_rms.append(
-                        _masked_rms(x[update_mask] - transport_before)
-                    )
-                    carrier_rt = endpoint_to_carrier_sync_fn(x[update_mask])
-                    carrier_to_endpoint_sync_gap_rms.append(
-                        _masked_rms(carrier_rt - inter_x[inter_update_mask])
-                    )
+            record_path_delta(f'surf_{i}', 'carrier', carrier_before_surf, inter_x, inter_update_mask)
 
             # Transport hidden state -> local hidden state.
             h = h.clone()
@@ -421,28 +336,11 @@ class AMEncoder(nn.Module):
                 edge_attr=ctx_edge_attr,
                 capture_bridge_diagnostics=capture_bridge_diagnostics,
             )
-        # Final R05 local readout is also part of the SAME physical state.
-        # Convert it into the carrier chart so the returned carrier/endpoint pair
-        # remains exactly one state in two analytic charts.
+        # Final native readout remains a latent coordinate workspace only.
         x = native_candidate
         collect_pair(self.out_layer)
         collect_coord(self.out_layer, 'out')
-        record_path_delta('out', 'local', native_before_out, x, update_mask)
-        if sequential_single_state:
-            if capture_bridge_diagnostics:
-                sequential_local_design_update_rms.append(
-                    _masked_rms(x[update_mask] - native_before_out[update_mask])
-                )
-            synced_carrier = endpoint_to_carrier_sync_fn(x[update_mask])
-            inter_x = inter_x.clone()
-            inter_x[inter_update_mask] = synced_carrier
-            if capture_bridge_diagnostics:
-                endpoint_rt = carrier_to_endpoint_sync_fn(
-                    inter_x[inter_update_mask]
-                )
-                local_to_carrier_sync_gap_rms.append(
-                    _masked_rms(endpoint_rt - x[update_mask])
-                )
+        record_path_delta('out', 'native', native_before_out, x, update_mask)
         ctx_states.append(h)
         ctx_coords.append(x)
 
@@ -552,25 +450,5 @@ class AMEncoder(nn.Module):
                 self.last_coord_diagnostics['native_basis_norm_rms_max'] = torch.stack(native_basis).max()
             if native_mech:
                 self.last_coord_diagnostics['native_update_to_alpha_rms_ratio_max'] = torch.stack(native_mech).max()
-
-            self.last_coord_diagnostics['sequential_single_state'] = x.new_tensor(
-                1.0 if sequential_single_state else 0.0
-            )
-            if sequential_local_design_update_rms:
-                vals = torch.stack(sequential_local_design_update_rms)
-                self.last_coord_diagnostics['sequential_local_update_rms_mean'] = vals.mean()
-                self.last_coord_diagnostics['sequential_local_update_rms_max'] = vals.max()
-            if sequential_transport_design_update_rms:
-                vals = torch.stack(sequential_transport_design_update_rms)
-                self.last_coord_diagnostics['sequential_transport_update_rms_mean'] = vals.mean()
-                self.last_coord_diagnostics['sequential_transport_update_rms_max'] = vals.max()
-            if local_to_carrier_sync_gap_rms:
-                self.last_coord_diagnostics['sequential_local_to_carrier_sync_gap_rms_max'] = (
-                    torch.stack(local_to_carrier_sync_gap_rms).max()
-                )
-            if carrier_to_endpoint_sync_gap_rms:
-                self.last_coord_diagnostics['sequential_carrier_to_endpoint_sync_gap_rms_max'] = (
-                    torch.stack(carrier_to_endpoint_sync_gap_rms).max()
-                )
 
         return h, x, inter_x

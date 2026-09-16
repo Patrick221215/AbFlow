@@ -2,10 +2,10 @@
   "experiment": {
     "id": "R72_R05_ABX_SINGLEFIELD_CARRIER_AUTHORITY_ANALYTIC3R_TVT_U02",
     "parent": "R70_R05_ABX_NATIVE_PAIR_EGNN_PRENORM_RAW_CARRIER_TERMINAL_DUALTIME_CTRL_TVT_U02",
-    "factor": "V238 long-run control: validated R72 carrier-primary single physical authority. Formal training horizon is 200 epochs; no short experimental cap. The latent native Cartesian workspace remains non-authoritative and is compared against R74 without changing Pair, dual-time, three-round refinement, losses, sampler, or test protocol.",
+    "factor": "R72 root-cause diagnostic resume: preserve the carrier-primary analytic single physical H3 field exactly; remove the falsified R75 sequential Cartesian writeback; add detached R05-vs-R72 diagnostics for authoritative/proposal intrinsic geometry, Score-Flow time bins, and exact 10-step Test trajectory. No new loss or learned module.",
     "protocol": "formal_train_val_test",
     "diagnostic_role": "r72_singlefield_carrier_primary_analytic3r",
-    "causal_question": "Over a sufficiently long matched training horizon, does retaining a non-authoritative native Cartesian workspace improve or harm H3 local geometry relative to strict single-Cartesian R74?"
+    "causal_question": "Which mechanism added beyond mature R05 causes the R72 H3 intrinsic/aligned plateau: carrier-authoritative round geometry, latent native workspace information loss/gauge drift, or Score-Flow time/outer integration behavior?"
   },
   "data": {
     "train": {
@@ -172,12 +172,13 @@
           "rounds": 3,
           "carrier_endpoint_relation": "analytic_f01_gfree_hybrid",
           "frame_conversion": "AG_centered_carrier <-> raw_physical <-> AB_centered_native_endpoint",
-          "non_primary_coordinate_output": "latent_native_geometry_workspace_zero_physical_authority",
+          "non_primary_coordinate_output": "native_latent_workspace_zero_cartesian_authority",
           "structure_authority": "analytic_endpoint_chart",
           "transport_authority": "analytic_carrier_chart",
           "terminal_authority": "integrated_carrier",
-          "round_recurrence": "carrier_authoritative_across_rounds + analytic_endpoint_view; latent native Cartesian workspace retained inside AMEncoder",
-          "strict_single_cartesian": false
+          "round_recurrence": "analytic_endpoint_to_native_context + carrier_to_interface_context",
+          "geometric_operator_mode": "latent_native_workspace",
+          "diagnostic_hypothesis": "compare mature-R05 local/intrinsic capability against R72-added carrier/Score-Flow/Single-Pair mechanisms without changing training objective"
         }
       }
     }
@@ -221,11 +222,19 @@
     "single_physical_field": true,
     "primary_chart": "carrier",
     "derived_chart": "endpoint",
-    "strict_single_cartesian": false
+    "geometric_operator_mode": "latent_native_workspace"
   },
   "evaluation": {
     "metric_workers": 8,
     "keep_structures": false,
-    "failure_policy": "record_and_continue"
+    "failure_policy": "record_and_continue",
+    "root_cause_diagnostics": {
+      "validation_authority_round_geometry": true,
+      "validation_native_proposal_geometry": true,
+      "validation_scoreflow_time_bins": 5,
+      "test_exact_trajectory": true,
+      "h3_intrinsic_pair_distance_mae": true,
+      "kabsch_metric_only_no_coordinate_mutation": true
+    }
   }
 }

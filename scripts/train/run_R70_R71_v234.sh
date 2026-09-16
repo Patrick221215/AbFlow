@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# V242 unified launcher for the active single-field R72 parent and the
-# single-state/two-sequential-operator R75 repair. GPU count is runtime-only.
+# R72 root-cause diagnostic launcher.  The formal mainline is carrier-primary
+# single-field only; the falsified R75 sequential Cartesian writeback is removed.
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PROJECT_ROOT=${ABFLOW_PROJECT_ROOT:-$ROOT}
 CONFIG_PATH=${1:-}
@@ -12,17 +12,15 @@ GPU_CSV=""; MASTER_PORT=""; MASTER_ADDR=""; RESUME_CHECKPOINT=""
 usage() {
   cat >&2 <<'USAGE'
 Usage:
-  bash scripts/train/run_R70_R71_v234.sh <R72-or-R75-config.json> \
-    --gpus 2,3,4,5,6,7 --port 29775 \
+  bash scripts/train/run_R70_R71_v234.sh <R72-config.json> \
+    --gpus 2,3,4,5,6,7 --port 29772 \
     [--resume /same-experiment/version_N/checkpoint/last_stepXXXX.pt]
 
-V242:
-  R72 = current carrier-primary parent (latent native workspace; historical control).
-  R75 = one physical state + two sequential geometric operators:
-        R05 local endpoint operator -> analytic endpoint->carrier sync ->
-        interface/Score-Flow transport operator -> analytic carrier->endpoint sync.
-
-The launcher never hard-codes GPU count and never overrides max_epoch/context_ratio.
+Formal R72 root-cause resume:
+  - carrier is the only recurrent/terminal Cartesian authority;
+  - native ctx/out coordinates are latent workspace only;
+  - Train -> Validation -> observational 10-step Test remains unchanged;
+  - diagnostics are detached observers, with no new loss/module/sampler mutation.
 USAGE
 }
 
@@ -130,10 +128,12 @@ export ABFLOW_EPOCH_TEST_FAIL_FAST=on
 export ABFLOW_EPOCH_TEST_MODEL_INVALID_POLICY=record_and_continue
 export ABFLOW_EPOCH_TEST_SHOW_SAMPLE_PROGRESS="${ABFLOW_EPOCH_TEST_SHOW_SAMPLE_PROGRESS:-on}"
 
-# Progress bars ON; routine forensic spam OFF. Outlier forensics remain available.
+# Progress bars ON; routine forensic spam OFF.  The compact R72 Test trajectory
+# observer is ON and reuses the exact formal sampler forwards.
 export ABFLOW_TQDM="${ABFLOW_TQDM:-on}"
 export ABFLOW_GEOMETRY_FORENSICS="${ABFLOW_GEOMETRY_FORENSICS:-off}"
 export ABFLOW_SAMPLE_FORENSICS="${ABFLOW_SAMPLE_FORENSICS:-off}"
+export ABFLOW_SAMPLE_AUTHORITY_DIAGNOSTICS="${ABFLOW_SAMPLE_AUTHORITY_DIAGNOSTICS:-on}"
 export ABFLOW_COORD_AUDIT_INTERVAL="${ABFLOW_COORD_AUDIT_INTERVAL:-1000000000}"
 export ABFLOW_COORD_AUDIT_FIRST_STEPS="${ABFLOW_COORD_AUDIT_FIRST_STEPS:-0}"
 export ABFLOW_GEOMETRY_AUTHORITY_INTERVAL=0
@@ -159,38 +159,30 @@ cp,out=sys.argv[1:3]; cfg=json.load(open(cp,encoding='utf-8')); exp=cfg['experim
 eid=exp['id']; stem=os.path.splitext(os.path.basename(cp))[0]; role=str(exp.get('diagnostic_role','')).lower()
 if not (eid==stem==os.path.basename(os.path.normpath(out))): raise SystemExit(f'identity mismatch: {eid} / {stem} / {out}')
 if exp.get('protocol')!='formal_train_val_test': raise SystemExit('formal_train_val_test required')
+if role!='r72_singlefield_carrier_primary_analytic3r': raise SystemExit(f'R72 diagnostic role required, got {role!r}')
 loader=cfg['training']['loader']
 if int(loader.get('per_gpu_batch_size',0)) <= 0: raise SystemExit('per_gpu_batch_size must be positive')
-if int(cfg['training']['schedule']['max_epoch']) != 200: raise SystemExit('V242 development protocol requires max_epoch=200')
-if int(cfg['model']['architecture']['iter_round']) != 3: raise SystemExit('V242 requires three physical rounds')
+if int(cfg['training']['schedule']['max_epoch']) != 200: raise SystemExit('R72 development horizon must remain 200 epochs')
+if int(cfg['model']['architecture']['iter_round']) != 3: raise SystemExit('R72 requires three physical rounds')
 sp=cfg['model']['representation']['single_pair']; pc=sp['pair_coordinate']; cc=sp['coordinate_controller']; pa=sp['physical_authority']
-if pc.get('mode')!='direct_shared': raise SystemExit('Pair direct_shared must remain unchanged')
+if pc.get('mode')!='direct_shared': raise SystemExit('Pair direct_shared must remain unchanged during root-cause diagnosis')
 if cc.get('mode')!='egnn_prenorm_raw': raise SystemExit('R05 raw Cartesian + coordinate PreNorm must remain unchanged')
-if not bool(sp.get('time_embed',True)): raise SystemExit('validated explicit time routing must remain enabled')
+if not bool(sp.get('time_embed',True)): raise SystemExit('explicit Single/Pair time routing must remain enabled for diagnosis')
 if float(cfg['loss']['distogram'].get('weight',0)) != 0: raise SystemExit('Distogram must remain off')
 if float(cfg['loss']['smooth_lddt'].get('weight',0)) != 0: raise SystemExit('smooth-lDDT must remain off')
-if pa.get('mode')!='carrier_primary_analytic': raise SystemExit('carrier_primary_analytic is the only formal physical authority')
-if int(pa.get('physical_dof',0)) != 1: raise SystemExit('exactly one physical H3 state is required')
-if int(pa.get('rounds',0)) != 3: raise SystemExit('authority must close in all three rounds')
-expected={
- 'r72_singlefield_carrier_primary_analytic3r':'latent_native_workspace',
- 'r75_single_state_sequential_local_transport_analytic3r':'sequential_local_then_transport',
-}
-if role not in expected: raise SystemExit(f'unsupported V242 role: {role!r}')
-op=str(pa.get('geometric_operator_mode','latent_native_workspace')).lower()
-if op != expected[role]: raise SystemExit(f'{role} requires geometric_operator_mode={expected[role]}, got {op}')
-if bool(pa.get('strict_single_cartesian',False)): raise SystemExit('retired strict_single_cartesian branch must not be enabled')
+if pa.get('mode')!='carrier_primary_analytic': raise SystemExit('carrier_primary_analytic is the only formal R72 authority')
+if int(pa.get('physical_dof',0)) != 1 or int(pa.get('rounds',0)) != 3: raise SystemExit('R72 requires one physical H3 field and three rounds')
+if str(pa.get('geometric_operator_mode','latent_native_workspace')).lower()!='latent_native_workspace': raise SystemExit('R75 sequential Cartesian writeback is forbidden')
 gen=cfg['generation']
 if gen.get('terminal_coordinate_authority')!='integrated_carrier_direct_h3': raise SystemExit('integrated carrier terminal required')
 if bool(gen.get('terminal_kabsch_fusion',True)): raise SystemExit('terminal Kabsch fusion forbidden')
 if gen.get('fixed_context')!='unchanged_exactly': raise SystemExit('fixed context must remain exact')
 print(f'[ExperimentIdentity] PASS id={eid} role={role} protocol={exp["protocol"]}')
-print(f'[PhysicalStateContract] physical_dof=1 authority=carrier endpoint=analytic operator_mode={op} rounds=3')
-if op=='sequential_local_then_transport':
-    print('[SequentialOperatorContract] local=R05_ctx_out_endpoint physical_writeback=analytic_endpoint_to_carrier transport=inter_surface_carrier resync=analytic_carrier_to_endpoint')
+print('[PhysicalStateContract] physical_dof=1 authority=carrier endpoint=analytic native_cartesian=latent_zero_authority rounds=3')
+print('[R05DeltaContract] added_mechanisms=SinglePair+explicit_time+carrier_scoreflow diagnostics=round_authority+native_proposal+time_bins+test_trajectory')
 print('[CoordinateControllerContract] pair=direct_shared controller=egnn_prenorm_raw raw_R05_vector=1 no_tanh=1 no_clipping=1 no_trust_radius=1')
-print('[LossContract] weights=sequence1+structure1+interface1+edge1 distogram0 smooth_lddt0 unchanged=1')
-print('[DiagnosticsContract] GeometryValidation=on TrainValidationGap=on SequentialOperatorValidation=on routine_stage_trace=off progress=train+validation+test:on')
+print('[LossContract] sequence1+structure1+interface1+edge1 distogram0 smooth_lddt0 new_loss=0')
+print('[DiagnosticsContract] R72GeometryValidation=on R72TimeValidation=on R72TestTrajectory=on routine_stage_trace=off progress=train+validation+test:on')
 PY
 
 python -m py_compile \
@@ -200,19 +192,30 @@ python -m py_compile \
   "$PROJECT_ROOT/trainer/AbFlow_trainer.py" \
   "$PROJECT_ROOT/train.py"
 
-grep -Fq "sequential_local_then_transport" "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo "V242 sequential operator model path missing" >&2; exit 2; }
-grep -Fq "endpoint_to_carrier_sync_fn" "$PROJECT_ROOT/models/modules/am_enc.py" || { echo "local->carrier writeback missing" >&2; exit 2; }
-grep -Fq "carrier_to_endpoint_sync_fn" "$PROJECT_ROOT/models/modules/am_enc.py" || { echo "carrier->endpoint resync missing" >&2; exit 2; }
-grep -Fq "[SequentialOperatorValidation]" "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo "operator validation log missing" >&2; exit 2; }
+if grep -R -Fq "sequential_local_then_transport" \
+  "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" \
+  "$PROJECT_ROOT/models/modules/am_enc.py"; then
+  echo "retired R75 sequential Cartesian writeback is still present" >&2; exit 2
+fi
+if grep -R -Fq "endpoint_to_carrier_sync_fn" \
+  "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" \
+  "$PROJECT_ROOT/models/modules/am_enc.py"; then
+  echo "retired R75 endpoint->carrier callback is still present" >&2; exit 2
+fi
 if grep -Fq "elif self.physical_authority_mode == 'endpoint_primary_analytic'" "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py"; then
   echo "retired R73 endpoint-primary branch is present" >&2; exit 2
 fi
+grep -Fq "def _validation_proxy_diagnostics" "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo "R72 validation diagnostics missing" >&2; exit 2; }
+grep -Fq "r72_prop_auth_r" "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo "native-proposal root-cause diagnostics missing" >&2; exit 2; }
+grep -Fq "[R72GeometryValidation]" "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo "R72 geometry summary missing" >&2; exit 2; }
+grep -Fq "[R72TimeValidation]" "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo "R72 time-bin summary missing" >&2; exit 2; }
+grep -Fq "[R72TestTrajectory]" "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo "R72 Test trajectory summary missing" >&2; exit 2; }
 grep -Fq "gen_X[paratope_mask] = interface_X_final" "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo "direct integrated carrier terminal missing" >&2; exit 2; }
 if grep -Fq "gen_X[ab] = torch.matmul(gen_X[ab], R.T) + trans" "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py"; then
   echo "legacy terminal Kabsch mutation is present" >&2; exit 2
 fi
 grep -Fq "return 0.5 * (cos(step / self.max_step * pi) + 1) * 0.9" "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo "context_ratio changed unexpectedly" >&2; exit 2; }
-echo "[Preflight] py_compile=PASS single_physical_state=PASS sequential_two_operators=PASS endpoint_primary_removed=PASS terminal_carrier=PASS no_terminal_kabsch=PASS context_ratio_unchanged=PASS"
+echo "[Preflight] py_compile=PASS r72_carrier_only=PASS r75_sequential_removed=PASS endpoint_primary_removed=PASS root_cause_diagnostics=PASS terminal_carrier=PASS no_terminal_kabsch=PASS context_ratio_unchanged=PASS"
 
 python - "$PROJECT_ROOT" <<'PY'
 import hashlib,os,sys

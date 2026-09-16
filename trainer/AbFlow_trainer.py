@@ -621,12 +621,7 @@ class AbFlowTrainer(Trainer):
 
 
     def _print_epoch_test_authority_trace(self, local_records):
-        """Aggregate model.sample authority diagnostics across Test ranks.
-
-        This is observation-only: records were collected from the exact forwards
-        already performed by the formal Test sampler.  No extra model query, RNG
-        call, sampler step, or metric computation is introduced.
-        """
+        """Aggregate geometry diagnostics from the exact formal 10-step Test."""
         gathered = [local_records]
         if dist.is_available() and dist.is_initialized():
             gathered = [None for _ in range(dist.get_world_size())]
@@ -639,59 +634,46 @@ class AbFlowTrainer(Trainer):
                 rows.extend(item)
         if not rows:
             return
-        fields = (
-            'seq_raw_ratio', 'seq_applied_ratio', 'seq_clip', 'seq_map_change',
-            'base_raw_ratio', 'base_applied_ratio', 'base_clip',
-            'edge_raw_ratio', 'edge_applied_ratio', 'edge_clip',
-            'coord_field_rms_A',
-        )
         by_step = {}
         for row in rows:
-            step = int(row.get('step', -1))
-            if step < 0:
+            try:
+                step = int(row.get('step', -1))
+            except Exception:
                 continue
-            by_step.setdefault(step, []).append(row)
+            if step >= 0:
+                by_step.setdefault(step, []).append(row)
+        steps = sorted(by_step)
+        if not steps:
+            return
 
         def mean_at(step, field):
             vals = []
             for row in by_step.get(step, []):
                 try:
-                    val = float(row.get(field, float('nan')))
+                    value = float(row.get(field, float('nan')))
                 except Exception:
                     continue
-                if isfinite(val):
-                    vals.append(val)
+                if isfinite(value):
+                    vals.append(value)
             return sum(vals) / len(vals) if vals else float('nan')
 
-        steps = sorted(by_step)
         def arr(field, nd=3):
-            return '(' + ','.join(self._fmt(mean_at(st, field), nd) for st in steps) + ')'
-        tvals = []
-        for st in steps:
-            vals = []
-            for row in by_step[st]:
-                try:
-                    v = float(row.get('t', float('nan')))
-                except Exception:
-                    continue
-                if isfinite(v):
-                    vals.append(v)
-            tvals.append(sum(vals) / len(vals) if vals else float('nan'))
+            return '[' + ','.join(self._fmt(mean_at(st, field), nd) for st in steps) + ']'
+
+        tvals = [mean_at(st, 't') for st in steps]
         print(
-            '[TestTrajectoryAudit] '
+            '[R72TestTrajectory] '
             f'epoch={self.epoch} '
-            f't=(' + ','.join(self._fmt(v, 2) for v in tvals) + ') '
-            f'seq_raw={arr("seq_raw_ratio")} '
-            f'seq_applied={arr("seq_applied_ratio")} '
-            f'seq_clip={arr("seq_clip")} '
-            f'seq_map_change={arr("seq_map_change")} '
-            f'base_raw={arr("base_raw_ratio")} '
-            f'base_applied={arr("base_applied_ratio")} '
-            f'base_clip={arr("base_clip")} '
-            f'edge_raw={arr("edge_raw_ratio")} '
-            f'edge_applied={arr("edge_applied_ratio")} '
-            f'edge_clip={arr("edge_clip")} '
-            f'coord_field_A={arr("coord_field_rms_A", 4)}'
+            f't=[' + ','.join(self._fmt(v, 2) for v in tvals) + '] '
+            f'x1_raw_A={arr("x1_raw_A",4)} '
+            f'x1_aligned_A={arr("x1_aligned_A",4)} '
+            f'x1_pair_A={arr("x1_pair_mae_A",4)} '
+            f'xnext_raw_A={arr("xnext_raw_A",4)} '
+            f'xnext_aligned_A={arr("xnext_aligned_A",4)} '
+            f'xnext_pair_A={arr("xnext_pair_mae_A",4)} '
+            f'bridge_s={arr("bridge_single_ratio",3)} '
+            f'bridge_z={arr("bridge_pair_ratio",3)} '
+            f'bridge_coord={arr("bridge_pair_coord_ratio",3)}'
         )
 
     def _valid_epoch(self, device):
@@ -796,7 +778,6 @@ class AbFlowTrainer(Trainer):
             if self.writer is not None:
                 self.writer.flush()
             self._print_validation_audits(validation_summary)
-            self._print_train_validation_gap(train_summary, validation_summary)
         self.writer_buffer = {}
 
         # V203 fixed third phase: every epoch performs formal EMA rollout Test.
@@ -989,301 +970,111 @@ class AbFlowTrainer(Trainer):
         return total / count, int(round(count))
 
     def _build_validation_epoch_summary(self, merged_buffer, valid_metric):
+        """Compact R72 root-cause summary; intentionally drops retired diagnostics."""
         m = lambda key: self._buffer_mean(merged_buffer, key)
         summary = {
-            "epoch": int(self.epoch),
-            "global_step": int(self.global_step),
-            "validation_metric": float(valid_metric),
-            "loss_overall": m("Overall/Loss/Validation"),
-            "loss_seq": m("Seq/SNLL/Validation"),
-            "aar": m("Seq/AAR/Validation"),
-            "loss_structure": m("Struct/StructLoss/Validation"),
-            "loss_interface": m("Dock/SPLoss/Validation"),
-            "loss_edge": m("Dock/EDLoss/Validation"),
-            "distogram_loss": m("DTM/distogram_loss/Validation"),
-            "smooth_lddt_loss": m("DTM/smooth_lddt_loss/Validation"),
-            "smooth_lddt_DD": m("DTM/smooth_lddt_DD/Validation"),
-            "smooth_lddt_DF": m("DTM/smooth_lddt_DF/Validation"),
-            "smooth_lddt_DA": m("DTM/smooth_lddt_DA/Validation"),
-            "relational_single_rms": m("DTM/relational_single_rms/Validation"),
-            "relational_pair_rms": m("DTM/relational_pair_rms/Validation"),
-            "relational_antigen_keep_fraction": m("DTM/relational_antigen_keep_fraction/Validation"),
-            "distogram_da_ce": m("DTM/distogram_da_ce/Validation"),
-            "distogram_da_contact_precision": m("DTM/distogram_da_contact_precision/Validation"),
-            "distogram_head_weight_rms": m("DTM/distogram_head_weight_rms/Validation"),
-            "distogram_task_pair_fraction": m("DTM/distogram_task_pair_fraction/Validation"),
-            "distogram_DD_ce": m("DTM/distogram_DD_ce/Validation"),
-            "distogram_DF_ce": m("DTM/distogram_DF_ce/Validation"),
-            "distogram_DA_ce": m("DTM/distogram_DA_ce/Validation"),
-            "distogram_context_context_optimized_pairs": m(
-                "DTM/distogram_context_context_optimized_pairs/Validation"
-            ),
-            "r05_parent_static_bio_rms": m("AbFlowDiag/r05_parent_static_bio_rms/Validation"),
-            "r05_parent_dynamic_bio_rms": m("AbFlowDiag/r05_parent_dynamic_bio_rms/Validation"),
-            "abx_single_bio_rms": m("AbFlowDiag/abx_single_bio_rms/Validation"),
-            "r05_time_embed_on": m("AbFlowDiag/r05_time_embed_on/Validation"),
-            "abx_time_embed_on": m("AbFlowDiag/abx_time_embed_on/Validation"),
-            "explicit_time_authority_count": m(
-                "AbFlowDiag/explicit_time_authority_count/Validation"
-            ),
-            "abx_ctx_edge_attr_rms": m("AbFlowDiag/abx_ctx_edge_attr_rms/Validation"),
-            "abx_inter_edge_attr_rms": m("AbFlowDiag/abx_inter_edge_attr_rms/Validation"),
-            "abx_surf_edge_attr_rms": m("AbFlowDiag/abx_surf_edge_attr_rms/Validation"),
-            "abx_ctx_edge_count": m("AbFlowDiag/abx_ctx_edge_count/Validation"),
-            "abx_inter_edge_count": m("AbFlowDiag/abx_inter_edge_count/Validation"),
-            "abx_surf_edge_count": m("AbFlowDiag/abx_surf_edge_count/Validation"),
-            "bridge_single_delta_to_base_ratio": m("AbFlowDiag/bridge_single_delta_to_base_ratio/Validation"),
-            "bridge_pair_delta_to_base_ratio_mean": m("AbFlowDiag/bridge_pair_delta_to_base_ratio_mean/Validation"),
-            "bridge_pair_delta_to_base_ratio_max": m("AbFlowDiag/bridge_pair_delta_to_base_ratio_max/Validation"),
-            "sf_chart_gap_A": m("AbFlowSF/final_chart_gap_A/Validation"),
-            "sf_canonical_active_rate": m("AbFlowSF/canonical_active_rate/Validation"),
-            "sf_latent_gap_r0_A": m("AbFlowSF/latent_native_gap_r0_A/Validation"),
-            "sf_latent_gap_r1_A": m("AbFlowSF/latent_native_gap_r1_A/Validation"),
-            "sf_latent_gap_r2_A": m("AbFlowSF/latent_native_gap_r2_A/Validation"),
-            "h3ca_raw_r0": m("AbFlowDiag/val_proxy_round0_h3_ca_rmsd/Validation"),
-            "h3ca_raw_r1": m("AbFlowDiag/val_proxy_round1_h3_ca_rmsd/Validation"),
-            "h3ca_raw_r2": m("AbFlowDiag/val_proxy_round2_h3_ca_rmsd/Validation"),
-            "h3ca_aligned_r0": m("AbFlowDiag/val_proxy_round0_h3_ca_aligned_rmsd/Validation"),
-            "h3ca_aligned_r1": m("AbFlowDiag/val_proxy_round1_h3_ca_aligned_rmsd/Validation"),
-            "h3ca_aligned_r2": m("AbFlowDiag/val_proxy_round2_h3_ca_aligned_rmsd/Validation"),
-            "aar_r0": m("AbFlowDiag/val_proxy_round0_aar/Validation"),
-            "aar_r1": m("AbFlowDiag/val_proxy_round1_aar/Validation"),
-            "aar_r2": m("AbFlowDiag/val_proxy_round2_aar/Validation"),
-            "refinement_raw_delta": m("AbFlowDiag/val_proxy_refinement_raw_rmsd_delta/Validation"),
-            "refinement_aligned_delta": m("AbFlowDiag/val_proxy_refinement_aligned_rmsd_delta/Validation"),
-            "raw_gain_01": m("AbFlowDiag/val_proxy_raw_gain_01/Validation"),
-            "raw_gain_12": m("AbFlowDiag/val_proxy_raw_gain_12/Validation"),
-            "aligned_gain_01": m("AbFlowDiag/val_proxy_aligned_gain_01/Validation"),
-            "aligned_gain_12": m("AbFlowDiag/val_proxy_aligned_gain_12/Validation"),
-            "aligned_improve_01_fraction": m("AbFlowDiag/val_proxy_aligned_improve_01_fraction/Validation"),
-            "aligned_improve_12_fraction": m("AbFlowDiag/val_proxy_aligned_improve_12_fraction/Validation"),
-            "aligned_improve_02_fraction": m("AbFlowDiag/val_proxy_aligned_improve_02_fraction/Validation"),
-            "contact_f1": m("AbFlowDiag/val_proxy_native_contact_f1/Validation"),
-            "caar": m("AbFlowDiag/val_proxy_caar/Validation"),
-            "seq_entropy": m("AbFlowDiag/val_proxy_seq_entropy/Validation"),
-            "seq_max_prob": m("AbFlowDiag/val_proxy_seq_max_prob/Validation"),
-            "seq_dominant_map_fraction": m("AbFlowDiag/val_proxy_seq_dominant_map_fraction/Validation"),
-            "seq_unique_map_classes": m("AbFlowDiag/val_proxy_seq_unique_map_classes/Validation"),
-            "proposal_aar": m("AbFlowDiag/seq_pep_vs_native_aar/Validation"),
-            "pred_vs_proposal_aar": m("AbFlowDiag/seq_pred_vs_pep_aar/Validation"),
-            "proposal_change_rate": m("AbFlowDiag/seq_change_from_proposal_rate/Validation"),
-            "proposal_preservation_rate": m("AbFlowDiag/seq_proposal_correct_preservation_rate/Validation"),
-            "proposal_damage_rate": m("AbFlowDiag/seq_proposal_correct_damage_rate/Validation"),
-            "proposal_correction_rate": m("AbFlowDiag/seq_proposal_wrong_correction_rate/Validation"),
-            "mf_single_rms": m("AbFlowDiag/mf_single_rms/Validation"),
-            "mf_pair_rms": m("AbFlowDiag/mf_pair_rms/Validation"),
-            "mf_pair_count": m("AbFlowDiag/mf_pair_count/Validation"),
-            "mf_pair_count_graph_mean": m("AbFlowDiag/mf_pair_count_graph_mean/Validation"),
-            "mf_pair_count_graph_max": m("AbFlowDiag/mf_pair_count_graph_max/Validation"),
-            "mf_local_token_count_graph_mean": m("AbFlowDiag/mf_local_token_count_graph_mean/Validation"),
-            "mf_local_token_count_graph_max": m("AbFlowDiag/mf_local_token_count_graph_max/Validation"),
-            "mf_allatom_pair_rbf_rms": m("AbFlowDiag/mf_allatom_pair_rbf_rms/Validation"),
-            "mf_opm_update_rms": m("AbFlowDiag/mf_opm_update_rms/Validation"),
-            "mf_triangle_update_rms": m("AbFlowDiag/mf_triangle_update_rms/Validation"),
-            "mf_pair_atom_update_rms": m("AbFlowDiag/mf_pair_atom_update_rms/Validation"),
-            "mf_pair_atom_residual_rms": m("AbFlowDiag/mf_pair_atom_residual_rms/Validation"),
-            "mf_pair_atom_adapter_weight_rms": m("AbFlowDiag/mf_pair_atom_adapter_weight_rms/Validation"),
-            "mf_base_residual_rms": m("AbFlowDiag/mf_base_residual_rms/Validation"),
-            "mf_base_residual_applied_rms": m("AbFlowDiag/mf_base_residual_applied_rms/Validation"),
-            "mf_base_raw_to_parent_ratio": m("AbFlowDiag/mf_base_raw_to_parent_ratio/Validation"),
-            "mf_base_applied_to_parent_ratio": m("AbFlowDiag/mf_base_applied_to_parent_ratio/Validation"),
-            "mf_base_authority_clip_fraction": m("AbFlowDiag/mf_base_authority_clip_fraction/Validation"),
-            "mf_base_authority_mean_scale": m("AbFlowDiag/mf_base_authority_mean_scale/Validation"),
-            "mf_edge_raw_ratio": m("AbFlowDiag/mf_edge_raw_ratio/Validation"),
-            "mf_edge_applied_ratio": m("AbFlowDiag/mf_edge_applied_ratio/Validation"),
-            "mf_edge_clip_fraction": m("AbFlowDiag/mf_edge_clip_fraction/Validation"),
-            "mf_edge_mean_scale": m("AbFlowDiag/mf_edge_mean_scale/Validation"),
-            "mf_seq_residual_rms": m("AbFlowDiag/mf_seq_residual_rms/Validation"),
-            "mf_seq_parent_logit_rms": m("AbFlowDiag/mf_seq_parent_logit_rms/Validation"),
-            "mf_seq_final_logit_rms": m("AbFlowDiag/mf_seq_final_logit_rms/Validation"),
-            "mf_seq_raw_residual_to_parent_ratio": m("AbFlowDiag/mf_seq_raw_residual_to_parent_ratio/Validation"),
-            "mf_seq_residual_to_parent_ratio": m("AbFlowDiag/mf_seq_residual_to_parent_ratio/Validation"),
-            "mf_seq_parent_residual_cos": m("AbFlowDiag/mf_seq_parent_residual_cos/Validation"),
-            "mf_seq_parent_to_final_map_change_rate": m("AbFlowDiag/mf_seq_parent_to_final_map_change_rate/Validation"),
-            "mf_seq_authority_clip_fraction": m("AbFlowDiag/mf_seq_authority_clip_fraction/Validation"),
-            "mf_seq_authority_mean_scale": m("AbFlowDiag/mf_seq_authority_mean_scale/Validation"),
-            "mf_single_round_delta_rms": m("AbFlowDiag/mf_single_round_delta_rms/Validation"),
-            "mf_pair_round_delta_rms": m("AbFlowDiag/mf_pair_round_delta_rms/Validation"),
-            "mf_base_adapter_weight_rms": m("AbFlowDiag/mf_base_adapter_weight_rms/Validation"),
-            "mf_seq_adapter_weight_rms": m("AbFlowDiag/mf_seq_adapter_weight_rms/Validation"),
-            "sequence_path_contract_exact": m("AbFlowDiag/sequence_path_contract_exact/Validation"),
-            "sequence_loss_scope_path_noisy": m("AbFlowDiag/sequence_loss_scope_path_noisy/Validation"),
-            "sequence_path_mask_rate": m("AbFlowDiag/sequence_path_mask_rate/Validation"),
-            "sequence_loss_mask_rate": m("AbFlowDiag/sequence_loss_mask_rate/Validation"),
-            "sequence_path_participation_rate": m("AbFlowDiag/sequence_path_participation_rate/Validation"),
-            "sequence_loss_coverage_design": m("AbFlowDiag/sequence_loss_coverage_design/Validation"),
-            "sequence_external_native_context_rate": m("AbFlowDiag/sequence_external_native_context_rate/Validation"),
-            "sequence_noisy_branch_rate": m("AbFlowDiag/sequence_noisy_branch_rate/Validation"),
-            "sequence_clean_branch_rate": m("AbFlowDiag/sequence_clean_branch_rate/Validation"),
-            "sequence_loss_on_noisy_precision": m("AbFlowDiag/sequence_loss_on_noisy_precision/Validation"),
-            "sequence_state_native_fraction": m("AbFlowDiag/sequence_state_native_fraction/Validation"),
-            "t_mean": m("AbFlowDiag/t_mean/Validation"),
-            "t_min": m("AbFlowDiag/t_min/Validation"),
-            "t_max": m("AbFlowDiag/t_max/Validation"),
+            'epoch': int(self.epoch),
+            'global_step': int(self.global_step),
+            'validation_metric': float(valid_metric),
+            'loss_overall': m('Overall/Loss/Validation'),
+            'loss_seq': m('Seq/SNLL/Validation'),
+            'aar': m('Seq/AAR/Validation'),
+            'loss_structure': m('Struct/StructLoss/Validation'),
+            'loss_interface': m('Dock/SPLoss/Validation'),
+            'loss_edge': m('Dock/EDLoss/Validation'),
+            'bridge_single': m('AbFlowDiag/bridge_single_delta_to_base_ratio/Validation'),
+            'bridge_pair': m('AbFlowDiag/bridge_pair_delta_to_base_ratio_mean/Validation'),
+            'bridge_pair_coord': m('AbFlowDiag/bridge_pair_coordinate_delta_to_base_ratio_mean/Validation'),
+            'chart_gap_A': m('AbFlowSF/final_chart_gap_A/Validation'),
+            'canonical_active_rate': m('AbFlowSF/canonical_active_rate/Validation'),
+            'latent_gap_r0_A': m('AbFlowSF/latent_native_gap_r0_A/Validation'),
+            'latent_gap_r1_A': m('AbFlowSF/latent_native_gap_r1_A/Validation'),
+            'latent_gap_r2_A': m('AbFlowSF/latent_native_gap_r2_A/Validation'),
+            'contact_f1': m('AbFlowDiag/r72_contact_f1/Validation'),
+            'caar': m('AbFlowDiag/r72_caar/Validation'),
         }
         for ridx in range(3):
-            op_prefix = f"AbFlowDiag/op_round{ridx}_"
-            summary[f"op_r{ridx}_sequential"] = m(
-                op_prefix + "sequential_single_state/Validation"
-            )
-            summary[f"op_r{ridx}_local_mean_A"] = m(
-                op_prefix + "sequential_local_update_rms_mean_A/Validation"
-            )
-            summary[f"op_r{ridx}_local_max_A"] = m(
-                op_prefix + "sequential_local_update_rms_max_A/Validation"
-            )
-            summary[f"op_r{ridx}_transport_mean_A"] = m(
-                op_prefix + "sequential_transport_update_rms_mean_A/Validation"
-            )
-            summary[f"op_r{ridx}_transport_max_A"] = m(
-                op_prefix + "sequential_transport_update_rms_max_A/Validation"
-            )
-            summary[f"op_r{ridx}_local_sync_gap_A"] = m(
-                op_prefix + "sequential_local_to_carrier_sync_gap_rms_max_A/Validation"
-            )
-            summary[f"op_r{ridx}_transport_sync_gap_A"] = m(
-                op_prefix + "sequential_carrier_to_endpoint_sync_gap_rms_max_A/Validation"
-            )
+            for metric in ('raw_A', 'aligned_A', 'pair_mae_A'):
+                summary[f'auth_r{ridx}_{metric}'] = m(
+                    f'AbFlowDiag/r72_auth_r{ridx}_{metric}/Validation')
+                summary[f'prop_r{ridx}_{metric}'] = m(
+                    f'AbFlowDiag/r72_prop_r{ridx}_{metric}/Validation')
+            summary[f'prop_auth_r{ridx}_aligned_gap_A'] = m(
+                f'AbFlowDiag/r72_prop_auth_r{ridx}_aligned_gap_A/Validation')
+            summary[f'prop_auth_r{ridx}_pair_gap_A'] = m(
+                f'AbFlowDiag/r72_prop_auth_r{ridx}_pair_gap_A/Validation')
+            summary[f'round{ridx}_aar'] = m(
+                f'AbFlowDiag/r72_round{ridx}_aar/Validation')
+        for tag in ('01', '12', '02'):
+            summary[f'auth_aligned_delta_{tag}_A'] = m(
+                f'AbFlowDiag/r72_auth_aligned_delta_A_{tag}/Validation')
+            summary[f'auth_aligned_improve_frac_{tag}'] = m(
+                f'AbFlowDiag/r72_auth_aligned_delta_A_improve_frac_{tag}/Validation')
+            summary[f'auth_pair_delta_{tag}_A'] = m(
+                f'AbFlowDiag/r72_auth_pair_delta_A_{tag}/Validation')
 
-        for ridx in range(3):
-            for name in (
-                "mf_single_rms", "mf_pair_rms", "mf_base_residual_rms",
-                "mf_base_residual_applied_rms",
-                "mf_base_raw_to_parent_ratio", "mf_base_applied_to_parent_ratio",
-                "mf_base_authority_clip_fraction", "mf_base_authority_mean_scale",
-                "mf_edge_raw_ratio", "mf_edge_applied_ratio",
-                "mf_edge_clip_fraction", "mf_edge_mean_scale",
-                "mf_seq_residual_rms", "mf_seq_parent_logit_rms",
-                "mf_seq_final_logit_rms", "mf_seq_raw_residual_to_parent_ratio",
-                "mf_seq_residual_to_parent_ratio",
-                "mf_seq_parent_residual_cos",
-                "mf_seq_parent_to_final_map_change_rate",
-                "mf_seq_authority_clip_fraction", "mf_seq_authority_mean_scale",
-                "mf_single_round_delta_rms", "mf_pair_round_delta_rms",
-            ):
-                summary[f"round{ridx}_{name}"] = m(
-                    f"AbFlowDiag/round{ridx}_{name}/Validation"
-                )
-            for name in (
-                "seq_entropy", "seq_max_prob", "seq_native_prob",
-                "seq_top1_margin",
-            ):
-                summary[f"round{ridx}_{name}"] = m(
-                    f"AbFlowDiag/val_proxy_round{ridx}_{name}/Validation"
-                )
-        for a, b, key in ((0, 1, "aar_delta01"), (1, 2, "aar_delta12")):
-            va, vb = summary.get(f"aar_r{a}"), summary.get(f"aar_r{b}")
-            summary[key] = (
-                float(vb) - float(va)
-                if va is not None and vb is not None
-                and isfinite(float(va)) and isfinite(float(vb))
-                else float("nan")
-            )
-        for bidx in range(5):
-            raw, count = self._weighted_timebin_metric(
-                merged_buffer, bidx, aligned=False
-            )
-            aligned, aligned_count = self._weighted_timebin_metric(
-                merged_buffer, bidx, aligned=True
-            )
-            summary[f"timebin{bidx}_h3ca_raw"] = raw
-            summary[f"timebin{bidx}_h3ca_aligned"] = aligned
-            summary[f"timebin{bidx}_count"] = count
-            summary[f"timebin{bidx}_aligned_count"] = aligned_count
-        # New observers use existing exact DDP validation buffers. CE/AAR bins
-        # use token-count-weighted sums; empty bins have no fabricated score.
-        prefix = 'DTM/r05v173_'
-        for key in merged_buffer:
-            if key.startswith(prefix) and key.endswith('/Validation'):
-                short = key[len(prefix):-len('/Validation')]
-                summary['r05v173_'+short] = m(key)
+        # Weighted by number of complexes, not by validation batch count.
         for b in range(5):
-            count = self._buffer_sum(merged_buffer, prefix+'seq_bin%d_count/Validation'%b)
-            if count > 0:
-                ce_sum = self._buffer_sum(merged_buffer, prefix+'seq_bin%d_ce_sum/Validation'%b)
-                hits = self._buffer_sum(merged_buffer, prefix+'seq_bin%d_correct/Validation'%b)
-                summary['r05v173_seq_bin%d_ce'%b] = ce_sum/count
-                summary['r05v173_seq_bin%d_aar'%b] = hits/count
-                summary['r05v173_seq_bin%d_count'%b] = count
+            for metric in ('raw_A', 'aligned_A', 'pair_mae_A'):
+                sum_key = f'AbFlowDiag/r72_timebin{b}_{metric}_sum/Validation'
+                count_key = f'AbFlowDiag/r72_timebin{b}_{metric}_count/Validation'
+                total = self._buffer_sum(merged_buffer, sum_key)
+                count = self._buffer_sum(merged_buffer, count_key)
+                summary[f'timebin{b}_{metric}'] = total / count if count > 0 else float('nan')
+                if metric == 'aligned_A':
+                    summary[f'timebin{b}_count'] = int(round(count)) if count > 0 else 0
         return summary
 
     def _print_validation_audits(self, summary):
         if not self._is_main_proc():
             return
-        # Proxy validation is used for checkpoint selection.  Do not print
-        # unavailable generator metrics as "nan"; free-running metrics are
-        # reported by the mandatory observational Test phase below.
         print(
-            "[Validation] "
-            f"epoch={self.epoch} val={self._fmt(summary.get('validation_metric'), 5)} "
-            f"seq={self._fmt(summary.get('loss_seq'), 5)} "
-            f"struct={self._fmt(summary.get('loss_structure'), 5)} "
-            f"interface={self._fmt(summary.get('loss_interface'), 5)} "
-            f"edge={self._fmt(summary.get('loss_edge'), 5)} "
-            f"aar={self._fmt(summary.get('aar'), 5)}"
+            '[Validation] '
+            f"epoch={self.epoch} val={self._fmt(summary.get('validation_metric'),5)} "
+            f"seq={self._fmt(summary.get('loss_seq'),5)} "
+            f"struct={self._fmt(summary.get('loss_structure'),5)} "
+            f"interface={self._fmt(summary.get('loss_interface'),5)} "
+            f"edge={self._fmt(summary.get('loss_edge'),5)} "
+            f"aar={self._fmt(summary.get('aar'),5)}"
         )
+        def vals(prefix, metric, nd=4):
+            return '[' + ','.join(
+                self._fmt(summary.get(f'{prefix}_r{r}_{metric}'), nd)
+                for r in range(3)) + ']'
         print(
-            "[GeometryValidation] "
+            '[R72GeometryValidation] '
             f"epoch={self.epoch} "
-            f"raw_A=[{self._fmt(summary.get('h3ca_raw_r0'),4)},"
-            f"{self._fmt(summary.get('h3ca_raw_r1'),4)},"
-            f"{self._fmt(summary.get('h3ca_raw_r2'),4)}] "
-            f"aligned_A=[{self._fmt(summary.get('h3ca_aligned_r0'),4)},"
-            f"{self._fmt(summary.get('h3ca_aligned_r1'),4)},"
-            f"{self._fmt(summary.get('h3ca_aligned_r2'),4)}] "
-            f"refine_raw_A={self._fmt(summary.get('refinement_raw_delta'),4)} "
-            f"refine_aligned_A={self._fmt(summary.get('refinement_aligned_delta'),4)} "
-            f"gain_raw=[{self._fmt(summary.get('raw_gain_01'),4)},"
-            f"{self._fmt(summary.get('raw_gain_12'),4)}] "
-            f"gain_aligned=[{self._fmt(summary.get('aligned_gain_01'),4)},"
-            f"{self._fmt(summary.get('aligned_gain_12'),4)}] "
-            f"aligned_improve_frac=[{self._fmt(summary.get('aligned_improve_01_fraction'),3)},"
-            f"{self._fmt(summary.get('aligned_improve_12_fraction'),3)},"
-            f"{self._fmt(summary.get('aligned_improve_02_fraction'),3)}] "
-            f"caar={self._fmt(summary.get('caar'),5)} "
-            f"contact_f1={self._fmt(summary.get('contact_f1'),5)} "
-            f"bridge_s={self._fmt(summary.get('bridge_single_delta_to_base_ratio'),4)} "
-            f"bridge_z={self._fmt(summary.get('bridge_pair_delta_to_base_ratio_mean'),4)} "
-            f"chart_gap_A={self._fmt(summary.get('sf_chart_gap_A'),6)}"
+            f"auth_raw_A={vals('auth','raw_A')} "
+            f"auth_aligned_A={vals('auth','aligned_A')} "
+            f"auth_pair_A={vals('auth','pair_mae_A')} "
+            f"d_aligned=[{self._fmt(summary.get('auth_aligned_delta_01_A'),4)},"
+            f"{self._fmt(summary.get('auth_aligned_delta_12_A'),4)}] "
+            f"d_pair=[{self._fmt(summary.get('auth_pair_delta_01_A'),4)},"
+            f"{self._fmt(summary.get('auth_pair_delta_12_A'),4)}] "
+            f"prop_raw_A={vals('prop','raw_A')} "
+            f"prop_aligned_A={vals('prop','aligned_A')} "
+            f"prop_pair_A={vals('prop','pair_mae_A')} "
+            f"prop_auth_aligned_gap_A=[{','.join(self._fmt(summary.get(f'prop_auth_r{r}_aligned_gap_A'),4) for r in range(3))}] "
+            f"prop_auth_pair_gap_A=[{','.join(self._fmt(summary.get(f'prop_auth_r{r}_pair_gap_A'),4) for r in range(3))}] "
+            f"round_aar=[{','.join(self._fmt(summary.get(f'round{r}_aar'),4) for r in range(3))}] "
+            f"caar={self._fmt(summary.get('caar'),4)} contact_f1={self._fmt(summary.get('contact_f1'),4)} "
+            f"bridge_s={self._fmt(summary.get('bridge_single'),3)} "
+            f"bridge_z={self._fmt(summary.get('bridge_pair'),3)} "
+            f"bridge_coord={self._fmt(summary.get('bridge_pair_coord'),3)} "
+            f"chart_gap_A={self._fmt(summary.get('chart_gap_A'),6)} "
+            f"latent_gap_A=[{self._fmt(summary.get('latent_gap_r0_A'),3)},"
+            f"{self._fmt(summary.get('latent_gap_r1_A'),3)},"
+            f"{self._fmt(summary.get('latent_gap_r2_A'),3)}]"
         )
-        op_parts = []
-        for ridx in range(3):
-            op_parts.append(
-                f"r{ridx}:local={self._fmt(summary.get(f'op_r{ridx}_local_mean_A'),4)}A"
-                f"/transport={self._fmt(summary.get(f'op_r{ridx}_transport_mean_A'),4)}A"
-                f" sync=[{self._fmt(summary.get(f'op_r{ridx}_local_sync_gap_A'),6)},"
-                f"{self._fmt(summary.get(f'op_r{ridx}_transport_sync_gap_A'),6)}]A"
-            )
+        bins = ('0-.2', '.2-.4', '.4-.6', '.6-.8', '.8-1')
         print(
-            "[SequentialOperatorValidation] "
-            f"epoch={self.epoch} " + " ".join(op_parts)
+            '[R72TimeValidation] '
+            f"epoch={self.epoch} bins=[{','.join(bins)}] "
+            f"aligned_A=[{','.join(self._fmt(summary.get(f'timebin{b}_aligned_A'),4) for b in range(5))}] "
+            f"pair_A=[{','.join(self._fmt(summary.get(f'timebin{b}_pair_mae_A'),4) for b in range(5))}] "
+            f"raw_A=[{','.join(self._fmt(summary.get(f'timebin{b}_raw_A'),4) for b in range(5))}] "
+            f"count=[{','.join(str(summary.get(f'timebin{b}_count',0)) for b in range(5))}]"
         )
-
-
-    def _print_train_validation_gap(self, train_summary, validation_summary):
-        """Print already-computed epoch means; execute no extra forward pass."""
-        if not self._is_main_proc():
-            return
-        pairs = (
-            ('total', 'loss', 'loss_overall'),
-            ('seq', 'seq', 'loss_seq'),
-            ('structure', 'structure', 'loss_structure'),
-            ('interface', 'interface', 'loss_interface'),
-            ('edge', 'edge', 'loss_edge'),
-        )
-        fields = []
-        for label, train_key, val_key in pairs:
-            tr = train_summary.get(train_key, float('nan'))
-            va = validation_summary.get(val_key, float('nan'))
-            try:
-                trf, vaf = float(tr), float(va)
-                gap = vaf - trf if isfinite(vaf) and isfinite(trf) else float('nan')
-            except Exception:
-                gap = float('nan')
-            fields.append(
-                f"{label}=({self._fmt(tr,5)}->{self._fmt(va,5)};gap={self._fmt(gap,5)})"
-            )
-        print(f"[TrainValidationGap] epoch={int(self.epoch)} " + ' '.join(fields))
 
 
     def _accumulate_train_component(self, name, value):
@@ -1469,7 +1260,7 @@ class AbFlowTrainer(Trainer):
         phase = 'val' if val else 'train'
         # V238: the detailed authority line is a startup semantic contract, not a
         # routine training trace. Long-run mechanism tracking is aggregated in
-        # [GeometryValidation] instead.
+        # [R72GeometryValidation] instead.
         if (not val) and (not self._singlefield_contract_verified) and self._diag_main_rank:
             print(
                 '[SingleFieldAuthorityAudit] '
@@ -1481,11 +1272,7 @@ class AbFlowTrainer(Trainer):
                 f'final_chart_gap_A={self._fmt(final_gap,6)} '
                 f'carrier_roundtrip_A={self._fmt(carrier_rt,6)} '
                 f'endpoint_roundtrip_A={self._fmt(endpoint_rt,6)} '
-                f'active={self._fmt(scalar("canonical_active_rate"),4)} '
-                f'round_gt_A={arr("round_endpoint_gt_rms_A")} '
-                f'round_step_A={arr("round_endpoint_step_rms_A")} '
-                f'round_carrier_target_A={arr("round_carrier_target_rms_A")} '
-                f'latent_native_gap_A={arr("round_discarded_endpoint_proposal_gap_rms_A")}',
+                f'active={self._fmt(scalar("canonical_active_rate"),4)}',
                 flush=True,
             )
 
@@ -1960,9 +1747,6 @@ class AbFlowTrainer(Trainer):
             self.log(f'PDev/PRMSDLoss/{log_type}', prmsd_loss, batch_idx, val)
 
         scorefm_losses = getattr(raw_model, "last_scorefm_losses", None) or {}
-        for name, value in scorefm_losses.items():
-            self.log(f"DTM/{name}/{log_type}", value, batch_idx, val)
-
         abflow_diagnostics = getattr(raw_model, "last_abflow_diagnostics", None) or {}
         for name, value in abflow_diagnostics.items():
             self.log(f"AbFlowDiag/{name}/{log_type}", value, batch_idx, val)

@@ -108,34 +108,22 @@ class AbFlowModel(nn.Module):
                 "endpoint_primary_analytic was rejected by R73 and is no longer a formal mode."
             )
         self.single_physical_field = self.physical_authority_mode != "legacy_split"
-        self.geometric_operator_mode = str(
+        # R75's sequential native->carrier Cartesian writeback was falsified.
+        # The formal R72 mainline therefore has one fixed geometry semantics:
+        # native ctx/out coordinates are latent message-passing workspace only,
+        # while the carrier is the sole recurrent/terminal Cartesian authority.
+        self.geometric_operator_mode = "latent_native_workspace"
+        requested_operator = str(
             authority_config.get("geometric_operator_mode", "latent_native_workspace")
             or "latent_native_workspace"
         ).strip().lower()
-        _operator_modes = {
-            "latent_native_workspace",
-            "sequential_local_then_transport",
-        }
-        if self.geometric_operator_mode not in _operator_modes:
+        if requested_operator != "latent_native_workspace":
             raise ValueError(
-                "model.representation.single_pair.physical_authority.geometric_operator_mode "
-                f"must be one of {sorted(_operator_modes)}, got "
-                f"{self.geometric_operator_mode!r}."
-            )
-        if (
-            self.geometric_operator_mode == "sequential_local_then_transport"
-            and self.physical_authority_mode != "carrier_primary_analytic"
-        ):
-            raise ValueError(
-                "sequential_local_then_transport requires "
-                "physical_authority.mode='carrier_primary_analytic'."
+                "Only R72 latent_native_workspace is supported on the formal mainline; "
+                f"got geometric_operator_mode={requested_operator!r}."
             )
         if bool(authority_config.get("strict_single_cartesian", False)):
-            raise ValueError(
-                "strict_single_cartesian is retired in V242. Use "
-                "geometric_operator_mode='sequential_local_then_transport' for "
-                "one physical state with local->transport operator composition."
-            )
+            raise ValueError("strict_single_cartesian is retired from the formal R72 mainline.")
 
         if self.coord_controller_mode in {"egnn_unit_direction", "egnn_prenorm_raw"} and self.pair_coord_mode != "direct_shared":
             raise ValueError(
@@ -324,6 +312,12 @@ class AbFlowModel(nn.Module):
         self._sample_forensic_records = []
         self._sample_forensic_alerted = False
 
+        # R72 root-cause observer: uses the exact formal Test sampler forwards.
+        # Runtime-only; no Parameter/buffer/checkpoint state and no extra RNG.
+        _sad = str(os.environ.get("ABFLOW_SAMPLE_AUTHORITY_DIAGNOSTICS", "off") or "off").strip().lower()
+        self.sample_authority_diagnostics = _sad in {"1", "true", "yes", "y", "on"}
+        self._sample_authority_records = []
+
         # Plain runtime metadata; not part of state_dict.
         self.geometry_coupling_contract = {
             'pair_coord_mode': self.pair_coord_mode,
@@ -394,8 +388,8 @@ class AbFlowModel(nn.Module):
             carrier_stages = []
             for i in range(getattr(self.gnn, 'n_layers', 0)):
                 carrier_stages.extend([f'inter_{i}', f'surf_{i}'])
-            native = ';'.join(stage_payload(d, st, 'local') for st in native_stages)
-            carrier = ';'.join(stage_payload(d, st, 'transport') for st in carrier_stages)
+            native = ';'.join(stage_payload(d, st, 'native') for st in native_stages)
+            carrier = ';'.join(stage_payload(d, st, 'carrier') for st in carrier_stages)
             print(
                 '[StageActuator] '
                 f'train_call={call} round={ridx} mode={self.coord_controller_mode} '
@@ -427,6 +421,14 @@ class AbFlowModel(nn.Module):
         records = list(self._sample_forensic_records)
         self._sample_forensic_records = []
         self._sample_forensic_alerted = False
+        return records
+
+    def reset_sample_authority_diagnostics(self):
+        self._sample_authority_records = []
+
+    def consume_sample_authority_diagnostics(self):
+        records = list(self._sample_authority_records)
+        self._sample_authority_records = []
         return records
 
     @staticmethod
@@ -776,9 +778,7 @@ class AbFlowModel(nn.Module):
                         batch_id, memory_H=None, smooth_prob=None, smooth_mask=None,
                         flow_t=None, coord_pep_condition=None,
                         coord_pep_condition_mask=None, seq_pep_condition=None,
-                        seq_pep_condition_mask=None, trunk_state=None,
-                        endpoint_to_carrier_sync_fn=None,
-                        carrier_to_endpoint_sync_fn=None):
+                        seq_pep_condition_mask=None, trunk_state=None):
         H_0, (ctx_edges, _), (atom_embeddings, atom_weights) = self.aa_feature(
             X, S, batch_id, self.k_neighbors, residue_pos,
             smooth_prob=smooth_prob, smooth_mask=smooth_mask)
@@ -876,9 +876,7 @@ class AbFlowModel(nn.Module):
             channel_attr=atom_embeddings, channel_weights=atom_weights,
             ctx_edge_attr=ctx_pair_attr, inter_edge_attr=inter_pair_attr,
             surf_edge_attr=surf_pair_attr, single_attr=trunk_single,
-            capture_bridge_diagnostics=capture_diag,
-            endpoint_to_carrier_sync_fn=endpoint_to_carrier_sync_fn,
-            carrier_to_endpoint_sync_fn=carrier_to_endpoint_sync_fn)
+            capture_bridge_diagnostics=capture_diag)
         if capture_diag:
             def _rms(value):
                 if value is None or value.numel() == 0:
@@ -1102,14 +1100,12 @@ class AbFlowModel(nn.Module):
                  flow_source_init=None):
         """R05 predictor at one outer transport state.
 
-        V242 preserves three physical refinement rounds and exactly one learned
+        R72 preserves three physical refinement rounds and exactly one learned
         H3 Cartesian degree of freedom.  The carrier is the Score-Flow chart and
-        the endpoint is its analytic clean-structure chart.  In
-        ``sequential_local_then_transport`` mode the mature R05 native ctx/out
-        update and the interface carrier inter/surface update are two SEQUENTIAL
-        operators on that same state: local endpoint update -> analytic carrier
-        sync -> transport update -> analytic endpoint sync.  No second physical
-        coordinate authority exists.
+        the endpoint is its analytic clean-structure chart.  Native ctx/out
+        coordinates are latent message-passing workspace with zero Cartesian
+        authority; only inter/surface carrier updates recurrently move the physical
+        state.
         """
         batch_id = self.batch_constants['batch_id']
         interface_batch_id = self.batch_constants['interface_batch_id']
@@ -1206,29 +1202,6 @@ class AbFlowModel(nn.Module):
             else:
                 coord_cond = coord_mask = seq_this = seq_mask_this = None
 
-            endpoint_to_carrier_sync_fn = None
-            carrier_to_endpoint_sync_fn = None
-            if self.geometric_operator_mode == 'sequential_local_then_transport':
-                # One physical state, two analytic chart views.  The local R05
-                # operator acts in the native endpoint chart; its H3 update is
-                # immediately mapped into the SAME carrier state before the
-                # interface/transport operator.  Transport then maps back to the
-                # endpoint chart before the next local layer.
-                def endpoint_to_carrier_sync_fn(endpoint_native_design):
-                    endpoint_interface = self._native_to_interface_model(
-                        endpoint_native_design, paratope_mask, batch_id,
-                        interface_batch_id)
-                    return self._endpoint_to_carrier_chart(
-                        transport_Xt, source_X0_model, endpoint_interface,
-                        t_int_model)
-
-                def carrier_to_endpoint_sync_fn(carrier_design):
-                    endpoint_interface = self._carrier_to_endpoint_chart(
-                        transport_Xt, source_X0_model, carrier_design, t_int_model)
-                    return self._interface_to_native_model(
-                        endpoint_interface, paratope_mask, batch_id,
-                        interface_batch_id)
-
             pred_logits, pred_X_proposal, carrier_proposal, H, edge_dist = self.message_passing(
                 X, S, residue_pos, interface_X, surface, paratope_mask,
                 batch_id, memory_H=memory_H, smooth_prob=pred_S_dist,
@@ -1237,9 +1210,7 @@ class AbFlowModel(nn.Module):
                 coord_pep_condition_mask=coord_mask,
                 seq_pep_condition=seq_this,
                 seq_pep_condition_mask=seq_mask_this,
-                trunk_state=trunk_state,
-                endpoint_to_carrier_sync_fn=endpoint_to_carrier_sync_fn,
-                carrier_to_endpoint_sync_fn=carrier_to_endpoint_sync_fn)
+                trunk_state=trunk_state)
 
             endpoint_proposal_native = pred_X_proposal[paratope_mask]
             if self.physical_authority_mode == 'carrier_primary_analytic':
@@ -1363,161 +1334,160 @@ class AbFlowModel(nn.Module):
     @torch.no_grad()
     def _validation_proxy_diagnostics(
             self, *, true_X, true_S, pred_S, r_logits,
-            paratope_mask, batch_id, interface_batch_id):
-        """Validation-only round geometry for the authoritative single field.
+            paratope_mask, batch_id, interface_batch_id, t_graph):
+        """R72-only root-cause diagnostics on states already produced by forward.
 
-        IMPORTANT: ``r_interface_X`` is the canonical carrier chart in R72 and
-        must not be compared directly against the clean native endpoint.  The
-        forward pass already stores the frame-correct raw-Angstrom endpoint
-        implied by the authoritative carrier after every physical R05 round in
-        ``_last_round_authority_endpoints_raw``.  Those are exactly the states
-        recurrently fed to the next round (through their analytic endpoint view),
-        so they are the correct objects for testing whether the three-round local
-        refinement still behaves like the strong R05 parent.
+        The diagnostic separates three questions that were conflated before:
+        (1) does the carrier-authoritative endpoint refine H3 intrinsic geometry
+            across the three R05 rounds;
+        (2) does the discarded/native R05 workspace still contain useful shape
+            information even when its absolute Cartesian gauge drifts;
+        (3) is the failure concentrated in a Score-Flow time region added after
+            the mature R05 parent.
 
-        This routine is detached/no-grad.  It changes no loss, state, sampler,
-        checkpoint rule, parameter, buffer, or physical authority.
+        Kabsch and pair-distance calculations are detached metrics only.  They
+        never mutate coordinates and never enter the loss.
         """
         out = {}
-        round_endpoints = list(
-            getattr(self, '_last_round_authority_endpoints_raw', []) or []
-        )
-        if interface_batch_id.numel() == 0 or not round_endpoints:
+        auth_rounds = list(getattr(self, '_last_round_authority_endpoints_raw', []) or [])
+        prop_rounds = list(getattr(self, '_last_round_proposal_endpoints_raw', []) or [])
+        if interface_batch_id.numel() == 0 or not auth_rounds:
             return out
 
         true_int = true_X[paratope_mask]
         ca_idx = 1 if true_int.shape[1] > 1 else 0
-        true_ca = true_int[:, ca_idx].float()
+        true_ca = true_int[:, ca_idx].detach().float()
         n_graph = int(interface_batch_id.max().item()) + 1
 
-        round_raw_graph = []
-        round_aligned_graph = []
-        for ridx, pred_int in enumerate(round_endpoints[:self.round]):
-            pred_ca = pred_int[:, ca_idx].float()
-            raw_values, aligned_values = [], []
+        def graph_geometry(pred_ca, ref_ca):
+            raw_vals, aligned_vals, pair_vals = [], [], []
             for gid in range(n_graph):
                 mask = interface_batch_id == gid
                 if not bool(mask.any()):
-                    raw_values.append(pred_ca.new_tensor(float('nan')))
-                    aligned_values.append(pred_ca.new_tensor(float('nan')))
+                    nan = pred_ca.new_tensor(float('nan'))
+                    raw_vals.append(nan); aligned_vals.append(nan); pair_vals.append(nan)
                     continue
-                pred_g = pred_ca[mask]
-                true_g = true_ca[mask]
-                raw_values.append(torch.sqrt(
-                    ((pred_g - true_g) ** 2).sum(-1).mean().clamp_min(0.0)
-                ))
-                if pred_g.shape[0] >= 3:
+                p = pred_ca[mask].detach().float()
+                q = ref_ca[mask].detach().float()
+                raw_vals.append(torch.sqrt(((p - q) ** 2).sum(-1).mean().clamp_min(0.0)))
+                if p.shape[0] >= 3:
                     try:
-                        _, rot, trans = kabsch_torch(
-                            pred_g, true_g, requires_grad=False
-                        )
-                        pred_aligned = torch.matmul(pred_g, rot.T) + trans
-                        aligned_values.append(torch.sqrt(
-                            ((pred_aligned - true_g) ** 2).sum(-1).mean().clamp_min(0.0)
-                        ))
+                        _, rot, trans = kabsch_torch(p, q, requires_grad=False)
+                        pa = torch.matmul(p, rot.T) + trans
+                        aligned_vals.append(torch.sqrt(
+                            ((pa - q) ** 2).sum(-1).mean().clamp_min(0.0)))
                     except Exception:
-                        aligned_values.append(pred_ca.new_tensor(float('nan')))
+                        aligned_vals.append(p.new_tensor(float('nan')))
                 else:
-                    # Very short H3s cannot define a full Kabsch rotation.  The
-                    # metric remains observational; use translation-only alignment.
-                    pred_centered = pred_g - pred_g.mean(0, keepdim=True)
-                    true_centered = true_g - true_g.mean(0, keepdim=True)
-                    aligned_values.append(torch.sqrt(
-                        ((pred_centered - true_centered) ** 2).sum(-1).mean().clamp_min(0.0)
-                    ))
+                    pc = p - p.mean(0, keepdim=True)
+                    qc = q - q.mean(0, keepdim=True)
+                    aligned_vals.append(torch.sqrt(
+                        ((pc - qc) ** 2).sum(-1).mean().clamp_min(0.0)))
+                if p.shape[0] >= 2:
+                    pair_vals.append((torch.pdist(p) - torch.pdist(q)).abs().mean())
+                else:
+                    pair_vals.append(p.new_tensor(float('nan')))
+            return torch.stack(raw_vals), torch.stack(aligned_vals), torch.stack(pair_vals)
 
-            raw_graph = torch.stack(raw_values)
-            aligned_graph = torch.stack(aligned_values)
-            round_raw_graph.append(raw_graph)
-            round_aligned_graph.append(aligned_graph)
+        def finite_mean(v):
+            m = torch.isfinite(v)
+            return v[m].mean() if bool(m.any()) else None
 
-            raw_valid = torch.isfinite(raw_graph)
-            aligned_valid = torch.isfinite(aligned_graph)
-            if bool(raw_valid.any()):
-                out[f'val_proxy_round{ridx}_h3_ca_rmsd'] = raw_graph[raw_valid].mean()
-            if bool(aligned_valid.any()):
-                out[f'val_proxy_round{ridx}_h3_ca_aligned_rmsd'] = aligned_graph[aligned_valid].mean()
-
-        def _mean_delta(a, b):
-            valid = torch.isfinite(a) & torch.isfinite(b)
-            if not bool(valid.any()):
-                return None
-            return (b[valid] - a[valid]).mean()
-
-        def _improve_fraction(a, b):
-            valid = torch.isfinite(a) & torch.isfinite(b)
-            if not bool(valid.any()):
-                return None
-            return (b[valid] < a[valid]).float().mean()
-
-        if len(round_raw_graph) >= 2:
-            value = _mean_delta(round_raw_graph[0], round_raw_graph[-1])
+        def add_mean(name, v):
+            value = finite_mean(v)
             if value is not None:
-                out['val_proxy_refinement_raw_rmsd_delta'] = value
-        if len(round_aligned_graph) >= 2:
-            value = _mean_delta(round_aligned_graph[0], round_aligned_graph[-1])
-            if value is not None:
-                out['val_proxy_refinement_aligned_rmsd_delta'] = value
+                out[name] = value
 
-        for a, b, tag in ((0, 1, '01'), (1, 2, '12'), (0, 2, '02')):
-            if len(round_aligned_graph) <= max(a, b):
-                continue
-            delta = _mean_delta(round_aligned_graph[a], round_aligned_graph[b])
-            frac = _improve_fraction(round_aligned_graph[a], round_aligned_graph[b])
-            if delta is not None:
-                out[f'val_proxy_aligned_gain_{tag}'] = delta
-            if frac is not None:
-                out[f'val_proxy_aligned_improve_{tag}_fraction'] = frac
-            if len(round_raw_graph) > max(a, b):
-                raw_delta = _mean_delta(round_raw_graph[a], round_raw_graph[b])
-                if raw_delta is not None:
-                    out[f'val_proxy_raw_gain_{tag}'] = raw_delta
+        auth_metrics, prop_metrics = [], []
+        for ridx, ep in enumerate(auth_rounds[:self.round]):
+            metrics = graph_geometry(ep[:, ca_idx].float(), true_ca)
+            auth_metrics.append(metrics)
+            add_mean(f'r72_auth_r{ridx}_raw_A', metrics[0])
+            add_mean(f'r72_auth_r{ridx}_aligned_A', metrics[1])
+            add_mean(f'r72_auth_r{ridx}_pair_mae_A', metrics[2])
 
+        for ridx, ep in enumerate(prop_rounds[:self.round]):
+            metrics = graph_geometry(ep[:, ca_idx].float(), true_ca)
+            prop_metrics.append(metrics)
+            add_mean(f'r72_prop_r{ridx}_raw_A', metrics[0])
+            add_mean(f'r72_prop_r{ridx}_aligned_A', metrics[1])
+            add_mean(f'r72_prop_r{ridx}_pair_mae_A', metrics[2])
+            if ridx < len(auth_rounds):
+                gap = graph_geometry(
+                    ep[:, ca_idx].float(), auth_rounds[ridx][:, ca_idx].float())
+                add_mean(f'r72_prop_auth_r{ridx}_aligned_gap_A', gap[1])
+                add_mean(f'r72_prop_auth_r{ridx}_pair_gap_A', gap[2])
+
+        def add_delta(prefix, metrics, field_idx):
+            if len(metrics) < 3:
+                return
+            for a, b, tag in ((0, 1, '01'), (1, 2, '12'), (0, 2, '02')):
+                va, vb = metrics[a][field_idx], metrics[b][field_idx]
+                valid = torch.isfinite(va) & torch.isfinite(vb)
+                if bool(valid.any()):
+                    out[f'{prefix}_{tag}'] = (vb[valid] - va[valid]).mean()
+                    if field_idx == 1:
+                        out[f'{prefix}_improve_frac_{tag}'] = (
+                            vb[valid] < va[valid]).float().mean()
+
+        add_delta('r72_auth_aligned_delta_A', auth_metrics, 1)
+        add_delta('r72_auth_pair_delta_A', auth_metrics, 2)
+
+        # Time-resolved final authoritative endpoint.  This is the cleanest test
+        # of whether the added Score-Flow/time machinery damages the mature R05
+        # local geometry only in particular noise/time regions.
+        if auth_metrics:
+            final_raw, final_aligned, final_pair = auth_metrics[-1]
+            tg = torch.as_tensor(t_graph, device=final_raw.device).detach().float().reshape(-1)
+            if tg.numel() == n_graph:
+                edges = torch.linspace(0.0, 1.0, 6, device=tg.device)
+                for b in range(5):
+                    sel = (tg >= edges[b]) & ((tg < edges[b + 1]) if b < 4 else (tg <= edges[b + 1]))
+                    for name, values in (
+                        ('raw_A', final_raw), ('aligned_A', final_aligned),
+                        ('pair_mae_A', final_pair)):
+                        valid = sel & torch.isfinite(values)
+                        out[f'r72_timebin{b}_{name}_sum'] = (
+                            values[valid].sum() if bool(valid.any()) else values.new_zeros(()))
+                        out[f'r72_timebin{b}_{name}_count'] = valid.sum().to(values.dtype)
+
+        # Sequence/interface proxies are retained because the final paper target
+        # is co-design, not isolated geometry.
         for ridx, (logits, mask) in enumerate(r_logits[:self.round]):
             if bool(mask.any()):
                 pred_round = torch.argmax(logits[mask], dim=-1)
-                out[f'val_proxy_round{ridx}_aar'] = (
-                    pred_round == true_S[mask]
-                ).float().mean()
+                out[f'r72_round{ridx}_aar'] = (
+                    pred_round == true_S[mask]).float().mean()
 
-        # Final authoritative endpoint interface/contact proxy.  Never use the
-        # discarded native proposal for this diagnostic.
         is_ag = self.batch_constants.get('is_ag')
-        if is_ag is None:
-            return out
-        pred_final_ca = round_endpoints[-1][:, ca_idx].float()
-        contact_f1, contact_precision, contact_recall, caar_values = [], [], [], []
-        paratope_indices = paratope_mask.nonzero(as_tuple=False).reshape(-1)
-        for gid in range(n_graph):
-            pm = interface_batch_id == gid
-            agm = (batch_id == gid) & is_ag & (true_S != self.aa_feature.boa_idx)
-            if not bool(pm.any()) or not bool(agm.any()):
-                continue
-            ag_ca = true_X[agm, ca_idx].float()
-            native_contact = torch.cdist(true_ca[pm], ag_ca) < 8.0
-            pred_contact = torch.cdist(pred_final_ca[pm], ag_ca) < 8.0
-            tp = (native_contact & pred_contact).float().sum()
-            fp = ((~native_contact) & pred_contact).float().sum()
-            fn = (native_contact & (~pred_contact)).float().sum()
-            precision = tp / (tp + fp + self.eps)
-            recall = tp / (tp + fn + self.eps)
-            f1 = 2.0 * precision * recall / (precision + recall + self.eps)
-            contact_precision.append(precision)
-            contact_recall.append(recall)
-            contact_f1.append(f1)
-            native_res = native_contact.any(dim=-1)
-            if bool(native_res.any()):
-                global_par_idx = paratope_indices[pm]
-                caar_values.append((
-                    pred_S[global_par_idx[native_res]]
-                    == true_S[global_par_idx[native_res]]
-                ).float().mean())
-        if contact_f1:
-            out['val_proxy_native_contact_f1'] = torch.stack(contact_f1).mean()
-            out['val_proxy_native_contact_precision'] = torch.stack(contact_precision).mean()
-            out['val_proxy_native_contact_recall'] = torch.stack(contact_recall).mean()
-        if caar_values:
-            out['val_proxy_caar'] = torch.stack(caar_values).mean()
+        if is_ag is not None and auth_rounds:
+            pred_final_ca = auth_rounds[-1][:, ca_idx].float()
+            contact_f1, caar_values = [], []
+            paratope_indices = paratope_mask.nonzero(as_tuple=False).reshape(-1)
+            for gid in range(n_graph):
+                pm = interface_batch_id == gid
+                agm = (batch_id == gid) & is_ag & (true_S != self.aa_feature.boa_idx)
+                if not bool(pm.any()) or not bool(agm.any()):
+                    continue
+                ag_ca = true_X[agm, ca_idx].float()
+                native_contact = torch.cdist(true_ca[pm], ag_ca) < 8.0
+                pred_contact = torch.cdist(pred_final_ca[pm], ag_ca) < 8.0
+                tp = (native_contact & pred_contact).float().sum()
+                fp = ((~native_contact) & pred_contact).float().sum()
+                fn = (native_contact & (~pred_contact)).float().sum()
+                precision = tp / (tp + fp + self.eps)
+                recall = tp / (tp + fn + self.eps)
+                contact_f1.append(2.0 * precision * recall / (precision + recall + self.eps))
+                native_res = native_contact.any(dim=-1)
+                if bool(native_res.any()):
+                    global_par_idx = paratope_indices[pm]
+                    caar_values.append((
+                        pred_S[global_par_idx[native_res]]
+                        == true_S[global_par_idx[native_res]]).float().mean())
+            if contact_f1:
+                out['r72_contact_f1'] = torch.stack(contact_f1).mean()
+            if caar_values:
+                out['r72_caar'] = torch.stack(caar_values).mean()
         return out
 
 
@@ -1662,9 +1632,6 @@ class AbFlowModel(nn.Module):
                 self.last_singlefield_diagnostics = {
                     'physical_dof': X.new_tensor(1.0),
                     'carrier_primary': X.new_tensor(1.0 if self.physical_authority_mode == 'carrier_primary_analytic' else 0.0),
-                    'sequential_local_then_transport': X.new_tensor(
-                        1.0 if self.geometric_operator_mode == 'sequential_local_then_transport' else 0.0
-                    ),
                     'canonical_active_rate': target_info.get('r3_canonical_active_rate', X.new_zeros(())).detach(),
                     'final_pred_vs_carrier_x1_rms_A': _masked_rms_A(final_chart_gap, atom_mask),
                     'final_carrier_roundtrip_rms_A': _masked_rms_A(carrier_rt - r_interface_X[-1], atom_mask),
@@ -1957,62 +1924,27 @@ class AbFlowModel(nn.Module):
                    if torch.is_tensor(v) and v.numel() == 1},
             }
 
-            # Explicit flow-time authority audit.  R05 always receives the
-            # outer Score-Flow time through ``flow_time_mlp``.  The donor
-            # Single/Pair trunk may independently embed the same scalar time;
-            # expose both routes explicitly so logs cannot collapse them into
-            # one ambiguous ``time=1`` flag.  This is observation-only.
-            donor_trunk = getattr(self.native_trunk, 'trunk', None)
-            r05_time_on = 1.0 if t_graph is not None else 0.0
-            abx_time_on = 1.0 if bool(
-                getattr(donor_trunk, 'use_time_embedding', False)
-            ) else 0.0
+            # Compact diagnostics for the mechanisms added beyond mature R05.
+            bridge = self._last_message_diagnostics or {}
             diag = {
-                't_min': t_graph.min().detach(),
                 't_mean': t_graph.mean().detach(),
-                't_max': t_graph.max().detach(),
-                'r05_time_embed_on': X.new_tensor(r05_time_on),
-                'abx_time_embed_on': X.new_tensor(abx_time_on),
-                'explicit_time_authority_count': X.new_tensor(
-                    r05_time_on + abx_time_on
-                ),
-                **{k: v.detach() if torch.is_tensor(v) else v
-                   for k, v in self._last_message_diagnostics.items()},
             }
+            for key in (
+                'bridge_single_delta_to_base_ratio',
+                'bridge_pair_delta_to_base_ratio_mean',
+                'bridge_pair_coordinate_delta_to_base_ratio_mean',
+            ):
+                value = bridge.get(key)
+                if torch.is_tensor(value) and value.numel() == 1:
+                    diag[key] = value.detach()
             if bool(getattr(self, '_diagnostic_validation_mode', False)):
                 diag.update(self._validation_proxy_diagnostics(
                     true_X=true_X, true_S=true_S, pred_S=pred_S,
                     r_logits=r_logits, paratope_mask=paratope_mask,
                     batch_id=batch_id, interface_batch_id=interface_batch_id,
+                    t_graph=t_graph,
                 ))
 
-                # V242 operator-composition diagnostics.  AMEncoder reports these
-                # in normalized model units; expose Angstrom-equivalent epoch
-                # summaries so we can test the exact repair hypothesis:
-                #   local R05 operator must move the SAME physical state,
-                #   transport must then move it,
-                #   analytic chart closure must stay near numerical precision.
-                scale = float(self.normalizer.std.detach().float().cpu().item())
-                op_keys = (
-                    'sequential_local_update_rms_mean',
-                    'sequential_local_update_rms_max',
-                    'sequential_transport_update_rms_mean',
-                    'sequential_transport_update_rms_max',
-                    'sequential_local_to_carrier_sync_gap_rms_max',
-                    'sequential_carrier_to_endpoint_sync_gap_rms_max',
-                )
-                for rec in (self._last_round_egnn_diagnostics or []):
-                    ridx = int(rec.get('round_idx', -1))
-                    coord = rec.get('coord', {}) or {}
-                    if ridx < 0:
-                        continue
-                    for key in op_keys:
-                        value = coord.get(key)
-                        if torch.is_tensor(value) and value.numel() == 1:
-                            diag[f'op_round{ridx}_{key}_A'] = value.detach() * scale
-                    seq_flag = coord.get('sequential_single_state')
-                    if torch.is_tensor(seq_flag) and seq_flag.numel() == 1:
-                        diag[f'op_round{ridx}_sequential_single_state'] = seq_flag.detach()
             self.last_abflow_diagnostics = {
                 k: (v.detach() if torch.is_tensor(v) else v)
                 for k, v in diag.items()
@@ -2026,6 +1958,35 @@ class AbFlowModel(nn.Module):
     def _sampling_time_grid(self, n_steps, device, dtype):
         return torch.linspace(0.0, 1.0, max(1, int(n_steps)) + 1,
                               device=device, dtype=dtype)
+
+    @torch.no_grad()
+    def _sample_h3_graph_metrics(self, pred_X, true_X, interface_batch_id, n_graph):
+        """Per-complex CA raw/aligned/pair-distance errors for Test observers."""
+        ca_idx = 1 if pred_X.shape[1] > 1 else 0
+        pred_ca = pred_X[:, ca_idx].detach().float()
+        true_ca = true_X[:, ca_idx].detach().float()
+        rows = []
+        for gid in range(int(n_graph)):
+            mask = interface_batch_id == gid
+            if not bool(mask.any()):
+                rows.append((float('nan'), float('nan'), float('nan')))
+                continue
+            p, q = pred_ca[mask], true_ca[mask]
+            raw = torch.sqrt(((p - q) ** 2).sum(-1).mean().clamp_min(0.0))
+            if p.shape[0] >= 3:
+                try:
+                    _, rot, trans = kabsch_torch(p, q, requires_grad=False)
+                    pa = torch.matmul(p, rot.T) + trans
+                    aligned = torch.sqrt(((pa - q) ** 2).sum(-1).mean().clamp_min(0.0))
+                except Exception:
+                    aligned = p.new_tensor(float('nan'))
+            else:
+                pc, qc = p - p.mean(0, keepdim=True), q - q.mean(0, keepdim=True)
+                aligned = torch.sqrt(((pc - qc) ** 2).sum(-1).mean().clamp_min(0.0))
+            pair = ((torch.pdist(p) - torch.pdist(q)).abs().mean()
+                    if p.shape[0] >= 2 else p.new_tensor(float('nan')))
+            rows.append((float(raw.item()), float(aligned.item()), float(pair.item())))
+        return rows
 
     @torch.no_grad()
     def sample(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep,
@@ -2081,7 +2042,7 @@ class AbFlowModel(nn.Module):
                 steps.set_postfix(t=f'{float(t):.2f}')
 
             prev_diag_capture = bool(getattr(self, '_diagnostic_capture', False))
-            if self.sample_forensics_enabled:
+            if self.sample_forensics_enabled or self.sample_authority_diagnostics:
                 self._diagnostic_capture = True
             try:
                 H, pred_S, r_logits, pred_X, r_interface_X, _, prmsd = self._forward(
@@ -2101,7 +2062,7 @@ class AbFlowModel(nn.Module):
                 t=t, t_next=t_next,
                 canonical_t_min=self.f01_hybrid_t_min)
 
-            if self.sample_forensics_enabled:
+            if self.sample_forensics_enabled or self.sample_authority_diagnostics:
                 t_value = float(t.detach().float().item())
                 t_next_value = float(t_next.detach().float().item())
                 if t_value < float(self.f01_hybrid_t_min):
@@ -2113,6 +2074,7 @@ class AbFlowModel(nn.Module):
                         t=t, boundary_eps=self.f01_hybrid_t_min)
                     carrier_mode = 'canonical'
 
+            if self.sample_forensics_enabled:
                 xt_stats = self._forensic_graph_stats(
                     Xt_before, interface_batch_id, batch_size)
                 carrier_stats = self._forensic_graph_stats(
@@ -2186,6 +2148,31 @@ class AbFlowModel(nn.Module):
                         'physical_round_worst_stage': round_worst_stage,
                     }
                     self._append_sample_forensic_record(row)
+
+            if self.sample_authority_diagnostics:
+                true_h3 = X[paratope_mask]
+                x1_metrics = self._sample_h3_graph_metrics(
+                    implied_x1, true_h3, interface_batch_id, batch_size)
+                next_metrics = self._sample_h3_graph_metrics(
+                    Xt_next, true_h3, interface_batch_id, batch_size)
+                bridge_single = self._diag_float(
+                    bridge_diag, 'bridge_single_delta_to_base_ratio')
+                bridge_pair = self._diag_float(
+                    bridge_diag, 'bridge_pair_delta_to_base_ratio_mean')
+                bridge_pair_coord = self._diag_float(
+                    bridge_diag, 'bridge_pair_coordinate_delta_to_base_ratio_mean')
+                for gid in range(batch_size):
+                    xr, xa, xp = x1_metrics[gid]
+                    nr, na, npair = next_metrics[gid]
+                    self._sample_authority_records.append({
+                        'step': int(i), 't': t_value, 't_next': t_next_value,
+                        'x1_raw_A': xr, 'x1_aligned_A': xa, 'x1_pair_mae_A': xp,
+                        'xnext_raw_A': nr, 'xnext_aligned_A': na,
+                        'xnext_pair_mae_A': npair,
+                        'bridge_single_ratio': bridge_single,
+                        'bridge_pair_ratio': bridge_pair,
+                        'bridge_pair_coord_ratio': bridge_pair_coord,
+                    })
 
             Xt = Xt_next
 
