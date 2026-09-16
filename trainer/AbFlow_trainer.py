@@ -105,9 +105,6 @@ class AbFlowTrainer(Trainer):
         self.log_alpha = log(config.final_lr / config.lr) / self.max_step
         super().__init__(model, train_loader, valid_loader, config)
 
-        # A scientific child run must never be silently redirected into a parent
-        # version directory by resume semantics.  The launcher publishes the exact
-        # run directory; fail before training if Trainer resolved anything else.
         expected_run_dir = str(os.environ.get("ABFLOW_EXPECTED_RUN_DIR", "") or "").strip()
         if expected_run_dir:
             expected_run_dir = os.path.abspath(expected_run_dir)
@@ -116,7 +113,7 @@ class AbFlowTrainer(Trainer):
                 raise RuntimeError(
                     "run-directory authority mismatch: "
                     f"expected={expected_run_dir} actual={actual_run_dir}. "
-                    "Cross-experiment resume/fork is forbidden for this clean run."
+                    "R77 is scratch-only and cannot inherit a parent run directory."
                 )
 
         # Epoch-level scientific summaries.  These are observational only and
@@ -315,7 +312,8 @@ class AbFlowTrainer(Trainer):
                 f"single={getattr(trunk_cfg, 'seq_channel', 'NA')} "
                 f"pair={getattr(trunk_cfg, 'pair_channel', 'NA')} "
                 f"time=R05:1/AbX:{int(bool(getattr(trunk_cfg, 'time_embed', False)))} "
-                "recycling=0 "
+                f"round_state_singlepair={int(bool(getattr(raw_model, 'round_state_conditioning_enabled', False)))} "
+                "prev_recycling=0 "
                 f"frame={geom_cfg.get('frame', 'NA')} "
                 "context=full_antibody+dataset_epitope "
                 "bridge=zero_start_residual "
@@ -527,7 +525,10 @@ class AbFlowTrainer(Trainer):
             # same parameter snapshot that is serialized by validation .ckpt.
             with validation_ema(self):
                 if (
-                    bool(getattr(raw_model, 'sample_authority_diagnostics', False))
+                    (
+                        bool(getattr(raw_model, 'sample_authority_diagnostics', False))
+                        or bool(getattr(raw_model, 'state_exposure_audit', False))
+                    )
                     and hasattr(raw_model, 'reset_sample_authority_diagnostics')
                 ):
                     raw_model.reset_sample_authority_diagnostics()
@@ -549,7 +550,10 @@ class AbFlowTrainer(Trainer):
                 )
                 self._validate_formal_epoch_test_metrics(metrics, device)
                 if (
-                    bool(getattr(raw_model, 'sample_authority_diagnostics', False))
+                    (
+                        bool(getattr(raw_model, 'sample_authority_diagnostics', False))
+                        or bool(getattr(raw_model, 'state_exposure_audit', False))
+                    )
                     and hasattr(raw_model, 'consume_sample_authority_diagnostics')
                 ):
                     local_trace = raw_model.consume_sample_authority_diagnostics()
@@ -635,7 +639,7 @@ class AbFlowTrainer(Trainer):
 
 
     def _print_epoch_test_authority_trace(self, local_records):
-        """Aggregate geometry diagnostics from the exact formal 10-step Test."""
+        """Compact field trajectory from the exact formal 10-step Test."""
         gathered = [local_records]
         if dist.is_available() and dist.is_initialized():
             gathered = [None for _ in range(dist.get_world_size())]
@@ -646,8 +650,6 @@ class AbFlowTrainer(Trainer):
         for item in gathered:
             if item:
                 rows.extend(item)
-        if not rows:
-            return
         by_step = {}
         for row in rows:
             try:
@@ -671,24 +673,38 @@ class AbFlowTrainer(Trainer):
                     vals.append(value)
             return sum(vals) / len(vals) if vals else float('nan')
 
-        def arr(field, nd=3):
-            return '[' + ','.join(self._fmt(mean_at(st, field), nd) for st in steps) + ']'
-
-        tvals = [mean_at(st, 't') for st in steps]
+        wanted = [0, 5, steps[-1]]
+        selected = []
+        for idx in wanted:
+            if idx in by_step and idx not in selected:
+                selected.append(idx)
+        tvals = [mean_at(st, 't') for st in selected]
+        def arr(field, nd=4):
+            return '[' + ','.join(self._fmt(mean_at(st, field), nd) for st in selected) + ']'
+        xnext_all = [(st, mean_at(st, 'xnext_aligned_A')) for st in steps]
+        finite_rows = [(st, v) for st, v in xnext_all if isfinite(v)]
+        if finite_rows:
+            best_step, best_aligned = min(finite_rows, key=lambda kv: kv[1])
+            best_t = mean_at(best_step, 't')
+            final_aligned = mean_at(steps[-1], 'xnext_aligned_A')
+            late_drift = final_aligned - best_aligned
+        else:
+            best_t = best_aligned = final_aligned = late_drift = float('nan')
         print(
-            '[R76TestTrajectory] '
+            '[TestFieldTrajectory] '
             f'epoch={self.epoch} '
             f't=[' + ','.join(self._fmt(v, 2) for v in tvals) + '] '
-            f'x1_raw_A={arr("x1_raw_A",4)} '
-            f'x1_aligned_A={arr("x1_aligned_A",4)} '
-            f'x1_pair_A={arr("x1_pair_mae_A",4)} '
-            f'xnext_raw_A={arr("xnext_raw_A",4)} '
-            f'xnext_aligned_A={arr("xnext_aligned_A",4)} '
-            f'xnext_pair_A={arr("xnext_pair_mae_A",4)} '
-            f'bridge_s={arr("bridge_single_ratio",3)} '
-            f'bridge_z={arr("bridge_pair_ratio",3)} '
-            f'bridge_coord={arr("bridge_pair_coord_ratio",3)}'
+            f'x1_aligned_A={arr("x1_aligned_A")} '
+            f'xnext_aligned_A={arr("xnext_aligned_A")} '
+            f'best_xnext_aligned_A={self._fmt(best_aligned,4)} '
+            f'best_t={self._fmt(best_t,2)} '
+            f'final_xnext_aligned_A={self._fmt(final_aligned,4)} '
+            f'late_drift_A={self._fmt(late_drift,4)} '
+            f'raw_final_A={self._fmt(mean_at(steps[-1], "xnext_raw_A"),4)} '
+            f'pair_final_A={self._fmt(mean_at(steps[-1], "xnext_pair_mae_A"),4)}'
         )
+        # R79: StateExposureAudit was already answered by R77 and is not a routine log.
+
 
     def _valid_epoch(self, device):
         """Exact EMA validation on the full set, sharded across DDP ranks.
@@ -984,7 +1000,7 @@ class AbFlowTrainer(Trainer):
         return total / count, int(round(count))
 
     def _build_validation_epoch_summary(self, merged_buffer, valid_metric):
-        """Compact carrier-synced-context summary; intentionally drops retired diagnostics."""
+        """Compact R77 summary: final-only inner refinement + time-field health."""
         m = lambda key: self._buffer_mean(merged_buffer, key)
         summary = {
             'epoch': int(self.epoch),
@@ -996,38 +1012,30 @@ class AbFlowTrainer(Trainer):
             'loss_structure': m('Struct/StructLoss/Validation'),
             'loss_interface': m('Dock/SPLoss/Validation'),
             'loss_edge': m('Dock/EDLoss/Validation'),
-            'bridge_single': m('AbFlowDiag/bridge_single_delta_to_base_ratio/Validation'),
-            'bridge_pair': m('AbFlowDiag/bridge_pair_delta_to_base_ratio_mean/Validation'),
-            'bridge_pair_coord': m('AbFlowDiag/bridge_pair_coordinate_delta_to_base_ratio_mean/Validation'),
-            'chart_gap_A': m('AbFlowSF/final_chart_gap_A/Validation'),
-            'canonical_active_rate': m('AbFlowSF/canonical_active_rate/Validation'),
-            'contact_f1': m('AbFlowDiag/r76_contact_f1/Validation'),
-            'caar': m('AbFlowDiag/r76_caar/Validation'),
         }
         for ridx in range(3):
             for metric in ('raw_A', 'aligned_A', 'pair_mae_A'):
                 summary[f'auth_r{ridx}_{metric}'] = m(
-                    f'AbFlowDiag/r76_auth_r{ridx}_{metric}/Validation')
-            summary[f'round{ridx}_aar'] = m(
-                f'AbFlowDiag/r76_round{ridx}_aar/Validation')
+                    f'AbFlowDiag/roundfield_auth_r{ridx}_{metric}/Validation')
         for tag in ('01', '12', '02'):
             summary[f'auth_aligned_delta_{tag}_A'] = m(
-                f'AbFlowDiag/r76_auth_aligned_delta_A_{tag}/Validation')
+                f'AbFlowDiag/roundfield_auth_aligned_delta_A_{tag}/Validation')
             summary[f'auth_aligned_improve_frac_{tag}'] = m(
-                f'AbFlowDiag/r76_auth_aligned_delta_A_improve_frac_{tag}/Validation')
+                f'AbFlowDiag/roundfield_auth_aligned_delta_A_improve_frac_{tag}/Validation')
             summary[f'auth_pair_delta_{tag}_A'] = m(
-                f'AbFlowDiag/r76_auth_pair_delta_A_{tag}/Validation')
+                f'AbFlowDiag/roundfield_auth_pair_delta_A_{tag}/Validation')
 
-        # Weighted by number of complexes, not by validation batch count.
-        for b in range(5):
-            for metric in ('raw_A', 'aligned_A', 'pair_mae_A'):
-                sum_key = f'AbFlowDiag/r76_timebin{b}_{metric}_sum/Validation'
-                count_key = f'AbFlowDiag/r76_timebin{b}_{metric}_count/Validation'
-                total = self._buffer_sum(merged_buffer, sum_key)
-                count = self._buffer_sum(merged_buffer, count_key)
-                summary[f'timebin{b}_{metric}'] = total / count if count > 0 else float('nan')
-                if metric == 'aligned_A':
-                    summary[f'timebin{b}_count'] = int(round(count)) if count > 0 else 0
+        for ridx in range(3):
+            for metric in (
+                'single_rms', 'pair_rms', 'single_refresh_rms',
+                'pair_refresh_rms', 'state_step_A',
+                'task_geometry_visible_fraction',
+                'non_task_design_geometry_visible_fraction',
+                'pair_coord_ratio',
+            ):
+                summary[f'roundrel_r{ridx}_{metric}'] = m(
+                    f'AbFlowDiag/roundrel_r{ridx}_{metric}/Validation'
+                )
         return summary
 
     def _print_validation_audits(self, summary):
@@ -1036,42 +1044,34 @@ class AbFlowTrainer(Trainer):
         print(
             '[Validation] '
             f"epoch={self.epoch} val={self._fmt(summary.get('validation_metric'),5)} "
-            f"seq={self._fmt(summary.get('loss_seq'),5)} "
             f"struct={self._fmt(summary.get('loss_structure'),5)} "
             f"interface={self._fmt(summary.get('loss_interface'),5)} "
-            f"edge={self._fmt(summary.get('loss_edge'),5)} "
-            f"aar={self._fmt(summary.get('aar'),5)}"
+            f"edge={self._fmt(summary.get('loss_edge'),5)}"
         )
         def vals(prefix, metric, nd=4):
             return '[' + ','.join(
                 self._fmt(summary.get(f'{prefix}_r{r}_{metric}'), nd)
                 for r in range(3)) + ']'
+        def relarr(metric, nd=4):
+            return '[' + ','.join(
+                self._fmt(summary.get(f'roundrel_r{r}_{metric}'), nd)
+                for r in range(3)) + ']'
         print(
-            '[R76GeometryValidation] '
-            f"epoch={self.epoch} "
+            '[RoundStateValidation] '
+            f"epoch={self.epoch} supervision=final_only prev_recycling=off "
             f"auth_raw_A={vals('auth','raw_A')} "
             f"auth_aligned_A={vals('auth','aligned_A')} "
             f"auth_pair_A={vals('auth','pair_mae_A')} "
             f"d_aligned=[{self._fmt(summary.get('auth_aligned_delta_01_A'),4)},"
             f"{self._fmt(summary.get('auth_aligned_delta_12_A'),4)}] "
-            f"d_pair=[{self._fmt(summary.get('auth_pair_delta_01_A'),4)},"
-            f"{self._fmt(summary.get('auth_pair_delta_12_A'),4)}] "
-            f"round_aar=[{','.join(self._fmt(summary.get(f'round{r}_aar'),4) for r in range(3))}] "
-            f"caar={self._fmt(summary.get('caar'),4)} contact_f1={self._fmt(summary.get('contact_f1'),4)} "
-            f"bridge_s={self._fmt(summary.get('bridge_single'),3)} "
-            f"bridge_z={self._fmt(summary.get('bridge_pair'),3)} "
-            f"bridge_coord={self._fmt(summary.get('bridge_pair_coord'),3)} "
-            f"chart_gap_A={self._fmt(summary.get('chart_gap_A'),6)}"
-        )
-
-        bins = ('0-.2', '.2-.4', '.4-.6', '.6-.8', '.8-1')
-        print(
-            '[R76TimeValidation] '
-            f"epoch={self.epoch} bins=[{','.join(bins)}] "
-            f"aligned_A=[{','.join(self._fmt(summary.get(f'timebin{b}_aligned_A'),4) for b in range(5))}] "
-            f"pair_A=[{','.join(self._fmt(summary.get(f'timebin{b}_pair_mae_A'),4) for b in range(5))}] "
-            f"raw_A=[{','.join(self._fmt(summary.get(f'timebin{b}_raw_A'),4) for b in range(5))}] "
-            f"count=[{','.join(str(summary.get(f'timebin{b}_count',0)) for b in range(5))}]"
+            f"state_step_A={relarr('state_step_A')} "
+            f"single_refresh_rms={relarr('single_refresh_rms',5)} "
+            f"pair_refresh_rms={relarr('pair_refresh_rms',5)} "
+            f"pair_coord_ratio={relarr('pair_coord_ratio',5)} "
+            f"h3_geom_visible={relarr('task_geometry_visible_fraction',3)} "
+            f"other_design_geom_visible={relarr('non_task_design_geometry_visible_fraction',3)} "
+            f"improve_frac_aligned=[{self._fmt(summary.get('auth_aligned_improve_frac_01'),3)},"
+            f"{self._fmt(summary.get('auth_aligned_improve_frac_12'),3)}]"
         )
 
 
@@ -1258,7 +1258,7 @@ class AbFlowTrainer(Trainer):
         phase = 'val' if val else 'train'
         # V238: the detailed authority line is a startup semantic contract, not a
         # routine training trace. Long-run mechanism tracking is aggregated in
-        # [R76GeometryValidation] instead.
+        # [InnerRefinementValidation] instead.
         if (not val) and (not self._singlefield_contract_verified) and self._diag_main_rank:
             print(
                 '[SingleFieldAuthorityAudit] '
@@ -1442,6 +1442,8 @@ class AbFlowTrainer(Trainer):
                 auth_rms = _round_graph_values('per_round_authority_endpoint_rms_A')
                 auth_abs = _round_graph_values('per_round_authority_endpoint_absmax_A')
                 auth_car = _round_graph_values('per_round_authority_carrier_target_rms_A')
+                disc_ep = _round_graph_values('per_round_discarded_endpoint_gap_rms_A')
+                disc_car = _round_graph_values('per_round_discarded_carrier_gap_rms_A')
                 if auth_rms or auth_car:
                     sf = getattr(raw_model, 'last_singlefield_diagnostics', None) or {}
                     print(
@@ -1452,6 +1454,8 @@ class AbFlowTrainer(Trainer):
                         f"endpoint_gt_rms_A={[round(v, 5) for v in auth_rms]} "
                         f"endpoint_absmax_A={[round(v, 5) for v in auth_abs]} "
                         f"carrier_target_rms_A={[round(v, 5) for v in auth_car]} "
+                        f"discard_endpoint_gap_A={[round(v, 5) for v in disc_ep]} "
+                        f"discard_carrier_gap_A={[round(v, 5) for v in disc_car]} "
                         f"final_chart_gap_A={self._fmt(self._scalar(sf.get('final_pred_vs_carrier_x1_rms_A')), 6)}"
                     )
 
@@ -1756,6 +1760,14 @@ class AbFlowTrainer(Trainer):
                 value = sf_diag.get(src)
                 if value is not None:
                     self.log(f"AbFlowSF/{dst}/Validation", value, batch_idx, True)
+            latent = sf_diag.get("round_discarded_endpoint_proposal_gap_rms_A")
+            if torch.is_tensor(latent):
+                flat = latent.reshape(-1)
+                for ridx in range(min(3, int(flat.numel()))):
+                    self.log(
+                        f"AbFlowSF/latent_native_gap_r{ridx}_A/Validation",
+                        flat[ridx], batch_idx, True
+                    )
 
         if not val and (
             int(self.global_step) < self._science_log_first_steps

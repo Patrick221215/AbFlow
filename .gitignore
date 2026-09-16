@@ -210,3 +210,13 @@ datasets/
 __cache__/
 __pycache__/
 checkpoints/
+results/
+results_dtm/
+results_abflow_test/
+results_abflow/
+results_scorefm_clean/
+results_module/
+results/
+FoldFlow-main/
+conditional-flow-matching-main/
+backups/

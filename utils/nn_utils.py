@@ -733,7 +733,8 @@ class SeparatedAminoAcidFeature(AminoAcidFeature):
         keep sequence/topology context through the base single path, but their
         clean/native structural embedding is blocked.
         """
-        mask = batch['mask'].bool() & batch['fixed_mask'].bool()
+        geometry_mask = batch.get('geometry_condition_mask', batch['fixed_mask'])
+        mask = batch['mask'].bool() & geometry_mask.bool()
         B, L = mask.shape
 
         aa = self.single_pair_context_aa(seq.long()) * mask[..., None]
@@ -1467,7 +1468,8 @@ class PairEmbedding(nn.Module):
         pseudo-beta distogram.  Only the row dimension is chunked so the large
         [B,L,L,14,14,3] / [B,14L,14L] temporaries are never materialized.
         """
-        fixed = batch['mask'].bool() & batch['fixed_mask'].bool()
+        geometry_mask = batch.get('geometry_condition_mask', batch['fixed_mask'])
+        fixed = batch['mask'].bool() & geometry_mask.bool()
         B, L = fixed.shape
         aa = seq.long()
         chain_ids = batch['chain_id']

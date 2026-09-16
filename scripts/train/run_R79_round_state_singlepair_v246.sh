@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# R77 matched R72 authority-closed exposure-audit launcher.
-# Scientific training semantics remain mature AbFlow/R05 final-round-only.
-# The only evaluation addition is a no-grad matched path-vs-rollout coordinate exposure audit.
+# R79 single-factor launcher: R77 + round-consistent current-state Single/Pair.
+# No prev_seq/prev_pair/prev_pos recycle state is permitted in this experiment.
+# Carrier remains the sole learned H3 Cartesian authority; F01/loss/sampler stay matched to R77.
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PROJECT_ROOT=${ABFLOW_PROJECT_ROOT:-$ROOT}
 CONFIG_PATH=${1:-}
@@ -13,15 +13,16 @@ GPU_CSV=""; MASTER_PORT=""; MASTER_ADDR=""
 usage() {
   cat >&2 <<'USAGE'
 Usage:
-  bash scripts/train/run_R70_R71_v234.sh <R77-config.json> \
-    --gpus 2,3,4,5,6,7 --port 29777
+  bash scripts/train/run_R79_round_state_singlepair_v246.sh <R79-config.json> \
+    --gpus 2,3,4,5,6,7 --port 29779
 
-R77 contract:
-  - base architecture = R72; native latent Cartesian workspace retained;
-  - mature AbFlow/R05 final-round-only coordinate supervision is preserved;
-  - structure supervision/writeback are H3(paratope)-only; fixed context exact;
-  - Test remains observation-only; matched path-vs-rollout exposure audit is evaluation-only;
-  - no resume/fork, no new module/loss family/sampler/controller.
+R79 contract:
+  - parent = R77 and starts from scratch;
+  - the ONLY scientific factor is current-state Single/Pair recomputation once per macro round;
+  - round0 relational H3 state = outer Xt; rounds1/2 = previous analytic endpoint;
+  - no prev_seq/prev_pair/prev_pos and no second recurrent memory branch;
+  - Pair stays static inside each EGNN round; memory_H/pred_S_dist stay inherited;
+  - carrier-primary single field, F01 path/sampler and final-round-only supervision unchanged.
 USAGE
 }
 
@@ -97,7 +98,7 @@ export ABFLOW_EPOCH_TEST_METRIC_WORKERS="$METRIC_WORKERS" ABFLOW_EPOCH_TEST_FAIL
 export ABFLOW_EPOCH_TEST_MODEL_INVALID_POLICY=record_and_continue ABFLOW_EPOCH_TEST_SHOW_SAMPLE_PROGRESS="${ABFLOW_EPOCH_TEST_SHOW_SAMPLE_PROGRESS:-on}"
 export ABFLOW_TQDM="${ABFLOW_TQDM:-on}" ABFLOW_GEOMETRY_FORENSICS="${ABFLOW_GEOMETRY_FORENSICS:-off}"
 export ABFLOW_SAMPLE_FORENSICS="${ABFLOW_SAMPLE_FORENSICS:-off}" ABFLOW_SAMPLE_AUTHORITY_DIAGNOSTICS="${ABFLOW_SAMPLE_AUTHORITY_DIAGNOSTICS:-on}"
-export ABFLOW_STATE_EXPOSURE_AUDIT="${ABFLOW_STATE_EXPOSURE_AUDIT:-on}"
+export ABFLOW_STATE_EXPOSURE_AUDIT=off
 export ABFLOW_COORD_AUDIT_INTERVAL="${ABFLOW_COORD_AUDIT_INTERVAL:-1000000000}" ABFLOW_COORD_AUDIT_FIRST_STEPS="${ABFLOW_COORD_AUDIT_FIRST_STEPS:-0}"
 export ABFLOW_GEOMETRY_AUTHORITY_INTERVAL=0
 export ABFLOW_TRAIN_LOSS_OUTLIER_THRESHOLD="${ABFLOW_TRAIN_LOSS_OUTLIER_THRESHOLD:-$OUTLIER_THRESHOLD}"
@@ -111,7 +112,7 @@ echo "[RunLog] canonical=$RUN_LOG latest=$LATEST_LOG"
 echo "[RunVersion] fixed_version=$VERSION dir=$RUN_DIR"
 echo "[RunConfig] config=$CONFIG_PATH"
 echo "[RunResources] physical_gpus=$GPU_CSV nproc=$NPROC_PER_NODE per_gpu_train_val_batch=$PER_GPU_BATCH_SIZE effective_global_train_batch=$EFFECTIVE_GLOBAL_TRAIN_BATCH test_batch=$TEST_BATCH master_addr=$MASTER_ADDR port=$MASTER_PORT"
-echo "[RunInit] mode=scratch parent=R72-matched optimizer=reset ema=reset epoch=0 best_val=reset"
+echo "[RunInit] mode=scratch parent=R77 optimizer=reset ema=reset epoch=0 best_val=reset"
 echo "[TrainingHorizon] source=json max_epoch=$MAX_EPOCH launcher_epoch_override=none"
 echo "[TrainValTestContract] order=train->validation->test checkpoint_selection=validation test_metrics=observation_only test_steps=$TEST_STEPS test_seed=$TEST_SEED"
 
@@ -121,52 +122,48 @@ cp,out=sys.argv[1:3]; cfg=json.load(open(cp,encoding='utf-8')); exp=cfg['experim
 eid=exp['id']; stem=os.path.splitext(os.path.basename(cp))[0]; role=str(exp.get('diagnostic_role','')).lower()
 if not (eid==stem==os.path.basename(os.path.normpath(out))): raise SystemExit(f'identity mismatch: {eid} / {stem} / {out}')
 if exp.get('protocol')!='formal_train_val_test': raise SystemExit('formal_train_val_test required')
-if role!='r77_r72_authority_closed_exposure_audit': raise SystemExit(f'R77 role required, got {role!r}')
-if str(exp.get('initialization','')).lower()!='scratch': raise SystemExit('R77 must start from scratch')
-if str(cfg['training']['schedule'].get('resume_checkpoint','') or '').strip(): raise SystemExit('R77 forbids resume_checkpoint')
-if int(cfg['model']['architecture']['iter_round']) != 3: raise SystemExit('R77 requires exactly 3 R72 refinement rounds')
-sp=cfg['model']['representation']['single_pair']; pc=sp['pair_coordinate']; cc=sp['coordinate_controller']; pa=sp['physical_authority']
-if pc.get('mode')!='direct_shared' or cc.get('mode')!='egnn_prenorm_raw': raise SystemExit('R72 Pair/controller must remain unchanged')
+if role!='r79_round_state_singlepair_only': raise SystemExit(f'R79 role required, got {role!r}')
+if exp.get('parent')!='R77_R05_ABX_R72_AUTHORITY_CLOSED_FINALROUND_ANALYTIC3R_TVT_U02': raise SystemExit('R79 must use R77 as parent identity')
+if str(exp.get('initialization','')).lower()!='scratch': raise SystemExit('R79 must start from scratch')
+if str(cfg['training']['schedule'].get('resume_checkpoint','') or '').strip(): raise SystemExit('R79 forbids resume_checkpoint')
+if int(cfg['model']['architecture']['iter_round']) != 3: raise SystemExit('R79 requires exactly 3 refinement rounds')
+sp=cfg['model']['representation']['single_pair']; pc=sp['pair_coordinate']; cc=sp['coordinate_controller']; pa=sp['physical_authority']; rs=sp.get('round_state_conditioning',{})
+if pc.get('mode')!='direct_shared' or cc.get('mode')!='egnn_prenorm_raw': raise SystemExit('R77 Pair/controller must remain unchanged')
 if not bool(sp.get('time_embed',True)): raise SystemExit('explicit Single/Pair time must remain on')
-if pa.get('mode')!='carrier_primary_analytic' or int(pa.get('physical_dof',0))!=1: raise SystemExit('R72 carrier-primary single field required')
-if pa.get('geometric_operator_mode')!='latent_native_workspace': raise SystemExit('R72 latent native workspace must be retained')
-if pa.get('native_latent_workspace')!='retained_from_R72': raise SystemExit('R72 native latent workspace retention must be explicit')
-if pa.get('refinement_supervision')!='final_round_only_inherited_from_AbFlow': raise SystemExit('R77 must preserve mature final-round-only supervision')
+if pa.get('mode')!='carrier_primary_analytic' or int(pa.get('physical_dof',0))!=1: raise SystemExit('carrier-primary single field required')
+if pa.get('geometric_operator_mode')!='latent_native_workspace': raise SystemExit('R77 latent native workspace must be retained')
+if pa.get('native_latent_workspace')!='retained_from_R72': raise SystemExit('native latent workspace retention must remain explicit')
+if pa.get('refinement_supervision')!='final_round_only_inherited_from_AbFlow': raise SystemExit('final-round-only supervision must remain unchanged')
 if pa.get('structure_supervision_mask')!='paratope_only' or pa.get('fixed_context_writeback')!='paratope_only': raise SystemExit('H3 authority closure required')
+if not bool(rs.get('enabled',False)) or rs.get('geometry_source')!='current_authoritative_state': raise SystemExit('round-state Single/Pair factor missing')
+if any(bool(rs.get(k,False)) for k in ('prev_seq','prev_pair','prev_pos')): raise SystemExit('prev_* recycle is forbidden in formal R79')
+if not bool(rs.get('pair_static_within_round',False)): raise SystemExit('Pair must stay static inside each EGNN round')
+if bool(rs.get('detach_between_rounds',True)): raise SystemExit('R79 keeps inherited differentiable physical recurrence; no recycle-style detach')
 if float(cfg['loss']['interface']) != 1.0: raise SystemExit('interface weight must remain 1.0')
 if float(cfg['loss']['distogram'].get('weight',0)) != 0 or float(cfg['loss']['smooth_lddt'].get('weight',0)) != 0: raise SystemExit('no auxiliary loss may be introduced')
 gen=cfg['generation']
-if gen.get('terminal_coordinate_authority')!='integrated_carrier_direct_h3' or bool(gen.get('terminal_kabsch_fusion',True)): raise SystemExit('R72 terminal carrier semantics required')
+if gen.get('terminal_coordinate_authority')!='integrated_carrier_direct_h3' or bool(gen.get('terminal_kabsch_fusion',True)): raise SystemExit('R77 terminal carrier semantics required')
 print(f'[ExperimentIdentity] PASS id={eid} parent={exp["parent"]} role={role}')
-print('[R72BaseContract] native_latent_workspace=retained Pair=direct_shared controller=egnn_prenorm_raw explicit_time=1 rounds=3')
-print('[RefinementContract] inner_rounds=3 coordinate_supervision=final_round_only inherited_from=AbFlow outer_t=shared')
-print('[StructureAuthorityContract] physical_rows=paratope structure_supervision=paratope_only recurrence_writeback=paratope_only fixed_context=exact')
-print('[ExposureAuditContract] same_test_complex=1 same_t=1 same_sequence_state=1 compare=rollout_state_vs_analytic_training_path no_grad=1 rng_isolated=1 checkpoint_selection_effect=0')
-print('[ScientificDeltaContract] versus_R72=authority_domain_closure_only versus_R76=native_latent_workspace_restored diagnostics_only_exposure_audit=1 new_loss=0 new_sampler=0')
-print('[DiagnosticsContract] InnerRefinementValidation=on TimeFieldValidation=on TestFieldTrajectory=compact StateExposureAudit=on native_proposal_metrics=off routine_stage_trace=off')
+print('[R77BaseContract] native_latent_workspace=retained Pair=direct_shared controller=egnn_prenorm_raw explicit_time=1 rounds=3')
+print('[SingleFieldContract] authority=carrier_primary_analytic physical_dof=1 structure=paratope_only writeback=paratope_only terminal=integrated_carrier')
+print('[RoundStateSinglePairContract] refresh=once_per_macro_round round0=outer_Xt later=previous_analytic_endpoint design_geometry=current_model_state geometry_scope=paratope_only other_cmask_geometry=blocked pair_static_within_round=1 prev_seq=0 prev_pair=0 prev_pos=0 detach=0')
+print('[ScientificDeltaContract] versus_R77=round_state_singlepair_only new_loss=0 new_sampler=0 new_controller=0 new_cartesian_field=0 prev_recycle=0')
+print('[DiagnosticsContract] RoundStateValidation=on TestFieldTrajectory=compact TimeFieldValidation=off StateExposureAudit=off routine_stage_trace=off')
 PY2
 
-python -m py_compile "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" "$PROJECT_ROOT/models/modules/am_enc.py" "$PROJECT_ROOT/models/modules/am_egnn.py" "$PROJECT_ROOT/trainer/AbFlow_trainer.py" "$PROJECT_ROOT/train.py"
-if grep -Fq 'mean_all_rounds_same_target' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py"; then echo 'retired all-round supervision branch still present' >&2; exit 2; fi
-if grep -Fq 'round_carrier_supervision' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py"; then echo 'retired round supervision selector still present' >&2; exit 2; fi
+python "$PROJECT_ROOT/tests/validate_R79_static.py" "$PROJECT_ROOT"
+python -m py_compile "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" "$PROJECT_ROOT/models/AbFlow/abflow_components.py" "$PROJECT_ROOT/utils/nn_utils.py" "$PROJECT_ROOT/models/modules/am_enc.py" "$PROJECT_ROOT/models/modules/am_egnn.py" "$PROJECT_ROOT/trainer/AbFlow_trainer.py" "$PROJECT_ROOT/train.py"
 grep -Fq 'structure_supervision_mask = (' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'structure authority closure missing' >&2; exit 2; }
 grep -Fq 'X[paratope_mask] = authority_endpoint_native' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'paratope-only writeback missing' >&2; exit 2; }
-grep -Fq 'x = native_candidate' "$PROJECT_ROOT/models/modules/am_enc.py" || { echo 'R72 native latent workspace unexpectedly removed' >&2; exit 2; }
-grep -Fq '[InnerRefinementValidation]' "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo 'inner-refinement log missing' >&2; exit 2; }
-grep -Fq '[TimeFieldValidation]' "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo 'time-field log missing' >&2; exit 2; }
-grep -Fq '[TestFieldTrajectory]' "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo 'test-field trajectory log missing' >&2; exit 2; }
-grep -Fq '[StateExposureAudit]' "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo 'state exposure audit log missing' >&2; exit 2; }
-grep -Fq 'oracle_Xt' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'oracle-path exposure audit missing' >&2; exit 2; }
-if grep -Fq 'sequential_local_then_transport' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py"; then echo 'R75 code must not re-enter R77' >&2; exit 2; fi
-if grep -Fq "elif self.physical_authority_mode == 'endpoint_primary_analytic'" "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py"; then echo 'R73 branch must remain removed' >&2; exit 2; fi
+grep -Fq 'x = native_candidate' "$PROJECT_ROOT/models/modules/am_enc.py" || { echo 'R77 native latent workspace unexpectedly removed' >&2; exit 2; }
 grep -Fq 'gen_X[paratope_mask] = interface_X_final' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'integrated carrier terminal missing' >&2; exit 2; }
 grep -Fq 'return 0.5 * (cos(step / self.max_step * pi) + 1) * 0.9' "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo 'context_ratio changed unexpectedly' >&2; exit 2; }
-echo '[Preflight] py_compile=PASS r72_base=PASS native_latent_workspace_retained=PASS final_round_only=PASS h3_authority_closed=PASS scratch_only=PASS sampler_unchanged=PASS state_exposure_audit=PASS'
+echo '[Preflight] py_compile=PASS r77_base=PASS round_state_singlepair=PASS prev_recycle=OFF single_field=PASS final_round_only=PASS h3_authority_closed=PASS sampler_unchanged=PASS logs_compact=PASS'
 
 python - "$PROJECT_ROOT" <<'PY2'
 import hashlib,os,sys
 root=sys.argv[1]
-for rel in ['models/AbFlow/AbFlow_model.py','models/modules/am_enc.py','models/modules/am_egnn.py','trainer/AbFlow_trainer.py','train.py','scripts/train/run_R70_R71_v234.sh']:
+for rel in ['models/AbFlow/AbFlow_model.py','models/AbFlow/abflow_components.py','utils/nn_utils.py','models/modules/am_enc.py','models/modules/am_egnn.py','trainer/AbFlow_trainer.py','train.py','scripts/train/run_R79_round_state_singlepair_v246.sh']:
  p=os.path.join(root,rel)
  if os.path.isfile(p): print(f'[SourceSHA256] {rel} {hashlib.sha256(open(p,"rb").read()).hexdigest()[:16]}')
 PY2

@@ -61,29 +61,9 @@ class NativeTrunk(nn.Module):
         self.enable_distogram = float(
             distogram_config.get("weight", 0.0)
         ) > 0.0
-        self.distogram_pair_scope = str(
-            distogram_config.get("pair_scope", "all_resolved") or "all_resolved"
-        ).strip().lower()
-        _distogram_scopes = {"all_resolved", "design_anchored", "generation_anchored"}
-        if self.distogram_pair_scope not in _distogram_scopes:
-            raise ValueError(
-                "loss.distogram.pair_scope must be one of "
-                f"{sorted(_distogram_scopes)}, got {self.distogram_pair_scope!r}."
-            )
-        self.distogram_reduction = str(
-            distogram_config.get("reduction", "pair_mean") or "pair_mean"
-        ).strip().lower()
-        _distogram_reductions = {"pair_mean", "relation_balanced"}
-        if self.distogram_reduction not in _distogram_reductions:
-            raise ValueError(
-                "loss.distogram.reduction must be one of "
-                f"{sorted(_distogram_reductions)}, got {self.distogram_reduction!r}."
-            )
-        if self.distogram_reduction == "relation_balanced" and self.distogram_pair_scope != "generation_anchored":
-            raise ValueError(
-                "relation_balanced Distogram requires pair_scope='generation_anchored' "
-                "so DD/DF/DA have unambiguous generated-region semantics."
-            )
+        self.distogram_pair_scope = distogram_config.get(
+            "pair_scope", "all_resolved"
+        )
         self.distogram_bins = int(distogram_config.get("bins", 64))
         self.distogram_min = float(distogram_config.get("min_bin", 2.3125))
         self.distogram_max = float(distogram_config.get("max_bin", 21.6875))
@@ -159,19 +139,7 @@ class NativeTrunk(nn.Module):
 
     def _pack(self, X, S, segment_ids, residue_pos, batch_id, valid_mask,
               is_antigen, design_mask, flow_t, cdr_type, atom_observed_mask=None,
-              aux_task_mask=None):
-        # ``design_mask`` is the donor information-barrier authority (cmask).
-        # ``aux_task_mask`` is the task-loss authority (generated degrees of
-        # freedom, paratope_mask for formal H3 runs).  Never conflate them:
-        # changing the information barrier to localize an auxiliary objective
-        # can leak native design geometry into the donor trunk.
-        if aux_task_mask is None:
-            aux_task_mask = design_mask
-        if tuple(aux_task_mask.shape) != tuple(design_mask.shape):
-            raise ValueError(
-                f"aux_task_mask shape mismatch: {tuple(aux_task_mask.shape)} "
-                f"vs design_mask {tuple(design_mask.shape)}"
-            )
+              aux_task_mask=None, condition_design_geometry=False):
         nodes, ab_lens, antigen_counts = self._ordered_nodes(
             valid_mask, batch_id, is_antigen,
         )
@@ -194,6 +162,12 @@ class NativeTrunk(nn.Module):
         AuxTask = torch.zeros_like(M)
         IsAg = torch.zeros_like(M)
         GI = S.new_full((B, L), -1)
+        if aux_task_mask is not None:
+            if tuple(aux_task_mask.shape) != (int(X.shape[0]),):
+                raise ValueError(
+                    f"AbFlow aux_task_mask shape mismatch: {tuple(aux_task_mask.shape)} "
+                    f"vs residue count {(int(X.shape[0]),)}"
+                )
         if atom_observed_mask is not None:
             if tuple(atom_observed_mask.shape) != tuple(X.shape[:-1]):
                 raise ValueError(
@@ -219,7 +193,8 @@ class NativeTrunk(nn.Module):
             Rp[b, :n] = rp.to(dtype=torch.long)
             M[b, :n] = True
             Design[b, :n] = design_mask[idx].bool()
-            AuxTask[b, :n] = aux_task_mask[idx].bool()
+            if aux_task_mask is not None:
+                AuxTask[b, :n] = aux_task_mask[idx].bool()
             IsAg[b, :n] = is_antigen[idx].bool()
             GI[b, :n] = idx
 
@@ -236,13 +211,30 @@ class NativeTrunk(nn.Module):
         ) * M[..., None].to(Xp.dtype)
         Xp_donor = torch.where(Exists.bool()[..., None], Xp, torch.zeros_like(Xp))
 
-        # single/pair semantics: design region is not a clean/native structural condition.
-        # Fixed scaffold/antigen structural embeddings are visible; design
-        # ResidueEmbedding/PairEmbedding geometry is blocked. The current Xt still
-        # enters R05 AM_E_GCL through its original multi-channel radial path.
+        # Keep the original clean-condition barrier as a separate semantic mask.
+        # R79 exposes geometry ONLY on the physical H3 authority domain supplied by
+        # aux_task_mask (paratope_mask), never on all cmask/design rows.  The caller
+        # has already replaced those H3 coordinates by the current model-visible
+        # physical state (outer Xt for round 0; analytic endpoint thereafter).
+        # Therefore no native X1 is revealed and no second Cartesian authority exists.
         Fixed = M & (~Design)
+        if bool(condition_design_geometry):
+            if aux_task_mask is None:
+                raise RuntimeError(
+                    "round-state geometry conditioning requires aux_task_mask "
+                    "(formal R79: paratope/H3 physical-authority domain)."
+                )
+            outside_design = AuxTask & (~Design)
+            if bool(outside_design.any()):
+                raise RuntimeError(
+                    "round-state geometry domain mismatch: aux_task_mask must be "
+                    "a subset of design_mask so physical and relational H3 domains agree."
+                )
+            GeometryCondition = Fixed | AuxTask
+        else:
+            GeometryCondition = Fixed
         Tors = _torsions_from_atom14(
-            Sp, Xp_donor, Chain, Fixed, atom_exists=Exists.bool(),
+            Sp, Xp_donor, Chain, GeometryCondition, atom_exists=Exists.bool(),
             epsilon=self.torsion_norm_eps,
         )
 
@@ -256,6 +248,7 @@ class NativeTrunk(nn.Module):
 
         batch = {
             'seq': Sp, 'seq_t': Sp, 'mask': M, 'fixed_mask': Fixed,
+            'geometry_condition_mask': GeometryCondition,
             'chain_id': Chain, 'residx': Rp, 'cdr_def': Cdr,
             'atom14_gt_positions': Xp_donor, 'atom14_gt_exists': Exists,
             'torsion_angles_sin_cos': Tors, 't': t.to(Xp.dtype),
@@ -299,11 +292,14 @@ class NativeTrunk(nn.Module):
 
     def forward(self, X, S, segment_ids, residue_pos, batch_id, valid_mask,
                 is_antigen, design_mask, flow_t, cdr_type, residue_feature,
-                round_idx=-1, atom_observed_mask=None, aux_task_mask=None):
+                round_idx=-1, atom_observed_mask=None, aux_task_mask=None,
+                condition_design_geometry=False):
         batch, GI, nodes, antigen_counts = self._pack(
             X, S, segment_ids, residue_pos, batch_id, valid_mask,
             is_antigen, design_mask, flow_t, cdr_type,
-            atom_observed_mask=atom_observed_mask, aux_task_mask=aux_task_mask,
+            atom_observed_mask=atom_observed_mask,
+            aux_task_mask=aux_task_mask,
+            condition_design_geometry=condition_design_geometry,
         )
 
         # single/pair donor dropout remains fully active, but it must not advance the
@@ -342,9 +338,22 @@ class NativeTrunk(nn.Module):
         node_graph, node_local = self._node_lookup(GI, mask, N)
         logits = self.distogram_head(z) if self.distogram_head is not None else None
         with torch.no_grad():
+            geom_mask = batch['geometry_condition_mask'].bool()
+            design = batch['_design_mask'].bool()
+            task = batch['_aux_task_mask'].bool()
+            task_count = task.sum().to(dtype=X.dtype)
+            other_design = design & (~task)
+            other_design_count = other_design.sum().to(dtype=X.dtype)
             self.last_diagnostics = {
                 'relational_single_rms': torch.sqrt(global_s.float().pow(2).mean() + 1e-8).to(X.dtype),
                 'relational_pair_rms': torch.sqrt(z.float().pow(2).mean() + 1e-8).to(X.dtype),
+                'relational_task_geometry_visible_fraction': (
+                    (geom_mask & task).sum().to(dtype=X.dtype) / task_count.clamp_min(1.0)
+                ),
+                'relational_non_task_design_geometry_visible_fraction': (
+                    (geom_mask & other_design).sum().to(dtype=X.dtype)
+                    / other_design_count.clamp_min(1.0)
+                ),
             }
         return {
             'single_global': global_s,
@@ -356,7 +365,6 @@ class NativeTrunk(nn.Module):
             'seq_padded': batch['seq'],
             'atom_exists_padded': batch['atom14_gt_exists'].bool(),
             'design_padded': batch['_design_mask'].bool(),
-            'aux_task_padded': batch['_aux_task_mask'].bool(),
             'is_antigen_padded': batch['_is_antigen'].bool(),
             'distogram_logits': logits,
             'biological_mask': valid_mask.bool(),
@@ -364,12 +372,14 @@ class NativeTrunk(nn.Module):
         }
 
     def distogram_loss_from_native(self, state, true_X, true_S, collect_audit=False):
-        """Distogram supervision with optional relation-balanced reduction.
+        """AbX-style distogram supervision on the live dense pair state.
 
-        ``pair_mean`` preserves the historical mean over every supervised pair.
-        ``relation_balanced`` first averages DD/DF/DA inside each complex and then
-        equally averages the relations that exist in that complex.  Pair counts
-        therefore no longer determine the semantic authority of the auxiliary loss.
+        The head/targets follow the supplied AbX implementation: symmetric
+        logits, pseudo-beta targets and 64 bins over 2.3125--21.6875 Angstrom.
+        For the support mask we adopt the standard Boltz-style non-self rule so
+        trivial i==j zero-distance labels do not dilute relational supervision.
+        ``all_resolved`` remains the formal R29/R30 scope; DA statistics are
+        observation-only and never rebalance the objective.
         """
         zero = true_X.sum() * 0.0
         if not self.enable_distogram or state.get('distogram_logits') is None:
@@ -406,79 +416,47 @@ class NativeTrunk(nn.Module):
             target.reshape(-1), reduction='none',
         ).reshape(B, L, L)
 
-        donor_pair_mask = pseudo_beta_mask[:, :, None] & pseudo_beta_mask[:, None, :]
-        donor_pair_mask = donor_pair_mask & (~torch.eye(
+        pair_mask = pseudo_beta_mask[:, :, None] & pseudo_beta_mask[:, None, :]
+        pair_mask = pair_mask & (~torch.eye(
             L, device=logits.device, dtype=torch.bool
         )[None, :, :])
-
         design = state['design_padded'].bool() & pseudo_beta_mask
-        generation = state.get('aux_task_padded', state['design_padded']).bool() & pseudo_beta_mask
-        antigen = state['is_antigen_padded'].bool() & pseudo_beta_mask
-        framework = pseudo_beta_mask & (~generation) & (~antigen)
-        generation_pair = generation[:, :, None] | generation[:, None, :]
-
-        pair_mask = donor_pair_mask
-        if self.distogram_pair_scope == 'generation_anchored':
-            pair_mask = donor_pair_mask & generation_pair
-        elif self.distogram_pair_scope == 'design_anchored':
-            pair_mask = donor_pair_mask & (design[:, :, None] | design[:, None, :])
+        if self.distogram_pair_scope == 'design_anchored':
+            pair_mask = pair_mask & (design[:, :, None] | design[:, None, :])
         elif self.distogram_pair_scope != 'all_resolved':
-            raise ValueError(f'unknown distogram pair_scope={self.distogram_pair_scope!r}')
+            raise ValueError(
+                f'unknown distogram pair_scope={self.distogram_pair_scope!r}'
+            )
 
-        if self.distogram_pair_scope == 'generation_anchored':
-            leaked_context_pair = pair_mask & (~generation_pair)
-            if bool(leaked_context_pair.any()):
-                raise RuntimeError(
-                    'generation_anchored Distogram contract violated: an optimized '
-                    'pair has no generated endpoint.'
-                )
-
-        gg = pair_mask & generation[:, :, None] & generation[:, None, :]
-        gf = pair_mask & (
-            (generation[:, :, None] & framework[:, None, :])
-            | (framework[:, :, None] & generation[:, None, :])
-        )
-        ga = pair_mask & (
-            (generation[:, :, None] & antigen[:, None, :])
-            | (antigen[:, :, None] & generation[:, None, :])
-        )
-
-        def graph_masked_mean(value, mask):
-            count = mask.sum(dim=(-1, -2))
-            mean = (value * mask.to(value.dtype)).sum(dim=(-1, -2)) / count.clamp_min(1).to(value.dtype)
-            return mean, count
-
-        dd_mean, dd_count = graph_masked_mean(ce, gg)
-        df_mean, df_count = graph_masked_mean(ce, gf)
-        da_mean, da_count = graph_masked_mean(ce, ga)
-
-        if self.distogram_reduction == 'relation_balanced':
-            rel_means = torch.stack([dd_mean, df_mean, da_mean], dim=-1)
-            rel_valid = torch.stack([dd_count > 0, df_count > 0, da_count > 0], dim=-1)
-            per_graph = (rel_means * rel_valid.to(rel_means.dtype)).sum(dim=-1) / rel_valid.sum(dim=-1).clamp_min(1).to(rel_means.dtype)
-            valid_graph = rel_valid.any(dim=-1)
-            loss = per_graph[valid_graph].mean() if bool(valid_graph.any()) else zero
-        else:
-            denom = pair_mask.sum(dim=(-1, -2)).to(ce.dtype).clamp_min(1.0)
-            per_graph = (ce * pair_mask.to(ce.dtype)).sum(dim=(-1, -2)) / denom
-            loss = per_graph.mean()
+        denom = pair_mask.sum(dim=(-1, -2)).to(ce.dtype).clamp_min(1.0)
+        per_graph = (ce * pair_mask.to(ce.dtype)).sum(dim=(-1, -2)) / denom
+        loss = per_graph.mean()
 
         audit = {}
         if collect_audit:
             with torch.no_grad():
-                def masked_mean(value, mask):
-                    n = mask.sum()
-                    return (value * mask.to(value.dtype)).sum() / n.clamp_min(1).to(value.dtype)
+                antigen = state['is_antigen_padded'].bool() & pseudo_beta_mask
+                da = pair_mask & design[:, :, None] & antigen[:, None, :]
+                da_n = da.sum()
+                da_ce = (
+                    (ce * da.to(ce.dtype)).sum() / da_n.clamp_min(1).to(ce.dtype)
+                )
+                probs = torch.softmax(logits.float(), dim=-1)
+                last_contact_bin = int((boundaries < 8.0).sum().item())
+                contact_prob = probs[..., :last_contact_bin + 1].sum(dim=-1)
+                native_contact = d2.squeeze(-1) < (8.0 ** 2)
+                soft_tp = (contact_prob * native_contact.float() * da.float()).sum()
+                soft_pred = (contact_prob * da.float()).sum()
                 audit = {
-                    'distogram_DD_pairs': gg.sum().to(loss.dtype),
-                    'distogram_DF_pairs': gf.sum().to(loss.dtype),
-                    'distogram_DA_pairs': ga.sum().to(loss.dtype),
-                    'distogram_DD_ce': masked_mean(ce, gg).to(loss.dtype),
-                    'distogram_DF_ce': masked_mean(ce, gf).to(loss.dtype),
-                    'distogram_DA_ce': masked_mean(ce, ga).to(loss.dtype),
-                    'distogram_relation_balanced': loss.new_tensor(
-                        1.0 if self.distogram_reduction == 'relation_balanced' else 0.0
-                    ),
+                    'distogram_valid_pairs': pair_mask.sum().to(loss.dtype),
+                    'distogram_da_ce': da_ce.to(loss.dtype),
+                    'distogram_da_contact_precision': (
+                        soft_tp / soft_pred.clamp_min(1e-8)
+                    ).to(loss.dtype),
+                    'distogram_head_weight_rms': (
+                        self.distogram_head.proj.weight.detach().float()
+                        .square().mean().sqrt()
+                    ).to(loss.dtype),
                 }
         return loss, audit
 

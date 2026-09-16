@@ -108,22 +108,82 @@ class AbFlowModel(nn.Module):
                 "endpoint_primary_analytic was rejected by R73 and is no longer a formal mode."
             )
         self.single_physical_field = self.physical_authority_mode != "legacy_split"
-        # R72 diagnostics falsified the hypothesis that the recurrent native
-        # Cartesian workspace contains superior intrinsic geometry: it is worse than
-        # carrier authority in every round and catastrophically unstable in round 0.
-        # Keep native hidden/message reasoning, but make coordinates a deterministic
-        # endpoint chart of the sole carrier state.
-        self.context_geometry_mode = str(
-            authority_config.get('context_geometry_mode', 'carrier_synced_readonly')
-            or 'carrier_synced_readonly'
+        # R75's sequential native->carrier Cartesian writeback was falsified.
+        # The formal R72 mainline therefore has one fixed geometry semantics:
+        # native ctx/out coordinates are latent message-passing workspace only,
+        # while the carrier is the sole recurrent/terminal Cartesian authority.
+        self.geometric_operator_mode = "latent_native_workspace"
+        requested_operator = str(
+            authority_config.get("geometric_operator_mode", "latent_native_workspace")
+            or "latent_native_workspace"
         ).strip().lower()
-        if self.context_geometry_mode != 'carrier_synced_readonly':
+        if requested_operator != "latent_native_workspace":
             raise ValueError(
-                'formal single-field mainline requires context_geometry_mode='
-                f"'carrier_synced_readonly', got {self.context_geometry_mode!r}."
+                "Only R72 latent_native_workspace is supported on the formal mainline; "
+                f"got geometric_operator_mode={requested_operator!r}."
             )
-        if bool(authority_config.get('native_cartesian_recurrence', False)):
-            raise ValueError('native_cartesian_recurrence must be false on the formal single-field path.')
+        if bool(authority_config.get("strict_single_cartesian", False)):
+            raise ValueError("strict_single_cartesian is retired from the formal R72 mainline.")
+
+        # R77 preserves the mature AbFlow/R05 supervision semantics: only the
+        # final inner-refinement output is a coordinate training target.  The
+        # earlier rounds remain free latent refinement states; no all-round
+        # same-target auxiliary supervision is present on the formal path.
+        self.structure_supervision_scope = str(
+            authority_config.get("structure_supervision_mask", "legacy_cmask")
+            or "legacy_cmask"
+        ).strip().lower()
+        if self.structure_supervision_scope not in {"legacy_cmask", "paratope_only"}:
+            raise ValueError(
+                "physical_authority.structure_supervision_mask must be "
+                "'legacy_cmask' or 'paratope_only'."
+            )
+        self.fixed_context_writeback_scope = str(
+            authority_config.get("fixed_context_writeback", "legacy_cmask")
+            or "legacy_cmask"
+        ).strip().lower()
+        if self.fixed_context_writeback_scope not in {"legacy_cmask", "paratope_only"}:
+            raise ValueError(
+                "physical_authority.fixed_context_writeback must be "
+                "'legacy_cmask' or 'paratope_only'."
+            )
+
+        # R79 single-factor experiment: synchronize the relational Single/Pair
+        # representation with the CURRENT authoritative H3 state at each of the
+        # three fixed-t macro refinement rounds.  This is deliberately NOT AbX
+        # prev/recycle: there is no prev_seq/prev_pair/prev_pos state, no added
+        # memory branch and no new loss.  Round 0 reads the actual outer Xt;
+        # rounds 1/2 read the previous carrier's analytic endpoint view.
+        round_state_cfg = representation_config.get("round_state_conditioning", {})
+        self.round_state_conditioning_enabled = bool(
+            round_state_cfg.get("enabled", False)
+        )
+        self.round_state_geometry_source = str(
+            round_state_cfg.get("geometry_source", "current_authoritative_state")
+            or "current_authoritative_state"
+        ).strip().lower()
+        if self.round_state_conditioning_enabled:
+            if self.round_state_geometry_source != "current_authoritative_state":
+                raise ValueError(
+                    "round_state_conditioning.geometry_source must be "
+                    "'current_authoritative_state'."
+                )
+            if not self.single_physical_field:
+                raise ValueError(
+                    "round-state Single/Pair conditioning requires the formal "
+                    "single physical Cartesian field."
+                )
+            if self.structure_supervision_scope != "paratope_only":
+                raise ValueError(
+                    "round-state Single/Pair conditioning requires paratope-only "
+                    "structure supervision so relational geometry and physical authority "
+                    "share the same H3 domain."
+                )
+            if self.fixed_context_writeback_scope != "paratope_only":
+                raise ValueError(
+                    "round-state Single/Pair conditioning requires paratope-only "
+                    "writeback so framework/antigen context stays exact."
+                )
 
         if self.coord_controller_mode in {"egnn_unit_direction", "egnn_prenorm_raw"} and self.pair_coord_mode != "direct_shared":
             raise ValueError(
@@ -310,10 +370,18 @@ class AbFlowModel(nn.Module):
         self._sample_forensic_records = []
         self._sample_forensic_alerted = False
 
-        # Formal trajectory observer: uses the exact Test sampler forwards.
+        # R72 root-cause observer: uses the exact formal Test sampler forwards.
         # Runtime-only; no Parameter/buffer/checkpoint state and no extra RNG.
         _sad = str(os.environ.get("ABFLOW_SAMPLE_AUTHORITY_DIAGNOSTICS", "off") or "off").strip().lower()
         self.sample_authority_diagnostics = _sad in {"1", "true", "yes", "y", "on"}
+        # R77 matched state-exposure audit.  Evaluation-only and RNG-isolated:
+        # at selected sampler times, compare the exact same network on
+        # (a) its free-rollout Cartesian state and (b) the analytic training-path
+        # state for the SAME test complex/time/sequence context.  This directly
+        # tests coordinate-state exposure mismatch without ValGen or new losses.
+        _sea = str(os.environ.get("ABFLOW_STATE_EXPOSURE_AUDIT", "off") or "off").strip().lower()
+        self.state_exposure_audit = _sea in {"1", "true", "yes", "y", "on"}
+        self.state_exposure_steps = {0, 2, 5, 8, 9}
         self._sample_authority_records = []
 
         # Plain runtime metadata; not part of state_dict.
@@ -325,7 +393,7 @@ class AbFlowModel(nn.Module):
             'coord_normalize': self.coord_normalize,
             'physical_authority_mode': self.physical_authority_mode,
             'single_physical_field': self.single_physical_field,
-            'context_geometry_mode': self.context_geometry_mode,
+            'geometric_operator_mode': self.geometric_operator_mode,
         }
 
     @staticmethod
@@ -776,8 +844,7 @@ class AbFlowModel(nn.Module):
                         batch_id, memory_H=None, smooth_prob=None, smooth_mask=None,
                         flow_t=None, coord_pep_condition=None,
                         coord_pep_condition_mask=None, seq_pep_condition=None,
-                        seq_pep_condition_mask=None, trunk_state=None,
-                        carrier_to_context_sync_fn=None):
+                        seq_pep_condition_mask=None, trunk_state=None):
         H_0, (ctx_edges, _), (atom_embeddings, atom_weights) = self.aa_feature(
             X, S, batch_id, self.k_neighbors, residue_pos,
             smooth_prob=smooth_prob, smooth_mask=smooth_mask)
@@ -875,8 +942,7 @@ class AbFlowModel(nn.Module):
             channel_attr=atom_embeddings, channel_weights=atom_weights,
             ctx_edge_attr=ctx_pair_attr, inter_edge_attr=inter_pair_attr,
             surf_edge_attr=surf_pair_attr, single_attr=trunk_single,
-            capture_bridge_diagnostics=capture_diag,
-            carrier_to_context_sync_fn=carrier_to_context_sync_fn)
+            capture_bridge_diagnostics=capture_diag)
         if capture_diag:
             def _rms(value):
                 if value is None or value.numel() == 0:
@@ -1100,11 +1166,12 @@ class AbFlowModel(nn.Module):
                  flow_source_init=None):
         """R05 predictor at one outer transport state.
 
-        Preserve three physical refinement rounds and exactly one learned H3
-        Cartesian degree of freedom.  The carrier is the Score-Flow chart; every
-        native H3 context coordinate is the deterministic analytic endpoint chart
-        of that carrier.  ctx/out coordinate heads remain only for checkpoint/DDP
-        compatibility and never form a recurrent Cartesian workspace.
+        R72 preserves three physical refinement rounds and exactly one learned
+        H3 Cartesian degree of freedom.  The carrier is the Score-Flow chart and
+        the endpoint is its analytic clean-structure chart.  Native ctx/out
+        coordinates are latent message-passing workspace with zero Cartesian
+        authority; only inter/surface carrier updates recurrently move the physical
+        state.
         """
         batch_id = self.batch_constants['batch_id']
         interface_batch_id = self.batch_constants['interface_batch_id']
@@ -1154,17 +1221,6 @@ class AbFlowModel(nn.Module):
             source_X0_model = None
             t_int_model = None
 
-        if self.single_physical_field:
-            context_endpoint_interface = self._carrier_to_endpoint_chart(
-                transport_Xt, source_X0_model, interface_X, t_int_model)
-            context_endpoint_native = self._interface_to_native_model(
-                context_endpoint_interface, paratope_mask, batch_id,
-                interface_batch_id)
-            # Make ctx-edge construction, NativeTrunk geometry, and the first EGNN
-            # ctx layer read the same deterministic endpoint view.
-            X = X.clone()
-            X[paratope_mask] = context_endpoint_native
-
         pep_X_model, pep_coord_valid = None, None
         if X_pep is not None and X_pep.shape == interface_X.shape:
             pep_X_raw = X_pep.to(device=X.device, dtype=X.dtype)
@@ -1180,19 +1236,34 @@ class AbFlowModel(nn.Module):
 
         trunk_S = S
         biological = paratope_mask.bool() | ((trunk_S >= 0) & (trunk_S < self.num_classes))
-        trunk_X = X.clone()
-        trunk_X[paratope_mask] = context_endpoint_native.to(trunk_X.dtype)
-        relational_X = self.normalizer.unnormalize(trunk_X)
-        trunk_state = self.native_trunk(
-            X=relational_X, S=trunk_S,
-            segment_ids=self.batch_constants['segment_ids'],
-            residue_pos=residue_pos, batch_id=batch_id,
-            valid_mask=biological, is_antigen=self.batch_constants['is_ag'],
-            design_mask=cmask, aux_task_mask=paratope_mask, flow_t=flow_t,
-            cdr_type=self.cdr_type, residue_feature=self.aa_feature,
-            round_idx=-1,
-            atom_observed_mask=self.batch_constants.get('xloss_mask'))
-        self._last_trunk_state = trunk_state
+
+        # R77 baseline computes this trunk once outside the three physical rounds.
+        # Formal R79 changes exactly this state/representation contract.  When the
+        # factor is enabled, the trunk is rebuilt at the START of every macro round
+        # from the current physical H3 view; no prev_* recycle state is introduced.
+        trunk_state = None
+        current_relational_h3_native = None
+        if self.round_state_conditioning_enabled:
+            # Before round 0, interface_X is the true outer transport state Xt,
+            # not a carrier prediction.  Convert the same physical coordinates
+            # into the native chart before using them as structural features.
+            current_relational_h3_native = self._interface_to_native_model(
+                interface_X, paratope_mask, batch_id, interface_batch_id
+            )
+        else:
+            trunk_X = X.clone()
+            trunk_X[paratope_mask] = interface_X.to(trunk_X.dtype)
+            relational_X = self.normalizer.unnormalize(trunk_X)
+            trunk_state = self.native_trunk(
+                X=relational_X, S=trunk_S,
+                segment_ids=self.batch_constants['segment_ids'],
+                residue_pos=residue_pos, batch_id=batch_id,
+                valid_mask=biological, is_antigen=self.batch_constants['is_ag'],
+                design_mask=cmask, aux_task_mask=paratope_mask, flow_t=flow_t,
+                cdr_type=self.cdr_type, residue_feature=self.aa_feature,
+                round_idx=-1,
+                atom_observed_mask=self.batch_constants.get('xloss_mask'))
+            self._last_trunk_state = trunk_state
 
         r_logits, r_interface_X, r_edge_dist = [], [interface_X.clone()], []
         pred_S_dist, memory_H = None, None
@@ -1200,8 +1271,85 @@ class AbFlowModel(nn.Module):
         authority_endpoints_native = []
         authority_carriers_interface = []
         round_chart_diag = []
+        round_relational_diag = []
+        previous_trunk_state = None
+        previous_relational_h3_raw = None
 
         for round_idx in range(self.round):
+            if self.round_state_conditioning_enabled:
+                # Single scientific factor: re-encode the CURRENT model-visible
+                # H3 physical state before each macro refinement round.  The donor
+                # receives no native target coordinates and no prev_* context.
+                trunk_X = X.clone()
+                trunk_X[paratope_mask] = current_relational_h3_native.to(trunk_X.dtype)
+                relational_X = self.normalizer.unnormalize(trunk_X)
+                trunk_state = self.native_trunk(
+                    X=relational_X, S=trunk_S,
+                    segment_ids=self.batch_constants['segment_ids'],
+                    residue_pos=residue_pos, batch_id=batch_id,
+                    valid_mask=biological, is_antigen=self.batch_constants['is_ag'],
+                    design_mask=cmask, aux_task_mask=paratope_mask, flow_t=flow_t,
+                    cdr_type=self.cdr_type, residue_feature=self.aa_feature,
+                    round_idx=round_idx,
+                    atom_observed_mask=self.batch_constants.get('xloss_mask'),
+                    condition_design_geometry=True)
+                self._last_trunk_state = trunk_state
+
+                if capture_diag:
+                    with torch.no_grad():
+                        def _rrms(v):
+                            vf = v.detach().float()
+                            if not vf.numel():
+                                return interface_X.new_zeros(())
+                            return vf.square().mean().sqrt().to(interface_X.dtype)
+
+                        def _coord_rms_A(a, b):
+                            d = a.detach().float() - b.detach().float()
+                            if not d.numel():
+                                return interface_X.new_zeros(())
+                            return d.square().sum(dim=-1).mean().sqrt().to(interface_X.dtype)
+
+                        rel_raw = self._native_paratope_model_to_raw(
+                            current_relational_h3_native, paratope_mask, batch_id
+                        )
+                        if previous_trunk_state is None:
+                            single_refresh = interface_X.new_zeros(())
+                            pair_refresh = interface_X.new_zeros(())
+                            state_step_A = interface_X.new_zeros(())
+                        else:
+                            single_refresh = _rrms(
+                                trunk_state['single_global'] - previous_trunk_state['single_global']
+                            )
+                            pair_refresh = _rrms(
+                                trunk_state['pair_dense'] - previous_trunk_state['pair_dense']
+                            )
+                            state_step_A = _coord_rms_A(rel_raw, previous_relational_h3_raw)
+                        round_relational_diag.append({
+                            'round_idx': int(round_idx),
+                            'single_rms': _rrms(trunk_state['single_global']),
+                            'pair_rms': _rrms(trunk_state['pair_dense']),
+                            'single_refresh_rms': single_refresh,
+                            'pair_refresh_rms': pair_refresh,
+                            'state_step_A': state_step_A,
+                            'task_geometry_visible_fraction': (
+                                trunk_state.get('diag', {}).get(
+                                    'relational_task_geometry_visible_fraction',
+                                    interface_X.new_zeros(())
+                                )
+                            ),
+                            'non_task_design_geometry_visible_fraction': (
+                                trunk_state.get('diag', {}).get(
+                                    'relational_non_task_design_geometry_visible_fraction',
+                                    interface_X.new_zeros(())
+                                )
+                            ),
+                        })
+                        previous_trunk_state = {
+                            'single_global': trunk_state['single_global'].detach(),
+                            'pair_dense': trunk_state['pair_dense'].detach(),
+                        }
+                        previous_relational_h3_raw = rel_raw.detach()
+
             if round_idx >= self.proposal_adapter_start_round:
                 coord_cond, coord_mask = self._build_coord_pep_condition_for_residues(
                     pep_X_model, interface_X, paratope_mask,
@@ -1209,15 +1357,6 @@ class AbFlowModel(nn.Module):
                 seq_this, seq_mask_this = seq_cond, seq_cond_mask
             else:
                 coord_cond = coord_mask = seq_this = seq_mask_this = None
-
-            carrier_to_context_sync_fn = None
-            if self.single_physical_field:
-                def carrier_to_context_sync_fn(carrier_design):
-                    endpoint_interface = self._carrier_to_endpoint_chart(
-                        transport_Xt, source_X0_model, carrier_design, t_int_model)
-                    return self._interface_to_native_model(
-                        endpoint_interface, paratope_mask, batch_id,
-                        interface_batch_id)
 
             pred_logits, pred_X_proposal, carrier_proposal, H, edge_dist = self.message_passing(
                 X, S, residue_pos, interface_X, surface, paratope_mask,
@@ -1227,30 +1366,46 @@ class AbFlowModel(nn.Module):
                 coord_pep_condition_mask=coord_mask,
                 seq_pep_condition=seq_this,
                 seq_pep_condition_mask=seq_mask_this,
-                trunk_state=trunk_state,
-                carrier_to_context_sync_fn=carrier_to_context_sync_fn)
+                trunk_state=trunk_state)
 
+            endpoint_proposal_native = pred_X_proposal[paratope_mask]
             if self.physical_authority_mode == 'carrier_primary_analytic':
                 authority_carrier = carrier_proposal
                 endpoint_interface = self._carrier_to_endpoint_chart(
                     transport_Xt, source_X0_model, authority_carrier, t_int_model)
                 authority_endpoint_native = self._interface_to_native_model(
                     endpoint_interface, paratope_mask, batch_id, interface_batch_id)
-            else:
-                raise RuntimeError(
-                    'formal carrier-synced context requires carrier_primary_analytic'
+                # The native coordinate head remains in the parameter graph for
+                # exact checkpoint/DDP compatibility, but has zero H3 authority.
+                authority_endpoint_native = (
+                    authority_endpoint_native + 0.0 * endpoint_proposal_native
                 )
+            else:
+                authority_endpoint_native = endpoint_proposal_native
+                authority_carrier = carrier_proposal
+                endpoint_interface = self._native_to_interface_model(
+                    authority_endpoint_native, paratope_mask, batch_id,
+                    interface_batch_id)
 
-            # R76 clean single-field closure.  The native coordinate proposal is
-            # not a physical prediction.  Keep fixed/native context numerically
-            # unchanged and retain only a zero-gradient DDP tether to the shared
-            # ctx coordinate head; H3 is overwritten by the analytic endpoint of
-            # the authoritative carrier below.
-            pred_X = X.clone()
-            pred_X = pred_X + 0.0 * pred_X_proposal
+            if (
+                self.single_physical_field
+                and self.fixed_context_writeback_scope == "paratope_only"
+            ):
+                # Fixed context must remain numerically fixed.  Keep a zero-valued
+                # graph tether to the native coordinate head for DDP/topology
+                # compatibility, but grant it no prediction or recurrence authority.
+                pred_X = X.clone()
+                pred_X = pred_X + 0.0 * pred_X_proposal
+            else:
+                pred_X = pred_X_proposal.clone()
             if self.single_physical_field:
                 pred_X[paratope_mask] = authority_endpoint_native
                 interface_X = authority_carrier
+                if self.round_state_conditioning_enabled:
+                    # The next relational round reads this analytic endpoint view.
+                    # No detach is inserted: this is the same differentiable physical
+                    # recurrence already present in R77, now made visible to Single/Pair.
+                    current_relational_h3_native = authority_endpoint_native
             else:
                 interface_X = carrier_proposal
 
@@ -1296,11 +1451,18 @@ class AbFlowModel(nn.Module):
             authority_endpoints_native.append(authority_endpoint_native)
             authority_carriers_interface.append(interface_X)
 
-            # Across rounds only H3 changes.  All non-paratope context remains
-            # fixed; this closes the historical route by which a discarded native
-            # Cartesian workspace could leak into structure loss/next-round context.
+            # Three-round refinement is at one fixed outer flow time.  R77 keeps
+            # R72's latent native workspace inside AMEncoder, but only the H3
+            # analytic endpoint of the authoritative carrier is written back into
+            # the global coordinate context.  Non-H3 context is immutable.
             X = X.clone()
-            X[paratope_mask] = authority_endpoint_native
+            if (
+                self.single_physical_field
+                and self.fixed_context_writeback_scope == "paratope_only"
+            ):
+                X[paratope_mask] = authority_endpoint_native
+            else:
+                X[cmask] = pred_X[cmask]
             X = self.aa_feature.update_global_coordinates(X, S)
 
             if not self.struct_only:
@@ -1312,7 +1474,7 @@ class AbFlowModel(nn.Module):
 
         prmsd = self.prmsd_ffn(H[cmask]).squeeze() if self.struct_only else None
 
-        # Convert the exact authority histories to raw Angstrom BEFORE
+        # Convert the authoritative round histories to raw Angstrom BEFORE
         # clearing the centering cache.  They are detached diagnostics only.
         with torch.no_grad():
             self._last_round_authority_endpoints_raw = [
@@ -1324,6 +1486,7 @@ class AbFlowModel(nn.Module):
                 for v in authority_carriers_interface
             ]
             self._last_round_chart_diagnostics = round_chart_diag
+            self._last_round_relational_diagnostics = round_relational_diag
 
         pred_X = self.normalizer.uncentering(
             self.normalizer.unnormalize(pred_X), batch_id)
@@ -1341,12 +1504,11 @@ class AbFlowModel(nn.Module):
     def _validation_proxy_diagnostics(
             self, *, true_X, true_S, pred_S, r_logits,
             paratope_mask, batch_id, interface_batch_id, t_graph):
-        """Carrier-authority geometry diagnostics on already-produced states.
+        """R77/R78 field-consistency diagnostics on already-produced states.
 
-        After the R72 diagnosis, the discarded native Cartesian proposal is no
-        longer a scientific variable.  Track only the sole authority across rounds
-        and across Score-Flow time.  Kabsch/pair-distance are detached metrics and
-        never mutate coordinates or enter the loss.
+        Only the authoritative round geometry and time bins are retained.  The
+        discarded native-proposal hypothesis was already falsified by R72 and is
+        no longer part of the routine experiment surface.  Kabsch is metric-only.
         """
         out = {}
         auth_rounds = list(getattr(self, '_last_round_authority_endpoints_raw', []) or [])
@@ -1401,9 +1563,9 @@ class AbFlowModel(nn.Module):
         for ridx, ep in enumerate(auth_rounds[:self.round]):
             metrics = graph_geometry(ep[:, ca_idx].float(), true_ca)
             auth_metrics.append(metrics)
-            add_mean(f'r76_auth_r{ridx}_raw_A', metrics[0])
-            add_mean(f'r76_auth_r{ridx}_aligned_A', metrics[1])
-            add_mean(f'r76_auth_r{ridx}_pair_mae_A', metrics[2])
+            add_mean(f'roundfield_auth_r{ridx}_raw_A', metrics[0])
+            add_mean(f'roundfield_auth_r{ridx}_aligned_A', metrics[1])
+            add_mean(f'roundfield_auth_r{ridx}_pair_mae_A', metrics[2])
 
         def add_delta(prefix, metrics, field_idx):
             if len(metrics) < 3:
@@ -1417,64 +1579,33 @@ class AbFlowModel(nn.Module):
                         out[f'{prefix}_improve_frac_{tag}'] = (
                             vb[valid] < va[valid]).float().mean()
 
-        add_delta('r76_auth_aligned_delta_A', auth_metrics, 1)
-        add_delta('r76_auth_pair_delta_A', auth_metrics, 2)
+        add_delta('roundfield_auth_aligned_delta_A', auth_metrics, 1)
+        add_delta('roundfield_auth_pair_delta_A', auth_metrics, 2)
 
-        # Time-resolved final authoritative endpoint.  This is the cleanest test
-        # of whether the added Score-Flow/time machinery damages the mature R05
-        # local geometry only in particular noise/time regions.
-        if auth_metrics:
-            final_raw, final_aligned, final_pair = auth_metrics[-1]
-            tg = torch.as_tensor(t_graph, device=final_raw.device).detach().float().reshape(-1)
-            if tg.numel() == n_graph:
-                edges = torch.linspace(0.0, 1.0, 6, device=tg.device)
-                for b in range(5):
-                    sel = (tg >= edges[b]) & ((tg < edges[b + 1]) if b < 4 else (tg <= edges[b + 1]))
-                    for name, values in (
-                        ('raw_A', final_raw), ('aligned_A', final_aligned),
-                        ('pair_mae_A', final_pair)):
-                        valid = sel & torch.isfinite(values)
-                        out[f'r76_timebin{b}_{name}_sum'] = (
-                            values[valid].sum() if bool(valid.any()) else values.new_zeros(()))
-                        out[f'r76_timebin{b}_{name}_count'] = valid.sum().to(values.dtype)
+        # R79 mechanism diagnostics: does the relational state actually refresh
+        # when the authoritative H3 state changes across the three macro rounds?
+        for rec in list(getattr(self, '_last_round_relational_diagnostics', []) or []):
+            ridx = int(rec.get('round_idx', -1))
+            if ridx < 0:
+                continue
+            for key in (
+                'single_rms', 'pair_rms', 'single_refresh_rms',
+                'pair_refresh_rms', 'state_step_A',
+                'task_geometry_visible_fraction',
+                'non_task_design_geometry_visible_fraction',
+            ):
+                value = rec.get(key)
+                if torch.is_tensor(value) and value.numel() == 1:
+                    out[f'roundrel_r{ridx}_{key}'] = value.detach()
 
-        # Sequence/interface proxies are retained because the final paper target
-        # is co-design, not isolated geometry.
-        for ridx, (logits, mask) in enumerate(r_logits[:self.round]):
-            if bool(mask.any()):
-                pred_round = torch.argmax(logits[mask], dim=-1)
-                out[f'r76_round{ridx}_aar'] = (
-                    pred_round == true_S[mask]).float().mean()
+        # Pair must continue to drive the real Cartesian actuator after refresh.
+        for rec in list(getattr(self, '_last_round_egnn_diagnostics', []) or []):
+            ridx = int(rec.get('round_idx', -1))
+            bridge = rec.get('bridge', {}) or {}
+            value = bridge.get('bridge_pair_coordinate_delta_to_base_ratio_mean')
+            if ridx >= 0 and torch.is_tensor(value) and value.numel() == 1:
+                out[f'roundrel_r{ridx}_pair_coord_ratio'] = value.detach()
 
-        is_ag = self.batch_constants.get('is_ag')
-        if is_ag is not None and auth_rounds:
-            pred_final_ca = auth_rounds[-1][:, ca_idx].float()
-            contact_f1, caar_values = [], []
-            paratope_indices = paratope_mask.nonzero(as_tuple=False).reshape(-1)
-            for gid in range(n_graph):
-                pm = interface_batch_id == gid
-                agm = (batch_id == gid) & is_ag & (true_S != self.aa_feature.boa_idx)
-                if not bool(pm.any()) or not bool(agm.any()):
-                    continue
-                ag_ca = true_X[agm, ca_idx].float()
-                native_contact = torch.cdist(true_ca[pm], ag_ca) < 8.0
-                pred_contact = torch.cdist(pred_final_ca[pm], ag_ca) < 8.0
-                tp = (native_contact & pred_contact).float().sum()
-                fp = ((~native_contact) & pred_contact).float().sum()
-                fn = (native_contact & (~pred_contact)).float().sum()
-                precision = tp / (tp + fp + self.eps)
-                recall = tp / (tp + fn + self.eps)
-                contact_f1.append(2.0 * precision * recall / (precision + recall + self.eps))
-                native_res = native_contact.any(dim=-1)
-                if bool(native_res.any()):
-                    global_par_idx = paratope_indices[pm]
-                    caar_values.append((
-                        pred_S[global_par_idx[native_res]]
-                        == true_S[global_par_idx[native_res]]).float().mean())
-            if contact_f1:
-                out['r76_contact_f1'] = torch.stack(contact_f1).mean()
-            if caar_values:
-                out['r76_caar'] = torch.stack(caar_values).mean()
         return out
 
 
@@ -1546,12 +1677,13 @@ class AbFlowModel(nn.Module):
                     count = count + sequence_loss_mask.sum()
             snll = snll / count.clamp_min(1.0)
 
-        # Loss authority must match coordinate authority.  In the formal
-        # single-field H3 task only paratope rows are physically predicted; extra
-        # cmask framework/template rows have no Cartesian actuator and therefore
-        # must not contribute an impossible structure gradient.
         structure_supervision_mask = (
-            paratope_mask if self.single_physical_field else cmask
+            paratope_mask
+            if (
+                self.single_physical_field
+                and self.structure_supervision_scope == "paratope_only"
+            )
+            else cmask
         )
         struct_loss, struct_details, bb_rmsd, _ = self.protein_feature.structure_loss(
             pred_X, true_X, true_S, structure_supervision_mask, batch_id, xloss_mask,
@@ -1559,8 +1691,13 @@ class AbFlowModel(nn.Module):
 
         atom_pos = self.aa_feature._construct_atom_pos(true_S[paratope_mask])
         atom_mask = atom_pos != self.aa_feature.atom_pos_pad_idx
+
+        # Preserve the mature AbFlow/R05 contract: the coordinate objective is
+        # applied only to the FINAL refinement output.  Earlier rounds are
+        # iterative latent states, not independent endpoint targets.
         interface_loss = self._coordinate_training_objective(
-            r_interface_X[-1], coord_target, atom_mask, interface_batch_id)
+            r_interface_X[-1], coord_target, atom_mask, interface_batch_id
+        )
 
         # V235 authority closure: structure and transport supervision must act on
         # two charts of the SAME physical H3 state, never two free coordinate fields.
@@ -2015,7 +2152,11 @@ class AbFlowModel(nn.Module):
                 steps.set_postfix(t=f'{float(t):.2f}')
 
             prev_diag_capture = bool(getattr(self, '_diagnostic_capture', False))
-            if self.sample_forensics_enabled or self.sample_authority_diagnostics:
+            if (
+                self.sample_forensics_enabled
+                or self.sample_authority_diagnostics
+                or self.state_exposure_audit
+            ):
                 self._diagnostic_capture = True
             try:
                 H, pred_S, r_logits, pred_X, r_interface_X, _, prmsd = self._forward(
@@ -2035,7 +2176,11 @@ class AbFlowModel(nn.Module):
                 t=t, t_next=t_next,
                 canonical_t_min=self.f01_hybrid_t_min)
 
-            if self.sample_forensics_enabled or self.sample_authority_diagnostics:
+            if (
+                self.sample_forensics_enabled
+                or self.sample_authority_diagnostics
+                or self.state_exposure_audit
+            ):
                 t_value = float(t.detach().float().item())
                 t_next_value = float(t_next.detach().float().item())
                 if t_value < float(self.f01_hybrid_t_min):
@@ -2145,6 +2290,62 @@ class AbFlowModel(nn.Module):
                         'bridge_single_ratio': bridge_single,
                         'bridge_pair_ratio': bridge_pair,
                         'bridge_pair_coord_ratio': bridge_pair_coord,
+                    })
+
+            # Matched coordinate-state exposure audit.  It never writes oracle
+            # coordinates into the rollout and never contributes to any loss.
+            # The same St/context/time are used; only the H3 Cartesian state is
+            # replaced by the analytic training-path state.  fork_rng guarantees
+            # that this diagnostic cannot perturb subsequent categorical sampling.
+            if self.state_exposure_audit and int(i) in self.state_exposure_steps:
+                true_h3 = X[paratope_mask]
+                oracle_t_int = self._time_for_interface(
+                    flow_t, interface_batch_id, source_X0)
+                oracle_Xt, _ = self._r05_primary_path(
+                    source_X0, true_h3, flow_t, oracle_t_int,
+                    interface_batch_id)
+                state_gap_metrics = self._sample_h3_graph_metrics(
+                    Xt_before, oracle_Xt, interface_batch_id, batch_size)
+                cuda_devices = [X.device.index] if X.is_cuda else []
+                with torch.random.fork_rng(devices=cuda_devices, enabled=True):
+                    prev_capture = bool(getattr(self, '_diagnostic_capture', False))
+                    self._diagnostic_capture = False
+                    try:
+                        _, _, _, _, oracle_r_interface_X, _, _ = self._forward(
+                            X, S, cmask, smask, paratope_mask, X_pep, S_pep,
+                            surface, residue_pos, template, lengths,
+                            interface_init=oracle_Xt,
+                            sequence_init=None if self.struct_only else St,
+                            flow_t=flow_t, flow_source_init=source_X0)
+                    finally:
+                        self._diagnostic_capture = prev_capture
+                oracle_carrier = oracle_r_interface_X[-1]
+                if t_value < float(self.f01_hybrid_t_min):
+                    oracle_x1 = oracle_carrier
+                else:
+                    oracle_x1 = self.r3_matcher.endpoint_from_canonical_carrier_gfree(
+                        x_t=oracle_Xt, x0=source_X0,
+                        carrier=oracle_carrier, t=t,
+                        boundary_eps=self.f01_hybrid_t_min)
+                oracle_x1_metrics = self._sample_h3_graph_metrics(
+                    oracle_x1, true_h3, interface_batch_id, batch_size)
+                rollout_x1_metrics = self._sample_h3_graph_metrics(
+                    implied_x1, true_h3, interface_batch_id, batch_size)
+                for gid in range(batch_size):
+                    sgr, sga, sgp = state_gap_metrics[gid]
+                    rr, ra, rp = rollout_x1_metrics[gid]
+                    orr, ora, orp = oracle_x1_metrics[gid]
+                    self._sample_authority_records.append({
+                        'step': int(i), 't': t_value, 't_next': t_next_value,
+                        'state_gap_raw_A': sgr,
+                        'state_gap_aligned_A': sga,
+                        'state_gap_pair_mae_A': sgp,
+                        'oracle_x1_raw_A': orr,
+                        'oracle_x1_aligned_A': ora,
+                        'oracle_x1_pair_mae_A': orp,
+                        'exposure_x1_raw_gap_A': rr - orr,
+                        'exposure_x1_aligned_gap_A': ra - ora,
+                        'exposure_x1_pair_gap_A': rp - orp,
                     })
 
             Xt = Xt_next
