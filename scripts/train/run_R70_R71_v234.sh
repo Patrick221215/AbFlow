@@ -2,36 +2,35 @@
 set -euo pipefail
 
 # R76 single-field launcher: carrier is the sole Cartesian state; native H3
-# coordinates are read-only analytic endpoint context.  Supports clean R72 fork.
+# coordinates are read-only analytic endpoint context.  Formal R76 is scratch-only.
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PROJECT_ROOT=${ABFLOW_PROJECT_ROOT:-$ROOT}
 CONFIG_PATH=${1:-}
 shift || true
-GPU_CSV=""; MASTER_PORT=""; MASTER_ADDR=""; RESUME_CHECKPOINT=""; FORK_CHECKPOINT=""
+GPU_CSV=""; MASTER_PORT=""; MASTER_ADDR=""
 
 usage() {
   cat >&2 <<'USAGE'
 Usage:
   bash scripts/train/run_R70_R71_v234.sh <R76-config.json> \
-    --gpus 2,3,4,5,6,7 --port 29776 \
-    [--fork-from /R72/version_N/checkpoint/last_stepXXXX.pt]
+    --gpus 2,3,4,5,6,7 --port 29776
 
-Formal R76 causal fork:
+Formal R76 clean scratch run:
+  - random/scratch initialization only; no --resume / --fork-from;
   - carrier is the sole recurrent/terminal Cartesian state;
   - native H3 context is the analytic endpoint view of the current carrier;
-  - ctx/out hidden reasoning stays active, native Cartesian recurrence is removed;
+  - structure supervision is paratope-only, matching physical coordinate authority;
   - Train -> Validation -> observational 10-step Test remains unchanged.
 USAGE
 }
 
 [[ -n "$CONFIG_PATH" ]] || { usage; exit 2; }
+echo "[LauncherStart] config=$CONFIG_PATH args=$*"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --gpus) GPU_CSV=${2:-}; shift 2 ;;
     --port) MASTER_PORT=${2:-}; shift 2 ;;
     --master-addr) MASTER_ADDR=${2:-}; shift 2 ;;
-    --resume) RESUME_CHECKPOINT=${2:-}; shift 2 ;;
-    --fork-from) FORK_CHECKPOINT=${2:-}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
   esac
@@ -55,14 +54,11 @@ tr=cfg['training']; rt=cfg.get('runtime',{}); gen=cfg['generation']; test=cfg['d
 if 'gpus' in rt: raise SystemExit('runtime.gpus is forbidden; pass GPUs on CLI')
 def abspath(v): return v if os.path.isabs(v) else os.path.abspath(os.path.join(root,v))
 out=abspath(tr['output_dir'])
-resume=tr.get('schedule',{}).get('resume_checkpoint','') or ''
-if resume: resume=abspath(resume)
 lg=tr.get('logging',{})
 vals={
  'OUTPUT_ROOT':out,
  'PER_GPU_BATCH_SIZE':tr['loader'].get('per_gpu_batch_size', tr['loader'].get('batch_size')),
  'MAX_EPOCH':tr['schedule']['max_epoch'],
- 'CFG_RESUME_CHECKPOINT':resume,
  'CFG_MASTER_ADDR':rt.get('master_addr','127.0.0.1'),
  'OMP_THREADS':rt.get('omp_num_threads',2),
  'CUDA_ALLOC':rt.get('cuda_allocator','max_split_size_mb:128'),
@@ -79,43 +75,34 @@ PY
 
 MASTER_ADDR=${MASTER_ADDR:-$CFG_MASTER_ADDR}
 [[ -n "$MASTER_PORT" && "$MASTER_PORT" =~ ^[0-9]+$ ]] || { echo "--port is required" >&2; exit 2; }
-RESUME_CHECKPOINT=${RESUME_CHECKPOINT:-$CFG_RESUME_CHECKPOINT}
-[[ -z "$RESUME_CHECKPOINT" || -z "$FORK_CHECKPOINT" ]] || { echo "--resume and --fork-from are mutually exclusive" >&2; exit 2; }
-[[ -n "$PER_GPU_BATCH_SIZE" && "$PER_GPU_BATCH_SIZE" =~ ^[0-9]+$ && "$PER_GPU_BATCH_SIZE" -gt 0 ]] || {
-  echo "training.loader.per_gpu_batch_size must be a positive integer" >&2; exit 2;
-}
-EFFECTIVE_GLOBAL_TRAIN_BATCH=$((PER_GPU_BATCH_SIZE * NPROC_PER_NODE))
-[[ "$TEST_STEPS" == "10" ]] || { echo "formal observational test must use n_steps=10" >&2; exit 2; }
-
-cd "$PROJECT_ROOT"
-mkdir -p "$OUTPUT_ROOT"
-if [[ -n "$RESUME_CHECKPOINT" ]]; then
-  [[ -f "$RESUME_CHECKPOINT" ]] || { echo "resume checkpoint not found: $RESUME_CHECKPOINT" >&2; exit 2; }
-  RUN_DIR=$(dirname "$(dirname "$RESUME_CHECKPOINT")")
-  [[ "$(realpath "$(dirname "$RUN_DIR")")" == "$(realpath "$OUTPUT_ROOT")" ]] || {
-    echo "cross-experiment resume forbidden: use --fork-from for a causal child experiment" >&2; exit 2;
-  }
-  VERSION_BASE=$(basename "$RUN_DIR")
-  [[ "$VERSION_BASE" =~ ^version_([0-9]+)$ ]] || { echo "resume must live under version_N/checkpoint" >&2; exit 2; }
-  VERSION=${BASH_REMATCH[1]}
-  unset ABFLOW_FIXED_VERSION || true
-else
-  if [[ -n "$FORK_CHECKPOINT" ]]; then
-    [[ -f "$FORK_CHECKPOINT" ]] || { echo "fork checkpoint not found: $FORK_CHECKPOINT" >&2; exit 2; }
-    RESUME_CHECKPOINT="$FORK_CHECKPOINT"
-  fi
-  VERSION=0
-  while ! mkdir "$OUTPUT_ROOT/version_$VERSION" 2>/dev/null; do VERSION=$((VERSION+1)); done
+# R76 formal run is scratch-only.  A changed geometry/loss authority must not
+# inherit parent optimizer/EMA/epoch/checkpoint-selection state.
+# Create OUTPUT_ROOT first.  Without this, mkdir <root>/version_N fails forever
+# when the experiment root does not yet exist.
+mkdir -p "$OUTPUT_ROOT" || { echo "Failed to create OUTPUT_ROOT: $OUTPUT_ROOT" >&2; exit 2; }
+VERSION=0
+while :; do
   RUN_DIR="$OUTPUT_ROOT/version_$VERSION"
-  export ABFLOW_FIXED_VERSION="$VERSION"
-fi
+  if mkdir "$RUN_DIR" 2>/dev/null; then
+    break
+  fi
+  if [[ ! -e "$RUN_DIR" ]]; then
+    echo "Failed to create run directory: $RUN_DIR" >&2
+    exit 2
+  fi
+  VERSION=$((VERSION+1))
+done
+EFFECTIVE_GLOBAL_TRAIN_BATCH=$((PER_GPU_BATCH_SIZE * NPROC_PER_NODE))
+export ABFLOW_FIXED_VERSION="$VERSION"
+export ABFLOW_EXPECTED_RUN_DIR="$RUN_DIR"
+export ABFLOW_REQUIRE_SCRATCH=1
+export ABFLOW_RESUME_CHECKPOINT=""
 RUN_LOG="$RUN_DIR/run_time.log"; LATEST_LOG="$OUTPUT_ROOT/run_time.log"
 mkdir -p "$RUN_DIR"; ln -sfn "version_$VERSION/run_time.log" "$LATEST_LOG"
 
 export ABFLOW_PROJECT_ROOT="$PROJECT_ROOT"
 export CUDA_VISIBLE_DEVICES="$GPU_CSV"
 export ABFLOW_NPROC_PER_NODE="$NPROC_PER_NODE"
-export ABFLOW_RESUME_CHECKPOINT="$RESUME_CHECKPOINT"
 export OMP_NUM_THREADS="$OMP_THREADS"
 export PYTHONUNBUFFERED=1
 [[ -n "$CUDA_ALLOC" ]] && export PYTORCH_CUDA_ALLOC_CONF="$CUDA_ALLOC"
@@ -134,7 +121,7 @@ export ABFLOW_EPOCH_TEST_FAIL_FAST=on
 export ABFLOW_EPOCH_TEST_MODEL_INVALID_POLICY=record_and_continue
 export ABFLOW_EPOCH_TEST_SHOW_SAMPLE_PROGRESS="${ABFLOW_EPOCH_TEST_SHOW_SAMPLE_PROGRESS:-on}"
 
-# Progress bars ON; routine forensic spam OFF.  The compact R72 Test trajectory
+# Progress bars ON; routine forensic spam OFF.  The compact R76 Test trajectory
 # observer is ON and reuses the exact formal sampler forwards.
 export ABFLOW_TQDM="${ABFLOW_TQDM:-on}"
 export ABFLOW_GEOMETRY_FORENSICS="${ABFLOW_GEOMETRY_FORENSICS:-off}"
@@ -155,8 +142,7 @@ echo "[RunLog] canonical=$RUN_LOG latest=$LATEST_LOG"
 echo "[RunVersion] fixed_version=$VERSION dir=$RUN_DIR"
 echo "[RunConfig] config=$CONFIG_PATH"
 echo "[RunResources] physical_gpus=$GPU_CSV nproc=$NPROC_PER_NODE per_gpu_train_val_batch=$PER_GPU_BATCH_SIZE effective_global_train_batch=$EFFECTIVE_GLOBAL_TRAIN_BATCH test_batch=$TEST_BATCH master_addr=$MASTER_ADDR port=$MASTER_PORT"
-echo "[RunResume] checkpoint=${RESUME_CHECKPOINT:-scratch}"
-[[ -z "$FORK_CHECKPOINT" ]] || echo "[RunFork] parent_checkpoint=$FORK_CHECKPOINT child_output=$RUN_DIR"
+echo "[RunInit] mode=scratch parent_checkpoint=none optimizer=reset ema=reset epoch=0 best_val=reset"
 echo "[TrainingHorizon] source=json max_epoch=$MAX_EPOCH launcher_epoch_override=none"
 echo "[TrainValTestContract] order=train->validation->test checkpoint_selection=validation test_metrics=observation_only test_steps=$TEST_STEPS test_seed=$TEST_SEED"
 
@@ -182,16 +168,20 @@ if int(pa.get('physical_dof',0)) != 1 or int(pa.get('rounds',0)) != 3: raise Sys
 if pa.get('context_geometry_mode')!='carrier_synced_readonly': raise SystemExit('R76 requires carrier_synced_readonly context geometry')
 if bool(pa.get('native_cartesian_recurrence',True)): raise SystemExit('native Cartesian recurrence must be disabled')
 if bool(pa.get('fixed_context_coordinate_writeback',True)): raise SystemExit('fixed-context coordinate writeback must be disabled')
+if pa.get('structure_supervision_mask')!='paratope_only': raise SystemExit('R76 clean run requires paratope-only structure supervision')
+if str(cfg['training']['schedule'].get('resume_checkpoint','') or '').strip(): raise SystemExit('R76 clean run forbids resume_checkpoint')
+if str(exp.get('initialization','')).lower()!='scratch': raise SystemExit('R76 clean run requires experiment.initialization=scratch')
 gen=cfg['generation']
 if gen.get('terminal_coordinate_authority')!='integrated_carrier_direct_h3': raise SystemExit('integrated carrier terminal required')
 if bool(gen.get('terminal_kabsch_fusion',True)): raise SystemExit('terminal Kabsch fusion forbidden')
 if gen.get('fixed_context')!='unchanged_exactly': raise SystemExit('fixed context must remain exact')
 print(f'[ExperimentIdentity] PASS id={eid} role={role} protocol={exp["protocol"]}')
 print('[PhysicalStateContract] physical_dof=1 authority=carrier endpoint=analytic rounds=3')
+print('[StructureAuthorityContract] prediction_rows=paratope structure_supervision=paratope_only extra_cmask_rows=fixed_context no_native_proposal_loss=1')
 print('[ContextGeometryContract] native_cartesian_recurrence=0 context_chart=analytic_endpoint_from_current_carrier ctx_hidden_reasoning=1 carrier_coordinate_operator=sole fixed_context_writeback=0')
 print('[R05DeltaContract] retained=SinglePair+explicit_time+carrier_scoreflow removed=recurrent_native_cartesian_workspace diagnostics=round_authority+time_bins+test_trajectory')
 print('[CoordinateControllerContract] pair=direct_shared controller=egnn_prenorm_raw raw_R05_vector=1 no_tanh=1 no_clipping=1 no_trust_radius=1')
-print('[LossContract] sequence1+structure1+interface1+edge1 distogram0 smooth_lddt0 new_loss=0')
+print('[LossContract] sequence1+structure1(paratope_only)+interface1+edge1 distogram0 smooth_lddt0 new_loss=0')
 print('[DiagnosticsContract] R76GeometryValidation=on R76TimeValidation=on R76TestTrajectory=on native_proposal_metrics=off routine_stage_trace=off progress=train+validation+test:on')
 PY
 
@@ -231,7 +221,12 @@ if grep -Fq "gen_X[ab] = torch.matmul(gen_X[ab], R.T) + trans" "$PROJECT_ROOT/mo
   echo "legacy terminal Kabsch mutation is present" >&2; exit 2
 fi
 grep -Fq "return 0.5 * (cos(step / self.max_step * pi) + 1) * 0.9" "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo "context_ratio changed unexpectedly" >&2; exit 2; }
-echo "[Preflight] py_compile=PASS single_carrier=PASS carrier_synced_context=PASS native_cartesian_recurrence_removed=PASS fixed_context_writeback_removed=PASS r75_removed=PASS endpoint_primary_removed=PASS diagnostics=PASS terminal_carrier=PASS no_terminal_kabsch=PASS context_ratio_unchanged=PASS"
+grep -Fq "structure_supervision_mask = (" "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo "paratope-only structure authority missing" >&2; exit 2; }
+grep -Fq "pred_X = X.clone()" "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo "fixed-context pred_X closure missing" >&2; exit 2; }
+if grep -Fq "pred_X = pred_X_proposal.clone()" "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py"; then
+  echo "discarded native proposal still numerically defines pred_X" >&2; exit 2
+fi
+echo "[Preflight] py_compile=PASS single_carrier=PASS carrier_synced_context=PASS native_cartesian_recurrence_removed=PASS fixed_context_writeback_removed=PASS structure_authority_closed=PASS scratch_only=PASS r75_removed=PASS endpoint_primary_removed=PASS diagnostics=PASS terminal_carrier=PASS no_terminal_kabsch=PASS context_ratio_unchanged=PASS"
 
 python - "$PROJECT_ROOT" <<'PY'
 import hashlib,os,sys

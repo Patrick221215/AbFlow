@@ -105,6 +105,20 @@ class AbFlowTrainer(Trainer):
         self.log_alpha = log(config.final_lr / config.lr) / self.max_step
         super().__init__(model, train_loader, valid_loader, config)
 
+        # A scientific child run must never be silently redirected into a parent
+        # version directory by resume semantics.  The launcher publishes the exact
+        # run directory; fail before training if Trainer resolved anything else.
+        expected_run_dir = str(os.environ.get("ABFLOW_EXPECTED_RUN_DIR", "") or "").strip()
+        if expected_run_dir:
+            expected_run_dir = os.path.abspath(expected_run_dir)
+            actual_run_dir = os.path.abspath(self.config.save_dir)
+            if actual_run_dir != expected_run_dir:
+                raise RuntimeError(
+                    "run-directory authority mismatch: "
+                    f"expected={expected_run_dir} actual={actual_run_dir}. "
+                    "Cross-experiment resume/fork is forbidden for this clean run."
+                )
+
         # Epoch-level scientific summaries.  These are observational only and
         # never participate in gradient computation or checkpoint selection.
         # We keep only the formal top-level objective components so the canonical

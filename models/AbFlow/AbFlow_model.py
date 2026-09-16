@@ -1241,7 +1241,13 @@ class AbFlowModel(nn.Module):
                     'formal carrier-synced context requires carrier_primary_analytic'
                 )
 
-            pred_X = pred_X_proposal.clone()
+            # R76 clean single-field closure.  The native coordinate proposal is
+            # not a physical prediction.  Keep fixed/native context numerically
+            # unchanged and retain only a zero-gradient DDP tether to the shared
+            # ctx coordinate head; H3 is overwritten by the analytic endpoint of
+            # the authoritative carrier below.
+            pred_X = X.clone()
+            pred_X = pred_X + 0.0 * pred_X_proposal
             if self.single_physical_field:
                 pred_X[paratope_mask] = authority_endpoint_native
                 interface_X = authority_carrier
@@ -1540,8 +1546,15 @@ class AbFlowModel(nn.Module):
                     count = count + sequence_loss_mask.sum()
             snll = snll / count.clamp_min(1.0)
 
+        # Loss authority must match coordinate authority.  In the formal
+        # single-field H3 task only paratope rows are physically predicted; extra
+        # cmask framework/template rows have no Cartesian actuator and therefore
+        # must not contribute an impossible structure gradient.
+        structure_supervision_mask = (
+            paratope_mask if self.single_physical_field else cmask
+        )
         struct_loss, struct_details, bb_rmsd, _ = self.protein_feature.structure_loss(
-            pred_X, true_X, true_S, cmask, batch_id, xloss_mask,
+            pred_X, true_X, true_S, structure_supervision_mask, batch_id, xloss_mask,
             self.aa_feature)
 
         atom_pos = self.aa_feature._construct_atom_pos(true_S[paratope_mask])

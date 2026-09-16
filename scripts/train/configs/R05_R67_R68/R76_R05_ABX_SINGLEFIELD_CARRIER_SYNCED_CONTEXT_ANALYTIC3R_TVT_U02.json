@@ -2,10 +2,11 @@
   "experiment": {
     "id": "R76_R05_ABX_SINGLEFIELD_CARRIER_SYNCED_CONTEXT_ANALYTIC3R_TVT_U02",
     "parent": "R72_R05_ABX_SINGLEFIELD_CARRIER_AUTHORITY_ANALYTIC3R_TVT_U02",
-    "factor": "Remove the falsified recurrent native Cartesian geometry workspace. Keep ctx/out hidden-message reasoning, but synchronize every H3 context coordinate from the current carrier through the analytic endpoint chart; carrier remains the sole learned/recurrent coordinate operator. Fixed non-paratope context never receives native coordinate writeback. No new loss/module/controller/sampler change.",
+    "factor": "Clean scratch test of the strict single-field carrier architecture. Remove recurrent native Cartesian workspace; ctx/out retain hidden-message reasoning and read the analytic carrier endpoint only. Structure supervision is restricted to the paratope/physical-authority rows, so no non-authoritative cmask coordinate can enter the loss. No parent checkpoint, optimizer, EMA, epoch or best-validation state is inherited.",
     "protocol": "formal_train_val_test",
     "diagnostic_role": "r76_carrier_synced_readonly_context_analytic3r",
-    "causal_question": "Does removing the unstable/redundant native Cartesian recurrence while preserving Single/Pair hidden reasoning recover mature-R05 intrinsic refinement without reintroducing validation runaway?"
+    "causal_question": "From a clean initialization, does one carrier Cartesian state plus carrier-synced read-only context recover mature-R05 intrinsic refinement without the impossible non-authoritative structure loss or historical validation runaway?",
+    "initialization": "scratch"
   },
   "data": {
     "train": {
@@ -172,14 +173,15 @@
           "rounds": 3,
           "carrier_endpoint_relation": "analytic_f01_gfree_hybrid",
           "frame_conversion": "AG_centered_carrier <-> raw_physical <-> AB_centered_native_endpoint",
-          "non_primary_coordinate_output": "none_recurrent; ctx_out_coordinate_candidates_computed_only_for_checkpoint_ddp_compatibility_and_discarded",
+          "non_primary_coordinate_output": "numeric_discard; zero_gradient_ddp_tether_only; never_enters_structure_loss_or_recurrence",
           "structure_authority": "analytic_endpoint_chart_of_carrier",
           "transport_authority": "analytic_carrier_chart",
           "terminal_authority": "integrated_carrier",
           "round_recurrence": "carrier_state_across_3_rounds; native_H3_context_is_analytic_endpoint_view_only",
           "context_geometry_mode": "carrier_synced_readonly",
           "native_cartesian_recurrence": false,
-          "fixed_context_coordinate_writeback": false
+          "fixed_context_coordinate_writeback": false,
+          "structure_supervision_mask": "paratope_only"
         }
       }
     }
