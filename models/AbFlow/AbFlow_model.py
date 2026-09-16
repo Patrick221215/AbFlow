@@ -108,22 +108,22 @@ class AbFlowModel(nn.Module):
                 "endpoint_primary_analytic was rejected by R73 and is no longer a formal mode."
             )
         self.single_physical_field = self.physical_authority_mode != "legacy_split"
-        # R75's sequential native->carrier Cartesian writeback was falsified.
-        # The formal R72 mainline therefore has one fixed geometry semantics:
-        # native ctx/out coordinates are latent message-passing workspace only,
-        # while the carrier is the sole recurrent/terminal Cartesian authority.
-        self.geometric_operator_mode = "latent_native_workspace"
-        requested_operator = str(
-            authority_config.get("geometric_operator_mode", "latent_native_workspace")
-            or "latent_native_workspace"
+        # R72 diagnostics falsified the hypothesis that the recurrent native
+        # Cartesian workspace contains superior intrinsic geometry: it is worse than
+        # carrier authority in every round and catastrophically unstable in round 0.
+        # Keep native hidden/message reasoning, but make coordinates a deterministic
+        # endpoint chart of the sole carrier state.
+        self.context_geometry_mode = str(
+            authority_config.get('context_geometry_mode', 'carrier_synced_readonly')
+            or 'carrier_synced_readonly'
         ).strip().lower()
-        if requested_operator != "latent_native_workspace":
+        if self.context_geometry_mode != 'carrier_synced_readonly':
             raise ValueError(
-                "Only R72 latent_native_workspace is supported on the formal mainline; "
-                f"got geometric_operator_mode={requested_operator!r}."
+                'formal single-field mainline requires context_geometry_mode='
+                f"'carrier_synced_readonly', got {self.context_geometry_mode!r}."
             )
-        if bool(authority_config.get("strict_single_cartesian", False)):
-            raise ValueError("strict_single_cartesian is retired from the formal R72 mainline.")
+        if bool(authority_config.get('native_cartesian_recurrence', False)):
+            raise ValueError('native_cartesian_recurrence must be false on the formal single-field path.')
 
         if self.coord_controller_mode in {"egnn_unit_direction", "egnn_prenorm_raw"} and self.pair_coord_mode != "direct_shared":
             raise ValueError(
@@ -288,8 +288,6 @@ class AbFlowModel(nn.Module):
         self.last_singlefield_diagnostics = {}
         self._last_round_authority_endpoints_raw = []
         self._last_round_authority_carriers_raw = []
-        self._last_round_proposal_endpoints_raw = []
-        self._last_round_proposal_carriers_raw = []
         self.grad_conflict_diagnostics = False
         self._diagnostic_capture = False
         self._diagnostic_validation_mode = False
@@ -312,7 +310,7 @@ class AbFlowModel(nn.Module):
         self._sample_forensic_records = []
         self._sample_forensic_alerted = False
 
-        # R72 root-cause observer: uses the exact formal Test sampler forwards.
+        # Formal trajectory observer: uses the exact Test sampler forwards.
         # Runtime-only; no Parameter/buffer/checkpoint state and no extra RNG.
         _sad = str(os.environ.get("ABFLOW_SAMPLE_AUTHORITY_DIAGNOSTICS", "off") or "off").strip().lower()
         self.sample_authority_diagnostics = _sad in {"1", "true", "yes", "y", "on"}
@@ -327,7 +325,7 @@ class AbFlowModel(nn.Module):
             'coord_normalize': self.coord_normalize,
             'physical_authority_mode': self.physical_authority_mode,
             'single_physical_field': self.single_physical_field,
-            'geometric_operator_mode': self.geometric_operator_mode,
+            'context_geometry_mode': self.context_geometry_mode,
         }
 
     @staticmethod
@@ -778,7 +776,8 @@ class AbFlowModel(nn.Module):
                         batch_id, memory_H=None, smooth_prob=None, smooth_mask=None,
                         flow_t=None, coord_pep_condition=None,
                         coord_pep_condition_mask=None, seq_pep_condition=None,
-                        seq_pep_condition_mask=None, trunk_state=None):
+                        seq_pep_condition_mask=None, trunk_state=None,
+                        carrier_to_context_sync_fn=None):
         H_0, (ctx_edges, _), (atom_embeddings, atom_weights) = self.aa_feature(
             X, S, batch_id, self.k_neighbors, residue_pos,
             smooth_prob=smooth_prob, smooth_mask=smooth_mask)
@@ -876,7 +875,8 @@ class AbFlowModel(nn.Module):
             channel_attr=atom_embeddings, channel_weights=atom_weights,
             ctx_edge_attr=ctx_pair_attr, inter_edge_attr=inter_pair_attr,
             surf_edge_attr=surf_pair_attr, single_attr=trunk_single,
-            capture_bridge_diagnostics=capture_diag)
+            capture_bridge_diagnostics=capture_diag,
+            carrier_to_context_sync_fn=carrier_to_context_sync_fn)
         if capture_diag:
             def _rms(value):
                 if value is None or value.numel() == 0:
@@ -1100,12 +1100,11 @@ class AbFlowModel(nn.Module):
                  flow_source_init=None):
         """R05 predictor at one outer transport state.
 
-        R72 preserves three physical refinement rounds and exactly one learned
-        H3 Cartesian degree of freedom.  The carrier is the Score-Flow chart and
-        the endpoint is its analytic clean-structure chart.  Native ctx/out
-        coordinates are latent message-passing workspace with zero Cartesian
-        authority; only inter/surface carrier updates recurrently move the physical
-        state.
+        Preserve three physical refinement rounds and exactly one learned H3
+        Cartesian degree of freedom.  The carrier is the Score-Flow chart; every
+        native H3 context coordinate is the deterministic analytic endpoint chart
+        of that carrier.  ctx/out coordinate heads remain only for checkpoint/DDP
+        compatibility and never form a recurrent Cartesian workspace.
         """
         batch_id = self.batch_constants['batch_id']
         interface_batch_id = self.batch_constants['interface_batch_id']
@@ -1155,6 +1154,17 @@ class AbFlowModel(nn.Module):
             source_X0_model = None
             t_int_model = None
 
+        if self.single_physical_field:
+            context_endpoint_interface = self._carrier_to_endpoint_chart(
+                transport_Xt, source_X0_model, interface_X, t_int_model)
+            context_endpoint_native = self._interface_to_native_model(
+                context_endpoint_interface, paratope_mask, batch_id,
+                interface_batch_id)
+            # Make ctx-edge construction, NativeTrunk geometry, and the first EGNN
+            # ctx layer read the same deterministic endpoint view.
+            X = X.clone()
+            X[paratope_mask] = context_endpoint_native
+
         pep_X_model, pep_coord_valid = None, None
         if X_pep is not None and X_pep.shape == interface_X.shape:
             pep_X_raw = X_pep.to(device=X.device, dtype=X.dtype)
@@ -1171,7 +1181,7 @@ class AbFlowModel(nn.Module):
         trunk_S = S
         biological = paratope_mask.bool() | ((trunk_S >= 0) & (trunk_S < self.num_classes))
         trunk_X = X.clone()
-        trunk_X[paratope_mask] = interface_X.to(trunk_X.dtype)
+        trunk_X[paratope_mask] = context_endpoint_native.to(trunk_X.dtype)
         relational_X = self.normalizer.unnormalize(trunk_X)
         trunk_state = self.native_trunk(
             X=relational_X, S=trunk_S,
@@ -1189,8 +1199,6 @@ class AbFlowModel(nn.Module):
         round_egnn_diagnostics = []
         authority_endpoints_native = []
         authority_carriers_interface = []
-        proposal_endpoints_native = []
-        proposal_carriers_interface = []
         round_chart_diag = []
 
         for round_idx in range(self.round):
@@ -1202,6 +1210,15 @@ class AbFlowModel(nn.Module):
             else:
                 coord_cond = coord_mask = seq_this = seq_mask_this = None
 
+            carrier_to_context_sync_fn = None
+            if self.single_physical_field:
+                def carrier_to_context_sync_fn(carrier_design):
+                    endpoint_interface = self._carrier_to_endpoint_chart(
+                        transport_Xt, source_X0_model, carrier_design, t_int_model)
+                    return self._interface_to_native_model(
+                        endpoint_interface, paratope_mask, batch_id,
+                        interface_batch_id)
+
             pred_logits, pred_X_proposal, carrier_proposal, H, edge_dist = self.message_passing(
                 X, S, residue_pos, interface_X, surface, paratope_mask,
                 batch_id, memory_H=memory_H, smooth_prob=pred_S_dist,
@@ -1210,26 +1227,19 @@ class AbFlowModel(nn.Module):
                 coord_pep_condition_mask=coord_mask,
                 seq_pep_condition=seq_this,
                 seq_pep_condition_mask=seq_mask_this,
-                trunk_state=trunk_state)
+                trunk_state=trunk_state,
+                carrier_to_context_sync_fn=carrier_to_context_sync_fn)
 
-            endpoint_proposal_native = pred_X_proposal[paratope_mask]
             if self.physical_authority_mode == 'carrier_primary_analytic':
                 authority_carrier = carrier_proposal
                 endpoint_interface = self._carrier_to_endpoint_chart(
                     transport_Xt, source_X0_model, authority_carrier, t_int_model)
                 authority_endpoint_native = self._interface_to_native_model(
                     endpoint_interface, paratope_mask, batch_id, interface_batch_id)
-                # The native coordinate head remains in the parameter graph for
-                # exact checkpoint/DDP compatibility, but has zero H3 authority.
-                authority_endpoint_native = (
-                    authority_endpoint_native + 0.0 * endpoint_proposal_native
-                )
             else:
-                authority_endpoint_native = endpoint_proposal_native
-                authority_carrier = carrier_proposal
-                endpoint_interface = self._native_to_interface_model(
-                    authority_endpoint_native, paratope_mask, batch_id,
-                    interface_batch_id)
+                raise RuntimeError(
+                    'formal carrier-synced context requires carrier_primary_analytic'
+                )
 
             pred_X = pred_X_proposal.clone()
             if self.single_physical_field:
@@ -1279,14 +1289,12 @@ class AbFlowModel(nn.Module):
             r_edge_dist.append(edge_dist)
             authority_endpoints_native.append(authority_endpoint_native)
             authority_carriers_interface.append(interface_X)
-            proposal_endpoints_native.append(endpoint_proposal_native)
-            proposal_carriers_interface.append(carrier_proposal)
 
-            # Three-round physical refinement is preserved.  Across rounds the
-            # native/full context receives the analytic endpoint chart of the SAME
-            # carrier field; the interface recurrence receives the carrier chart.
+            # Across rounds only H3 changes.  All non-paratope context remains
+            # fixed; this closes the historical route by which a discarded native
+            # Cartesian workspace could leak into structure loss/next-round context.
             X = X.clone()
-            X[cmask] = pred_X[cmask]
+            X[paratope_mask] = authority_endpoint_native
             X = self.aa_feature.update_global_coordinates(X, S)
 
             if not self.struct_only:
@@ -1298,7 +1306,7 @@ class AbFlowModel(nn.Module):
 
         prmsd = self.prmsd_ffn(H[cmask]).squeeze() if self.struct_only else None
 
-        # Convert the exact authority/proposal histories to raw Angstrom BEFORE
+        # Convert the exact authority histories to raw Angstrom BEFORE
         # clearing the centering cache.  They are detached diagnostics only.
         with torch.no_grad():
             self._last_round_authority_endpoints_raw = [
@@ -1308,14 +1316,6 @@ class AbFlowModel(nn.Module):
             self._last_round_authority_carriers_raw = [
                 self._interface_model_to_raw(v, interface_batch_id).detach()
                 for v in authority_carriers_interface
-            ]
-            self._last_round_proposal_endpoints_raw = [
-                self._native_paratope_model_to_raw(v, paratope_mask, batch_id).detach()
-                for v in proposal_endpoints_native
-            ]
-            self._last_round_proposal_carriers_raw = [
-                self._interface_model_to_raw(v, interface_batch_id).detach()
-                for v in proposal_carriers_interface
             ]
             self._last_round_chart_diagnostics = round_chart_diag
 
@@ -1335,22 +1335,15 @@ class AbFlowModel(nn.Module):
     def _validation_proxy_diagnostics(
             self, *, true_X, true_S, pred_S, r_logits,
             paratope_mask, batch_id, interface_batch_id, t_graph):
-        """R72-only root-cause diagnostics on states already produced by forward.
+        """Carrier-authority geometry diagnostics on already-produced states.
 
-        The diagnostic separates three questions that were conflated before:
-        (1) does the carrier-authoritative endpoint refine H3 intrinsic geometry
-            across the three R05 rounds;
-        (2) does the discarded/native R05 workspace still contain useful shape
-            information even when its absolute Cartesian gauge drifts;
-        (3) is the failure concentrated in a Score-Flow time region added after
-            the mature R05 parent.
-
-        Kabsch and pair-distance calculations are detached metrics only.  They
-        never mutate coordinates and never enter the loss.
+        After the R72 diagnosis, the discarded native Cartesian proposal is no
+        longer a scientific variable.  Track only the sole authority across rounds
+        and across Score-Flow time.  Kabsch/pair-distance are detached metrics and
+        never mutate coordinates or enter the loss.
         """
         out = {}
         auth_rounds = list(getattr(self, '_last_round_authority_endpoints_raw', []) or [])
-        prop_rounds = list(getattr(self, '_last_round_proposal_endpoints_raw', []) or [])
         if interface_batch_id.numel() == 0 or not auth_rounds:
             return out
 
@@ -1398,25 +1391,13 @@ class AbFlowModel(nn.Module):
             if value is not None:
                 out[name] = value
 
-        auth_metrics, prop_metrics = [], []
+        auth_metrics = []
         for ridx, ep in enumerate(auth_rounds[:self.round]):
             metrics = graph_geometry(ep[:, ca_idx].float(), true_ca)
             auth_metrics.append(metrics)
-            add_mean(f'r72_auth_r{ridx}_raw_A', metrics[0])
-            add_mean(f'r72_auth_r{ridx}_aligned_A', metrics[1])
-            add_mean(f'r72_auth_r{ridx}_pair_mae_A', metrics[2])
-
-        for ridx, ep in enumerate(prop_rounds[:self.round]):
-            metrics = graph_geometry(ep[:, ca_idx].float(), true_ca)
-            prop_metrics.append(metrics)
-            add_mean(f'r72_prop_r{ridx}_raw_A', metrics[0])
-            add_mean(f'r72_prop_r{ridx}_aligned_A', metrics[1])
-            add_mean(f'r72_prop_r{ridx}_pair_mae_A', metrics[2])
-            if ridx < len(auth_rounds):
-                gap = graph_geometry(
-                    ep[:, ca_idx].float(), auth_rounds[ridx][:, ca_idx].float())
-                add_mean(f'r72_prop_auth_r{ridx}_aligned_gap_A', gap[1])
-                add_mean(f'r72_prop_auth_r{ridx}_pair_gap_A', gap[2])
+            add_mean(f'r76_auth_r{ridx}_raw_A', metrics[0])
+            add_mean(f'r76_auth_r{ridx}_aligned_A', metrics[1])
+            add_mean(f'r76_auth_r{ridx}_pair_mae_A', metrics[2])
 
         def add_delta(prefix, metrics, field_idx):
             if len(metrics) < 3:
@@ -1430,8 +1411,8 @@ class AbFlowModel(nn.Module):
                         out[f'{prefix}_improve_frac_{tag}'] = (
                             vb[valid] < va[valid]).float().mean()
 
-        add_delta('r72_auth_aligned_delta_A', auth_metrics, 1)
-        add_delta('r72_auth_pair_delta_A', auth_metrics, 2)
+        add_delta('r76_auth_aligned_delta_A', auth_metrics, 1)
+        add_delta('r76_auth_pair_delta_A', auth_metrics, 2)
 
         # Time-resolved final authoritative endpoint.  This is the cleanest test
         # of whether the added Score-Flow/time machinery damages the mature R05
@@ -1447,16 +1428,16 @@ class AbFlowModel(nn.Module):
                         ('raw_A', final_raw), ('aligned_A', final_aligned),
                         ('pair_mae_A', final_pair)):
                         valid = sel & torch.isfinite(values)
-                        out[f'r72_timebin{b}_{name}_sum'] = (
+                        out[f'r76_timebin{b}_{name}_sum'] = (
                             values[valid].sum() if bool(valid.any()) else values.new_zeros(()))
-                        out[f'r72_timebin{b}_{name}_count'] = valid.sum().to(values.dtype)
+                        out[f'r76_timebin{b}_{name}_count'] = valid.sum().to(values.dtype)
 
         # Sequence/interface proxies are retained because the final paper target
         # is co-design, not isolated geometry.
         for ridx, (logits, mask) in enumerate(r_logits[:self.round]):
             if bool(mask.any()):
                 pred_round = torch.argmax(logits[mask], dim=-1)
-                out[f'r72_round{ridx}_aar'] = (
+                out[f'r76_round{ridx}_aar'] = (
                     pred_round == true_S[mask]).float().mean()
 
         is_ag = self.batch_constants.get('is_ag')
@@ -1485,9 +1466,9 @@ class AbFlowModel(nn.Module):
                         pred_S[global_par_idx[native_res]]
                         == true_S[global_par_idx[native_res]]).float().mean())
             if contact_f1:
-                out['r72_contact_f1'] = torch.stack(contact_f1).mean()
+                out['r76_contact_f1'] = torch.stack(contact_f1).mean()
             if caar_values:
-                out['r72_caar'] = torch.stack(caar_values).mean()
+                out['r76_caar'] = torch.stack(caar_values).mean()
         return out
 
 
@@ -1606,15 +1587,6 @@ class AbFlowModel(nn.Module):
                         round_step.append(_masked_rms_A(ep_raw - prev, atom_mask))
                     prev = ep_raw
 
-                proposal_endpoint_gap = []
-                proposal_carrier_gap = []
-                for ep_auth, car_auth, ep_prop, car_prop in zip(
-                        self._last_round_authority_endpoints_raw,
-                        self._last_round_authority_carriers_raw,
-                        self._last_round_proposal_endpoints_raw,
-                        self._last_round_proposal_carriers_raw):
-                    proposal_endpoint_gap.append(_masked_rms_A(ep_prop - ep_auth, atom_mask))
-                    proposal_carrier_gap.append(_masked_rms_A(car_prop - car_auth, atom_mask))
 
                 chart_roundtrip = []
                 endpoint_roundtrip = []
@@ -1639,8 +1611,6 @@ class AbFlowModel(nn.Module):
                     'round_endpoint_gt_rms_A': torch.stack(round_gt) if round_gt else X.new_zeros((0,)),
                     'round_endpoint_step_rms_A': torch.stack(round_step) if round_step else X.new_zeros((0,)),
                     'round_carrier_target_rms_A': torch.stack(round_carrier_target) if round_carrier_target else X.new_zeros((0,)),
-                    'round_discarded_endpoint_proposal_gap_rms_A': torch.stack(proposal_endpoint_gap) if proposal_endpoint_gap else X.new_zeros((0,)),
-                    'round_discarded_carrier_proposal_gap_rms_A': torch.stack(proposal_carrier_gap) if proposal_carrier_gap else X.new_zeros((0,)),
                     'round_carrier_chart_roundtrip_rms_A': torch.stack(chart_roundtrip) if chart_roundtrip else X.new_zeros((0,)),
                     'round_endpoint_chart_roundtrip_rms_A': torch.stack(endpoint_roundtrip) if endpoint_roundtrip else X.new_zeros((0,)),
                     'round_endpoint_chart_disagreement_rms_A': torch.stack(chart_disagree) if chart_disagree else X.new_zeros((0,)),
@@ -1801,23 +1771,15 @@ class AbFlowModel(nn.Module):
                 authority_round_rms = []
                 authority_round_absmax = []
                 authority_carrier_target_rms = []
-                discarded_endpoint_gap_rms = []
-                discarded_carrier_gap_rms = []
-                for ep_auth, car_auth, ep_prop, car_prop in zip(
+                for ep_auth, car_auth in zip(
                         self._last_round_authority_endpoints_raw,
-                        self._last_round_authority_carriers_raw,
-                        self._last_round_proposal_endpoints_raw,
-                        self._last_round_proposal_carriers_raw):
+                        self._last_round_authority_carriers_raw):
                     authority_round_rms.append(self._per_graph_coord_rms(
                         ep_auth, gt_interface_X, atom_mask, interface_batch_id, batch_size))
                     authority_round_absmax.append(self._per_graph_absmax(
                         ep_auth, interface_batch_id, batch_size))
                     authority_carrier_target_rms.append(self._per_graph_coord_rms(
                         car_auth, coord_target, atom_mask, interface_batch_id, batch_size))
-                    discarded_endpoint_gap_rms.append(self._per_graph_coord_rms(
-                        ep_prop, ep_auth, atom_mask, interface_batch_id, batch_size))
-                    discarded_carrier_gap_rms.append(self._per_graph_coord_rms(
-                        car_prop, car_auth, atom_mask, interface_batch_id, batch_size))
 
                 def _stack_round(values):
                     return (torch.stack(values, dim=0) if values
@@ -1853,8 +1815,6 @@ class AbFlowModel(nn.Module):
                     'per_round_authority_endpoint_rms_A': _stack_round(authority_round_rms).detach(),
                     'per_round_authority_endpoint_absmax_A': _stack_round(authority_round_absmax).detach(),
                     'per_round_authority_carrier_target_rms_A': _stack_round(authority_carrier_target_rms).detach(),
-                    'per_round_discarded_endpoint_gap_rms_A': _stack_round(discarded_endpoint_gap_rms).detach(),
-                    'per_round_discarded_carrier_gap_rms_A': _stack_round(discarded_carrier_gap_rms).detach(),
                     'per_round_graph_delta_rms_A': round_delta_rms.detach(),
                     'per_round_graph_absmax_A': round_absmax.detach(),
                     'per_graph_t': t_graph.detach().float(),

@@ -662,7 +662,7 @@ class AbFlowTrainer(Trainer):
 
         tvals = [mean_at(st, 't') for st in steps]
         print(
-            '[R72TestTrajectory] '
+            '[R76TestTrajectory] '
             f'epoch={self.epoch} '
             f't=[' + ','.join(self._fmt(v, 2) for v in tvals) + '] '
             f'x1_raw_A={arr("x1_raw_A",4)} '
@@ -970,7 +970,7 @@ class AbFlowTrainer(Trainer):
         return total / count, int(round(count))
 
     def _build_validation_epoch_summary(self, merged_buffer, valid_metric):
-        """Compact R72 root-cause summary; intentionally drops retired diagnostics."""
+        """Compact carrier-synced-context summary; intentionally drops retired diagnostics."""
         m = lambda key: self._buffer_mean(merged_buffer, key)
         summary = {
             'epoch': int(self.epoch),
@@ -987,37 +987,28 @@ class AbFlowTrainer(Trainer):
             'bridge_pair_coord': m('AbFlowDiag/bridge_pair_coordinate_delta_to_base_ratio_mean/Validation'),
             'chart_gap_A': m('AbFlowSF/final_chart_gap_A/Validation'),
             'canonical_active_rate': m('AbFlowSF/canonical_active_rate/Validation'),
-            'latent_gap_r0_A': m('AbFlowSF/latent_native_gap_r0_A/Validation'),
-            'latent_gap_r1_A': m('AbFlowSF/latent_native_gap_r1_A/Validation'),
-            'latent_gap_r2_A': m('AbFlowSF/latent_native_gap_r2_A/Validation'),
-            'contact_f1': m('AbFlowDiag/r72_contact_f1/Validation'),
-            'caar': m('AbFlowDiag/r72_caar/Validation'),
+            'contact_f1': m('AbFlowDiag/r76_contact_f1/Validation'),
+            'caar': m('AbFlowDiag/r76_caar/Validation'),
         }
         for ridx in range(3):
             for metric in ('raw_A', 'aligned_A', 'pair_mae_A'):
                 summary[f'auth_r{ridx}_{metric}'] = m(
-                    f'AbFlowDiag/r72_auth_r{ridx}_{metric}/Validation')
-                summary[f'prop_r{ridx}_{metric}'] = m(
-                    f'AbFlowDiag/r72_prop_r{ridx}_{metric}/Validation')
-            summary[f'prop_auth_r{ridx}_aligned_gap_A'] = m(
-                f'AbFlowDiag/r72_prop_auth_r{ridx}_aligned_gap_A/Validation')
-            summary[f'prop_auth_r{ridx}_pair_gap_A'] = m(
-                f'AbFlowDiag/r72_prop_auth_r{ridx}_pair_gap_A/Validation')
+                    f'AbFlowDiag/r76_auth_r{ridx}_{metric}/Validation')
             summary[f'round{ridx}_aar'] = m(
-                f'AbFlowDiag/r72_round{ridx}_aar/Validation')
+                f'AbFlowDiag/r76_round{ridx}_aar/Validation')
         for tag in ('01', '12', '02'):
             summary[f'auth_aligned_delta_{tag}_A'] = m(
-                f'AbFlowDiag/r72_auth_aligned_delta_A_{tag}/Validation')
+                f'AbFlowDiag/r76_auth_aligned_delta_A_{tag}/Validation')
             summary[f'auth_aligned_improve_frac_{tag}'] = m(
-                f'AbFlowDiag/r72_auth_aligned_delta_A_improve_frac_{tag}/Validation')
+                f'AbFlowDiag/r76_auth_aligned_delta_A_improve_frac_{tag}/Validation')
             summary[f'auth_pair_delta_{tag}_A'] = m(
-                f'AbFlowDiag/r72_auth_pair_delta_A_{tag}/Validation')
+                f'AbFlowDiag/r76_auth_pair_delta_A_{tag}/Validation')
 
         # Weighted by number of complexes, not by validation batch count.
         for b in range(5):
             for metric in ('raw_A', 'aligned_A', 'pair_mae_A'):
-                sum_key = f'AbFlowDiag/r72_timebin{b}_{metric}_sum/Validation'
-                count_key = f'AbFlowDiag/r72_timebin{b}_{metric}_count/Validation'
+                sum_key = f'AbFlowDiag/r76_timebin{b}_{metric}_sum/Validation'
+                count_key = f'AbFlowDiag/r76_timebin{b}_{metric}_count/Validation'
                 total = self._buffer_sum(merged_buffer, sum_key)
                 count = self._buffer_sum(merged_buffer, count_key)
                 summary[f'timebin{b}_{metric}'] = total / count if count > 0 else float('nan')
@@ -1042,7 +1033,7 @@ class AbFlowTrainer(Trainer):
                 self._fmt(summary.get(f'{prefix}_r{r}_{metric}'), nd)
                 for r in range(3)) + ']'
         print(
-            '[R72GeometryValidation] '
+            '[R76GeometryValidation] '
             f"epoch={self.epoch} "
             f"auth_raw_A={vals('auth','raw_A')} "
             f"auth_aligned_A={vals('auth','aligned_A')} "
@@ -1051,24 +1042,17 @@ class AbFlowTrainer(Trainer):
             f"{self._fmt(summary.get('auth_aligned_delta_12_A'),4)}] "
             f"d_pair=[{self._fmt(summary.get('auth_pair_delta_01_A'),4)},"
             f"{self._fmt(summary.get('auth_pair_delta_12_A'),4)}] "
-            f"prop_raw_A={vals('prop','raw_A')} "
-            f"prop_aligned_A={vals('prop','aligned_A')} "
-            f"prop_pair_A={vals('prop','pair_mae_A')} "
-            f"prop_auth_aligned_gap_A=[{','.join(self._fmt(summary.get(f'prop_auth_r{r}_aligned_gap_A'),4) for r in range(3))}] "
-            f"prop_auth_pair_gap_A=[{','.join(self._fmt(summary.get(f'prop_auth_r{r}_pair_gap_A'),4) for r in range(3))}] "
             f"round_aar=[{','.join(self._fmt(summary.get(f'round{r}_aar'),4) for r in range(3))}] "
             f"caar={self._fmt(summary.get('caar'),4)} contact_f1={self._fmt(summary.get('contact_f1'),4)} "
             f"bridge_s={self._fmt(summary.get('bridge_single'),3)} "
             f"bridge_z={self._fmt(summary.get('bridge_pair'),3)} "
             f"bridge_coord={self._fmt(summary.get('bridge_pair_coord'),3)} "
-            f"chart_gap_A={self._fmt(summary.get('chart_gap_A'),6)} "
-            f"latent_gap_A=[{self._fmt(summary.get('latent_gap_r0_A'),3)},"
-            f"{self._fmt(summary.get('latent_gap_r1_A'),3)},"
-            f"{self._fmt(summary.get('latent_gap_r2_A'),3)}]"
+            f"chart_gap_A={self._fmt(summary.get('chart_gap_A'),6)}"
         )
+
         bins = ('0-.2', '.2-.4', '.4-.6', '.6-.8', '.8-1')
         print(
-            '[R72TimeValidation] '
+            '[R76TimeValidation] '
             f"epoch={self.epoch} bins=[{','.join(bins)}] "
             f"aligned_A=[{','.join(self._fmt(summary.get(f'timebin{b}_aligned_A'),4) for b in range(5))}] "
             f"pair_A=[{','.join(self._fmt(summary.get(f'timebin{b}_pair_mae_A'),4) for b in range(5))}] "
@@ -1260,7 +1244,7 @@ class AbFlowTrainer(Trainer):
         phase = 'val' if val else 'train'
         # V238: the detailed authority line is a startup semantic contract, not a
         # routine training trace. Long-run mechanism tracking is aggregated in
-        # [R72GeometryValidation] instead.
+        # [R76GeometryValidation] instead.
         if (not val) and (not self._singlefield_contract_verified) and self._diag_main_rank:
             print(
                 '[SingleFieldAuthorityAudit] '
@@ -1444,8 +1428,6 @@ class AbFlowTrainer(Trainer):
                 auth_rms = _round_graph_values('per_round_authority_endpoint_rms_A')
                 auth_abs = _round_graph_values('per_round_authority_endpoint_absmax_A')
                 auth_car = _round_graph_values('per_round_authority_carrier_target_rms_A')
-                disc_ep = _round_graph_values('per_round_discarded_endpoint_gap_rms_A')
-                disc_car = _round_graph_values('per_round_discarded_carrier_gap_rms_A')
                 if auth_rms or auth_car:
                     sf = getattr(raw_model, 'last_singlefield_diagnostics', None) or {}
                     print(
@@ -1456,8 +1438,6 @@ class AbFlowTrainer(Trainer):
                         f"endpoint_gt_rms_A={[round(v, 5) for v in auth_rms]} "
                         f"endpoint_absmax_A={[round(v, 5) for v in auth_abs]} "
                         f"carrier_target_rms_A={[round(v, 5) for v in auth_car]} "
-                        f"discard_endpoint_gap_A={[round(v, 5) for v in disc_ep]} "
-                        f"discard_carrier_gap_A={[round(v, 5) for v in disc_car]} "
                         f"final_chart_gap_A={self._fmt(self._scalar(sf.get('final_pred_vs_carrier_x1_rms_A')), 6)}"
                     )
 
@@ -1762,14 +1742,6 @@ class AbFlowTrainer(Trainer):
                 value = sf_diag.get(src)
                 if value is not None:
                     self.log(f"AbFlowSF/{dst}/Validation", value, batch_idx, True)
-            latent = sf_diag.get("round_discarded_endpoint_proposal_gap_rms_A")
-            if torch.is_tensor(latent):
-                flat = latent.reshape(-1)
-                for ridx in range(min(3, int(flat.numel()))):
-                    self.log(
-                        f"AbFlowSF/latent_native_gap_r{ridx}_A/Validation",
-                        flat[ridx], batch_idx, True
-                    )
 
         if not val and (
             int(self.global_step) < self._science_log_first_steps

@@ -109,16 +109,17 @@ class AMEncoder(nn.Module):
         inter_edges, update_mask, inter_update_mask, aligned_edges,
         epi_index, channel_attr, channel_weights, ctx_edge_attr=None,
         inter_edge_attr=None, surf_edge_attr=None, single_attr=None,
-        capture_bridge_diagnostics=False,
+        capture_bridge_diagnostics=False, carrier_to_context_sync_fn=None,
     ):
-        """Run the R72 latent-native / carrier-authoritative recurrence.
+        """Run a strict single-Cartesian carrier recurrence.
 
-        The native ctx/out coordinate stream is a message-passing workspace only.
-        It can shape hidden features, but it never writes Cartesian coordinates into
-        the physical H3 state.  The inter/surface carrier stream is the sole recurrent
-        Cartesian authority.  This is the exact R72 semantic boundary we want to
-        diagnose against the mature R05 parent; no clipping, tanh controller, trust
-        radius, manual step scale, or second physical coordinate authority is added.
+        ``inter_x`` is the only learned/recurrent coordinate state.  ``x`` is a
+        read-only native-frame context view: H3 rows are analytically synchronized
+        from the current carrier before every ctx layer.  The historical ctx/out
+        coordinate heads are still executed so R72 checkpoints/DDP graphs remain
+        compatible, but their coordinate candidates are numerically discarded.
+        Hidden/message updates from ctx remain active.  Thus there is one learned
+        Cartesian operator, not a second recurrent geometry workspace.
         """
         use_dual = self.pair_coord_mode == 'bounded_residual'
 
@@ -201,6 +202,31 @@ class AMEncoder(nn.Module):
             self.last_coord_diagnostics[f'{stage}.{stream}_design_update_rms'] = _masked_rms(delta, design_mask)
             self.last_coord_diagnostics[f'{stage}.{stream}_design_update_absmax'] = _masked_absmax(delta, design_mask)
 
+        def _retain_coord_head_graph(candidate, reference):
+            # Keep historical coordinate-head parameters in the autograd/DDP graph
+            # without allowing their numeric Cartesian proposal to recurse.  Use one
+            # finite scalar to avoid 0*inf -> nan if a dormant head ever runs away.
+            if candidate.numel() == 0:
+                return reference
+            probe = torch.nan_to_num(
+                candidate.reshape(-1)[0].float(), nan=0.0, posinf=0.0, neginf=0.0
+            ).to(reference.dtype)
+            return reference + probe * 0.0
+
+        def _sync_context_from_carrier(context_x, carrier_x):
+            if carrier_to_context_sync_fn is None:
+                return context_x
+            endpoint_native = carrier_to_context_sync_fn(carrier_x[inter_update_mask])
+            expected = context_x[update_mask]
+            if tuple(endpoint_native.shape) != tuple(expected.shape):
+                raise RuntimeError(
+                    'carrier->context endpoint shape mismatch: '
+                    f'endpoint={tuple(endpoint_native.shape)} expected={tuple(expected.shape)}'
+                )
+            synced = context_x.clone()
+            synced[update_mask] = endpoint_native.to(synced)
+            return synced
+
 
         def collect_pair(module):
             if not capture_bridge_diagnostics:
@@ -245,6 +271,9 @@ class AMEncoder(nn.Module):
         inter_channel_weights = channel_weights[inter_mask]
 
         ctx_states, ctx_coords, inter_coords = [], [], []
+        # First ctx layer must see the analytic endpoint chart of the SAME carrier
+        # that will be updated by inter/surface, never a free/template H3 workspace.
+        x = _sync_context_from_carrier(x, inter_x)
         for i in range(self.n_layers):
             ctx_layer = self._modules[f'ctx_gcl_{i}']
             native_before = x
@@ -260,12 +289,11 @@ class AMEncoder(nn.Module):
                     edge_attr=ctx_edge_attr,
                     capture_bridge_diagnostics=capture_bridge_diagnostics,
                 )
-            # Native R05 coordinate workspace: informative for message passing,
-            # but deliberately zero Cartesian authority in R72.
-            x = native_candidate
+            # The ctx layer still updates hidden/message states, but its learned
+            # Cartesian proposal is no longer a recurrent geometry workspace.
+            x = _retain_coord_head_graph(native_candidate, native_before)
             collect_pair(ctx_layer)
             collect_coord(ctx_layer, f'ctx_{i}')
-            record_path_delta(f'ctx_{i}', 'native', native_before, x, update_mask)
             # Shared hidden state flows from local reasoning into interface reasoning.
             inter_h = inter_h.clone()
             inter_h[inter_update_mask] = h[update_mask]
@@ -319,6 +347,11 @@ class AMEncoder(nn.Module):
             if use_dual:
                 h_base = h_base.clone()
                 h_base[inter_mask] = inter_h_base
+
+            # Deterministic chart refresh: next ctx layer reads the clean endpoint
+            # implied by the newly updated carrier.  No learned local coordinate
+            # field survives across layers.
+            x = _sync_context_from_carrier(x, inter_x)
             ctx_states.append(h)
             ctx_coords.append(x)
             inter_coords.append(inter_x)
@@ -336,18 +369,21 @@ class AMEncoder(nn.Module):
                 edge_attr=ctx_edge_attr,
                 capture_bridge_diagnostics=capture_bridge_diagnostics,
             )
-        # Final native readout remains a latent coordinate workspace only.
-        x = native_candidate
+        # out_layer hidden reasoning is retained; its coordinate proposal is
+        # discarded for the same single-state reason as ctx_gcl_i.
+        x = _retain_coord_head_graph(native_candidate, native_before_out)
         collect_pair(self.out_layer)
         collect_coord(self.out_layer, 'out')
-        record_path_delta('out', 'native', native_before_out, x, update_mask)
         ctx_states.append(h)
         ctx_coords.append(x)
 
         if self.dense:
             h = torch.cat(ctx_states, dim=-1)
-            x = torch.mean(torch.stack(ctx_coords), dim=0)
-            inter_x = torch.mean(torch.stack(inter_coords), dim=0)
+            if carrier_to_context_sync_fn is None:
+                x = torch.mean(torch.stack(ctx_coords), dim=0)
+                inter_x = torch.mean(torch.stack(inter_coords), dim=0)
+            # In strict single-state mode coordinate averaging would manufacture a
+            # second state.  Keep the final carrier and its synchronized endpoint.
 
         h = self.dropout(h)
         h = self.linear_out(h)
@@ -408,47 +444,27 @@ class AMEncoder(nn.Module):
                         vals.append(value)
                 return vals
 
-            native_dx = _stage_values(('ctx_', 'out'), '.local_design_update_rms')
-            carrier_dx = _stage_values(('inter_', 'surf_'), '.transport_design_update_rms')
-            native_dx_max = _stage_values(('ctx_', 'out'), '.local_design_update_absmax')
-            carrier_dx_max = _stage_values(('inter_', 'surf_'), '.transport_design_update_absmax')
-            native_alpha = _stage_values(('ctx_', 'out'), '.coord_state_coeff_raw_rms')
+            carrier_dx = _stage_values(('inter_', 'surf_'), '.carrier_design_update_rms')
+            carrier_dx_max = _stage_values(('inter_', 'surf_'), '.carrier_design_update_absmax')
             carrier_alpha = _stage_values(('inter_', 'surf_'), '.coord_state_coeff_raw_rms')
-            native_alpha_max = _stage_values(('ctx_', 'out'), '.coord_state_coeff_raw_absmax')
             carrier_alpha_max = _stage_values(('inter_', 'surf_'), '.coord_state_coeff_raw_absmax')
-            native_lever = _stage_values(('ctx_', 'out'), '.coord_diff_norm_rms')
             carrier_lever = _stage_values(('inter_', 'surf_'), '.coord_diff_norm_rms')
-            native_lever_max = _stage_values(('ctx_', 'out'), '.coord_diff_norm_absmax')
             carrier_lever_max = _stage_values(('inter_', 'surf_'), '.coord_diff_norm_absmax')
-            native_basis = _stage_values(('ctx_', 'out'), '.coord_direction_norm_rms')
-            native_mech = _stage_values(('ctx_', 'out'), '.coord_update_to_alpha_rms_ratio')
-            if native_dx:
-                self.last_coord_diagnostics['native_design_update_rms_max'] = torch.stack(native_dx).max()
             if carrier_dx:
                 self.last_coord_diagnostics['carrier_design_update_rms_max'] = torch.stack(carrier_dx).max()
-            if native_dx_max:
-                self.last_coord_diagnostics['native_design_update_absmax_max'] = torch.stack(native_dx_max).max()
             if carrier_dx_max:
                 self.last_coord_diagnostics['carrier_design_update_absmax_max'] = torch.stack(carrier_dx_max).max()
-            if native_alpha:
-                self.last_coord_diagnostics['native_alpha_rms_max'] = torch.stack(native_alpha).max()
             if carrier_alpha:
                 self.last_coord_diagnostics['carrier_alpha_rms_max'] = torch.stack(carrier_alpha).max()
-            if native_alpha_max:
-                self.last_coord_diagnostics['native_alpha_absmax_max'] = torch.stack(native_alpha_max).max()
             if carrier_alpha_max:
                 self.last_coord_diagnostics['carrier_alpha_absmax_max'] = torch.stack(carrier_alpha_max).max()
-            if native_lever:
-                self.last_coord_diagnostics['native_lever_rms_max'] = torch.stack(native_lever).max()
             if carrier_lever:
                 self.last_coord_diagnostics['carrier_lever_rms_max'] = torch.stack(carrier_lever).max()
-            if native_lever_max:
-                self.last_coord_diagnostics['native_lever_absmax_max'] = torch.stack(native_lever_max).max()
             if carrier_lever_max:
                 self.last_coord_diagnostics['carrier_lever_absmax_max'] = torch.stack(carrier_lever_max).max()
-            if native_basis:
-                self.last_coord_diagnostics['native_basis_norm_rms_max'] = torch.stack(native_basis).max()
-            if native_mech:
-                self.last_coord_diagnostics['native_update_to_alpha_rms_ratio_max'] = torch.stack(native_mech).max()
+            self.last_coord_diagnostics['native_cartesian_recurrence'] = x.new_tensor(0.0)
+            self.last_coord_diagnostics['carrier_synced_context'] = x.new_tensor(
+                1.0 if carrier_to_context_sync_fn is not None else 0.0
+            )
 
         return h, x, inter_x
