@@ -509,6 +509,20 @@ class AbFlowTrainer(Trainer):
         )
 
         raw_model = self.model.module if hasattr(self.model, "module") else self.model
+
+        # Diagnostic-only, epoch-gated matched state-exposure audit.  This never
+        # changes model parameters, sampler states, coordinates, losses, or RNG
+        # used by training.  It only adds oracle-path forwards at selected Test
+        # epochs so rollout-vs-training-path state dependence can be measured
+        # after the R81 geometry contract has been fixed.
+        prev_state_exposure_audit = bool(getattr(raw_model, 'state_exposure_audit', False))
+        exposure_spec = str(os.environ.get('ABFLOW_STATE_EXPOSURE_EPOCHS', '') or '').strip()
+        exposure_epochs = {
+            int(v.strip()) for v in exposure_spec.split(',') if v.strip()
+        } if exposure_spec else set()
+        if hasattr(raw_model, 'state_exposure_audit'):
+            raw_model.state_exposure_audit = int(self.epoch) in exposure_epochs
+
         dataset = self._ensure_epoch_test_dataset(raw_model)
         epoch_dir = os.path.join(
             self._epoch_test_root, f"epoch_{int(self.epoch):04d}"
@@ -584,6 +598,8 @@ class AbFlowTrainer(Trainer):
                 cleanup_structures(epoch_dir)
 
         finally:
+            if hasattr(raw_model, 'state_exposure_audit'):
+                raw_model.state_exposure_audit = prev_state_exposure_audit
             # The order matters: restore EMA/raw parameters first (context exit),
             # then restore RNG and training/eval mode.  No optimizer or scheduler
             # state is ever touched by Test.
@@ -703,7 +719,40 @@ class AbFlowTrainer(Trainer):
             f'raw_final_A={self._fmt(mean_at(steps[-1], "xnext_raw_A"),4)} '
             f'pair_final_A={self._fmt(mean_at(steps[-1], "xnext_pair_mae_A"),4)}'
         )
-        # R79: StateExposureAudit was already answered by R77 and is not a routine log.
+        # R81 v251: sparse matched oracle-path audit is re-enabled only on
+        # explicitly selected epochs because R81 changed the relational geometry
+        # contract and the remaining gap is now rollout-state dependent.
+        exposure_steps = []
+        for st in steps:
+            vals_exp = [r for r in by_step.get(st, [])
+                        if isfinite(float(r.get('oracle_x1_aligned_A', float('nan'))))]
+            if vals_exp:
+                exposure_steps.append(st)
+        if exposure_steps:
+            def exp_mean(step, field):
+                vals = []
+                for row in by_step.get(step, []):
+                    try:
+                        value = float(row.get(field, float('nan')))
+                    except Exception:
+                        continue
+                    if isfinite(value):
+                        vals.append(value)
+                return sum(vals) / len(vals) if vals else float('nan')
+            def exp_arr(field, nd=4):
+                return '[' + ','.join(self._fmt(exp_mean(st, field), nd) for st in exposure_steps) + ']'
+            print(
+                '[TestStateExposure] '
+                f'epoch={self.epoch} '
+                f't=[' + ','.join(self._fmt(exp_mean(st, 't'), 2) for st in exposure_steps) + '] '
+                f'state_gap_raw_A={exp_arr("state_gap_raw_A")} '
+                f'state_gap_aligned_A={exp_arr("state_gap_aligned_A")} '
+                f'rollout_x1_aligned_A={exp_arr("rollout_x1_aligned_A")} '
+                f'oracle_x1_aligned_A={exp_arr("oracle_x1_aligned_A")} '
+                f'exposure_aligned_gap_A={exp_arr("exposure_x1_aligned_gap_A")} '
+                f'exposure_raw_gap_A={exp_arr("exposure_x1_raw_gap_A")} '
+                f'exposure_pair_gap_A={exp_arr("exposure_x1_pair_gap_A")}')
+
 
 
     def _valid_epoch(self, device):
@@ -1014,9 +1063,11 @@ class AbFlowTrainer(Trainer):
             'loss_edge': m('Dock/EDLoss/Validation'),
         }
         for ridx in range(3):
-            for metric in ('raw_A', 'aligned_A', 'pair_mae_A'):
+            for metric in ('raw_A', 'centered_A', 'aligned_A', 'h3_ag_pair_mae_A', 'rotation_excess_A'):
                 summary[f'auth_r{ridx}_{metric}'] = m(
                     f'AbFlowDiag/roundfield_auth_r{ridx}_{metric}/Validation')
+            summary[f'auth_r{ridx}_torque_angle_deg'] = m(
+                f'AbFlowDiag/roundfield_auth_r{ridx}_torque_angle_deg/Validation')
         for tag in ('01', '12', '02'):
             summary[f'auth_raw_delta_{tag}_A'] = m(
                 f'AbFlowDiag/roundfield_auth_raw_delta_A_{tag}/Validation')
@@ -1040,6 +1091,31 @@ class AbFlowTrainer(Trainer):
             summary[f'step_target_cos_{tag}'] = m(
                 f'AbFlowDiag/roundfield_step_target_cos_{tag}/Validation'
             )
+            summary[f'step_target_cos_pos_frac_{tag}'] = m(
+                f'AbFlowDiag/roundfield_step_target_cos_pos_frac_{tag}/Validation'
+            )
+        summary['raw_improve_frac_02'] = m(
+            'AbFlowDiag/roundfield_raw_improve_frac_02/Validation'
+        )
+        summary['h3_ag_pair_improve_frac_02'] = m(
+            'AbFlowDiag/roundfield_h3_ag_pair_improve_frac_02/Validation'
+        )
+        summary['rotation_excess_improve_frac_02'] = m(
+            'AbFlowDiag/roundfield_rotation_excess_improve_frac_02/Validation'
+        )
+        for tag in ('01', '12'):
+            summary[f'step_translation_cos_{tag}'] = m(
+                f'AbFlowDiag/roundfield_step_translation_cos_{tag}/Validation'
+            )
+            summary[f'step_translation_cos_pos_frac_{tag}'] = m(
+                f'AbFlowDiag/roundfield_step_translation_cos_pos_frac_{tag}/Validation'
+            )
+            summary[f'step_centered_cos_{tag}'] = m(
+                f'AbFlowDiag/roundfield_step_centered_cos_{tag}/Validation'
+            )
+            summary[f'step_centered_cos_pos_frac_{tag}'] = m(
+                f'AbFlowDiag/roundfield_step_centered_cos_pos_frac_{tag}/Validation'
+            )
         summary['legacy_cross_frame_distortion_A'] = m(
             'AbFlowDiag/relational_legacy_cross_frame_distortion_A/Validation'
         )
@@ -1061,20 +1137,24 @@ class AbFlowTrainer(Trainer):
                 for r in range(3)) + ']'
         print(
             '[RoundTransportValidation] '
-            f"epoch={self.epoch} supervision=final_only relational_state=endpoint "
-            f"pair_frame=common_raw_complex "
+            f'epoch={self.epoch} supervision=final_only relational_state=endpoint '
+            f'pair_frame=common_raw_complex pose_actuator=pair_torque_tangent '
             f"raw_A={vals('auth','raw_A')} "
+            f"centered_A={vals('auth','centered_A')} "
             f"aligned_A={vals('auth','aligned_A')} "
-            f"pair_A={vals('auth','pair_mae_A')} "
+            f"rotation_excess_A={vals('auth','rotation_excess_A')} "
+            f"h3_ag_pair_A={vals('auth','h3_ag_pair_mae_A')} "
             f"centroid_A={vals('auth','centroid_A')} "
-            f"ag_nearest_A={vals('auth','ag_nearest_A')} "
-            f"step_target_cos=[{self._fmt(summary.get('step_target_cos_01'),4)},"
-            f"{self._fmt(summary.get('step_target_cos_12'),4)}]"
+            f"torque_deg={vals('auth','torque_angle_deg',3)} "
+            f"translation_cos=[{self._fmt(summary.get('step_translation_cos_01'),4)},{self._fmt(summary.get('step_translation_cos_12'),4)}] "
+            f"pose_cos=[{self._fmt(summary.get('step_centered_cos_01'),4)},{self._fmt(summary.get('step_centered_cos_12'),4)}] "
+            f"pose_pos_frac=[{self._fmt(summary.get('step_centered_cos_pos_frac_01'),3)},{self._fmt(summary.get('step_centered_cos_pos_frac_12'),3)}]"
         )
         if int(self.epoch) == 0:
             print(
-                '[PairFrameValidation] '
-                'current_frame=common_raw_complex '
+                '[RelationalGeometryContract] '
+                'frame=common_raw_complex units=angstrom '
+                'pair_distance_divisor_A=10 local_coordinate_scale_A=0.1 '
                 f"legacy_cross_frame_distortion_A={self._fmt(summary.get('legacy_cross_frame_distortion_A'),4)} "
                 'current_cross_frame_error_A=0_by_construction'
             )
