@@ -735,7 +735,7 @@ class AbFlowTrainer(Trainer):
         self.model.eval()
         try:
             with validation_ema(self):
-                with torch.no_grad():
+                with torch.inference_mode():
                     t_iter = (
                         tqdm(
                             self.valid_loader,
@@ -1018,24 +1018,31 @@ class AbFlowTrainer(Trainer):
                 summary[f'auth_r{ridx}_{metric}'] = m(
                     f'AbFlowDiag/roundfield_auth_r{ridx}_{metric}/Validation')
         for tag in ('01', '12', '02'):
+            summary[f'auth_raw_delta_{tag}_A'] = m(
+                f'AbFlowDiag/roundfield_auth_raw_delta_A_{tag}/Validation')
             summary[f'auth_aligned_delta_{tag}_A'] = m(
                 f'AbFlowDiag/roundfield_auth_aligned_delta_A_{tag}/Validation')
             summary[f'auth_aligned_improve_frac_{tag}'] = m(
                 f'AbFlowDiag/roundfield_auth_aligned_delta_A_improve_frac_{tag}/Validation')
             summary[f'auth_pair_delta_{tag}_A'] = m(
                 f'AbFlowDiag/roundfield_auth_pair_delta_A_{tag}/Validation')
+            summary[f'auth_centroid_delta_{tag}_A'] = m(
+                f'AbFlowDiag/roundfield_auth_centroid_delta_A_{tag}/Validation')
+            summary[f'auth_ag_nearest_delta_{tag}_A'] = m(
+                f'AbFlowDiag/roundfield_auth_ag_nearest_delta_A_{tag}/Validation')
 
         for ridx in range(3):
-            for metric in (
-                'single_rms', 'pair_rms', 'single_refresh_rms',
-                'pair_refresh_rms', 'state_step_A',
-                'task_geometry_visible_fraction',
-                'non_task_design_geometry_visible_fraction',
-                'pair_coord_ratio',
-            ):
-                summary[f'roundrel_r{ridx}_{metric}'] = m(
-                    f'AbFlowDiag/roundrel_r{ridx}_{metric}/Validation'
+            for metric in ('centroid_A', 'rotation_deg', 'ag_nearest_A'):
+                summary[f'auth_r{ridx}_{metric}'] = m(
+                    f'AbFlowDiag/roundfield_auth_r{ridx}_{metric}/Validation'
                 )
+        for tag in ('01', '12'):
+            summary[f'step_target_cos_{tag}'] = m(
+                f'AbFlowDiag/roundfield_step_target_cos_{tag}/Validation'
+            )
+        summary['legacy_cross_frame_distortion_A'] = m(
+            'AbFlowDiag/relational_legacy_cross_frame_distortion_A/Validation'
+        )
         return summary
 
     def _print_validation_audits(self, summary):
@@ -1052,27 +1059,25 @@ class AbFlowTrainer(Trainer):
             return '[' + ','.join(
                 self._fmt(summary.get(f'{prefix}_r{r}_{metric}'), nd)
                 for r in range(3)) + ']'
-        def relarr(metric, nd=4):
-            return '[' + ','.join(
-                self._fmt(summary.get(f'roundrel_r{r}_{metric}'), nd)
-                for r in range(3)) + ']'
         print(
-            '[RoundStateValidation] '
-            f"epoch={self.epoch} supervision=final_only prev_recycling=off "
-            f"auth_raw_A={vals('auth','raw_A')} "
-            f"auth_aligned_A={vals('auth','aligned_A')} "
-            f"auth_pair_A={vals('auth','pair_mae_A')} "
-            f"d_aligned=[{self._fmt(summary.get('auth_aligned_delta_01_A'),4)},"
-            f"{self._fmt(summary.get('auth_aligned_delta_12_A'),4)}] "
-            f"state_step_A={relarr('state_step_A')} "
-            f"single_refresh_rms={relarr('single_refresh_rms',5)} "
-            f"pair_refresh_rms={relarr('pair_refresh_rms',5)} "
-            f"pair_coord_ratio={relarr('pair_coord_ratio',5)} "
-            f"h3_geom_visible={relarr('task_geometry_visible_fraction',3)} "
-            f"other_design_geom_visible={relarr('non_task_design_geometry_visible_fraction',3)} "
-            f"improve_frac_aligned=[{self._fmt(summary.get('auth_aligned_improve_frac_01'),3)},"
-            f"{self._fmt(summary.get('auth_aligned_improve_frac_12'),3)}]"
+            '[RoundTransportValidation] '
+            f"epoch={self.epoch} supervision=final_only relational_state=endpoint "
+            f"pair_frame=common_raw_complex "
+            f"raw_A={vals('auth','raw_A')} "
+            f"aligned_A={vals('auth','aligned_A')} "
+            f"pair_A={vals('auth','pair_mae_A')} "
+            f"centroid_A={vals('auth','centroid_A')} "
+            f"ag_nearest_A={vals('auth','ag_nearest_A')} "
+            f"step_target_cos=[{self._fmt(summary.get('step_target_cos_01'),4)},"
+            f"{self._fmt(summary.get('step_target_cos_12'),4)}]"
         )
+        if int(self.epoch) == 0:
+            print(
+                '[PairFrameValidation] '
+                'current_frame=common_raw_complex '
+                f"legacy_cross_frame_distortion_A={self._fmt(summary.get('legacy_cross_frame_distortion_A'),4)} "
+                'current_cross_frame_error_A=0_by_construction'
+            )
 
 
     def _accumulate_train_component(self, name, value):
@@ -1312,9 +1317,13 @@ class AbFlowTrainer(Trainer):
             and self._requires_live_bridge_contract()
             and not self._live_bridge_contract_verified
         )
-        capture_diagnostics = bool(val) or science_step_diag or bridge_contract_probe
+        # Validation needs detached transport/pose observers, not the expensive
+        # layer-by-layer GNN bridge capture that R79 already proved live.  Keep
+        # heavy capture only for the initial train bridge contract / explicit
+        # science cadence; keep validation proxy diagnostics independently on.
+        capture_diagnostics = bool(science_step_diag or bridge_contract_probe)
         raw_model._diagnostic_capture = bool(capture_diagnostics)
-        raw_model._diagnostic_validation_mode = bool(val and capture_diagnostics)
+        raw_model._diagnostic_validation_mode = bool(val)
 
         loss, seq_detail, structure_detail, dock_detail, pdev_detail = self.model(**batch)
         snll, aar = seq_detail

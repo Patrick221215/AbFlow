@@ -1326,6 +1326,7 @@ def seqformer_config(config, recycle_features=False, recycle_pos=False):
     outer_channel = int(attention['opm_channel'])
     tri_hidden = int(attention['triangle_hidden'])
     chunk = int(execution.get('triangle_chunk_size', 64))
+    eval_chunk = int(execution.get('triangle_chunk_size_eval', chunk))
 
     return _Cfg.from_dict({
         'seqformer_num_block': int(config.get('blocks', 1)),
@@ -1340,6 +1341,12 @@ def seqformer_config(config, recycle_features=False, recycle_pos=False):
         ),
         'pair_distance_chunk_size': int(
             execution.get('pair_distance_chunk_size', 8)
+        ),
+        'pair_distance_chunk_size_eval': int(
+            execution.get(
+                'pair_distance_chunk_size_eval',
+                execution.get('pair_distance_chunk_size', 8),
+            )
         ),
         'time_embed': bool(config.get('time_embed', True)),
         'prev_pos': {
@@ -1382,14 +1389,14 @@ def seqformer_config(config, recycle_features=False, recycle_pos=False):
                 'gating': True, 'inp_kernels': [],
                 'dropout_rate': float(dropout.get('triangle', 0.1)),
                 'shared_dropout': False,
-                'chunk_size': chunk,
+                'chunk_size': chunk, 'eval_chunk_size': eval_chunk,
             },
             'triangle_attention_ending_node': {
                 'orientation': 'per_column', 'num_head': tri_heads,
                 'gating': True, 'inp_kernels': [],
                 'dropout_rate': float(dropout.get('triangle', 0.1)),
                 'shared_dropout': False,
-                'chunk_size': chunk,
+                'chunk_size': chunk, 'eval_chunk_size': eval_chunk,
             },
             'pair_transition': {
                 'orientation': 'per_row', 'num_intermediate_factor': 4,
@@ -1409,6 +1416,13 @@ class PairEmbedding(nn.Module):
         self.feat_dim = int(feat_dim)
         self.pair_distance_chunk_size = max(
             1, int(getattr(config, 'pair_distance_chunk_size', 8))
+        )
+        self.pair_distance_chunk_size_eval = max(
+            self.pair_distance_chunk_size,
+            int(getattr(
+                config, 'pair_distance_chunk_size_eval',
+                self.pair_distance_chunk_size,
+            )),
         )
         self.dgram_config = config.prev_pos
         self.num_bins = self.dgram_config.num_bins
@@ -1481,7 +1495,14 @@ class PairEmbedding(nn.Module):
         disto_bins = dgram_from_positions(pseudo_beta, **self.dgram_config)
 
         pair_chunks = []
-        chunk = self.pair_distance_chunk_size
+        # Chunking changes only execution order: every row/pair is still evaluated
+        # by the same exact equations.  Training and eval can therefore use
+        # different memory/speed points without changing the scientific model.
+        chunk = (
+            self.pair_distance_chunk_size
+            if self.training
+            else self.pair_distance_chunk_size_eval
+        )
 
         # Full right-side atom bank is reused by every row chunk.
         rhs_atoms = coords.reshape(B, L * self.max_num_atoms, 3).float()
@@ -1986,7 +2007,11 @@ class TriangleAttention(nn.Module):
         # cubic logits/softmax temporary becomes [B,chunk,H,L,L] instead of
         # [B,L,H,L,L].  No approximation, sparsification or attention deletion.
         bias = rearrange(self.proj_pair(pair_act), 'b i j h -> b h i j')
-        chunk = max(1, int(c.chunk_size))
+        chunk = max(1, int(
+            c.chunk_size
+            if self.training
+            else getattr(c, 'eval_chunk_size', c.chunk_size)
+        ))
         if int(pair_act.shape[1]) > chunk:
             outs = []
             for start in range(0, int(pair_act.shape[1]), chunk):

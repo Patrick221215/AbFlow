@@ -16,8 +16,9 @@ from configs import (
     CDR_TO_ENUM, UNKNOWN_AB_REGION_INDEX, imgt_region_index, normalize_regions,
 )
 from utils.nn_utils import (
-    DistogramHead, SinglePairEncoder, _atom14_chemical_mask,
-    _atom14_exists_from_seq, _torsions_from_atom14, pseudo_beta_fn_v2,
+    DistogramHead, SinglePairEncoder, _abflow_ca_fill_observed_mask,
+    _atom14_chemical_mask, _atom14_exists_from_seq, _torsions_from_atom14,
+    pseudo_beta_fn_v2,
 )
 
 class NativeTrunk(nn.Module):
@@ -51,6 +52,27 @@ class NativeTrunk(nn.Module):
         geometry_cfg = representation_config.get("geometry", {})
         self.torsion_norm_eps = float(geometry_cfg.get("torsion_norm_eps", 1e-12))
         self.ca_fill_tol2 = float(geometry_cfg.get("ca_fill_tol2", 1e-12))
+
+        # R79 correctness barrier: once H3 geometry is opened to the relational
+        # trunk, the generated task domain must not inherit native atom-resolution
+        # metadata through xloss_mask.  Fixed scaffold/antigen remain observed
+        # conditions; H3 atom support is inferred from the CURRENT model-visible
+        # sequence/coordinates using the existing AbFlow CA-fill convention.
+        round_state_cfg = representation_config.get("round_state_conditioning", {})
+        self.task_atom_observation_source = str(
+            round_state_cfg.get(
+                "task_atom_observation_source", "native_xloss_mask"
+            ) or "native_xloss_mask"
+        ).strip().lower()
+        if self.task_atom_observation_source not in {
+            "native_xloss_mask", "current_state_ca_fill"
+        }:
+            raise ValueError(
+                "round_state_conditioning.task_atom_observation_source must be "
+                "'native_xloss_mask' or 'current_state_ca_fill', got "
+                f"{self.task_atom_observation_source!r}."
+            )
+
         self.single_dim = int(
             self.trunk.config.seq_channel + self.trunk.config.index_embed_size
         )
@@ -206,8 +228,34 @@ class NativeTrunk(nn.Module):
         # xloss_mask; donor AbFlow stores unresolved atom14 coordinates as zero.
         # Translate only this private donor input representation. Parent R05 X,
         # EGNN geometry, losses and coordinate authority are untouched.
+        # Do not let native H3 atom-observation/missingness become an
+        # information side-channel after R79 opens H3 relational geometry.
+        # The fixed context keeps its dataset observation mask because it is
+        # observed at inference.  H3 replaces that mask by one inferred solely
+        # from the current model-visible state.
+        observation_for_encoder = Obsp
+        if (
+            bool(condition_design_geometry)
+            and self.task_atom_observation_source == "current_state_ca_fill"
+        ):
+            if aux_task_mask is None:
+                raise RuntimeError(
+                    "current_state_ca_fill requires aux_task_mask so the H3 "
+                    "information barrier has an explicit task domain."
+                )
+            current_state_observed = _abflow_ca_fill_observed_mask(
+                Sp, Xp, tol2=self.ca_fill_tol2
+            ).to(dtype=Xp.dtype)
+            observation_for_encoder = (
+                current_state_observed
+                if Obsp is None
+                else torch.where(
+                    AuxTask[..., None], current_state_observed, Obsp
+                )
+            )
+
         Exists = _atom14_exists_from_seq(
-            Sp, Xp, Obsp, tol2=self.ca_fill_tol2
+            Sp, Xp, observation_for_encoder, tol2=self.ca_fill_tol2
         ) * M[..., None].to(Xp.dtype)
         Xp_donor = torch.where(Exists.bool()[..., None], Xp, torch.zeros_like(Xp))
 
@@ -257,6 +305,256 @@ class NativeTrunk(nn.Module):
         }
         return batch, GI, nodes, antigen_counts
 
+
+    def prepare_layout(self, X_ref, S, segment_ids, residue_pos, batch_id,
+                       valid_mask, is_antigen, design_mask, flow_t, cdr_type,
+                       atom_observed_mask=None, aux_task_mask=None,
+                       condition_design_geometry=False):
+        """Prepare the round-invariant NativeTrunk packing layout once.
+
+        R79/R80 refresh Single/Pair three times at one fixed outer ``t``.  Across
+        those macro rounds sequence ids, chain/residue ids, task masks, padded
+        topology and global<->padded lookup are invariant; only H3 coordinates
+        (and therefore atom observability/torsions/geometric features) change.
+        Rebuilding the static layout three times adds Python work and CUDA
+        synchronization but no new mathematics.  This method hoists exactly
+        those invariant operations while leaving every geometry-dependent tensor
+        to ``_pack_prepared``.
+        """
+        nodes, ab_lens, antigen_counts = self._ordered_nodes(
+            valid_mask, batch_id, is_antigen,
+        )
+        B = len(nodes)
+        L = max([int(idx.numel()) for idx in nodes] or [0])
+        if L == 0:
+            raise RuntimeError("AbFlow trunk received no biological residues")
+        if X_ref.shape[1] != 14:
+            raise ValueError(
+                f" single/pair port requires the donor's formal 14-slot full-atom state; got {tuple(X_ref.shape)}"
+            )
+        if aux_task_mask is not None and tuple(aux_task_mask.shape) != (int(X_ref.shape[0]),):
+            raise ValueError(
+                f"AbFlow aux_task_mask shape mismatch: {tuple(aux_task_mask.shape)} "
+                f"vs residue count {(int(X_ref.shape[0]),)}"
+            )
+        if atom_observed_mask is not None and tuple(atom_observed_mask.shape) != tuple(X_ref.shape[:-1]):
+            raise ValueError(
+                f"AbFlow xloss_mask shape mismatch: {tuple(atom_observed_mask.shape)} "
+                f"vs X {tuple(X_ref.shape)}"
+            )
+
+        Sp = S.new_full((B, L), 20)
+        Obsp = X_ref.new_zeros((B, L, 14)) if atom_observed_mask is not None else None
+        Seg = segment_ids.new_zeros((B, L))
+        Rp = torch.zeros((B, L), device=X_ref.device, dtype=torch.long)
+        M = torch.zeros((B, L), device=X_ref.device, dtype=torch.bool)
+        Design = torch.zeros_like(M)
+        AuxTask = torch.zeros_like(M)
+        IsAg = torch.zeros_like(M)
+        GI = S.new_full((B, L), -1)
+
+        pack_global_parts, pack_batch_parts, pack_local_parts = [], [], []
+        for b, idx in enumerate(nodes):
+            n = int(idx.numel())
+            if n == 0:
+                continue
+            pack_global_parts.append(idx.long())
+            pack_batch_parts.append(torch.full(
+                (n,), b, device=idx.device, dtype=torch.long))
+            pack_local_parts.append(torch.arange(
+                n, device=idx.device, dtype=torch.long))
+
+        if pack_global_parts:
+            PG = torch.cat(pack_global_parts, dim=0)
+            PB = torch.cat(pack_batch_parts, dim=0)
+            PL = torch.cat(pack_local_parts, dim=0)
+            Sp[PB, PL] = S[PG].long().clamp(0, 22)
+            if Obsp is not None:
+                Obsp[PB, PL] = atom_observed_mask[PG].to(dtype=X_ref.dtype)
+            Seg[PB, PL] = segment_ids[PG]
+            rp = residue_pos[PG]
+            rp = rp[..., 0] if rp.dim() > 1 else rp
+            if torch.is_floating_point(rp):
+                rp = torch.round(rp)
+            Rp[PB, PL] = rp.to(dtype=torch.long)
+            M[PB, PL] = True
+            Design[PB, PL] = design_mask[PG].bool()
+            if aux_task_mask is not None:
+                AuxTask[PB, PL] = aux_task_mask[PG].bool()
+            IsAg[PB, PL] = is_antigen[PG].bool()
+            GI[PB, PL] = PG.to(dtype=GI.dtype)
+        else:
+            PG = torch.empty(0, device=X_ref.device, dtype=torch.long)
+            PB = torch.empty(0, device=X_ref.device, dtype=torch.long)
+            PL = torch.empty(0, device=X_ref.device, dtype=torch.long)
+
+        Chain = self._remap_chain_ids(Seg, M)
+        antibody_len = torch.tensor(ab_lens, device=X_ref.device, dtype=torch.long)
+        Cdr = self._cdr_definition(Rp, Chain, M, antibody_len, cdr_type, Design)
+
+        Fixed = M & (~Design)
+        if bool(condition_design_geometry):
+            if aux_task_mask is None:
+                raise RuntimeError(
+                    "round-state geometry conditioning requires aux_task_mask "
+                    "(formal R80: paratope/H3 physical-authority domain)."
+                )
+            outside_design = AuxTask & (~Design)
+            if bool(outside_design.any()):
+                raise RuntimeError(
+                    "round-state geometry domain mismatch: aux_task_mask must be "
+                    "a subset of design_mask so physical and relational H3 domains agree."
+                )
+            GeometryCondition = Fixed | AuxTask
+        else:
+            GeometryCondition = Fixed
+
+        t = flow_t
+        if t is None:
+            t = X_ref.new_zeros(B)
+        elif t.dim() == 0:
+            t = t.expand(B)
+        elif t.numel() != B:
+            t = torch.stack([
+                t[batch_id == gid].reshape(-1)[0] for gid in range(B)
+            ])
+        t = t.to(X_ref.dtype)
+
+        node_graph, node_local = self._node_lookup(GI, M, int(S.shape[0]))
+        return {
+            'B': B, 'L': L, 'nodes': nodes,
+            'pack_global': PG, 'pack_batch': PB, 'pack_local': PL,
+            'seq': Sp, 'native_observed': Obsp, 'segment': Seg,
+            'residx': Rp, 'mask': M, 'design': Design, 'aux_task': AuxTask,
+            'is_antigen': IsAg, 'global_index': GI, 'chain': Chain,
+            'cdr_def': Cdr, 'antibody_len': antibody_len,
+            'fixed': Fixed, 'geometry_condition': GeometryCondition,
+            't': t, 'antigen_counts': antigen_counts,
+            'node_graph': node_graph, 'node_local': node_local,
+            'valid_mask_global': valid_mask.bool(),
+            'condition_design_geometry': bool(condition_design_geometry),
+        }
+
+    def _pack_prepared(self, X, layout):
+        """Fill only round-dependent geometry into a prepared static layout."""
+        B, L = int(layout['B']), int(layout['L'])
+        PB, PL, PG = layout['pack_batch'], layout['pack_local'], layout['pack_global']
+        Xp = X.new_zeros((B, L, 14, 3))
+        if PG.numel():
+            Xp[PB, PL] = X[PG]
+
+        Sp = layout['seq']
+        M = layout['mask']
+        Design = layout['design']
+        AuxTask = layout['aux_task']
+        Fixed = layout['fixed']
+        GeometryCondition = layout['geometry_condition']
+        Obsp = layout['native_observed']
+
+        observation_for_encoder = Obsp
+        if (
+            layout['condition_design_geometry']
+            and self.task_atom_observation_source == 'current_state_ca_fill'
+        ):
+            current_state_observed = _abflow_ca_fill_observed_mask(
+                Sp, Xp, tol2=self.ca_fill_tol2
+            ).to(dtype=Xp.dtype)
+            observation_for_encoder = (
+                current_state_observed
+                if Obsp is None
+                else torch.where(AuxTask[..., None], current_state_observed, Obsp)
+            )
+
+        Exists = _atom14_exists_from_seq(
+            Sp, Xp, observation_for_encoder, tol2=self.ca_fill_tol2
+        ) * M[..., None].to(Xp.dtype)
+        Xp_donor = torch.where(Exists.bool()[..., None], Xp, torch.zeros_like(Xp))
+        Tors = _torsions_from_atom14(
+            Sp, Xp_donor, layout['chain'], GeometryCondition,
+            atom_exists=Exists.bool(), epsilon=self.torsion_norm_eps,
+        )
+        batch = {
+            'seq': Sp, 'seq_t': Sp, 'mask': M, 'fixed_mask': Fixed,
+            'geometry_condition_mask': GeometryCondition,
+            'chain_id': layout['chain'], 'residx': layout['residx'],
+            'cdr_def': layout['cdr_def'],
+            'atom14_gt_positions': Xp_donor, 'atom14_gt_exists': Exists,
+            'torsion_angles_sin_cos': Tors, 't': layout['t'],
+            'antibody_len': layout['antibody_len'], 'is_recycling': False,
+            '_design_mask': Design, '_aux_task_mask': AuxTask,
+            '_is_antigen': layout['is_antigen'],
+        }
+        return batch
+
+    def forward_prepared(self, layout, X, residue_feature, round_idx=-1):
+        """Run exact NativeTrunk math using a round-invariant prepared layout."""
+        batch = self._pack_prepared(X, layout)
+
+        if self.training:
+            call_index = int(self._training_forward_call.item())
+            self._training_forward_call.add_(1)
+            rank = (
+                int(torch.distributed.get_rank())
+                if torch.distributed.is_available() and torch.distributed.is_initialized()
+                else 0
+            )
+            donor_seed = self.forward_seed + 1_000_003 * rank + call_index
+            rng_devices = (
+                [int(X.device.index)]
+                if X.is_cuda and X.device.index is not None else []
+            )
+            with torch.random.fork_rng(devices=rng_devices):
+                torch.default_generator.manual_seed(donor_seed)
+                if X.is_cuda:
+                    with torch.cuda.device(X.device):
+                        torch.cuda.manual_seed(donor_seed)
+                s, z = self.trunk(batch, residue_feature)
+        else:
+            s, z = self.trunk(batch, residue_feature)
+
+        N = int(layout['node_graph'].shape[0])
+        global_s = s.new_zeros((N, s.shape[-1]))
+        PG, PB, PL = layout['pack_global'], layout['pack_batch'], layout['pack_local']
+        if PG.numel():
+            global_s[PG] = s[PB, PL]
+        logits = self.distogram_head(z) if self.distogram_head is not None else None
+        with torch.no_grad():
+            geom_mask = batch['geometry_condition_mask'].bool()
+            design = batch['_design_mask'].bool()
+            task = batch['_aux_task_mask'].bool()
+            task_count = task.sum().to(dtype=X.dtype)
+            other_design = design & (~task)
+            other_design_count = other_design.sum().to(dtype=X.dtype)
+            self.last_diagnostics = {
+                'relational_single_rms': torch.sqrt(
+                    global_s.float().pow(2).mean() + 1e-8).to(X.dtype),
+                'relational_pair_rms': torch.sqrt(
+                    z.float().pow(2).mean() + 1e-8).to(X.dtype),
+                'relational_task_geometry_visible_fraction': (
+                    (geom_mask & task).sum().to(dtype=X.dtype)
+                    / task_count.clamp_min(1.0)
+                ),
+                'relational_non_task_design_geometry_visible_fraction': (
+                    (geom_mask & other_design).sum().to(dtype=X.dtype)
+                    / other_design_count.clamp_min(1.0)
+                ),
+            }
+        return {
+            'single_global': global_s,
+            'pair_dense': z,
+            'node_graph': layout['node_graph'],
+            'node_local': layout['node_local'],
+            'global_index': layout['global_index'],
+            'mask': batch['mask'],
+            'seq_padded': batch['seq'],
+            'atom_exists_padded': batch['atom14_gt_exists'].bool(),
+            'design_padded': batch['_design_mask'].bool(),
+            'is_antigen_padded': batch['_is_antigen'].bool(),
+            'distogram_logits': logits,
+            'biological_mask': layout['valid_mask_global'],
+            'diag': self.last_diagnostics,
+        }
+
     @staticmethod
     def _node_lookup(GI, mask, n_global):
         graph = GI.new_full((n_global,), -1)
@@ -294,82 +592,20 @@ class NativeTrunk(nn.Module):
                 is_antigen, design_mask, flow_t, cdr_type, residue_feature,
                 round_idx=-1, atom_observed_mask=None, aux_task_mask=None,
                 condition_design_geometry=False):
-        batch, GI, nodes, antigen_counts = self._pack(
-            X, S, segment_ids, residue_pos, batch_id, valid_mask,
-            is_antigen, design_mask, flow_t, cdr_type,
+        """Compatibility wrapper; R80 model uses prepare_layout+forward_prepared."""
+        layout = self.prepare_layout(
+            X_ref=X, S=S, segment_ids=segment_ids, residue_pos=residue_pos,
+            batch_id=batch_id, valid_mask=valid_mask, is_antigen=is_antigen,
+            design_mask=design_mask, flow_t=flow_t, cdr_type=cdr_type,
             atom_observed_mask=atom_observed_mask,
             aux_task_mask=aux_task_mask,
             condition_design_geometry=condition_design_geometry,
         )
+        return self.forward_prepared(
+            layout=layout, X=X, residue_feature=residue_feature,
+            round_idx=round_idx,
+        )
 
-        # single/pair donor dropout remains fully active, but it must not advance the
-        # RNG stream later consumed by the parent R05 EGNN dropout. Otherwise a
-        # mathematically zero bridge would still alter the parent's stochastic
-        # training function. A call-indexed, rank-local donor RNG gives fresh
-        # masks while fork_rng restores parent CPU/current-CUDA states on exit.
-        if self.training:
-            call_index = int(self._training_forward_call.item())
-            self._training_forward_call.add_(1)
-            rank = (
-                int(torch.distributed.get_rank())
-                if torch.distributed.is_available() and torch.distributed.is_initialized()
-                else 0
-            )
-            donor_seed = self.forward_seed + 1_000_003 * rank + call_index
-            rng_devices = (
-                [int(X.device.index)]
-                if X.is_cuda and X.device.index is not None else []
-            )
-            with torch.random.fork_rng(devices=rng_devices):
-                torch.default_generator.manual_seed(donor_seed)
-                if X.is_cuda:
-                    with torch.cuda.device(X.device):
-                        torch.cuda.manual_seed(donor_seed)
-                s, z = self.trunk(batch, residue_feature)
-        else:
-            s, z = self.trunk(batch, residue_feature)
-        mask = batch['mask']
-        N = int(S.shape[0])
-        global_s = s.new_zeros((N, s.shape[-1]))
-        for b, idx in enumerate(nodes):
-            n = int(idx.numel())
-            if n:
-                global_s[idx] = s[b, :n]
-        node_graph, node_local = self._node_lookup(GI, mask, N)
-        logits = self.distogram_head(z) if self.distogram_head is not None else None
-        with torch.no_grad():
-            geom_mask = batch['geometry_condition_mask'].bool()
-            design = batch['_design_mask'].bool()
-            task = batch['_aux_task_mask'].bool()
-            task_count = task.sum().to(dtype=X.dtype)
-            other_design = design & (~task)
-            other_design_count = other_design.sum().to(dtype=X.dtype)
-            self.last_diagnostics = {
-                'relational_single_rms': torch.sqrt(global_s.float().pow(2).mean() + 1e-8).to(X.dtype),
-                'relational_pair_rms': torch.sqrt(z.float().pow(2).mean() + 1e-8).to(X.dtype),
-                'relational_task_geometry_visible_fraction': (
-                    (geom_mask & task).sum().to(dtype=X.dtype) / task_count.clamp_min(1.0)
-                ),
-                'relational_non_task_design_geometry_visible_fraction': (
-                    (geom_mask & other_design).sum().to(dtype=X.dtype)
-                    / other_design_count.clamp_min(1.0)
-                ),
-            }
-        return {
-            'single_global': global_s,
-            'pair_dense': z,
-            'node_graph': node_graph,
-            'node_local': node_local,
-            'global_index': GI,
-            'mask': mask,
-            'seq_padded': batch['seq'],
-            'atom_exists_padded': batch['atom14_gt_exists'].bool(),
-            'design_padded': batch['_design_mask'].bool(),
-            'is_antigen_padded': batch['_is_antigen'].bool(),
-            'distogram_logits': logits,
-            'biological_mask': valid_mask.bool(),
-            'diag': self.last_diagnostics,
-        }
 
     def distogram_loss_from_native(self, state, true_X, true_S, collect_audit=False):
         """AbX-style distogram supervision on the live dense pair state.

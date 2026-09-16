@@ -1,12 +1,12 @@
 {
   "experiment": {
-    "id": "R79_R05_ABX_R77_ROUND_STATE_SINGLEPAIR_ANALYTIC3R_TVT_U02",
-    "parent": "R77_R05_ABX_R72_AUTHORITY_CLOSED_FINALROUND_ANALYTIC3R_TVT_U02",
+    "id": "R80_R05_ABX_R79_CARRIER_CONSISTENT_SINGLEPAIR_ANALYTIC3R_TVT_U02",
+    "parent": "R79_R05_ABX_R77_ROUND_STATE_SINGLEPAIR_ANALYTIC3R_TVT_U02",
     "initialization": "scratch",
-    "factor": "Single-factor R77 optimization: recompute Single/Pair once at the start of each of the three fixed-t macro refinement rounds from the current model-visible H3 physical state (round0 outer Xt; rounds1/2 previous analytic endpoint). No prev_seq/prev_pair/prev_pos, no new loss/sampler/controller, and carrier remains the sole learned Cartesian authority.",
+    "factor": "Single-factor clean-R79 optimization: keep round-wise Single/Pair refresh and the leakage-safe H3 information barrier, but make rounds1/2 relational geometry read the previous carrier state, i.e. the same authoritative physical state that the EGNN actuator recurrently updates. No prev_seq/prev_pair/prev_pos, new loss, sampler, controller, or Cartesian field.",
     "protocol": "formal_train_val_test",
-    "diagnostic_role": "r79_round_state_singlepair_only",
-    "causal_question": "Does making the relational Single/Pair representation condition on the current authoritative H3 state at each macro refinement round improve inner refinement and free-rollout geometry, when every other R77 training, authority, loss and sampler contract is held fixed?"
+    "diagnostic_role": "r80_carrier_consistent_singlepair_only",
+    "causal_question": "Does closing the cross-chart mismatch T(endpoint)->G(carrier) into T(carrier)->G(carrier) preserve local/sequence gains while preventing macro rounds from improving aligned geometry but worsening absolute H3 placement?"
   },
   "data": {
     "train": {
@@ -35,7 +35,7 @@
     }
   },
   "training": {
-    "output_dir": "./results_module/R79_R05_ABX_R77_ROUND_STATE_SINGLEPAIR_ANALYTIC3R_TVT_U02",
+    "output_dir": "./results_module/R80_R05_ABX_R79_CARRIER_CONSISTENT_SINGLEPAIR_ANALYTIC3R_TVT_U02",
     "optimizer": {
       "lr": 0.001,
       "final_lr": 0.0001,
@@ -149,9 +149,10 @@
         "execution": {
           "triangle_chunk_size": 64,
           "activation_checkpoint": true,
-          "pair_distance_chunk_size": 16,
-          "triangle_chunk_size_eval": 96,
-          "pair_distance_chunk_size_eval": 32
+          "pair_distance_chunk_size": 8,
+          "triangle_chunk_size_eval": 64,
+          "pair_distance_chunk_size_eval": 8,
+          "static_layout_cache": true
         },
         "pair_coordinate": {
           "mode": "direct_shared",
@@ -179,20 +180,20 @@
           "structure_authority": "analytic_endpoint_chart",
           "transport_authority": "analytic_carrier_chart",
           "terminal_authority": "integrated_carrier",
-          "round_recurrence": "analytic_endpoint_to_native_context + carrier_to_interface_context",
+          "round_recurrence": "carrier_to_native_relational_context + carrier_to_interface_context",
           "geometric_operator_mode": "latent_native_workspace",
           "outer_time_semantics": "shared_fixed_t_iterative_refinement",
           "structure_supervision_mask": "paratope_only",
           "fixed_context_writeback": "paratope_only",
           "native_latent_workspace": "retained_from_R72",
           "refinement_supervision": "final_round_only_inherited_from_AbFlow",
-          "diagnostic_hypothesis": "R77 updates the single physical H3 state across three rounds while its dense Single/Pair representation is computed once outside the loop. R79 tests only whether conditioning Single/Pair on the current authoritative H3 state once per macro round restores state/representation consistency."
+          "diagnostic_hypothesis": "Clean R79 shows progressive aligned/pair refinement but simultaneous raw-placement degradation within the same three-round forward. R80 changes only the round1/2 relational geometry source from the derived endpoint chart to the same carrier state used by the coordinate actuator."
         },
         "round_state_conditioning": {
           "enabled": true,
           "geometry_source": "current_authoritative_state",
           "round0_state": "outer_Xt",
-          "later_round_state": "previous_analytic_endpoint",
+          "later_round_state": "previous_carrier",
           "condition_design_geometry": true,
           "prev_seq": false,
           "prev_pair": false,
@@ -200,7 +201,8 @@
           "detach_between_rounds": false,
           "pair_static_within_round": true,
           "geometry_scope": "paratope_only",
-          "task_atom_observation_source": "current_state_ca_fill"
+          "task_atom_observation_source": "current_state_ca_fill",
+          "native_task_observation_mask_forbidden": true
         }
       }
     }
@@ -232,7 +234,7 @@
   },
   "generation": {
     "checkpoint": "",
-    "save_dir": "./results_generation/R79_R05_ABX_R77_ROUND_STATE_SINGLEPAIR_ANALYTIC3R_TVT_U02",
+    "save_dir": "./results_generation/R80_R05_ABX_R79_CARRIER_CONSISTENT_SINGLEPAIR_ANALYTIC3R_TVT_U02",
     "batch_size": 20,
     "num_workers": 4,
     "n_steps": 10,
@@ -259,9 +261,10 @@
       "native_proposal_routine_metrics": false,
       "validation_inner_refinement_geometry": true,
       "test_state_exposure_matched_oracle_path": false,
-      "validation_round_state_singlepair": true,
-      "validation_round_relational_refresh": true,
-      "validation_pair_coordinate_actuation": true
+      "validation_round_state_singlepair": false,
+      "validation_round_relational_refresh": false,
+      "validation_pair_coordinate_actuation": false,
+      "validation_transport_pose": true
     }
   }
 }

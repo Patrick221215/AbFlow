@@ -148,12 +148,13 @@ class AbFlowModel(nn.Module):
                 "'legacy_cmask' or 'paratope_only'."
             )
 
-        # R79 single-factor experiment: synchronize the relational Single/Pair
-        # representation with the CURRENT authoritative H3 state at each of the
-        # three fixed-t macro refinement rounds.  This is deliberately NOT AbX
-        # prev/recycle: there is no prev_seq/prev_pair/prev_pos state, no added
-        # memory branch and no new loss.  Round 0 reads the actual outer Xt;
-        # rounds 1/2 read the previous carrier's analytic endpoint view.
+        # R81 mainline: keep the clean R79 macro-round state semantics and fix
+        # only the relational GEOMETRY FRAME.  AbFlow internally centers antigen
+        # and antibody separately, which is valid for the legacy R05 branches but
+        # cannot be used directly for dense cross-chain Pair distances.  R81
+        # restores one common raw complex frame before NativeTrunk geometry is
+        # constructed.  The rejected R80 previous-carrier branch is intentionally
+        # absent from the mainline.
         round_state_cfg = representation_config.get("round_state_conditioning", {})
         self.round_state_conditioning_enabled = bool(
             round_state_cfg.get("enabled", False)
@@ -162,11 +163,28 @@ class AbFlowModel(nn.Module):
             round_state_cfg.get("geometry_source", "current_authoritative_state")
             or "current_authoritative_state"
         ).strip().lower()
+        self.round_state_later_state = str(
+            round_state_cfg.get("later_round_state", "previous_analytic_endpoint")
+            or "previous_analytic_endpoint"
+        ).strip().lower()
+        self.relational_coordinate_frame = str(
+            round_state_cfg.get("relational_coordinate_frame", "common_raw_complex")
+            or "common_raw_complex"
+        ).strip().lower()
         if self.round_state_conditioning_enabled:
             if self.round_state_geometry_source != "current_authoritative_state":
                 raise ValueError(
                     "round_state_conditioning.geometry_source must be "
                     "'current_authoritative_state'."
+                )
+            if self.round_state_later_state != "previous_analytic_endpoint":
+                raise ValueError(
+                    "R81 mainline requires later_round_state='previous_analytic_endpoint'; "
+                    "the R80 previous-carrier ablation was rejected."
+                )
+            if self.relational_coordinate_frame != "common_raw_complex":
+                raise ValueError(
+                    "R81 requires relational_coordinate_frame='common_raw_complex'."
                 )
             if not self.single_physical_field:
                 raise ValueError(
@@ -1160,6 +1178,46 @@ class AbFlowModel(nn.Module):
         return self._raw_paratope_to_native_model(raw, paratope_mask, batch_id)
 
 
+    def _relational_common_raw_coordinates(self, separated_model_X, batch_id):
+        """Restore one physical complex frame for NativeTrunk geometry.
+
+        AbFlow's legacy normalizer centers antigen and antibody independently.
+        That convention is retained everywhere else.  Dense cross-chain Pair
+        geometry, however, must compare coordinates in one common origin.  This
+        helper exactly inverts the per-chain centering for the relational donor
+        only; it introduces no new coordinates and no target/native information.
+        """
+        separated_raw = self.normalizer.unnormalize(separated_model_X)
+        return self.normalizer.uncentering(separated_raw, batch_id, _type=1)
+
+    @torch.no_grad()
+    def _legacy_cross_frame_distortion_A(self, separated_model_X, common_raw_X,
+                                         S, paratope_mask, batch_id):
+        """Mean CA cross-chain distance error caused by legacy separate centering."""
+        ca_idx = 1 if separated_model_X.shape[1] > 1 else 0
+        separated_raw = self.normalizer.unnormalize(separated_model_X)
+        is_ag = self.batch_constants['is_ag'].bool()
+        non_global = S != self.aa_feature.boa_idx
+        vals = []
+        n_graph = int(batch_id.max().item()) + 1 if batch_id.numel() else 0
+        for gid in range(n_graph):
+            h3 = paratope_mask & (batch_id == gid)
+            ag = is_ag & non_global & (batch_id == gid)
+            if not bool(h3.any()) or not bool(ag.any()):
+                continue
+            legacy = torch.cdist(
+                separated_raw[h3, ca_idx].float(),
+                separated_raw[ag, ca_idx].float(),
+            )
+            physical = torch.cdist(
+                common_raw_X[h3, ca_idx].float(),
+                common_raw_X[ag, ca_idx].float(),
+            )
+            vals.append((legacy - physical).abs().mean())
+        if not vals:
+            return separated_model_X.new_zeros(())
+        return torch.stack(vals).mean().to(separated_model_X.dtype)
+
     def _forward(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep,
                  surface, residue_pos, template, lengths, init_noise=None,
                  interface_init=None, sequence_init=None, flow_t=None,
@@ -1180,6 +1238,11 @@ class AbFlowModel(nn.Module):
             or getattr(self, 'geometry_forensics_enabled', False)
             or getattr(self, 'sample_forensics_enabled', False)
         )
+        if not capture_diag:
+            # Never reuse bridge/EGNN diagnostics from an earlier train or sample
+            # forward when validation intentionally disables expensive capture.
+            self._last_message_diagnostics = {}
+            self._last_round_egnn_diagnostics = []
         X, S, surface = X.clone(), S.clone(), surface.clone()
         X, S = self.init_mask(X, S, cmask, smask, template)
         X, S = self.replace_pep(X, S, paratope_mask, X_pep, S_pep)
@@ -1237,6 +1300,21 @@ class AbFlowModel(nn.Module):
         trunk_S = S
         biological = paratope_mask.bool() | ((trunk_S >= 0) & (trunk_S < self.num_classes))
 
+        # Execution-only optimization: sequence/chain/residue/mask/topology packing
+        # is invariant across the three fixed-t macro rounds. Build that layout
+        # once; every round still recomputes current-state atom existence, torsions,
+        # Single, Pair and the full Seqformer on its own physical H3 coordinates.
+        trunk_layout = self.native_trunk.prepare_layout(
+            X_ref=self.normalizer.unnormalize(X), S=trunk_S,
+            segment_ids=self.batch_constants['segment_ids'],
+            residue_pos=residue_pos, batch_id=batch_id,
+            valid_mask=biological, is_antigen=self.batch_constants['is_ag'],
+            design_mask=cmask, aux_task_mask=paratope_mask, flow_t=flow_t,
+            cdr_type=self.cdr_type,
+            atom_observed_mask=self.batch_constants.get('xloss_mask'),
+            condition_design_geometry=self.round_state_conditioning_enabled,
+        )
+
         # R77 baseline computes this trunk once outside the three physical rounds.
         # Formal R79 changes exactly this state/representation contract.  When the
         # factor is enabled, the trunk is rebuilt at the START of every macro round
@@ -1253,16 +1331,12 @@ class AbFlowModel(nn.Module):
         else:
             trunk_X = X.clone()
             trunk_X[paratope_mask] = interface_X.to(trunk_X.dtype)
-            relational_X = self.normalizer.unnormalize(trunk_X)
-            trunk_state = self.native_trunk(
-                X=relational_X, S=trunk_S,
-                segment_ids=self.batch_constants['segment_ids'],
-                residue_pos=residue_pos, batch_id=batch_id,
-                valid_mask=biological, is_antigen=self.batch_constants['is_ag'],
-                design_mask=cmask, aux_task_mask=paratope_mask, flow_t=flow_t,
-                cdr_type=self.cdr_type, residue_feature=self.aa_feature,
-                round_idx=-1,
-                atom_observed_mask=self.batch_constants.get('xloss_mask'))
+            relational_X = self._relational_common_raw_coordinates(
+                trunk_X, batch_id
+            )
+            trunk_state = self.native_trunk.forward_prepared(
+                layout=trunk_layout, X=relational_X,
+                residue_feature=self.aa_feature, round_idx=-1)
             self._last_trunk_state = trunk_state
 
         r_logits, r_interface_X, r_edge_dist = [], [interface_X.clone()], []
@@ -1274,6 +1348,7 @@ class AbFlowModel(nn.Module):
         round_relational_diag = []
         previous_trunk_state = None
         previous_relational_h3_raw = None
+        self._last_relational_legacy_cross_frame_distortion_A = X.new_zeros(())
 
         for round_idx in range(self.round):
             if self.round_state_conditioning_enabled:
@@ -1282,17 +1357,18 @@ class AbFlowModel(nn.Module):
                 # receives no native target coordinates and no prev_* context.
                 trunk_X = X.clone()
                 trunk_X[paratope_mask] = current_relational_h3_native.to(trunk_X.dtype)
-                relational_X = self.normalizer.unnormalize(trunk_X)
-                trunk_state = self.native_trunk(
-                    X=relational_X, S=trunk_S,
-                    segment_ids=self.batch_constants['segment_ids'],
-                    residue_pos=residue_pos, batch_id=batch_id,
-                    valid_mask=biological, is_antigen=self.batch_constants['is_ag'],
-                    design_mask=cmask, aux_task_mask=paratope_mask, flow_t=flow_t,
-                    cdr_type=self.cdr_type, residue_feature=self.aa_feature,
-                    round_idx=round_idx,
-                    atom_observed_mask=self.batch_constants.get('xloss_mask'),
-                    condition_design_geometry=True)
+                relational_X = self._relational_common_raw_coordinates(
+                    trunk_X, batch_id
+                )
+                if bool(getattr(self, '_diagnostic_validation_mode', False)) and round_idx == 0:
+                    self._last_relational_legacy_cross_frame_distortion_A = (
+                        self._legacy_cross_frame_distortion_A(
+                            trunk_X, relational_X, S, paratope_mask, batch_id
+                        )
+                    )
+                trunk_state = self.native_trunk.forward_prepared(
+                    layout=trunk_layout, X=relational_X,
+                    residue_feature=self.aa_feature, round_idx=round_idx)
                 self._last_trunk_state = trunk_state
 
                 if capture_diag:
@@ -1402,9 +1478,9 @@ class AbFlowModel(nn.Module):
                 pred_X[paratope_mask] = authority_endpoint_native
                 interface_X = authority_carrier
                 if self.round_state_conditioning_enabled:
-                    # The next relational round reads this analytic endpoint view.
-                    # No detach is inserted: this is the same differentiable physical
-                    # recurrence already present in R77, now made visible to Single/Pair.
+                    # Clean R79 recurrence retained exactly: the next relational
+                    # round reads the previous analytic endpoint view.  R81 changes
+                    # only the frame in which the dense donor geometry is computed.
                     current_relational_h3_native = authority_endpoint_native
             else:
                 interface_X = carrier_proposal
@@ -1520,23 +1596,33 @@ class AbFlowModel(nn.Module):
         true_ca = true_int[:, ca_idx].detach().float()
         n_graph = int(interface_batch_id.max().item()) + 1
 
+        is_ag = self.batch_constants['is_ag'].bool()
+        non_global = true_S != self.aa_feature.boa_idx
+        true_ca_global = true_X[:, ca_idx].detach().float()
+
         def graph_geometry(pred_ca, ref_ca):
             raw_vals, aligned_vals, pair_vals = [], [], []
+            centroid_vals, rotation_vals, ag_nearest_vals = [], [], []
             for gid in range(n_graph):
                 mask = interface_batch_id == gid
                 if not bool(mask.any()):
                     nan = pred_ca.new_tensor(float('nan'))
                     raw_vals.append(nan); aligned_vals.append(nan); pair_vals.append(nan)
+                    centroid_vals.append(nan); rotation_vals.append(nan); ag_nearest_vals.append(nan)
                     continue
                 p = pred_ca[mask].detach().float()
                 q = ref_ca[mask].detach().float()
                 raw_vals.append(torch.sqrt(((p - q) ** 2).sum(-1).mean().clamp_min(0.0)))
+                centroid_vals.append(torch.linalg.norm(p.mean(0) - q.mean(0)))
+                rot_angle = p.new_tensor(float('nan'))
                 if p.shape[0] >= 3:
                     try:
                         _, rot, trans = kabsch_torch(p, q, requires_grad=False)
                         pa = torch.matmul(p, rot.T) + trans
                         aligned_vals.append(torch.sqrt(
                             ((pa - q) ** 2).sum(-1).mean().clamp_min(0.0)))
+                        cos_angle = ((torch.trace(rot.float()) - 1.0) * 0.5).clamp(-1.0, 1.0)
+                        rot_angle = torch.rad2deg(torch.acos(cos_angle))
                     except Exception:
                         aligned_vals.append(p.new_tensor(float('nan')))
                 else:
@@ -1544,11 +1630,25 @@ class AbFlowModel(nn.Module):
                     qc = q - q.mean(0, keepdim=True)
                     aligned_vals.append(torch.sqrt(
                         ((pc - qc) ** 2).sum(-1).mean().clamp_min(0.0)))
+                rotation_vals.append(rot_angle)
                 if p.shape[0] >= 2:
                     pair_vals.append((torch.pdist(p) - torch.pdist(q)).abs().mean())
                 else:
                     pair_vals.append(p.new_tensor(float('nan')))
-            return torch.stack(raw_vals), torch.stack(aligned_vals), torch.stack(pair_vals)
+
+                ag_mask = (batch_id == gid) & is_ag & non_global
+                if bool(ag_mask.any()):
+                    ag = true_ca_global[ag_mask]
+                    pred_nearest = torch.cdist(p, ag).min(dim=1).values
+                    true_nearest = torch.cdist(q, ag).min(dim=1).values
+                    ag_nearest_vals.append((pred_nearest - true_nearest).abs().mean())
+                else:
+                    ag_nearest_vals.append(p.new_tensor(float('nan')))
+            return (
+                torch.stack(raw_vals), torch.stack(aligned_vals), torch.stack(pair_vals),
+                torch.stack(centroid_vals), torch.stack(rotation_vals),
+                torch.stack(ag_nearest_vals),
+            )
 
         def finite_mean(v):
             m = torch.isfinite(v)
@@ -1566,6 +1666,9 @@ class AbFlowModel(nn.Module):
             add_mean(f'roundfield_auth_r{ridx}_raw_A', metrics[0])
             add_mean(f'roundfield_auth_r{ridx}_aligned_A', metrics[1])
             add_mean(f'roundfield_auth_r{ridx}_pair_mae_A', metrics[2])
+            add_mean(f'roundfield_auth_r{ridx}_centroid_A', metrics[3])
+            add_mean(f'roundfield_auth_r{ridx}_rotation_deg', metrics[4])
+            add_mean(f'roundfield_auth_r{ridx}_ag_nearest_A', metrics[5])
 
         def add_delta(prefix, metrics, field_idx):
             if len(metrics) < 3:
@@ -1579,32 +1682,35 @@ class AbFlowModel(nn.Module):
                         out[f'{prefix}_improve_frac_{tag}'] = (
                             vb[valid] < va[valid]).float().mean()
 
+        add_delta('roundfield_auth_raw_delta_A', auth_metrics, 0)
         add_delta('roundfield_auth_aligned_delta_A', auth_metrics, 1)
         add_delta('roundfield_auth_pair_delta_A', auth_metrics, 2)
+        add_delta('roundfield_auth_centroid_delta_A', auth_metrics, 3)
+        add_delta('roundfield_auth_ag_nearest_delta_A', auth_metrics, 5)
 
-        # R79 mechanism diagnostics: does the relational state actually refresh
-        # when the authoritative H3 state changes across the three macro rounds?
-        for rec in list(getattr(self, '_last_round_relational_diagnostics', []) or []):
-            ridx = int(rec.get('round_idx', -1))
-            if ridx < 0:
-                continue
-            for key in (
-                'single_rms', 'pair_rms', 'single_refresh_rms',
-                'pair_refresh_rms', 'state_step_A',
-                'task_geometry_visible_fraction',
-                'non_task_design_geometry_visible_fraction',
-            ):
-                value = rec.get(key)
-                if torch.is_tensor(value) and value.numel() == 1:
-                    out[f'roundrel_r{ridx}_{key}'] = value.detach()
-
-        # Pair must continue to drive the real Cartesian actuator after refresh.
-        for rec in list(getattr(self, '_last_round_egnn_diagnostics', []) or []):
-            ridx = int(rec.get('round_idx', -1))
-            bridge = rec.get('bridge', {}) or {}
-            value = bridge.get('bridge_pair_coordinate_delta_to_base_ratio_mean')
-            if ridx >= 0 and torch.is_tensor(value) and value.numel() == 1:
-                out[f'roundrel_r{ridx}_pair_coord_ratio'] = value.detach()
+        # R80 transport-direction diagnostic: does each macro-round displacement
+        # point toward the native endpoint in absolute coordinates?  This uses
+        # already-produced detached round states and never mutates coordinates.
+        if len(auth_rounds) >= 2:
+            ca_rounds = [ep[:, ca_idx].detach().float() for ep in auth_rounds[:self.round]]
+            for a, b, tag in ((0, 1, '01'), (1, 2, '12')):
+                if b >= len(ca_rounds):
+                    continue
+                vals = []
+                for gid in range(n_graph):
+                    mask = interface_batch_id == gid
+                    if not bool(mask.any()):
+                        continue
+                    pa = ca_rounds[a][mask]
+                    pb = ca_rounds[b][mask]
+                    q = true_ca[mask]
+                    step = (pb - pa).reshape(-1)
+                    target = (q - pa).reshape(-1)
+                    denom = torch.linalg.norm(step) * torch.linalg.norm(target)
+                    if bool(denom > 1e-8):
+                        vals.append(torch.dot(step, target) / denom)
+                if vals:
+                    out[f'roundfield_step_target_cos_{tag}'] = torch.stack(vals).mean()
 
         return out
 
@@ -2048,6 +2154,9 @@ class AbFlowModel(nn.Module):
                 if torch.is_tensor(value) and value.numel() == 1:
                     diag[key] = value.detach()
             if bool(getattr(self, '_diagnostic_validation_mode', False)):
+                diag['relational_legacy_cross_frame_distortion_A'] = (
+                    self._last_relational_legacy_cross_frame_distortion_A.detach()
+                )
                 diag.update(self._validation_proxy_diagnostics(
                     true_X=true_X, true_S=true_S, pred_S=pred_S,
                     r_logits=r_logits, paratope_mask=paratope_mask,
@@ -2154,7 +2263,6 @@ class AbFlowModel(nn.Module):
             prev_diag_capture = bool(getattr(self, '_diagnostic_capture', False))
             if (
                 self.sample_forensics_enabled
-                or self.sample_authority_diagnostics
                 or self.state_exposure_audit
             ):
                 self._diagnostic_capture = True
