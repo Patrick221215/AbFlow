@@ -129,6 +129,7 @@ class AbFlowTrainer(Trainer):
         self._epoch_train_counts = {name: 0 for name in self._train_component_names}
         self._last_validation_summary = {}
         self._last_epoch_test_metrics = {}
+        self._outer_exposure_printed_epoch = -1
 
         # Diagnostics are intentionally console-first.  The launcher tees the
         # complete stdout/stderr stream into version_0/run_time.log, so we do not
@@ -1127,28 +1128,34 @@ class AbFlowTrainer(Trainer):
         print(
             '[Validation] '
             f"epoch={self.epoch} val={self._fmt(summary.get('validation_metric'),5)} "
+            f"seq={self._fmt(summary.get('loss_seq'),5)} "
             f"struct={self._fmt(summary.get('loss_structure'),5)} "
             f"interface={self._fmt(summary.get('loss_interface'),5)} "
             f"edge={self._fmt(summary.get('loss_edge'),5)}"
         )
-        def vals(prefix, metric, nd=4):
-            return '[' + ','.join(
-                self._fmt(summary.get(f'{prefix}_r{r}_{metric}'), nd)
-                for r in range(3)) + ']'
+
+        def _delta(a, b):
+            try:
+                return float(a) - float(b)
+            except Exception:
+                return float('nan')
+
+        # R83 keeps only the fields needed to prove that the inherited R82 inner
+        # actuator remains healthy.  The scientific question has moved outward to
+        # rollout-state robustness, so the old 3x10 matrix is no longer printed.
+        r0_aligned = summary.get('auth_r0_aligned_A')
+        r2_aligned = summary.get('auth_r2_aligned_A')
         print(
-            '[RoundTransportValidation] '
-            f'epoch={self.epoch} supervision=final_only relational_state=endpoint '
-            f'pair_frame=common_raw_complex pose_actuator=pair_torque_tangent '
-            f"raw_A={vals('auth','raw_A')} "
-            f"centered_A={vals('auth','centered_A')} "
-            f"aligned_A={vals('auth','aligned_A')} "
-            f"rotation_excess_A={vals('auth','rotation_excess_A')} "
-            f"h3_ag_pair_A={vals('auth','h3_ag_pair_mae_A')} "
-            f"centroid_A={vals('auth','centroid_A')} "
-            f"torque_deg={vals('auth','torque_angle_deg',3)} "
-            f"translation_cos=[{self._fmt(summary.get('step_translation_cos_01'),4)},{self._fmt(summary.get('step_translation_cos_12'),4)}] "
-            f"pose_cos=[{self._fmt(summary.get('step_centered_cos_01'),4)},{self._fmt(summary.get('step_centered_cos_12'),4)}] "
-            f"pose_pos_frac=[{self._fmt(summary.get('step_centered_cos_pos_frac_01'),3)},{self._fmt(summary.get('step_centered_cos_pos_frac_12'),3)}]"
+            '[InnerRefinement] '
+            f'epoch={self.epoch} pair_frame=common_raw_complex torque=on '
+            f"final_raw_A={self._fmt(summary.get('auth_r2_raw_A'),4)} "
+            f"final_aligned_A={self._fmt(r2_aligned,4)} "
+            f"aligned_gain_02_A={self._fmt(_delta(r0_aligned, r2_aligned),4)} "
+            f"final_pair_A={self._fmt(summary.get('auth_r2_h3_ag_pair_mae_A'),4)} "
+            f"final_rotation_excess_A={self._fmt(summary.get('auth_r2_rotation_excess_A'),4)} "
+            f"final_centroid_A={self._fmt(summary.get('auth_r2_centroid_A'),4)} "
+            f"pose_cos12={self._fmt(summary.get('step_centered_cos_12'),4)} "
+            f"torque_r2_deg={self._fmt(summary.get('auth_r2_torque_angle_deg'),3)}"
         )
         if int(self.epoch) == 0:
             print(
@@ -1314,7 +1321,7 @@ class AbFlowTrainer(Trainer):
                 f"val={self._fmt(row['val_loss'], 5)} "
                 f"AAR={self._fmt(row['test_AAR'], 5)} CAAR={self._fmt(row['test_CAAR'], 5)} "
                 f"H3raw={self._fmt(row['test_H3raw'], 4, 'A')} H3aligned={self._fmt(row['test_H3aligned'], 4, 'A')} "
-                f"TM={self._fmt(row['test_TM'], 5)} lDDT={self._fmt(row['test_lDDT'], 5)} DockQ={self._fmt(row['test_DockQ'], 5)} "
+                f"DockQ={self._fmt(row['test_DockQ'], 5)} "
                 f"best_val_epoch={row['best_val_epoch']} best_val={self._fmt(row['best_val_loss'], 5)}"
             )
 
@@ -1404,6 +1411,8 @@ class AbFlowTrainer(Trainer):
         capture_diagnostics = bool(science_step_diag or bridge_contract_probe)
         raw_model._diagnostic_capture = bool(capture_diagnostics)
         raw_model._diagnostic_validation_mode = bool(val)
+        if hasattr(raw_model, 'set_outer_state_exposure_context'):
+            raw_model.set_outer_state_exposure_context(self.epoch, self.global_step)
 
         loss, seq_detail, structure_detail, dock_detail, pdev_detail = self.model(**batch)
         snll, aar = seq_detail
@@ -1837,6 +1846,30 @@ class AbFlowTrainer(Trainer):
         abflow_diagnostics = getattr(raw_model, "last_abflow_diagnostics", None) or {}
         for name, value in abflow_diagnostics.items():
             self.log(f"AbFlowDiag/{name}/{log_type}", value, batch_idx, val)
+
+        # R83 console audit: one line per epoch, only when coordinate exposure is
+        # actually active.  This verifies the scientific delta without restoring
+        # the old high-volume bridge/geometry print tree.
+        if not val:
+            exposure_frac = self._scalar(
+                abflow_diagnostics.get('outer_exposure_graph_fraction')
+            )
+            if (
+                exposure_frac is not None and exposure_frac > 0.0
+                and self._outer_exposure_printed_epoch != int(self.epoch)
+                and self._diag_main_rank
+            ):
+                self._outer_exposure_printed_epoch = int(self.epoch)
+                print(
+                    '[OuterStateExposure] '
+                    f'epoch={self.epoch} step={self.global_step} '
+                    f'mode={getattr(raw_model, "outer_state_exposure_mode", "off")} '
+                    f'graph_frac={self._fmt(exposure_frac,3)} '
+                    f't={self._fmt(self._scalar(abflow_diagnostics.get("outer_exposure_t_mean")),3)} '
+                    f'state_gap_A={self._fmt(self._scalar(abflow_diagnostics.get("outer_exposure_state_gap_A")),4)} '
+                    f'target_gap_A={self._fmt(self._scalar(abflow_diagnostics.get("outer_exposure_target_gap_A")),4)} '
+                    'target=recomputed_from_exposed_state sequence=analytic_main_time detached=1'
+                )
 
         # V238 compact single-field validation observers. These are detached
         # diagnostics only; they never enter the objective or checkpoint rule.

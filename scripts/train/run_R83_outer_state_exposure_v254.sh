@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# R81 diagnostic-closure launcher: model math is identical to R81.
-# Scientific delta versus clean R79 remains the common raw-complex Angstrom
-# relational geometry contract.  v251 changes diagnostics only: compact
-# pose/interface decomposition plus an epoch-gated matched rollout-vs-oracle
-# Test state-exposure observer.  Train->Validation->Test, F01/loss/sampler,
-# anti-leak barrier, three round refreshes and one physical Cartesian field stay unchanged.
+# R83 outer-state exposure launcher: exact R82 parent plus one detached training-state delta.
+# Scientific delta versus exact R82 is detached one-step OUTER coordinate-state exposure only.
+# R82 common-frame/Angstrom Pair geometry, anti-leak barrier, torque tangent,
+# single physical Cartesian field, losses, sequence rollout and formal F01 Test
+# sampler remain unchanged.  The main carrier target is recomputed from the
+# actually exposed state to preserve state/target consistency.
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PROJECT_ROOT=${ABFLOW_PROJECT_ROOT:-$ROOT}
 CONFIG_PATH=${1:-}
@@ -16,16 +16,15 @@ GPU_CSV=""; MASTER_PORT=""; MASTER_ADDR=""
 usage() {
   cat >&2 <<'USAGE'
 Usage:
-  bash scripts/train/run_R81_common_frame_singlepair_v251.sh <R81-config.json> \
+  bash scripts/train/run_R83_outer_state_exposure_v254.sh <R83-config.json> \
     --gpus 2,3,4,5,6,7 --port 29784
 
-R81 v251 contract:
-  - parent = clean R79 and starts from scratch;
-  - round0 relational state = outer Xt; rounds1/2 = previous analytic endpoint;
-  - dense Single/Pair geometry uses one common raw-complex Angstrom frame;
-  - no prev_seq/prev_pair/prev_pos, no new loss/sampler/controller/Cartesian field;
-  - H3 native xloss_mask remains blocked; Pair stays static inside each round;
-  - v251 adds diagnostics only; model math is identical to R81;
+R83 v254 contract:
+  - parent = exact R82 and starts from scratch;
+  - R82 torque/common-frame/anti-leak/3-round recurrence are retained exactly;
+  - one scheduled detached prepass exposes the main forward to a one-step outer coordinate state at the same t;
+  - target is recomputed from that exposed state; sequence state remains analytic at the main t;
+  - no new loss, sampler, head, recycle path or Cartesian authority;
   - Train -> Validation -> Test remains unchanged (10 steps, seed 2023).
 USAGE
 }
@@ -103,7 +102,7 @@ export ABFLOW_EPOCH_TEST_MODEL_INVALID_POLICY=record_and_continue ABFLOW_EPOCH_T
 export ABFLOW_TQDM="${ABFLOW_TQDM:-on}" ABFLOW_GEOMETRY_FORENSICS="${ABFLOW_GEOMETRY_FORENSICS:-off}"
 export ABFLOW_SAMPLE_FORENSICS="${ABFLOW_SAMPLE_FORENSICS:-off}" ABFLOW_SAMPLE_AUTHORITY_DIAGNOSTICS="${ABFLOW_SAMPLE_AUTHORITY_DIAGNOSTICS:-on}"
 export ABFLOW_STATE_EXPOSURE_AUDIT=off
-export ABFLOW_STATE_EXPOSURE_EPOCHS="${ABFLOW_STATE_EXPOSURE_EPOCHS:-9}"
+export ABFLOW_STATE_EXPOSURE_EPOCHS="${ABFLOW_STATE_EXPOSURE_EPOCHS:-29,39,49,59}"
 export ABFLOW_STATE_EXPOSURE_STEPS="${ABFLOW_STATE_EXPOSURE_STEPS:-0,5,9}"
 export ABFLOW_COORD_AUDIT_INTERVAL="${ABFLOW_COORD_AUDIT_INTERVAL:-1000000000}" ABFLOW_COORD_AUDIT_FIRST_STEPS="${ABFLOW_COORD_AUDIT_FIRST_STEPS:-0}"
 export ABFLOW_GEOMETRY_AUTHORITY_INTERVAL=0
@@ -118,7 +117,7 @@ echo "[RunLog] canonical=$RUN_LOG latest=$LATEST_LOG"
 echo "[RunVersion] fixed_version=$VERSION dir=$RUN_DIR"
 echo "[RunConfig] config=$CONFIG_PATH"
 echo "[RunResources] physical_gpus=$GPU_CSV nproc=$NPROC_PER_NODE per_gpu_train_val_batch=$PER_GPU_BATCH_SIZE effective_global_train_batch=$EFFECTIVE_GLOBAL_TRAIN_BATCH test_batch=$TEST_BATCH master_addr=$MASTER_ADDR port=$MASTER_PORT"
-echo "[RunInit] mode=scratch parent=R79_clean optimizer=reset ema=reset epoch=0 best_val=reset"
+echo "[RunInit] mode=scratch parent=R82_exact optimizer=reset ema=reset epoch=0 best_val=reset"
 echo "[TrainingHorizon] source=json max_epoch=$MAX_EPOCH launcher_epoch_override=none"
 echo "[TrainValTestContract] order=train->validation->test checkpoint_selection=validation test_metrics=observation_only test_steps=$TEST_STEPS test_seed=$TEST_SEED"
 
@@ -128,30 +127,39 @@ cp,out=sys.argv[1:3]; cfg=json.load(open(cp,encoding='utf-8')); exp=cfg['experim
 eid=exp['id']; stem=os.path.splitext(os.path.basename(cp))[0]; role=str(exp.get('diagnostic_role','')).lower()
 if not (eid==stem==os.path.basename(os.path.normpath(out))): raise SystemExit(f'identity mismatch: {eid} / {stem} / {out}')
 if exp.get('protocol')!='formal_train_val_test': raise SystemExit('formal_train_val_test required')
-if role!='r81_common_frame_singlepair_only': raise SystemExit(f'R81 role required, got {role!r}')
-if exp.get('parent')!='R79_R05_ABX_R77_ROUND_STATE_SINGLEPAIR_ANALYTIC3R_TVT_U02': raise SystemExit('R81 must use clean R79 as parent identity')
-if str(exp.get('initialization','')).lower()!='scratch': raise SystemExit('R81 must start from scratch')
-if str(cfg['training']['schedule'].get('resume_checkpoint','') or '').strip(): raise SystemExit('R81 forbids resume_checkpoint')
-if int(cfg['model']['architecture']['iter_round']) != 3: raise SystemExit('R81 requires exactly 3 refinement rounds')
+if role!='r83_detached_one_step_outer_coordinate_exposure_only': raise SystemExit(f'R83 role required, got {role!r}')
+if exp.get('parent')!='R82_R05_ABX_R81_TORQUE_TANGENT_SINGLEPAIR_ANALYTIC3R_TVT_U02': raise SystemExit('R83 must use exact R82 as parent identity')
+if str(exp.get('initialization','')).lower()!='scratch': raise SystemExit('R83 must start from scratch')
+if str(cfg['training']['schedule'].get('resume_checkpoint','') or '').strip(): raise SystemExit('R83 forbids resume_checkpoint')
+if int(cfg['model']['architecture']['iter_round']) != 3: raise SystemExit('R83 requires exactly 3 refinement rounds')
 sp=cfg['model']['representation']['single_pair']; pc=sp['pair_coordinate']; cc=sp['coordinate_controller']; pa=sp['physical_authority']; rs=sp.get('round_state_conditioning',{})
-if pc.get('mode')!='direct_shared' or cc.get('mode')!='egnn_prenorm_raw': raise SystemExit('R79 Pair/controller must remain unchanged')
+if pc.get('mode')!='direct_shared' or cc.get('mode')!='egnn_prenorm_raw': raise SystemExit('inherited Pair/controller contract changed')
 if not bool(sp.get('time_embed',True)): raise SystemExit('explicit Single/Pair time must remain on')
 if pa.get('mode')!='carrier_primary_analytic' or int(pa.get('physical_dof',0))!=1: raise SystemExit('carrier-primary single field required')
 if pa.get('geometric_operator_mode')!='latent_native_workspace': raise SystemExit('R77 latent native workspace must be retained')
 if pa.get('refinement_supervision')!='final_round_only_inherited_from_AbFlow': raise SystemExit('final-round-only supervision must remain unchanged')
 if pa.get('structure_supervision_mask')!='paratope_only' or pa.get('fixed_context_writeback')!='paratope_only': raise SystemExit('H3 authority closure required')
 if not bool(rs.get('enabled',False)) or rs.get('geometry_source')!='current_authoritative_state': raise SystemExit('round-state Single/Pair factor missing')
-if rs.get('round0_state')!='outer_Xt' or rs.get('later_round_state')!='previous_analytic_endpoint': raise SystemExit('R81 requires clean-R79 outer_Xt -> previous_analytic_endpoint recurrence')
-if rs.get('relational_coordinate_frame')!='common_raw_complex': raise SystemExit('R81 common_raw_complex relational frame required')
-if rs.get('relational_coordinate_units')!='angstrom': raise SystemExit('R81 relational coordinates must be raw Angstrom geometry')
+if rs.get('round0_state')!='outer_Xt' or rs.get('later_round_state')!='previous_analytic_endpoint': raise SystemExit('R83 retains outer_Xt -> previous_analytic_endpoint recurrence')
+if rs.get('relational_coordinate_frame')!='common_raw_complex': raise SystemExit('R83 retains common_raw_complex relational frame')
+if rs.get('relational_coordinate_units')!='angstrom': raise SystemExit('R83 retains raw Angstrom relational geometry')
 if any(bool(rs.get(k,False)) for k in ('prev_seq','prev_pair','prev_pos')): raise SystemExit('prev_* recycle is forbidden')
 if not bool(rs.get('pair_static_within_round',False)): raise SystemExit('Pair must stay static inside each EGNN round')
-if bool(rs.get('detach_between_rounds',True)): raise SystemExit('R81 keeps differentiable physical recurrence')
+if bool(rs.get('detach_between_rounds',True)): raise SystemExit('R83 keeps differentiable physical recurrence')
 if rs.get('task_atom_observation_source')!='current_state_ca_fill' or not bool(rs.get('native_task_observation_mask_forbidden',False)): raise SystemExit('clean H3 observation barrier required')
+pt=sp.get('pose_torque_actuation',{})
+if not bool(pt.get('enabled',False)) or pt.get('mode')!='pair_conditioned_centroid_rodrigues': raise SystemExit('R83 must retain exact R82 torque tangent')
+if pt.get('pivot')!='h3_ca_centroid' or pt.get('apply_to')!='carrier_after_egnn': raise SystemExit('R82 torque semantics changed')
+oe=sp.get('outer_state_exposure',{})
+if not bool(oe.get('enabled',False)) or oe.get('mode')!='detached_one_step_f01_coordinate': raise SystemExit('R83 detached one-step coordinate exposure required')
+if int(oe.get('warmup_epochs',-1))!=30 or int(oe.get('period',-1))!=4: raise SystemExit('R83 exposure schedule must be warmup=30 epochs, period=4')
+if abs(float(oe.get('step_dt',-1))-0.1)>1e-12 or abs(float(oe.get('min_t',-1))-0.1)>1e-12 or abs(float(oe.get('max_t',-1))-0.9)>1e-12: raise SystemExit('R83 exposure time contract changed')
+if oe.get('prepass')!='eval_no_grad' or oe.get('main_target')!='recompute_from_exposed_state': raise SystemExit('R83 detached/target consistency contract changed')
+if oe.get('sequence_state')!='analytic_at_main_time': raise SystemExit('R83 must remain coordinate-only exposure')
 ex=sp.get('execution',{})
-if int(ex.get('triangle_chunk_size',64)) != 64 or int(ex.get('pair_distance_chunk_size',8)) != 8: raise SystemExit('R81 keeps matched train chunks 64/8')
-if int(ex.get('triangle_chunk_size_eval',64)) != 64 or int(ex.get('pair_distance_chunk_size_eval',8)) != 8: raise SystemExit('R81 keeps matched eval chunks 64/8')
-if not bool(ex.get('static_layout_cache',False)): raise SystemExit('R81 retains execution-only static layout reuse')
+if int(ex.get('triangle_chunk_size',64)) != 64 or int(ex.get('pair_distance_chunk_size',8)) != 8: raise SystemExit('R83 keeps matched train chunks 64/8')
+if int(ex.get('triangle_chunk_size_eval',64)) != 64 or int(ex.get('pair_distance_chunk_size_eval',8)) != 8: raise SystemExit('R83 keeps matched eval chunks 64/8')
+if not bool(ex.get('static_layout_cache',False)): raise SystemExit('R83 retains execution-only static layout reuse')
 if float(cfg['loss']['interface']) != 1.0: raise SystemExit('interface weight must remain 1.0')
 if float(cfg['loss']['distogram'].get('weight',0)) != 0 or float(cfg['loss']['smooth_lddt'].get('weight',0)) != 0: raise SystemExit('no auxiliary loss may be introduced')
 gen=cfg['generation']
@@ -160,30 +168,54 @@ if int(gen.get('n_steps',0))!=10 or int(gen.get('seed',-1))!=2023: raise SystemE
 print(f'[ExperimentIdentity] PASS id={eid} parent={exp["parent"]} role={role}')
 print('[SingleFieldContract] authority=carrier_primary_analytic physical_dof=1 structure=paratope_only writeback=paratope_only terminal=integrated_carrier')
 print('[RoundStateSinglePairContract] refresh=once_per_macro_round round0=outer_Xt later=previous_analytic_endpoint relational_frame=common_raw_complex pair_static_within_round=1 prev_seq=0 prev_pair=0 prev_pos=0 detach=0')
+print('[PoseActuationContract] inherited_R82=pair_conditioned_centroid_rodrigues pivot=h3_ca_centroid exact_rigid=1')
+print('[OuterStateExposureContract] mode=detached_one_step_f01_coordinate main_time=same_t warmup_epochs=30 period=4 dt=0.1 t_window=0.1..0.9 prepass=eval_no_grad target=recomputed sequence=analytic_main_time')
 print('[LeakageBarrier] task=H3 native_task_xloss_mask=BLOCKED task_atom_observation=current_state_ca_fill fixed_context_observation=ALLOWED')
 print('[ExecutionContract] static_layout_once_per_outer=1 SinglePair_refreshes=3 train_chunks=64/8 eval_chunks=64/8 validation_bridge_capture=off equations=UNCHANGED train_val_test=UNCHANGED epoch_test=ON')
-print('[ScientificDeltaContract] versus_clean_R79=relational_geometry_contract_common_raw_angstrom_only new_loss=0 new_sampler=0 new_controller=0 new_cartesian_field=0 prev_recycle=0')
-print('[DiagnosticDeltaContract] versus_R81=model_math_none centered_pose=on h3_ag_pair=on state_exposure=epoch_gated_observer_only')
+print('[ScientificDeltaContract] versus_exact_R82=detached_one_step_outer_coordinate_state_exposure_only new_loss=0 new_sampler=0 new_head=0 new_cartesian_field=0 sequence_rollout=0')
+print('[DiagnosticContract] inner_refinement=compact outer_trajectory=compact matched_rollout_oracle=epochs_29_39_49_59')
 print('[RelationalGeometryContract] frame=common_raw_complex units=angstrom pair_distance_divisor_A=10 local_coordinate_scale_A=0.1')
-print('[DiagnosticsContract] RoundTransportValidation=pose_interface_compact RelationalGeometryContract=epoch0 TestFieldTrajectory=compact StateExposureAudit=epoch_gated_observer_only')
+print('[DiagnosticsContract] Validation=seq+struct+interface+edge InnerRefinement=compact TestFieldTrajectory=compact TestStateExposure=epoch_gated')
 PY2
 
-grep -Fq 'current_state_observed = _abflow_ca_fill_observed_mask(' "$PROJECT_ROOT/models/AbFlow/abflow_components.py" || { echo 'H3 observation barrier missing' >&2; exit 2; }
+python - "$PROJECT_ROOT" <<'PY2'
+import hashlib, os, sys
+root=sys.argv[1]
+expected={
+ 'models/AbFlow/abflow_components.py':'3621235a1670d156',
+ 'utils/nn_utils.py':'17facac7fc7cc85b',
+ 'models/modules/am_enc.py':'0bed7e9c826490e0',
+ 'models/modules/am_egnn.py':'134e23b1c5e68bf4',
+ 'train.py':'b7bf85b7779af7fc',
+}
+for rel,prefix in expected.items():
+ p=os.path.join(root,rel)
+ if not os.path.isfile(p): raise SystemExit(f'R82 parent dependency missing: {rel}')
+ got=hashlib.sha256(open(p,'rb').read()).hexdigest()[:16]
+ if got!=prefix:
+  raise SystemExit(f'R82 parent dependency SHA mismatch: {rel} expected={prefix} got={got}. Do not overwrite the running R82 parent with a stale attachment.')
+print('[ParentDependencySHA] PASS ' + ' '.join(f'{k}={v}' for k,v in expected.items()))
+PY2
+grep -Fq 'Fixed = M & (~Design)' "$PROJECT_ROOT/models/AbFlow/abflow_components.py" || { echo 'H3 donor information barrier missing' >&2; exit 2; }
 grep -Fq 'def prepare_layout(' "$PROJECT_ROOT/models/AbFlow/abflow_components.py" || { echo 'static NativeTrunk layout optimization missing' >&2; exit 2; }
 grep -Fq 'def forward_prepared(' "$PROJECT_ROOT/models/AbFlow/abflow_components.py" || { echo 'prepared NativeTrunk forward missing' >&2; exit 2; }
-grep -Fq 'def _relational_common_raw_coordinates(' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'R81 common raw relational frame missing' >&2; exit 2; }
-grep -Fq 'current_relational_h3_native = authority_endpoint_native' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'clean R79 endpoint recurrence missing' >&2; exit 2; }
-grep -Fq "'[RoundTransportValidation] '" "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo 'transport diagnostics missing' >&2; exit 2; }
+grep -Fq 'def _relational_common_raw_coordinates(' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'common raw relational frame missing' >&2; exit 2; }
+grep -Fq 'def _apply_pair_torque_actuation(' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'R82 torque tangent missing' >&2; exit 2; }
+grep -Fq 'def _same_noise_analytic_state_at_previous_time(' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'R83 outer exposure helper missing' >&2; exit 2; }
+grep -Fq 'recompute_from_exposed_state' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'R83 target consistency guard missing' >&2; exit 2; }
+grep -Fq 'current_relational_h3_native = authority_endpoint_native' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'analytic-endpoint round recurrence missing' >&2; exit 2; }
+grep -Fq "'[InnerRefinement] '" "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo 'R83 compact inner-refinement diagnostics missing' >&2; exit 2; }
+grep -Fq "'[OuterStateExposure] '" "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo 'R83 outer exposure diagnostics missing' >&2; exit 2; }
 python -m py_compile "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" "$PROJECT_ROOT/models/AbFlow/abflow_components.py" "$PROJECT_ROOT/utils/nn_utils.py" "$PROJECT_ROOT/models/modules/am_enc.py" "$PROJECT_ROOT/models/modules/am_egnn.py" "$PROJECT_ROOT/trainer/AbFlow_trainer.py" "$PROJECT_ROOT/train.py"
 grep -Fq 'X[paratope_mask] = authority_endpoint_native' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'paratope-only endpoint supervision/writeback missing' >&2; exit 2; }
 grep -Fq 'gen_X[paratope_mask] = interface_X_final' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'integrated carrier terminal missing' >&2; exit 2; }
 grep -Fq 'return 0.5 * (cos(step / self.max_step * pi) + 1) * 0.9' "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo 'context_ratio changed unexpectedly' >&2; exit 2; }
-echo '[Preflight] py_compile=PASS common_pair_frame=PASS h3_native_observation_blocked=PASS static_layout=PASS validation_bridge_capture=OFF train_val_test=UNCHANGED epoch_test=ON prev_recycle=OFF single_field=PASS final_round_only=PASS sampler_unchanged=PASS'
+echo '[Preflight] py_compile=PASS parent_R82_contract=PASS common_pair_frame=PASS h3_native_observation_blocked=PASS torque_tangent=PASS outer_state_exposure=PASS target_recompute=PASS train_val_test=UNCHANGED sampler=UNCHANGED single_field=PASS'
 
 python - "$PROJECT_ROOT" <<'PY2'
 import hashlib,os,sys
 root=sys.argv[1]
-for rel in ['models/AbFlow/AbFlow_model.py','models/AbFlow/abflow_components.py','utils/nn_utils.py','models/modules/am_enc.py','models/modules/am_egnn.py','trainer/AbFlow_trainer.py','train.py','scripts/train/run_R81_common_frame_singlepair_v251.sh']:
+for rel in ['models/AbFlow/AbFlow_model.py','models/AbFlow/abflow_components.py','utils/nn_utils.py','models/modules/am_enc.py','models/modules/am_egnn.py','trainer/AbFlow_trainer.py','train.py','scripts/train/run_R83_outer_state_exposure_v254.sh']:
  p=os.path.join(root,rel)
  if os.path.isfile(p): print(f'[SourceSHA256] {rel} {hashlib.sha256(open(p,"rb").read()).hexdigest()[:16]}')
 PY2
