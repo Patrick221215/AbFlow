@@ -129,7 +129,6 @@ class AbFlowTrainer(Trainer):
         self._epoch_train_counts = {name: 0 for name in self._train_component_names}
         self._last_validation_summary = {}
         self._last_epoch_test_metrics = {}
-        self._outer_exposure_printed_epoch = -1
 
         # Diagnostics are intentionally console-first.  The launcher tees the
         # complete stdout/stderr stream into version_0/run_time.log, so we do not
@@ -715,11 +714,28 @@ class AbFlowTrainer(Trainer):
             f'xnext_aligned_A={arr("xnext_aligned_A")} '
             f'best_xnext_aligned_A={self._fmt(best_aligned,4)} '
             f'best_t={self._fmt(best_t,2)} '
-            f'final_xnext_aligned_A={self._fmt(final_aligned,4)} '
             f'late_drift_A={self._fmt(late_drift,4)} '
             f'raw_final_A={self._fmt(mean_at(steps[-1], "xnext_raw_A"),4)} '
             f'pair_final_A={self._fmt(mean_at(steps[-1], "xnext_pair_mae_A"),4)}'
         )
+        if any(isfinite(mean_at(st, 'seq_field_nll')) for st in selected):
+            print(
+                '[TestSequenceTrajectory] '
+                f'epoch={self.epoch} '
+                f't=[' + ','.join(self._fmt(v, 2) for v in tvals) + '] '
+                f'state_AAR={arr("seq_state_aar",4)} '
+                f'field_AAR={arr("seq_field_aar",4)} '
+                f'field_NLL={arr("seq_field_nll",4)}'
+            )
+        if any(isfinite(mean_at(st, 'support_bb_internal_residual_A')) for st in selected):
+            print(
+                '[TestSupportTrajectory] '
+                f'epoch={self.epoch} '
+                f't=[' + ','.join(self._fmt(v, 2) for v in tvals) + '] '
+                f'ca_residual_A={arr("support_ca_residual_A",4)} '
+                f'bb_internal_residual_A={arr("support_bb_internal_residual_A",4)} '
+                f'bb_internal_over_sigma={arr("support_bb_internal_over_sigma",4)}'
+            )
         # R81 v251: sparse matched oracle-path audit is re-enabled only on
         # explicitly selected epochs because R81 changed the relational geometry
         # contract and the remaining gap is now rollout-state dependent.
@@ -748,11 +764,13 @@ class AbFlowTrainer(Trainer):
                 f't=[' + ','.join(self._fmt(exp_mean(st, 't'), 2) for st in exposure_steps) + '] '
                 f'state_gap_raw_A={exp_arr("state_gap_raw_A")} '
                 f'state_gap_aligned_A={exp_arr("state_gap_aligned_A")} '
-                f'rollout_x1_aligned_A={exp_arr("rollout_x1_aligned_A")} '
-                f'oracle_x1_aligned_A={exp_arr("oracle_x1_aligned_A")} '
-                f'exposure_aligned_gap_A={exp_arr("exposure_x1_aligned_gap_A")} '
-                f'exposure_raw_gap_A={exp_arr("exposure_x1_raw_gap_A")} '
-                f'exposure_pair_gap_A={exp_arr("exposure_x1_pair_gap_A")}')
+                f'output_gap_aligned_A={exp_arr("output_gap_aligned_A")} '
+                f'oracle_gain_aligned_A={exp_arr("oracle_gain_aligned_A")} '
+                f'oracle_gain_pair_A={exp_arr("oracle_gain_pair_A")} '
+                f'seq_jsd={exp_arr("seq_jsd",6)} '
+                f'oracle_gain_seqNLL={exp_arr("oracle_gain_seq_nll",5)} '
+                f'oracle_gain_seqAAR={exp_arr("oracle_gain_seq_aar",5)}'
+            )
 
 
 
@@ -1062,6 +1080,14 @@ class AbFlowTrainer(Trainer):
             'loss_structure': m('Struct/StructLoss/Validation'),
             'loss_interface': m('Dock/SPLoss/Validation'),
             'loss_edge': m('Dock/EDLoss/Validation'),
+            'path_sigma_A': m('AbFlowPath/r3_sigma_mean/Validation'),
+            'path_noise_vec_A': m('AbFlowPath/r3_noise_vector_rms_A/Validation'),
+            'path_ca_noise_A': m('AbFlowPath/r3_ca_noise_vector_rms_A/Validation'),
+            'path_bb_internal_A': m('AbFlowPath/r3_internal_bb_noise_vector_rms_A/Validation'),
+            'path_bb_over_sigma': m('AbFlowPath/r3_internal_bb_over_sigma/Validation'),
+            'path_rank_per_res': m('AbFlowPath/r3_support_rank_per_residue/Validation'),
+            'path_sidechain_ca_tied': m('AbFlowPath/r3_sidechain_ca_tied/Validation'),
+            'path_scope_code': m('AbFlowPath/r3_noise_scope_code/Validation'),
         }
         for ridx in range(3):
             for metric in ('raw_A', 'centered_A', 'aligned_A', 'h3_ag_pair_mae_A', 'rotation_excess_A'):
@@ -1125,38 +1151,47 @@ class AbFlowTrainer(Trainer):
     def _print_validation_audits(self, summary):
         if not self._is_main_proc():
             return
-        lr = self.config.lr if self.scheduler is None else self.scheduler.get_last_lr()[0]
+        current_lr = (
+            self.config.lr if self.scheduler is None
+            else self.scheduler.get_last_lr()[0]
+        )
         print(
             '[Validation] '
             f"epoch={self.epoch} val={self._fmt(summary.get('validation_metric'),5)} "
-            f"lr={self._fmt(lr,8)} "
+            f"lr={self._fmt(current_lr,8)} "
             f"seq={self._fmt(summary.get('loss_seq'),5)} "
             f"val_AAR={self._fmt(summary.get('aar'),5)} "
             f"struct={self._fmt(summary.get('loss_structure'),5)} "
             f"interface={self._fmt(summary.get('loss_interface'),5)} "
             f"edge={self._fmt(summary.get('loss_edge'),5)}"
         )
-
-        def _delta(a, b):
-            try:
-                return float(a) - float(b)
-            except Exception:
-                return float('nan')
-
-        # R83 keeps only the fields needed to prove that the inherited R82 inner
-        # actuator remains healthy.  The scientific question has moved outward to
-        # rollout-state robustness, so the old 3x10 matrix is no longer printed.
-        r0_aligned = summary.get('auth_r0_aligned_A')
-        r2_aligned = summary.get('auth_r2_aligned_A')
         print(
-            '[InnerRefinement] '
-            f'epoch={self.epoch} '
-            f"final_raw_A={self._fmt(summary.get('auth_r2_raw_A'),4)} "
-            f"final_aligned_A={self._fmt(r2_aligned,4)} "
-            f"aligned_gain_02_A={self._fmt(_delta(r0_aligned, r2_aligned),4)} "
-            f"final_pair_A={self._fmt(summary.get('auth_r2_h3_ag_pair_mae_A'),4)} "
-            f"final_rotation_excess_A={self._fmt(summary.get('auth_r2_rotation_excess_A'),4)} "
-            f"pose_cos12={self._fmt(summary.get('step_centered_cos_12'),4)}"
+            '[PathSupportValidation] '
+            f"epoch={self.epoch} "
+            f"scope={'backbone_atom' if (summary.get('path_scope_code') or 0.0) > 0.5 else 'residue'} "
+            f"sigma_A={self._fmt(summary.get('path_sigma_A'),5)} "
+            f"noise_vec_A={self._fmt(summary.get('path_noise_vec_A'),5)} "
+            f"ca_noise_A={self._fmt(summary.get('path_ca_noise_A'),5)} "
+            f"bb_internal_A={self._fmt(summary.get('path_bb_internal_A'),5)} "
+            f"bb_over_sigma={self._fmt(summary.get('path_bb_over_sigma'),5)} "
+            f"rank_per_res={self._fmt(summary.get('path_rank_per_res'),0)} "
+            f"sidechain_ca_tied={self._fmt(summary.get('path_sidechain_ca_tied'),0)}"
+        )
+        def vals(prefix, metric, nd=4):
+            return '[' + ','.join(
+                self._fmt(summary.get(f'{prefix}_r{r}_{metric}'), nd)
+                for r in range(3)) + ']'
+        print(
+            '[RoundTransportValidation] '
+            f"epoch={self.epoch} "
+            f"raw_A={vals('auth','raw_A')} "
+            f"centered_A={vals('auth','centered_A')} "
+            f"aligned_A={vals('auth','aligned_A')} "
+            f"h3_ag_pair_A={vals('auth','h3_ag_pair_mae_A')} "
+            f"centroid_A={vals('auth','centroid_A')} "
+            f"torque_deg={vals('auth','torque_angle_deg',3)} "
+            f"translation_cos=[{self._fmt(summary.get('step_translation_cos_01'),4)},{self._fmt(summary.get('step_translation_cos_12'),4)}] "
+            f"pose_cos=[{self._fmt(summary.get('step_centered_cos_01'),4)},{self._fmt(summary.get('step_centered_cos_12'),4)}]"
         )
         if int(self.epoch) == 0:
             print(
@@ -1322,8 +1357,6 @@ class AbFlowTrainer(Trainer):
                 f"val={self._fmt(row['val_loss'], 5)} "
                 f"AAR={self._fmt(row['test_AAR'], 5)} CAAR={self._fmt(row['test_CAAR'], 5)} "
                 f"H3raw={self._fmt(row['test_H3raw'], 4, 'A')} H3aligned={self._fmt(row['test_H3aligned'], 4, 'A')} "
-                f"TM={self._fmt(row['test_TM'], 5)} "
-                f"lDDT={self._fmt(row['test_lDDT'], 5)} "
                 f"DockQ={self._fmt(row['test_DockQ'], 5)} "
                 f"best_val_epoch={row['best_val_epoch']} best_val={self._fmt(row['best_val_loss'], 5)}"
             )
@@ -1414,6 +1447,7 @@ class AbFlowTrainer(Trainer):
         capture_diagnostics = bool(science_step_diag or bridge_contract_probe)
         raw_model._diagnostic_capture = bool(capture_diagnostics)
         raw_model._diagnostic_validation_mode = bool(val)
+
         loss, seq_detail, structure_detail, dock_detail, pdev_detail = self.model(**batch)
         snll, aar = seq_detail
         struct_loss, xloss, bond_loss, sc_bond_loss = structure_detail
@@ -1846,32 +1880,21 @@ class AbFlowTrainer(Trainer):
         abflow_diagnostics = getattr(raw_model, "last_abflow_diagnostics", None) or {}
         for name, value in abflow_diagnostics.items():
             self.log(f"AbFlowDiag/{name}/{log_type}", value, batch_idx, val)
-
-        # R83 console audit: one line per epoch from epoch 0. Every training graph
-        # is exposed; this verifies the scientific delta without restoring
-        # the old high-volume bridge/geometry print tree.
-        if not val:
-            exposure_frac = self._scalar(
-                abflow_diagnostics.get('outer_exposure_graph_fraction')
-            )
-            if (
-                exposure_frac is not None and exposure_frac > 0.0
-                and self._outer_exposure_printed_epoch != int(self.epoch)
-                and self._diag_main_rank
-            ):
-                self._outer_exposure_printed_epoch = int(self.epoch)
-                print(
-                    '[OuterStateExposure] '
-                    f'epoch={self.epoch} step={self.global_step} '
-                    f'mode={getattr(raw_model, "outer_state_exposure_mode", "off")} '
-                    f'graph_frac={self._fmt(exposure_frac,3)} '
-                    f't={self._fmt(self._scalar(abflow_diagnostics.get("outer_exposure_t_mean")),3)} '
-                    f'state_gap_A={self._fmt(self._scalar(abflow_diagnostics.get("outer_exposure_state_gap_A")),4)} '
-                    f'target_gap_A={self._fmt(self._scalar(abflow_diagnostics.get("outer_exposure_target_gap_A")),4)} '
-                    f'target_identity_err_A={self._fmt(self._scalar(abflow_diagnostics.get("outer_exposure_target_identity_err_A")),6)} '
-                    f'target_identity_rel={self._fmt(self._scalar(abflow_diagnostics.get("outer_exposure_target_identity_rel")),6)} '
-                    'target=recomputed_from_exposed_state sequence=analytic_main_time detached=1'
-                )
+        # R84 path-support observers.  These are detached values from the
+        # already-sampled F01 training state; they never alter the objective.
+        for name in (
+            "r3_sigma_mean",
+            "r3_noise_vector_rms_A",
+            "r3_ca_noise_vector_rms_A",
+            "r3_internal_bb_noise_vector_rms_A",
+            "r3_internal_bb_over_sigma",
+            "r3_support_rank_per_residue",
+            "r3_sidechain_ca_tied",
+            "r3_noise_scope_code",
+        ):
+            value = scorefm_losses.get(name)
+            if value is not None:
+                self.log(f"AbFlowPath/{name}/{log_type}", value, batch_idx, val)
 
         # V238 compact single-field validation observers. These are detached
         # diagnostics only; they never enter the objective or checkpoint rule.
@@ -1917,6 +1940,18 @@ class AbFlowTrainer(Trainer):
                 f"{self._fmt(_ad('abx_surf_edge_attr_rms'), 4)}) "
                 f"bridge_s={self._fmt(_ad('bridge_single_delta_to_base_ratio'), 6)} "
                 f"bridge_z={self._fmt(_ad('bridge_pair_delta_to_base_ratio_mean'), 6)}"
+            )
+            print(
+                "[PathSupportStep] "
+                f"epoch={self.epoch} step={self.global_step} "
+                f"scope={getattr(raw_model, 'r3_noise_scope', 'residue')} "
+                f"sigma_A={self._fmt(_sf('r3_sigma_mean'), 5)} "
+                f"noise_vec_A={self._fmt(_sf('r3_noise_vector_rms_A'), 5)} "
+                f"ca_noise_A={self._fmt(_sf('r3_ca_noise_vector_rms_A'), 5)} "
+                f"bb_internal_A={self._fmt(_sf('r3_internal_bb_noise_vector_rms_A'), 5)} "
+                f"bb_over_sigma={self._fmt(_sf('r3_internal_bb_over_sigma'), 5)} "
+                f"rank_per_res={self._fmt(_sf('r3_support_rank_per_residue'), 0)} "
+                f"sidechain_ca_tied={self._fmt(_sf('r3_sidechain_ca_tied'), 0)}"
             )
             if bool(getattr(raw_model, "distogram_enabled", False)):
                 print(
