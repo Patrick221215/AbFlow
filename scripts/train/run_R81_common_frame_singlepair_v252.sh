@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# R83 outer-state exposure launcher: exact R82 parent plus one detached training-state delta.
-# Scientific delta versus exact R82 is detached one-step OUTER coordinate-state exposure only.
-# R82 common-frame/Angstrom Pair geometry, anti-leak barrier, torque tangent,
-# single physical Cartesian field, losses, sequence rollout and formal F01 Test
-# sampler remain unchanged.  The main carrier target is recomputed from the
-# actually exposed state to preserve state/target consistency.
+# R81 diagnostic-closure launcher: model math is identical to R81.
+# Scientific delta versus clean R79 remains the common raw-complex Angstrom
+# relational geometry contract.  v251 changes diagnostics only: compact
+# pose/interface decomposition plus an epoch-gated matched rollout-vs-oracle
+# Test state-exposure observer.  Train->Validation->Test, F01/loss/sampler,
+# anti-leak barrier, three round refreshes and one physical Cartesian field stay unchanged.
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PROJECT_ROOT=${ABFLOW_PROJECT_ROOT:-$ROOT}
 CONFIG_PATH=${1:-}
@@ -16,15 +16,17 @@ GPU_CSV=""; MASTER_PORT=""; MASTER_ADDR=""
 usage() {
   cat >&2 <<'USAGE'
 Usage:
-  bash scripts/train/run_R83_outer_state_exposure_v254.sh <R83-config.json> \
+  bash scripts/train/run_R81_common_frame_singlepair_v252.sh <R81-config.json> \
     --gpus 2,3,4,5,6,7 --port 29784
 
-R83 v254 contract:
-  - parent = exact R82 and starts from scratch;
-  - R82 torque/common-frame/anti-leak/3-round recurrence are retained exactly;
-  - one scheduled detached prepass exposes the main forward to a one-step outer coordinate state at the same t;
-  - target is recomputed from that exposed state; sequence state remains analytic at the main t;
-  - no new loss, sampler, head, recycle path or Cartesian authority;
+R81 v252 contract:
+  - parent = clean R79; starts from scratch when resume_checkpoint is empty;
+  - a non-empty training.schedule.resume_checkpoint is always allowed: same-experiment resumes in-place, external checkpoints resume into a new destination version_N;
+  - round0 relational state = outer Xt; rounds1/2 = previous analytic endpoint;
+  - dense Single/Pair geometry uses one common raw-complex Angstrom frame;
+  - no prev_seq/prev_pair/prev_pos, no new loss/sampler/controller/Cartesian field;
+  - H3 native xloss_mask remains blocked; Pair stays static inside each round;
+  - v251 adds diagnostics only; model math is identical to R81;
   - Train -> Validation -> Test remains unchanged (10 steps, seed 2023).
 USAGE
 }
@@ -56,6 +58,7 @@ tr=cfg['training']; rt=cfg.get('runtime',{}); gen=cfg['generation']; test=cfg['d
 if 'gpus' in rt: raise SystemExit('runtime.gpus is forbidden; pass GPUs on CLI')
 def abspath(v): return v if os.path.isabs(v) else os.path.abspath(os.path.join(root,v))
 lg=tr.get('logging',{})
+resume=str(tr.get('schedule',{}).get('resume_checkpoint','') or '').strip()
 vals={
  'OUTPUT_ROOT':abspath(tr['output_dir']),
  'PER_GPU_BATCH_SIZE':tr['loader'].get('per_gpu_batch_size', tr['loader'].get('batch_size')),
@@ -66,6 +69,7 @@ vals={
  'METRIC_WORKERS':ev.get('metric_workers',8), 'SCI_FIRST':lg.get('science_first_steps',0),
  'SCI_INTERVAL':lg.get('science_interval',0), 'OUTLIER_THRESHOLD':lg.get('train_loss_outlier_threshold',1000.0),
  'EXP_ID':cfg['experiment']['id'], 'EXP_ROLE':cfg['experiment'].get('diagnostic_role',''),
+ 'RESUME_CHECKPOINT':abspath(resume) if resume else '',
 }
 for k,v in vals.items(): print(f'{k}='+shlex.quote(str(v)))
 PY2
@@ -77,17 +81,64 @@ MASTER_ADDR=${MASTER_ADDR:-$CFG_MASTER_ADDR}
 EFFECTIVE_GLOBAL_TRAIN_BATCH=$((PER_GPU_BATCH_SIZE * NPROC_PER_NODE))
 
 mkdir -p "$OUTPUT_ROOT" || { echo "Failed to create OUTPUT_ROOT: $OUTPUT_ROOT" >&2; exit 2; }
-VERSION=0
-while :; do
-  RUN_DIR="$OUTPUT_ROOT/version_$VERSION"
-  if mkdir "$RUN_DIR" 2>/dev/null; then break; fi
-  if [[ ! -e "$RUN_DIR" ]]; then echo "Failed to create run directory: $RUN_DIR" >&2; exit 2; fi
-  VERSION=$((VERSION+1))
-done
-export ABFLOW_FIXED_VERSION="$VERSION"
-export ABFLOW_EXPECTED_RUN_DIR="$RUN_DIR"
-export ABFLOW_REQUIRE_SCRATCH=1
-export ABFLOW_RESUME_CHECKPOINT=""
+
+if [[ -n "$RESUME_CHECKPOINT" ]]; then
+  [[ -f "$RESUME_CHECKPOINT" ]] || { echo "resume_checkpoint not found: $RESUME_CHECKPOINT" >&2; exit 2; }
+
+  CKPT_DIR=$(dirname "$RESUME_CHECKPOINT")
+  [[ "$(basename "$CKPT_DIR")" == "checkpoint" ]] || {
+    echo "resume_checkpoint must be under a checkpoint/ directory: $RESUME_CHECKPOINT" >&2
+    exit 2
+  }
+
+  SOURCE_RUN_DIR=$(dirname "$CKPT_DIR")
+  SOURCE_RUN_BASE=$(basename "$SOURCE_RUN_DIR")
+  SOURCE_VERSION=""
+  if [[ "$SOURCE_RUN_BASE" =~ ^version_([0-9]+)$ ]]; then
+    SOURCE_VERSION="${BASH_REMATCH[1]}"
+  fi
+
+  OUTPUT_ROOT_REAL=$(cd "$OUTPUT_ROOT" && pwd -P)
+  SOURCE_ROOT_REAL=$(cd "$(dirname "$SOURCE_RUN_DIR")" && pwd -P)
+
+  if [[ -n "$SOURCE_VERSION" && "$SOURCE_ROOT_REAL" == "$OUTPUT_ROOT_REAL" ]]; then
+    # Exact same-experiment resume: continue in the original version_N.
+    VERSION="$SOURCE_VERSION"
+    RUN_DIR="$OUTPUT_ROOT/version_$VERSION"
+    RUN_MODE="resume_same"
+  else
+    # Cross-experiment / external checkpoint continuation:
+    # load checkpoint state, but keep all new artifacts under this experiment.
+    VERSION=0
+    while :; do
+      RUN_DIR="$OUTPUT_ROOT/version_$VERSION"
+      if mkdir "$RUN_DIR" 2>/dev/null; then break; fi
+      if [[ ! -e "$RUN_DIR" ]]; then echo "Failed to create run directory: $RUN_DIR" >&2; exit 2; fi
+      VERSION=$((VERSION+1))
+    done
+    RUN_MODE="resume_external"
+  fi
+
+  export ABFLOW_FIXED_VERSION="$VERSION"
+  export ABFLOW_EXPECTED_RUN_DIR="$RUN_DIR"
+  export ABFLOW_REQUIRE_SCRATCH=0
+  export ABFLOW_RESUME_CHECKPOINT="$RESUME_CHECKPOINT"
+else
+  VERSION=0
+  while :; do
+    RUN_DIR="$OUTPUT_ROOT/version_$VERSION"
+    if mkdir "$RUN_DIR" 2>/dev/null; then break; fi
+    if [[ ! -e "$RUN_DIR" ]]; then echo "Failed to create run directory: $RUN_DIR" >&2; exit 2; fi
+    VERSION=$((VERSION+1))
+  done
+
+  export ABFLOW_FIXED_VERSION="$VERSION"
+  export ABFLOW_EXPECTED_RUN_DIR="$RUN_DIR"
+  export ABFLOW_REQUIRE_SCRATCH=1
+  export ABFLOW_RESUME_CHECKPOINT=""
+  RUN_MODE="scratch"
+fi
+
 RUN_LOG="$RUN_DIR/run_time.log"; LATEST_LOG="$OUTPUT_ROOT/run_time.log"
 ln -sfn "version_$VERSION/run_time.log" "$LATEST_LOG"
 
@@ -102,7 +153,7 @@ export ABFLOW_EPOCH_TEST_MODEL_INVALID_POLICY=record_and_continue ABFLOW_EPOCH_T
 export ABFLOW_TQDM="${ABFLOW_TQDM:-on}" ABFLOW_GEOMETRY_FORENSICS="${ABFLOW_GEOMETRY_FORENSICS:-off}"
 export ABFLOW_SAMPLE_FORENSICS="${ABFLOW_SAMPLE_FORENSICS:-off}" ABFLOW_SAMPLE_AUTHORITY_DIAGNOSTICS="${ABFLOW_SAMPLE_AUTHORITY_DIAGNOSTICS:-on}"
 export ABFLOW_STATE_EXPOSURE_AUDIT=off
-export ABFLOW_STATE_EXPOSURE_EPOCHS="${ABFLOW_STATE_EXPOSURE_EPOCHS:-29,39,49,59}"
+export ABFLOW_STATE_EXPOSURE_EPOCHS="${ABFLOW_STATE_EXPOSURE_EPOCHS:-2}"
 export ABFLOW_STATE_EXPOSURE_STEPS="${ABFLOW_STATE_EXPOSURE_STEPS:-0,5,9}"
 export ABFLOW_COORD_AUDIT_INTERVAL="${ABFLOW_COORD_AUDIT_INTERVAL:-1000000000}" ABFLOW_COORD_AUDIT_FIRST_STEPS="${ABFLOW_COORD_AUDIT_FIRST_STEPS:-0}"
 export ABFLOW_GEOMETRY_AUTHORITY_INTERVAL=0
@@ -117,7 +168,17 @@ echo "[RunLog] canonical=$RUN_LOG latest=$LATEST_LOG"
 echo "[RunVersion] fixed_version=$VERSION dir=$RUN_DIR"
 echo "[RunConfig] config=$CONFIG_PATH"
 echo "[RunResources] physical_gpus=$GPU_CSV nproc=$NPROC_PER_NODE per_gpu_train_val_batch=$PER_GPU_BATCH_SIZE effective_global_train_batch=$EFFECTIVE_GLOBAL_TRAIN_BATCH test_batch=$TEST_BATCH master_addr=$MASTER_ADDR port=$MASTER_PORT"
-echo "[RunInit] mode=scratch parent=R82_exact optimizer=reset ema=reset epoch=0 best_val=reset"
+case "$RUN_MODE" in
+  resume_same)
+    echo "[RunInit] mode=resume checkpoint=$RESUME_CHECKPOINT source=same_experiment destination_version=$VERSION optimizer=resume ema=resume epoch=resume"
+    ;;
+  resume_external)
+    echo "[RunInit] mode=resume checkpoint=$RESUME_CHECKPOINT source=external_experiment destination_version=$VERSION optimizer=resume ema=resume epoch=resume"
+    ;;
+  scratch)
+    echo "[RunInit] mode=scratch parent=R79_clean optimizer=reset ema=reset epoch=0 best_val=reset"
+    ;;
+esac
 echo "[TrainingHorizon] source=json max_epoch=$MAX_EPOCH launcher_epoch_override=none"
 echo "[TrainValTestContract] order=train->validation->test checkpoint_selection=validation test_metrics=observation_only test_steps=$TEST_STEPS test_seed=$TEST_SEED"
 
@@ -127,39 +188,30 @@ cp,out=sys.argv[1:3]; cfg=json.load(open(cp,encoding='utf-8')); exp=cfg['experim
 eid=exp['id']; stem=os.path.splitext(os.path.basename(cp))[0]; role=str(exp.get('diagnostic_role','')).lower()
 if not (eid==stem==os.path.basename(os.path.normpath(out))): raise SystemExit(f'identity mismatch: {eid} / {stem} / {out}')
 if exp.get('protocol')!='formal_train_val_test': raise SystemExit('formal_train_val_test required')
-if role!='r83_detached_one_step_outer_coordinate_exposure_only': raise SystemExit(f'R83 role required, got {role!r}')
-if exp.get('parent')!='R82_R05_ABX_R81_TORQUE_TANGENT_SINGLEPAIR_ANALYTIC3R_TVT_U02': raise SystemExit('R83 must use exact R82 as parent identity')
-if str(exp.get('initialization','')).lower()!='scratch': raise SystemExit('R83 must start from scratch')
-if str(cfg['training']['schedule'].get('resume_checkpoint','') or '').strip(): raise SystemExit('R83 forbids resume_checkpoint')
-if int(cfg['model']['architecture']['iter_round']) != 3: raise SystemExit('R83 requires exactly 3 refinement rounds')
+if role!='r81_pose_rollout_closure_only': raise SystemExit(f'R81 role required, got {role!r}')
+if exp.get('parent')!='R79_R05_ABX_R77_ROUND_STATE_SINGLEPAIR_ANALYTIC3R_TVT_U02': raise SystemExit('R81 must use clean R79 as parent identity')
+resume=str(cfg['training']['schedule'].get('resume_checkpoint','') or '').strip()
+print(f'[ResumeContract] mode={"resume" if resume else "scratch"} checkpoint={resume if resume else "none"}')
+if int(cfg['model']['architecture']['iter_round']) != 3: raise SystemExit('R81 requires exactly 3 refinement rounds')
 sp=cfg['model']['representation']['single_pair']; pc=sp['pair_coordinate']; cc=sp['coordinate_controller']; pa=sp['physical_authority']; rs=sp.get('round_state_conditioning',{})
-if pc.get('mode')!='direct_shared' or cc.get('mode')!='egnn_prenorm_raw': raise SystemExit('inherited Pair/controller contract changed')
+if pc.get('mode')!='direct_shared' or cc.get('mode')!='egnn_prenorm_raw': raise SystemExit('R79 Pair/controller must remain unchanged')
 if not bool(sp.get('time_embed',True)): raise SystemExit('explicit Single/Pair time must remain on')
 if pa.get('mode')!='carrier_primary_analytic' or int(pa.get('physical_dof',0))!=1: raise SystemExit('carrier-primary single field required')
 if pa.get('geometric_operator_mode')!='latent_native_workspace': raise SystemExit('R77 latent native workspace must be retained')
 if pa.get('refinement_supervision')!='final_round_only_inherited_from_AbFlow': raise SystemExit('final-round-only supervision must remain unchanged')
 if pa.get('structure_supervision_mask')!='paratope_only' or pa.get('fixed_context_writeback')!='paratope_only': raise SystemExit('H3 authority closure required')
 if not bool(rs.get('enabled',False)) or rs.get('geometry_source')!='current_authoritative_state': raise SystemExit('round-state Single/Pair factor missing')
-if rs.get('round0_state')!='outer_Xt' or rs.get('later_round_state')!='previous_analytic_endpoint': raise SystemExit('R83 retains outer_Xt -> previous_analytic_endpoint recurrence')
-if rs.get('relational_coordinate_frame')!='common_raw_complex': raise SystemExit('R83 retains common_raw_complex relational frame')
-if rs.get('relational_coordinate_units')!='angstrom': raise SystemExit('R83 retains raw Angstrom relational geometry')
+if rs.get('round0_state')!='outer_Xt' or rs.get('later_round_state')!='previous_analytic_endpoint': raise SystemExit('R81 requires clean-R79 outer_Xt -> previous_analytic_endpoint recurrence')
+if rs.get('relational_coordinate_frame')!='common_raw_complex': raise SystemExit('R81 common_raw_complex relational frame required')
+if rs.get('relational_coordinate_units')!='angstrom': raise SystemExit('R81 relational coordinates must be raw Angstrom geometry')
 if any(bool(rs.get(k,False)) for k in ('prev_seq','prev_pair','prev_pos')): raise SystemExit('prev_* recycle is forbidden')
 if not bool(rs.get('pair_static_within_round',False)): raise SystemExit('Pair must stay static inside each EGNN round')
-if bool(rs.get('detach_between_rounds',True)): raise SystemExit('R83 keeps differentiable physical recurrence')
+if bool(rs.get('detach_between_rounds',True)): raise SystemExit('R81 keeps differentiable physical recurrence')
 if rs.get('task_atom_observation_source')!='current_state_ca_fill' or not bool(rs.get('native_task_observation_mask_forbidden',False)): raise SystemExit('clean H3 observation barrier required')
-pt=sp.get('pose_torque_actuation',{})
-if not bool(pt.get('enabled',False)) or pt.get('mode')!='pair_conditioned_centroid_rodrigues': raise SystemExit('R83 must retain exact R82 torque tangent')
-if pt.get('pivot')!='h3_ca_centroid' or pt.get('apply_to')!='carrier_after_egnn': raise SystemExit('R82 torque semantics changed')
-oe=sp.get('outer_state_exposure',{})
-if not bool(oe.get('enabled',False)) or oe.get('mode')!='detached_one_step_f01_coordinate': raise SystemExit('R83 detached one-step coordinate exposure required')
-if int(oe.get('warmup_epochs',-1))!=30 or int(oe.get('period',-1))!=4: raise SystemExit('R83 exposure schedule must be warmup=30 epochs, period=4')
-if abs(float(oe.get('step_dt',-1))-0.1)>1e-12 or abs(float(oe.get('min_t',-1))-0.1)>1e-12 or abs(float(oe.get('max_t',-1))-0.9)>1e-12: raise SystemExit('R83 exposure time contract changed')
-if oe.get('prepass')!='eval_no_grad' or oe.get('main_target')!='recompute_from_exposed_state': raise SystemExit('R83 detached/target consistency contract changed')
-if oe.get('sequence_state')!='analytic_at_main_time': raise SystemExit('R83 must remain coordinate-only exposure')
 ex=sp.get('execution',{})
-if int(ex.get('triangle_chunk_size',64)) != 64 or int(ex.get('pair_distance_chunk_size',8)) != 8: raise SystemExit('R83 keeps matched train chunks 64/8')
-if int(ex.get('triangle_chunk_size_eval',64)) != 64 or int(ex.get('pair_distance_chunk_size_eval',8)) != 8: raise SystemExit('R83 keeps matched eval chunks 64/8')
-if not bool(ex.get('static_layout_cache',False)): raise SystemExit('R83 retains execution-only static layout reuse')
+if int(ex.get('triangle_chunk_size',64)) != 64 or int(ex.get('pair_distance_chunk_size',8)) != 8: raise SystemExit('R81 keeps matched train chunks 64/8')
+if int(ex.get('triangle_chunk_size_eval',64)) != 64 or int(ex.get('pair_distance_chunk_size_eval',8)) != 8: raise SystemExit('R81 keeps matched eval chunks 64/8')
+if not bool(ex.get('static_layout_cache',False)): raise SystemExit('R81 retains execution-only static layout reuse')
 if float(cfg['loss']['interface']) != 1.0: raise SystemExit('interface weight must remain 1.0')
 if float(cfg['loss']['distogram'].get('weight',0)) != 0 or float(cfg['loss']['smooth_lddt'].get('weight',0)) != 0: raise SystemExit('no auxiliary loss may be introduced')
 gen=cfg['generation']
@@ -168,54 +220,30 @@ if int(gen.get('n_steps',0))!=10 or int(gen.get('seed',-1))!=2023: raise SystemE
 print(f'[ExperimentIdentity] PASS id={eid} parent={exp["parent"]} role={role}')
 print('[SingleFieldContract] authority=carrier_primary_analytic physical_dof=1 structure=paratope_only writeback=paratope_only terminal=integrated_carrier')
 print('[RoundStateSinglePairContract] refresh=once_per_macro_round round0=outer_Xt later=previous_analytic_endpoint relational_frame=common_raw_complex pair_static_within_round=1 prev_seq=0 prev_pair=0 prev_pos=0 detach=0')
-print('[PoseActuationContract] inherited_R82=pair_conditioned_centroid_rodrigues pivot=h3_ca_centroid exact_rigid=1')
-print('[OuterStateExposureContract] mode=detached_one_step_f01_coordinate main_time=same_t warmup_epochs=30 period=4 dt=0.1 t_window=0.1..0.9 prepass=eval_no_grad target=recomputed sequence=analytic_main_time')
 print('[LeakageBarrier] task=H3 native_task_xloss_mask=BLOCKED task_atom_observation=current_state_ca_fill fixed_context_observation=ALLOWED')
 print('[ExecutionContract] static_layout_once_per_outer=1 SinglePair_refreshes=3 train_chunks=64/8 eval_chunks=64/8 validation_bridge_capture=off equations=UNCHANGED train_val_test=UNCHANGED epoch_test=ON')
-print('[ScientificDeltaContract] versus_exact_R82=detached_one_step_outer_coordinate_state_exposure_only new_loss=0 new_sampler=0 new_head=0 new_cartesian_field=0 sequence_rollout=0')
-print('[DiagnosticContract] inner_refinement=compact outer_trajectory=compact matched_rollout_oracle=epochs_29_39_49_59')
+print('[ScientificDeltaContract] versus_clean_R79=relational_geometry_contract_common_raw_angstrom_only new_loss=0 new_sampler=0 new_controller=0 new_cartesian_field=0 prev_recycle=0')
+print('[DiagnosticDeltaContract] versus_R81=model_math_none pose_decomposition=on h3_ag_pair=on state_exposure=epoch2_sparse_observer_only')
 print('[RelationalGeometryContract] frame=common_raw_complex units=angstrom pair_distance_divisor_A=10 local_coordinate_scale_A=0.1')
-print('[DiagnosticsContract] Validation=seq+struct+interface+edge InnerRefinement=compact TestFieldTrajectory=compact TestStateExposure=epoch_gated')
+print('[DiagnosticsContract] RoundTransportValidation=pose_interface_compact RelationalGeometryContract=epoch0 TestFieldTrajectory=compact StateExposureAudit=epoch_gated_observer_only')
 PY2
 
-python - "$PROJECT_ROOT" <<'PY2'
-import hashlib, os, sys
-root=sys.argv[1]
-expected={
- 'models/AbFlow/abflow_components.py':'3621235a1670d156',
- 'utils/nn_utils.py':'17facac7fc7cc85b',
- 'models/modules/am_enc.py':'0bed7e9c826490e0',
- 'models/modules/am_egnn.py':'134e23b1c5e68bf4',
- 'train.py':'b7bf85b7779af7fc',
-}
-for rel,prefix in expected.items():
- p=os.path.join(root,rel)
- if not os.path.isfile(p): raise SystemExit(f'R82 parent dependency missing: {rel}')
- got=hashlib.sha256(open(p,'rb').read()).hexdigest()[:16]
- if got!=prefix:
-  raise SystemExit(f'R82 parent dependency SHA mismatch: {rel} expected={prefix} got={got}. Do not overwrite the running R82 parent with a stale attachment.')
-print('[ParentDependencySHA] PASS ' + ' '.join(f'{k}={v}' for k,v in expected.items()))
-PY2
-grep -Fq 'Fixed = M & (~Design)' "$PROJECT_ROOT/models/AbFlow/abflow_components.py" || { echo 'H3 donor information barrier missing' >&2; exit 2; }
+grep -Fq 'current_state_observed = _abflow_ca_fill_observed_mask(' "$PROJECT_ROOT/models/AbFlow/abflow_components.py" || { echo 'H3 observation barrier missing' >&2; exit 2; }
 grep -Fq 'def prepare_layout(' "$PROJECT_ROOT/models/AbFlow/abflow_components.py" || { echo 'static NativeTrunk layout optimization missing' >&2; exit 2; }
 grep -Fq 'def forward_prepared(' "$PROJECT_ROOT/models/AbFlow/abflow_components.py" || { echo 'prepared NativeTrunk forward missing' >&2; exit 2; }
-grep -Fq 'def _relational_common_raw_coordinates(' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'common raw relational frame missing' >&2; exit 2; }
-grep -Fq 'def _apply_pair_torque_actuation(' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'R82 torque tangent missing' >&2; exit 2; }
-grep -Fq 'def _same_noise_analytic_state_at_previous_time(' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'R83 outer exposure helper missing' >&2; exit 2; }
-grep -Fq 'recompute_from_exposed_state' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'R83 target consistency guard missing' >&2; exit 2; }
-grep -Fq 'current_relational_h3_native = authority_endpoint_native' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'analytic-endpoint round recurrence missing' >&2; exit 2; }
-grep -Fq "'[InnerRefinement] '" "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo 'R83 compact inner-refinement diagnostics missing' >&2; exit 2; }
-grep -Fq "'[OuterStateExposure] '" "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo 'R83 outer exposure diagnostics missing' >&2; exit 2; }
+grep -Fq 'def _relational_common_raw_coordinates(' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'R81 common raw relational frame missing' >&2; exit 2; }
+grep -Fq 'current_relational_h3_native = authority_endpoint_native' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'clean R79 endpoint recurrence missing' >&2; exit 2; }
+grep -Fq "'[RoundTransportValidation] '" "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo 'transport diagnostics missing' >&2; exit 2; }
 python -m py_compile "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" "$PROJECT_ROOT/models/AbFlow/abflow_components.py" "$PROJECT_ROOT/utils/nn_utils.py" "$PROJECT_ROOT/models/modules/am_enc.py" "$PROJECT_ROOT/models/modules/am_egnn.py" "$PROJECT_ROOT/trainer/AbFlow_trainer.py" "$PROJECT_ROOT/train.py"
 grep -Fq 'X[paratope_mask] = authority_endpoint_native' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'paratope-only endpoint supervision/writeback missing' >&2; exit 2; }
 grep -Fq 'gen_X[paratope_mask] = interface_X_final' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'integrated carrier terminal missing' >&2; exit 2; }
 grep -Fq 'return 0.5 * (cos(step / self.max_step * pi) + 1) * 0.9' "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo 'context_ratio changed unexpectedly' >&2; exit 2; }
-echo '[Preflight] py_compile=PASS parent_R82_contract=PASS common_pair_frame=PASS h3_native_observation_blocked=PASS torque_tangent=PASS outer_state_exposure=PASS target_recompute=PASS train_val_test=UNCHANGED sampler=UNCHANGED single_field=PASS'
+echo "[Preflight] py_compile=PASS resume_supported=PASS cross_experiment_resume=ALLOWED run_mode=$RUN_MODE common_pair_frame=PASS h3_native_observation_blocked=PASS static_layout=PASS validation_bridge_capture=OFF train_val_test=UNCHANGED epoch_test=ON prev_recycle=OFF single_field=PASS final_round_only=PASS sampler_unchanged=PASS"
 
 python - "$PROJECT_ROOT" <<'PY2'
 import hashlib,os,sys
 root=sys.argv[1]
-for rel in ['models/AbFlow/AbFlow_model.py','models/AbFlow/abflow_components.py','utils/nn_utils.py','models/modules/am_enc.py','models/modules/am_egnn.py','trainer/AbFlow_trainer.py','train.py','scripts/train/run_R83_outer_state_exposure_v254.sh']:
+for rel in ['models/AbFlow/AbFlow_model.py','models/AbFlow/abflow_components.py','utils/nn_utils.py','models/modules/am_enc.py','models/modules/am_egnn.py','trainer/AbFlow_trainer.py','train.py','scripts/train/run_R81_common_frame_singlepair_v252.sh']:
  p=os.path.join(root,rel)
  if os.path.isfile(p): print(f'[SourceSHA256] {rel} {hashlib.sha256(open(p,"rb").read()).hexdigest()[:16]}')
 PY2
