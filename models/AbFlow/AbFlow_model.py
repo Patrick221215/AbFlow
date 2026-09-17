@@ -2482,6 +2482,102 @@ class AbFlowModel(nn.Module):
         return rows
 
     @torch.no_grad()
+    def _sample_sequence_graph_metrics(
+            self, logits, state_S, true_S, design_mask,
+            interface_batch_id, n_graph):
+        """Per-complex sequence-field diagnostics for the formal Test observer.
+
+        These values are computed *after* the ordinary sampler forward and are
+        never fed back into sampling/training.  ``field_*`` measures the current
+        network logits; ``state_aar`` measures the categorical rollout state
+        before the current refresh.
+        """
+        logits = logits.detach().float()
+        state_S = state_S.detach().long()
+        true_S = true_S.detach().long()
+        design_mask = design_mask.detach().bool()
+        rows = []
+        n_class = int(logits.shape[-1])
+        for gid in range(int(n_graph)):
+            mask = (
+                (interface_batch_id == gid)
+                & design_mask
+                & (true_S >= 0)
+                & (true_S < n_class)
+            )
+            if not bool(mask.any()):
+                rows.append((float('nan'), float('nan'), float('nan')))
+                continue
+            local_logits = logits[mask]
+            local_true = true_S[mask]
+            field_nll = F.cross_entropy(
+                local_logits, local_true, reduction='mean')
+            field_aar = (
+                local_logits.argmax(dim=-1) == local_true
+            ).float().mean()
+            state_aar = (
+                state_S[mask] == local_true
+            ).float().mean()
+            rows.append((
+                float(field_nll.item()),
+                float(field_aar.item()),
+                float(state_aar.item()),
+            ))
+        return rows
+
+    @torch.no_grad()
+    def _sample_sequence_exposure_metrics(
+            self, rollout_logits, oracle_logits, true_S, design_mask,
+            interface_batch_id, n_graph):
+        """Coordinate-state sensitivity of the sequence field.
+
+        The two logits come from the same network/time/sequence context; only
+        the Cartesian H3 state differs (free rollout versus analytic path).
+        Positive ``oracle_gain_*`` therefore means the analytic coordinate state
+        improves the sequence field without changing sequence context.
+        """
+        rollout_logits = rollout_logits.detach().float()
+        oracle_logits = oracle_logits.detach().float()
+        true_S = true_S.detach().long()
+        design_mask = design_mask.detach().bool()
+        rows = []
+        n_class = int(rollout_logits.shape[-1])
+        eps = 1e-8
+        for gid in range(int(n_graph)):
+            mask = (
+                (interface_batch_id == gid)
+                & design_mask
+                & (true_S >= 0)
+                & (true_S < n_class)
+            )
+            if not bool(mask.any()):
+                rows.append((
+                    float('nan'), float('nan'), float('nan'),
+                    float('nan'), float('nan'),
+                ))
+                continue
+            rl = rollout_logits[mask]
+            ol = oracle_logits[mask]
+            y = true_S[mask]
+            rnll = F.cross_entropy(rl, y, reduction='mean')
+            onll = F.cross_entropy(ol, y, reduction='mean')
+            raar = (rl.argmax(dim=-1) == y).float().mean()
+            oaar = (ol.argmax(dim=-1) == y).float().mean()
+            rp = torch.softmax(rl, dim=-1).clamp_min(eps)
+            op = torch.softmax(ol, dim=-1).clamp_min(eps)
+            mp = (0.5 * (rp + op)).clamp_min(eps)
+            jsd = 0.5 * (
+                (rp * (rp.log() - mp.log())).sum(dim=-1)
+                + (op * (op.log() - mp.log())).sum(dim=-1)
+            ).mean()
+            rows.append((
+                float(rnll.item()), float(onll.item()),
+                float(raar.item()), float(oaar.item()),
+                float(jsd.item()),
+            ))
+        return rows
+
+    @torch.no_grad()
     def sample(self, X, S, cmask, smask, paratope_mask, X_pep, S_pep,
                surface, residue_pos, template, lengths, n_steps=10,
                init_noise=None, return_hidden=False, show_progress=False,
@@ -2655,6 +2751,17 @@ class AbFlowModel(nn.Module):
                     implied_x1, true_h3, interface_batch_id, batch_size)
                 next_metrics = self._sample_h3_graph_metrics(
                     Xt_next, true_h3, interface_batch_id, batch_size)
+                seq_metrics = None
+                if not self.struct_only:
+                    rollout_logits_h3 = r_logits[-1][0][paratope_mask]
+                    seq_metrics = self._sample_sequence_graph_metrics(
+                        rollout_logits_h3,
+                        St,
+                        S[paratope_mask],
+                        smask[paratope_mask],
+                        interface_batch_id,
+                        batch_size,
+                    )
                 bridge_single = self._diag_float(
                     bridge_diag, 'bridge_single_delta_to_base_ratio')
                 bridge_pair = self._diag_float(
@@ -2664,7 +2771,7 @@ class AbFlowModel(nn.Module):
                 for gid in range(batch_size):
                     xr, xa, xp = x1_metrics[gid]
                     nr, na, npair = next_metrics[gid]
-                    self._sample_authority_records.append({
+                    row = {
                         'step': int(i), 't': t_value, 't_next': t_next_value,
                         'x1_raw_A': xr, 'x1_aligned_A': xa, 'x1_pair_mae_A': xp,
                         'xnext_raw_A': nr, 'xnext_aligned_A': na,
@@ -2672,7 +2779,15 @@ class AbFlowModel(nn.Module):
                         'bridge_single_ratio': bridge_single,
                         'bridge_pair_ratio': bridge_pair,
                         'bridge_pair_coord_ratio': bridge_pair_coord,
-                    })
+                    }
+                    if seq_metrics is not None:
+                        seq_nll, seq_aar, state_aar = seq_metrics[gid]
+                        row.update({
+                            'seq_field_nll': seq_nll,
+                            'seq_field_aar': seq_aar,
+                            'seq_state_aar': state_aar,
+                        })
+                    self._sample_authority_records.append(row)
 
             # Matched coordinate-state exposure audit.  It never writes oracle
             # coordinates into the rollout and never contributes to any loss.
@@ -2693,7 +2808,7 @@ class AbFlowModel(nn.Module):
                     prev_capture = bool(getattr(self, '_diagnostic_capture', False))
                     self._diagnostic_capture = False
                     try:
-                        _, _, _, _, oracle_r_interface_X, _, _ = self._forward(
+                        _, _, oracle_r_logits, _, oracle_r_interface_X, _, _ = self._forward(
                             X, S, cmask, smask, paratope_mask, X_pep, S_pep,
                             surface, residue_pos, template, lengths,
                             interface_init=oracle_Xt,
@@ -2713,11 +2828,32 @@ class AbFlowModel(nn.Module):
                     oracle_x1, true_h3, interface_batch_id, batch_size)
                 rollout_x1_metrics = self._sample_h3_graph_metrics(
                     implied_x1, true_h3, interface_batch_id, batch_size)
+
+                # Direct same-network output divergence.  This is distinct from
+                # the difference in error-to-native: it answers how sensitive
+                # the learned field itself is to rollout-vs-analytic state.
+                output_gap_metrics = self._sample_h3_graph_metrics(
+                    implied_x1, oracle_x1, interface_batch_id, batch_size)
+
+                seq_exposure_metrics = None
+                if not self.struct_only:
+                    rollout_logits_h3 = r_logits[-1][0][paratope_mask]
+                    oracle_logits_h3 = oracle_r_logits[-1][0][paratope_mask]
+                    seq_exposure_metrics = self._sample_sequence_exposure_metrics(
+                        rollout_logits_h3,
+                        oracle_logits_h3,
+                        S[paratope_mask],
+                        smask[paratope_mask],
+                        interface_batch_id,
+                        batch_size,
+                    )
+
                 for gid in range(batch_size):
                     sgr, sga, sgp = state_gap_metrics[gid]
                     rr, ra, rp = rollout_x1_metrics[gid]
                     orr, ora, orp = oracle_x1_metrics[gid]
-                    self._sample_authority_records.append({
+                    ogr, oga, ogp = output_gap_metrics[gid]
+                    row = {
                         'step': int(i), 't': t_value, 't_next': t_next_value,
                         'state_gap_raw_A': sgr,
                         'state_gap_aligned_A': sga,
@@ -2728,10 +2864,27 @@ class AbFlowModel(nn.Module):
                         'rollout_x1_raw_A': rr,
                         'rollout_x1_aligned_A': ra,
                         'rollout_x1_pair_mae_A': rp,
-                        'exposure_x1_raw_gap_A': rr - orr,
-                        'exposure_x1_aligned_gap_A': ra - ora,
-                        'exposure_x1_pair_gap_A': rp - orp,
-                    })
+                        'output_gap_raw_A': ogr,
+                        'output_gap_aligned_A': oga,
+                        'output_gap_pair_A': ogp,
+                        # Positive oracle_gain means analytic-path coordinates
+                        # improve the prediction while sequence context is held fixed.
+                        'oracle_gain_raw_A': rr - orr,
+                        'oracle_gain_aligned_A': ra - ora,
+                        'oracle_gain_pair_A': rp - orp,
+                    }
+                    if seq_exposure_metrics is not None:
+                        rnll, onll, raar, oaar, jsd = seq_exposure_metrics[gid]
+                        row.update({
+                            'rollout_seq_nll': rnll,
+                            'oracle_seq_nll': onll,
+                            'rollout_seq_aar': raar,
+                            'oracle_seq_aar': oaar,
+                            'seq_jsd': jsd,
+                            'oracle_gain_seq_nll': rnll - onll,
+                            'oracle_gain_seq_aar': oaar - raar,
+                        })
+                    self._sample_authority_records.append(row)
 
             Xt = Xt_next
 

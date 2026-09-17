@@ -19,7 +19,7 @@ Usage:
     --gpus 2,3,4,5,6,7 --port 29786
 
 R82 contract:
-  - parent = clean R81 and starts from scratch;
+  - origin = clean R81 scratch run; strict same-version resume is supported;
   - round0 relational state = outer Xt; rounds1/2 = previous analytic endpoint;
   - dense Single/Pair geometry uses one common raw-complex Angstrom frame;
   - no prev_seq/prev_pair/prev_pos, no new loss/sampler/controller/Cartesian field;
@@ -144,6 +144,8 @@ export ABFLOW_EPOCH_TEST_MODEL_INVALID_POLICY=record_and_continue ABFLOW_EPOCH_T
 export ABFLOW_TQDM="${ABFLOW_TQDM:-on}" ABFLOW_GEOMETRY_FORENSICS="${ABFLOW_GEOMETRY_FORENSICS:-off}"
 export ABFLOW_SAMPLE_FORENSICS="${ABFLOW_SAMPLE_FORENSICS:-off}" ABFLOW_SAMPLE_AUTHORITY_DIAGNOSTICS="${ABFLOW_SAMPLE_AUTHORITY_DIAGNOSTICS:-on}"
 export ABFLOW_STATE_EXPOSURE_AUDIT=off
+export ABFLOW_STATE_EXPOSURE_EPOCHS="${ABFLOW_STATE_EXPOSURE_EPOCHS:-77,80,90,100,125,150,175,199}"
+export ABFLOW_STATE_EXPOSURE_STEPS="${ABFLOW_STATE_EXPOSURE_STEPS:-0,5,9}"
 export ABFLOW_COORD_AUDIT_INTERVAL="${ABFLOW_COORD_AUDIT_INTERVAL:-1000000000}" ABFLOW_COORD_AUDIT_FIRST_STEPS="${ABFLOW_COORD_AUDIT_FIRST_STEPS:-0}"
 export ABFLOW_GEOMETRY_AUTHORITY_INTERVAL=0
 export ABFLOW_TRAIN_LOSS_OUTLIER_THRESHOLD="${ABFLOW_TRAIN_LOSS_OUTLIER_THRESHOLD:-$OUTLIER_THRESHOLD}"
@@ -164,6 +166,7 @@ else
 fi
 echo "[TrainingHorizon] source=json max_epoch=$MAX_EPOCH launcher_epoch_override=none"
 echo "[TrainValTestContract] order=train->validation->test checkpoint_selection=validation test_metrics=observation_only test_steps=$TEST_STEPS test_seed=$TEST_SEED"
+echo "[StateExposureAuditContract] epochs=$ABFLOW_STATE_EXPOSURE_EPOCHS steps=$ABFLOW_STATE_EXPOSURE_STEPS isolate=coordinate_state sequence_context=same_rollout_St observer_only=1 training_effect=0 rng_restored=1 optimizer_untouched=1 sampler_unchanged=1"
 
 python - "$CONFIG_PATH" "$OUTPUT_ROOT" <<'PY2'
 import json, os, sys
@@ -200,7 +203,7 @@ print('[SingleFieldContract] authority=carrier_primary_analytic physical_dof=1 t
 print('[RelationalGeometryContract] frame=common_raw_complex units=angstrom anti_leak=on rounds=3 later=previous_analytic_endpoint')
 print('[PoseActuationContract] base=R05_pair_radial torque=pair_conditioned centroid=h3_ca exact_rodrigues=1 translation_preserved=1 rigid_internal_geometry_preserved=1 zero_init=1')
 print('[ScientificDeltaContract] versus_R81=pair_conditioned_centroid_preserving_torque_tangent_only new_loss=0 new_sampler=0 new_coordinate_field=0 prev_recycle=0')
-print('[DiagnosticsContract] RoundTransportValidation=compact TestFieldTrajectory=compact StateExposureAudit=off')
+print('[DiagnosticsContract] RoundTransportValidation=compact TestFieldTrajectory=compact TestSequenceTrajectory=compact StateExposureAudit=epoch_gated_same_sequence_context')
 PY2
 grep -Fq 'current_state_observed = _abflow_ca_fill_observed_mask(' "$PROJECT_ROOT/models/AbFlow/abflow_components.py" || { echo 'H3 observation barrier missing' >&2; exit 2; }
 grep -Fq 'def prepare_layout(' "$PROJECT_ROOT/models/AbFlow/abflow_components.py" || { echo 'static NativeTrunk layout optimization missing' >&2; exit 2; }
@@ -210,11 +213,13 @@ grep -Fq 'def _apply_pair_torque_actuation(' "$PROJECT_ROOT/models/AbFlow/AbFlow
 grep -Fq 'pair_conditioned_centroid_rodrigues' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'R82 torque mode missing' >&2; exit 2; }
 grep -Fq 'current_relational_h3_native = authority_endpoint_native' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'clean R79 endpoint recurrence missing' >&2; exit 2; }
 grep -Fq "'[RoundTransportValidation] '" "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo 'transport diagnostics missing' >&2; exit 2; }
+grep -Fq "'[TestSequenceTrajectory] '" "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo 'sequence trajectory diagnostics missing' >&2; exit 2; }
+grep -Fq "'oracle_gain_seq_nll'" "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'P0/P1 coupling diagnostics missing' >&2; exit 2; }
 python -m py_compile "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" "$PROJECT_ROOT/models/AbFlow/abflow_components.py" "$PROJECT_ROOT/utils/nn_utils.py" "$PROJECT_ROOT/models/modules/am_enc.py" "$PROJECT_ROOT/models/modules/am_egnn.py" "$PROJECT_ROOT/trainer/AbFlow_trainer.py" "$PROJECT_ROOT/train.py"
 grep -Fq 'X[paratope_mask] = authority_endpoint_native' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'paratope-only endpoint supervision/writeback missing' >&2; exit 2; }
 grep -Fq 'gen_X[paratope_mask] = interface_X_final' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'integrated carrier terminal missing' >&2; exit 2; }
 grep -Fq 'return 0.5 * (cos(step / self.max_step * pi) + 1) * 0.9' "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo 'context_ratio changed unexpectedly' >&2; exit 2; }
-echo "[Preflight] py_compile=PASS resume_supported=PASS run_mode=$RUN_MODE common_pair_frame=PASS h3_native_observation_blocked=PASS torque_tangent=PASS zero_init=PASS train_val_test=UNCHANGED epoch_test=ON single_field=PASS sampler_unchanged=PASS"
+echo "[Preflight] py_compile=PASS resume_supported=PASS run_mode=$RUN_MODE p0_p1_diagnostics=PASS common_pair_frame=PASS h3_native_observation_blocked=PASS torque_tangent=PASS zero_init=PASS train_val_test=UNCHANGED epoch_test=ON single_field=PASS sampler_unchanged=PASS"
 
 python - "$PROJECT_ROOT" <<'PY2'
 import hashlib,os,sys

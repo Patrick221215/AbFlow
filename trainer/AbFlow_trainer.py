@@ -714,11 +714,19 @@ class AbFlowTrainer(Trainer):
             f'xnext_aligned_A={arr("xnext_aligned_A")} '
             f'best_xnext_aligned_A={self._fmt(best_aligned,4)} '
             f'best_t={self._fmt(best_t,2)} '
-            f'final_xnext_aligned_A={self._fmt(final_aligned,4)} '
             f'late_drift_A={self._fmt(late_drift,4)} '
             f'raw_final_A={self._fmt(mean_at(steps[-1], "xnext_raw_A"),4)} '
             f'pair_final_A={self._fmt(mean_at(steps[-1], "xnext_pair_mae_A"),4)}'
         )
+        if any(isfinite(mean_at(st, 'seq_field_nll')) for st in selected):
+            print(
+                '[TestSequenceTrajectory] '
+                f'epoch={self.epoch} '
+                f't=[' + ','.join(self._fmt(v, 2) for v in tvals) + '] '
+                f'state_AAR={arr("seq_state_aar",4)} '
+                f'field_AAR={arr("seq_field_aar",4)} '
+                f'field_NLL={arr("seq_field_nll",4)}'
+            )
         # R81 v251: sparse matched oracle-path audit is re-enabled only on
         # explicitly selected epochs because R81 changed the relational geometry
         # contract and the remaining gap is now rollout-state dependent.
@@ -747,11 +755,13 @@ class AbFlowTrainer(Trainer):
                 f't=[' + ','.join(self._fmt(exp_mean(st, 't'), 2) for st in exposure_steps) + '] '
                 f'state_gap_raw_A={exp_arr("state_gap_raw_A")} '
                 f'state_gap_aligned_A={exp_arr("state_gap_aligned_A")} '
-                f'rollout_x1_aligned_A={exp_arr("rollout_x1_aligned_A")} '
-                f'oracle_x1_aligned_A={exp_arr("oracle_x1_aligned_A")} '
-                f'exposure_aligned_gap_A={exp_arr("exposure_x1_aligned_gap_A")} '
-                f'exposure_raw_gap_A={exp_arr("exposure_x1_raw_gap_A")} '
-                f'exposure_pair_gap_A={exp_arr("exposure_x1_pair_gap_A")}')
+                f'output_gap_aligned_A={exp_arr("output_gap_aligned_A")} '
+                f'oracle_gain_aligned_A={exp_arr("oracle_gain_aligned_A")} '
+                f'oracle_gain_pair_A={exp_arr("oracle_gain_pair_A")} '
+                f'seq_jsd={exp_arr("seq_jsd",6)} '
+                f'oracle_gain_seqNLL={exp_arr("oracle_gain_seq_nll",5)} '
+                f'oracle_gain_seqAAR={exp_arr("oracle_gain_seq_aar",5)}'
+            )
 
 
 
@@ -1124,9 +1134,16 @@ class AbFlowTrainer(Trainer):
     def _print_validation_audits(self, summary):
         if not self._is_main_proc():
             return
+        current_lr = (
+            self.config.lr if self.scheduler is None
+            else self.scheduler.get_last_lr()[0]
+        )
         print(
             '[Validation] '
             f"epoch={self.epoch} val={self._fmt(summary.get('validation_metric'),5)} "
+            f"lr={self._fmt(current_lr,8)} "
+            f"seq={self._fmt(summary.get('loss_seq'),5)} "
+            f"val_AAR={self._fmt(summary.get('aar'),5)} "
             f"struct={self._fmt(summary.get('loss_structure'),5)} "
             f"interface={self._fmt(summary.get('loss_interface'),5)} "
             f"edge={self._fmt(summary.get('loss_edge'),5)}"
@@ -1137,18 +1154,15 @@ class AbFlowTrainer(Trainer):
                 for r in range(3)) + ']'
         print(
             '[RoundTransportValidation] '
-            f'epoch={self.epoch} supervision=final_only relational_state=endpoint '
-            f'pair_frame=common_raw_complex pose_actuator=pair_torque_tangent '
+            f"epoch={self.epoch} "
             f"raw_A={vals('auth','raw_A')} "
             f"centered_A={vals('auth','centered_A')} "
             f"aligned_A={vals('auth','aligned_A')} "
-            f"rotation_excess_A={vals('auth','rotation_excess_A')} "
             f"h3_ag_pair_A={vals('auth','h3_ag_pair_mae_A')} "
             f"centroid_A={vals('auth','centroid_A')} "
             f"torque_deg={vals('auth','torque_angle_deg',3)} "
             f"translation_cos=[{self._fmt(summary.get('step_translation_cos_01'),4)},{self._fmt(summary.get('step_translation_cos_12'),4)}] "
-            f"pose_cos=[{self._fmt(summary.get('step_centered_cos_01'),4)},{self._fmt(summary.get('step_centered_cos_12'),4)}] "
-            f"pose_pos_frac=[{self._fmt(summary.get('step_centered_cos_pos_frac_01'),3)},{self._fmt(summary.get('step_centered_cos_pos_frac_12'),3)}]"
+            f"pose_cos=[{self._fmt(summary.get('step_centered_cos_01'),4)},{self._fmt(summary.get('step_centered_cos_12'),4)}]"
         )
         if int(self.epoch) == 0:
             print(
@@ -1314,7 +1328,7 @@ class AbFlowTrainer(Trainer):
                 f"val={self._fmt(row['val_loss'], 5)} "
                 f"AAR={self._fmt(row['test_AAR'], 5)} CAAR={self._fmt(row['test_CAAR'], 5)} "
                 f"H3raw={self._fmt(row['test_H3raw'], 4, 'A')} H3aligned={self._fmt(row['test_H3aligned'], 4, 'A')} "
-                f"TM={self._fmt(row['test_TM'], 5)} lDDT={self._fmt(row['test_lDDT'], 5)} DockQ={self._fmt(row['test_DockQ'], 5)} "
+                f"DockQ={self._fmt(row['test_DockQ'], 5)} "
                 f"best_val_epoch={row['best_val_epoch']} best_val={self._fmt(row['best_val_loss'], 5)}"
             )
 
