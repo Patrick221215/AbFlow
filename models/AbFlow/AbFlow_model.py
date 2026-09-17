@@ -67,6 +67,28 @@ class AbFlowModel(nn.Module):
             pair_coord_config.get("delta_bound", 1.0)
         )
 
+        # R82: complete the Cartesian actuator basis with one centroid-preserving
+        # rotational tangent.  This is NOT a second coordinate field: the only
+        # recurrent/terminal state remains the carrier.  The temporary axis-angle
+        # action is inferred from current H3--antigen Pair/hidden state and is
+        # applied as an exact rigid Rodrigues rotation about the current H3 CA
+        # centroid.  Translation and intrinsic rigid geometry are therefore
+        # orthogonal to this branch by construction.
+        pose_torque_cfg = representation_config.get("pose_torque_actuation", {})
+        self.pose_torque_enabled = bool(pose_torque_cfg.get("enabled", False))
+        self.pose_torque_mode = str(
+            pose_torque_cfg.get("mode", "off") or "off"
+        ).strip().lower()
+        self.pose_torque_hidden = int(pose_torque_cfg.get("hidden_dim", 64))
+        if self.pose_torque_enabled:
+            if self.pose_torque_mode != "pair_conditioned_centroid_rodrigues":
+                raise ValueError(
+                    "R82 pose_torque_actuation.mode must be "
+                    "'pair_conditioned_centroid_rodrigues'."
+                )
+            if bool(pose_torque_cfg.get("manual_scale", False)):
+                raise ValueError("R82 forbids manual pose-torque step scaling.")
+
         # V219 formal controller: preserve Pair as a first-class EGNN edge condition
         # and restore the original R05 raw Cartesian relative-vector operator.
         # Stability is introduced only at the representation->action boundary by
@@ -298,6 +320,26 @@ class AbFlowModel(nn.Module):
                 distogram_config=distogram_config,
                 forward_seed=int(representation_config["forward_seed"]),
             )
+
+        if self.pose_torque_enabled:
+            # Invariant Pair/hidden features predict only scalar edge weights.
+            # The axial direction is built geometrically from cross products, so
+            # the resulting action is SE(3)-equivariant without emitting an
+            # unconstrained learned 3-vector.  Zero-init makes the exact R81
+            # operator the initialization point of this matched ablation.
+            self.pose_torque_pair_norm = nn.LayerNorm(self.native_trunk.pair_dim)
+            self.pose_torque_hidden_norm = nn.LayerNorm(hidden_size)
+            torque_in = self.native_trunk.pair_dim + 2 * hidden_size + 2
+            self.pose_torque_edge_mlp = nn.Sequential(
+                nn.Linear(torque_in, self.pose_torque_hidden),
+                nn.SiLU(),
+                nn.Linear(self.pose_torque_hidden, 1, bias=False),
+            )
+            nn.init.zeros_(self.pose_torque_edge_mlp[-1].weight)
+        else:
+            self.pose_torque_pair_norm = None
+            self.pose_torque_hidden_norm = None
+            self.pose_torque_edge_mlp = None
 
         self.gnn = AMEncoder(
             embed_size, hidden_size, hidden_size, self.n_channel,
@@ -861,6 +903,140 @@ class AbFlowModel(nn.Module):
         return emb * mask[:, None].to(emb.dtype), mask
 
 
+    def _apply_pair_torque_actuation(
+            self, pred_local_X, local_inter_edges, local_is_ab, local_batch_id,
+            local_global, trunk_state, hidden_global):
+        """Apply the R82 Pair-conditioned rigid rotational tangent to the carrier.
+
+        Standard EGNN coordinate heads use scalar-weighted relative vectors.  The
+        R81 diagnostics show that this basis already learns translation and local
+        deformation, while the translation-free pose component has the wrong sign.
+        R82 adds the missing axial/tangential basis without creating a second
+        physical field:
+
+            tau_ij = beta_ij * (l_hat_i x d_hat_ij)
+            omega_b = mean_edges(tau_ij)
+            X'_H3 = c_b + Exp([omega_b]_x) (X_H3 - c_b)
+
+        beta_ij is invariant and depends only on the current Pair state, processed
+        hidden states, and two invariant geometric scalars.  The rotation is exact
+        Rodrigues, uses no target/Kabsch coordinates, has no clipping/tanh/manual
+        scale, preserves the H3 CA centroid exactly, and preserves all intra-H3
+        pair distances under the rigid action.
+        """
+        zero = pred_local_X.new_zeros(())
+        stats = {
+            'pose_torque_angle_deg_mean': zero,
+            'pose_torque_angle_deg_max': zero,
+        }
+        if not self.pose_torque_enabled:
+            return pred_local_X, stats
+        if local_inter_edges is None or local_inter_edges.numel() == 0:
+            return pred_local_X, stats
+        if pred_local_X.shape[0] != local_is_ab.numel():
+            raise RuntimeError('R82 torque local coordinate/mask size mismatch.')
+
+        row, col = local_inter_edges.long()
+        row_ab = local_is_ab[row]
+        col_ab = local_is_ab[col]
+        cross_mask = torch.logical_xor(row_ab, col_ab)
+        if not bool(cross_mask.any()):
+            return pred_local_X, stats
+        row, col = row[cross_mask], col[cross_mask]
+        row_ab = row_ab[cross_mask]
+        h_local = torch.where(row_ab, row, col)
+        ag_local = torch.where(row_ab, col, row)
+
+        h3_mask = local_is_ab.bool()
+        if not bool(h3_mask.any()):
+            return pred_local_X, stats
+        h3_graph = local_batch_id[h3_mask].long()
+        edge_graph = local_batch_id[h_local].long()
+        n_graph = int(local_batch_id.max().item()) + 1 if local_batch_id.numel() else 0
+        if n_graph <= 0:
+            return pred_local_X, stats
+
+        # Geometry is evaluated in the same AG-centered carrier frame used by the
+        # physical inter/surface EGNN actuator.  Work in fp32 for stable Rodrigues.
+        x32 = pred_local_X.float()
+        ca_idx = 1 if x32.shape[1] > 1 else 0
+        ca = x32[:, ca_idx]
+        h3_center = scatter_mean(ca[h3_mask], h3_graph, dim=0, dim_size=n_graph)
+        lever = ca[h_local] - h3_center[edge_graph]
+        direction = ca[ag_local] - ca[h_local]
+        lever_unit = F.normalize(lever, dim=-1, eps=self.eps)
+        direction_unit = F.normalize(direction, dim=-1, eps=self.eps)
+        axial_basis = torch.cross(lever_unit, direction_unit, dim=-1)
+
+        # Always gather Pair in H3(query)->Ag(key) semantic order.  Bidirectional
+        # KNN duplicates are harmless because the graph torque uses a mean.
+        h_global = local_global[h_local]
+        ag_global = local_global[ag_local]
+        pair_edges = torch.stack([h_global, ag_global], dim=0)
+        pair_attr = self.native_trunk.gather_pair(
+            trunk_state['pair_dense'], pair_edges,
+            trunk_state['node_graph'], trunk_state['node_local'])
+        pair_attr = self.pose_torque_pair_norm(pair_attr.to(hidden_global))
+        h_h3 = self.pose_torque_hidden_norm(hidden_global[h_global])
+        h_ag = self.pose_torque_hidden_norm(hidden_global[ag_global])
+        dist = torch.linalg.norm(direction, dim=-1, keepdim=True)
+        angle_cos = (lever_unit * direction_unit).sum(dim=-1, keepdim=True)
+        invariants = torch.cat([
+            torch.log1p(dist).to(pair_attr.dtype),
+            angle_cos.to(pair_attr.dtype),
+        ], dim=-1)
+        beta = self.pose_torque_edge_mlp(
+            torch.cat([pair_attr, h_h3, h_ag, invariants], dim=-1)
+        ).squeeze(-1).float()
+
+        edge_omega = beta[:, None] * axial_basis
+        omega = scatter_mean(edge_omega, edge_graph, dim=0, dim_size=n_graph)
+
+        # Exact axis-angle action around the H3 CA centroid.  Using the exponential
+        # map rather than an additive cross-product approximation makes the branch
+        # exactly rigid for any learned angle and therefore cannot degrade aligned
+        # H3 geometry by construction.
+        theta = torch.linalg.norm(omega, dim=-1)
+        theta2 = theta.square()
+        small = theta2 < 1.0e-8
+        A = torch.where(
+            small,
+            1.0 - theta2 / 6.0,
+            torch.sin(theta) / theta.clamp_min(1.0e-8),
+        )
+        B = torch.where(
+            small,
+            0.5 - theta2 / 24.0,
+            (1.0 - torch.cos(theta)) / theta2.clamp_min(1.0e-8),
+        )
+
+        h3_x = x32[h3_mask]
+        rel = h3_x - h3_center[h3_graph, None, :]
+        w = omega[h3_graph, None, :].expand_as(rel)
+        wxr = torch.cross(w, rel, dim=-1)
+        wxwxr = torch.cross(w, wxr, dim=-1)
+        rotated_rel = (
+            rel
+            + A[h3_graph, None, None] * wxr
+            + B[h3_graph, None, None] * wxwxr
+        )
+        rotated_h3 = h3_center[h3_graph, None, :] + rotated_rel
+        out = pred_local_X.clone()
+        out[h3_mask] = rotated_h3.to(out.dtype)
+
+        with torch.no_grad():
+            has_edge = torch.zeros(n_graph, device=edge_graph.device, dtype=torch.bool)
+            has_edge[torch.unique(edge_graph)] = True
+            valid_theta = theta[has_edge]
+            if valid_theta.numel():
+                angle_deg = torch.rad2deg(valid_theta)
+                stats = {
+                    'pose_torque_angle_deg_mean': angle_deg.mean().to(out.dtype),
+                    'pose_torque_angle_deg_max': angle_deg.max().to(out.dtype),
+                }
+        return out, stats
+
+
     def message_passing(self, X, S, residue_pos, interface_X, surf, paratope_mask,
                         batch_id, memory_H=None, smooth_prob=None, smooth_mask=None,
                         flow_t=None, coord_pep_condition=None,
@@ -964,6 +1140,17 @@ class AbFlowModel(nn.Module):
             ctx_edge_attr=ctx_pair_attr, inter_edge_attr=inter_pair_attr,
             surf_edge_attr=surf_pair_attr, single_attr=trunk_single,
             capture_bridge_diagnostics=capture_diag)
+
+        pred_local_X, pose_torque_stats = self._apply_pair_torque_actuation(
+            pred_local_X=pred_local_X,
+            local_inter_edges=local_inter_edges,
+            local_is_ab=local_is_ab,
+            local_batch_id=local_batch_id,
+            local_global=local_global,
+            trunk_state=trunk_state,
+            hidden_global=H,
+        )
+        self._last_pose_torque_stats = pose_torque_stats
         if capture_diag:
             def _rms(value):
                 if value is None or value.numel() == 0:
@@ -977,6 +1164,10 @@ class AbFlowModel(nn.Module):
             self._last_message_diagnostics.update(
                 getattr(self.gnn, 'last_bridge_diagnostics', {}) or {}
             )
+            self._last_message_diagnostics.update({
+                k: (v.detach() if torch.is_tensor(v) else v)
+                for k, v in pose_torque_stats.items()
+            })
         pred_logits = None if self.struct_only else self.ffn_residue(H)
         return pred_logits, pred_X, pred_local_X[local_is_ab], H, p_edge_dist
 
@@ -1345,6 +1536,7 @@ class AbFlowModel(nn.Module):
         r_logits, r_interface_X, r_edge_dist = [], [interface_X.clone()], []
         pred_S_dist, memory_H = None, None
         round_egnn_diagnostics = []
+        round_pose_torque_stats = []
         authority_endpoints_native = []
         authority_carriers_interface = []
         round_chart_diag = []
@@ -1446,6 +1638,10 @@ class AbFlowModel(nn.Module):
                 seq_pep_condition=seq_this,
                 seq_pep_condition_mask=seq_mask_this,
                 trunk_state=trunk_state)
+            round_pose_torque_stats.append({
+                k: (v.detach() if torch.is_tensor(v) else v)
+                for k, v in (getattr(self, '_last_pose_torque_stats', {}) or {}).items()
+            })
 
             endpoint_proposal_native = pred_X_proposal[paratope_mask]
             if self.physical_authority_mode == 'carrier_primary_analytic':
@@ -1575,6 +1771,7 @@ class AbFlowModel(nn.Module):
                 value, interface_batch_id, _type=4)
         self.normalizer.clear_cache()
         self._last_round_egnn_diagnostics = round_egnn_diagnostics
+        self._last_round_pose_torque_stats = round_pose_torque_stats
         self._maybe_log_coordinate_controller_audit(round_egnn_diagnostics)
         return H, S, r_logits, pred_X, r_interface_X, r_edge_dist, prmsd
 
@@ -1694,6 +1891,13 @@ class AbFlowModel(nn.Module):
             add_mean(f'roundfield_auth_r{ridx}_h3_ag_pair_mae_A', metrics[6])
             add_mean(f'roundfield_auth_r{ridx}_centered_A', metrics[7])
             add_mean(f'roundfield_auth_r{ridx}_rotation_excess_A', metrics[8])
+
+        # R82 action magnitude is an observer only; it never enters a loss.
+        for ridx, stat in enumerate(
+                list(getattr(self, '_last_round_pose_torque_stats', []) or [])[:self.round]):
+            value = stat.get('pose_torque_angle_deg_mean') if isinstance(stat, dict) else None
+            if value is not None:
+                out[f'roundfield_auth_r{ridx}_torque_angle_deg'] = value.detach()
 
         def add_delta(prefix, metrics, field_idx):
             if len(metrics) < 3:

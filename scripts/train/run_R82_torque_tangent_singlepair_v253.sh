@@ -56,6 +56,7 @@ tr=cfg['training']; rt=cfg.get('runtime',{}); gen=cfg['generation']; test=cfg['d
 if 'gpus' in rt: raise SystemExit('runtime.gpus is forbidden; pass GPUs on CLI')
 def abspath(v): return v if os.path.isabs(v) else os.path.abspath(os.path.join(root,v))
 lg=tr.get('logging',{})
+resume=str(tr.get('schedule',{}).get('resume_checkpoint','') or '').strip()
 vals={
  'OUTPUT_ROOT':abspath(tr['output_dir']),
  'PER_GPU_BATCH_SIZE':tr['loader'].get('per_gpu_batch_size', tr['loader'].get('batch_size')),
@@ -66,6 +67,7 @@ vals={
  'METRIC_WORKERS':ev.get('metric_workers',8), 'SCI_FIRST':lg.get('science_first_steps',0),
  'SCI_INTERVAL':lg.get('science_interval',0), 'OUTLIER_THRESHOLD':lg.get('train_loss_outlier_threshold',1000.0),
  'EXP_ID':cfg['experiment']['id'], 'EXP_ROLE':cfg['experiment'].get('diagnostic_role',''),
+ 'RESUME_CHECKPOINT':abspath(resume) if resume else '',
 }
 for k,v in vals.items(): print(f'{k}='+shlex.quote(str(v)))
 PY2
@@ -77,17 +79,57 @@ MASTER_ADDR=${MASTER_ADDR:-$CFG_MASTER_ADDR}
 EFFECTIVE_GLOBAL_TRAIN_BATCH=$((PER_GPU_BATCH_SIZE * NPROC_PER_NODE))
 
 mkdir -p "$OUTPUT_ROOT" || { echo "Failed to create OUTPUT_ROOT: $OUTPUT_ROOT" >&2; exit 2; }
-VERSION=0
-while :; do
-  RUN_DIR="$OUTPUT_ROOT/version_$VERSION"
-  if mkdir "$RUN_DIR" 2>/dev/null; then break; fi
-  if [[ ! -e "$RUN_DIR" ]]; then echo "Failed to create run directory: $RUN_DIR" >&2; exit 2; fi
-  VERSION=$((VERSION+1))
-done
-export ABFLOW_FIXED_VERSION="$VERSION"
-export ABFLOW_EXPECTED_RUN_DIR="$RUN_DIR"
-export ABFLOW_REQUIRE_SCRATCH=1
-export ABFLOW_RESUME_CHECKPOINT=""
+
+if [[ -n "$RESUME_CHECKPOINT" ]]; then
+  [[ -f "$RESUME_CHECKPOINT" ]] || {
+    echo "resume_checkpoint not found: $RESUME_CHECKPOINT" >&2
+    exit 2
+  }
+
+  CKPT_DIR=$(dirname "$RESUME_CHECKPOINT")
+  [[ "$(basename "$CKPT_DIR")" == "checkpoint" ]] || {
+    echo "resume_checkpoint must live under version_N/checkpoint/: $RESUME_CHECKPOINT" >&2
+    exit 2
+  }
+
+  RUN_DIR=$(dirname "$CKPT_DIR")
+  VERSION_BASE=$(basename "$RUN_DIR")
+  [[ "$VERSION_BASE" =~ ^version_([0-9]+)$ ]] || {
+    echo "resume_checkpoint must live under version_N/checkpoint/: $RESUME_CHECKPOINT" >&2
+    exit 2
+  }
+  VERSION="${BASH_REMATCH[1]}"
+
+  RESUME_ROOT=$(realpath "$(dirname "$RUN_DIR")")
+  OUTPUT_ROOT_REAL=$(realpath "$OUTPUT_ROOT")
+  [[ "$RESUME_ROOT" == "$OUTPUT_ROOT_REAL" ]] || {
+    echo "resume_checkpoint does not belong to this R82 experiment:" >&2
+    echo "  checkpoint root: $RESUME_ROOT" >&2
+    echo "  config output:   $OUTPUT_ROOT_REAL" >&2
+    exit 2
+  }
+
+  export ABFLOW_FIXED_VERSION="$VERSION"
+  export ABFLOW_EXPECTED_RUN_DIR="$RUN_DIR"
+  export ABFLOW_REQUIRE_SCRATCH=0
+  export ABFLOW_RESUME_CHECKPOINT="$RESUME_CHECKPOINT"
+  RUN_MODE="resume"
+else
+  VERSION=0
+  while :; do
+    RUN_DIR="$OUTPUT_ROOT/version_$VERSION"
+    if mkdir "$RUN_DIR" 2>/dev/null; then break; fi
+    if [[ ! -e "$RUN_DIR" ]]; then echo "Failed to create run directory: $RUN_DIR" >&2; exit 2; fi
+    VERSION=$((VERSION+1))
+  done
+
+  export ABFLOW_FIXED_VERSION="$VERSION"
+  export ABFLOW_EXPECTED_RUN_DIR="$RUN_DIR"
+  export ABFLOW_REQUIRE_SCRATCH=1
+  export ABFLOW_RESUME_CHECKPOINT=""
+  RUN_MODE="scratch"
+fi
+
 RUN_LOG="$RUN_DIR/run_time.log"; LATEST_LOG="$OUTPUT_ROOT/run_time.log"
 ln -sfn "version_$VERSION/run_time.log" "$LATEST_LOG"
 
@@ -115,7 +157,11 @@ echo "[RunLog] canonical=$RUN_LOG latest=$LATEST_LOG"
 echo "[RunVersion] fixed_version=$VERSION dir=$RUN_DIR"
 echo "[RunConfig] config=$CONFIG_PATH"
 echo "[RunResources] physical_gpus=$GPU_CSV nproc=$NPROC_PER_NODE per_gpu_train_val_batch=$PER_GPU_BATCH_SIZE effective_global_train_batch=$EFFECTIVE_GLOBAL_TRAIN_BATCH test_batch=$TEST_BATCH master_addr=$MASTER_ADDR port=$MASTER_PORT"
-echo "[RunInit] mode=scratch parent=R81_clean optimizer=reset ema=reset epoch=0 best_val=reset"
+if [[ "$RUN_MODE" == "resume" ]]; then
+  echo "[RunInit] mode=resume experiment=R82 checkpoint=$RESUME_CHECKPOINT version=$VERSION optimizer=resume ema=resume epoch=resume best_val=resume"
+else
+  echo "[RunInit] mode=scratch parent=R81_clean optimizer=reset ema=reset epoch=0 best_val=reset"
+fi
 echo "[TrainingHorizon] source=json max_epoch=$MAX_EPOCH launcher_epoch_override=none"
 echo "[TrainValTestContract] order=train->validation->test checkpoint_selection=validation test_metrics=observation_only test_steps=$TEST_STEPS test_seed=$TEST_SEED"
 
@@ -128,7 +174,8 @@ if exp.get('protocol')!='formal_train_val_test': raise SystemExit('formal_train_
 if role!='r82_pair_torque_tangent_actuation_only': raise SystemExit(f'R82 role required, got {role!r}')
 if exp.get('parent')!='R81_R05_ABX_R79_COMMON_FRAME_SINGLEPAIR_ANALYTIC3R_TVT_U02': raise SystemExit('R82 parent must be clean R81')
 if str(exp.get('initialization','')).lower()!='scratch': raise SystemExit('R82 must start from scratch')
-if str(cfg['training']['schedule'].get('resume_checkpoint','') or '').strip(): raise SystemExit('R82 forbids resume_checkpoint')
+resume=str(cfg['training']['schedule'].get('resume_checkpoint','') or '').strip()
+print(f'[ResumeContract] mode={"resume" if resume else "scratch"} checkpoint={resume if resume else "none"}')
 sp=cfg['model']['representation']['single_pair']; pc=sp['pair_coordinate']; cc=sp['coordinate_controller']; pa=sp['physical_authority']; rs=sp['round_state_conditioning']; tq=sp.get('pose_torque_actuation',{})
 if int(cfg['model']['architecture']['iter_round']) != 3: raise SystemExit('R82 requires exactly 3 refinement rounds')
 if pc.get('mode')!='direct_shared' or cc.get('mode')!='egnn_prenorm_raw': raise SystemExit('R81 Pair/base EGNN controller must remain unchanged')
@@ -167,7 +214,7 @@ python -m py_compile "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" "$PROJECT_ROO
 grep -Fq 'X[paratope_mask] = authority_endpoint_native' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'paratope-only endpoint supervision/writeback missing' >&2; exit 2; }
 grep -Fq 'gen_X[paratope_mask] = interface_X_final' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'integrated carrier terminal missing' >&2; exit 2; }
 grep -Fq 'return 0.5 * (cos(step / self.max_step * pi) + 1) * 0.9' "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo 'context_ratio changed unexpectedly' >&2; exit 2; }
-echo '[Preflight] py_compile=PASS common_pair_frame=PASS h3_native_observation_blocked=PASS torque_tangent=PASS zero_init=PASS train_val_test=UNCHANGED epoch_test=ON single_field=PASS sampler_unchanged=PASS'
+echo "[Preflight] py_compile=PASS resume_supported=PASS run_mode=$RUN_MODE common_pair_frame=PASS h3_native_observation_blocked=PASS torque_tangent=PASS zero_init=PASS train_val_test=UNCHANGED epoch_test=ON single_field=PASS sampler_unchanged=PASS"
 
 python - "$PROJECT_ROOT" <<'PY2'
 import hashlib,os,sys

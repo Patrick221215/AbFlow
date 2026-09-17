@@ -1066,6 +1066,8 @@ class AbFlowTrainer(Trainer):
             for metric in ('raw_A', 'centered_A', 'aligned_A', 'h3_ag_pair_mae_A', 'rotation_excess_A'):
                 summary[f'auth_r{ridx}_{metric}'] = m(
                     f'AbFlowDiag/roundfield_auth_r{ridx}_{metric}/Validation')
+            summary[f'auth_r{ridx}_torque_angle_deg'] = m(
+                f'AbFlowDiag/roundfield_auth_r{ridx}_torque_angle_deg/Validation')
         for tag in ('01', '12', '02'):
             summary[f'auth_raw_delta_{tag}_A'] = m(
                 f'AbFlowDiag/roundfield_auth_raw_delta_A_{tag}/Validation')
@@ -1136,20 +1138,17 @@ class AbFlowTrainer(Trainer):
         print(
             '[RoundTransportValidation] '
             f'epoch={self.epoch} supervision=final_only relational_state=endpoint '
-            f'pair_frame=common_raw_complex '
+            f'pair_frame=common_raw_complex pose_actuator=pair_torque_tangent '
             f"raw_A={vals('auth','raw_A')} "
             f"centered_A={vals('auth','centered_A')} "
             f"aligned_A={vals('auth','aligned_A')} "
             f"rotation_excess_A={vals('auth','rotation_excess_A')} "
             f"h3_ag_pair_A={vals('auth','h3_ag_pair_mae_A')} "
             f"centroid_A={vals('auth','centroid_A')} "
-            f"step_total_cos=[{self._fmt(summary.get('step_target_cos_01'),4)},{self._fmt(summary.get('step_target_cos_12'),4)}] "
-            f"step_translation_cos=[{self._fmt(summary.get('step_translation_cos_01'),4)},{self._fmt(summary.get('step_translation_cos_12'),4)}] "
-            f"step_centered_cos=[{self._fmt(summary.get('step_centered_cos_01'),4)},{self._fmt(summary.get('step_centered_cos_12'),4)}] "
-            f"step_centered_pos_frac=[{self._fmt(summary.get('step_centered_cos_pos_frac_01'),3)},{self._fmt(summary.get('step_centered_cos_pos_frac_12'),3)}] "
-            f"raw_improve_frac_02={self._fmt(summary.get('raw_improve_frac_02'),3)} "
-            f"h3_ag_improve_frac_02={self._fmt(summary.get('h3_ag_pair_improve_frac_02'),3)} "
-            f"rotation_excess_improve_frac_02={self._fmt(summary.get('rotation_excess_improve_frac_02'),3)}"
+            f"torque_deg={vals('auth','torque_angle_deg',3)} "
+            f"translation_cos=[{self._fmt(summary.get('step_translation_cos_01'),4)},{self._fmt(summary.get('step_translation_cos_12'),4)}] "
+            f"pose_cos=[{self._fmt(summary.get('step_centered_cos_01'),4)},{self._fmt(summary.get('step_centered_cos_12'),4)}] "
+            f"pose_pos_frac=[{self._fmt(summary.get('step_centered_cos_pos_frac_01'),3)},{self._fmt(summary.get('step_centered_cos_pos_frac_12'),3)}]"
         )
         if int(self.epoch) == 0:
             print(
