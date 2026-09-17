@@ -145,7 +145,7 @@ export ABFLOW_TQDM="${ABFLOW_TQDM:-on}" ABFLOW_GEOMETRY_FORENSICS="${ABFLOW_GEOM
 export ABFLOW_SAMPLE_FORENSICS="${ABFLOW_SAMPLE_FORENSICS:-off}" ABFLOW_SAMPLE_AUTHORITY_DIAGNOSTICS="${ABFLOW_SAMPLE_AUTHORITY_DIAGNOSTICS:-on}"
 export ABFLOW_STATE_EXPOSURE_AUDIT=off
 export ABFLOW_STATE_EXPOSURE_EPOCHS="${ABFLOW_STATE_EXPOSURE_EPOCHS:-77,80,90,100,125,150,175,199}"
-export ABFLOW_STATE_EXPOSURE_STEPS="${ABFLOW_STATE_EXPOSURE_STEPS:-0,5,9}"
+export ABFLOW_STATE_EXPOSURE_STEPS="${ABFLOW_STATE_EXPOSURE_STEPS:-0,1,2,3,5,9}"
 export ABFLOW_COORD_AUDIT_INTERVAL="${ABFLOW_COORD_AUDIT_INTERVAL:-1000000000}" ABFLOW_COORD_AUDIT_FIRST_STEPS="${ABFLOW_COORD_AUDIT_FIRST_STEPS:-0}"
 export ABFLOW_GEOMETRY_AUTHORITY_INTERVAL=0
 export ABFLOW_TRAIN_LOSS_OUTLIER_THRESHOLD="${ABFLOW_TRAIN_LOSS_OUTLIER_THRESHOLD:-$OUTLIER_THRESHOLD}"
@@ -166,7 +166,7 @@ else
 fi
 echo "[TrainingHorizon] source=json max_epoch=$MAX_EPOCH launcher_epoch_override=none"
 echo "[TrainValTestContract] order=train->validation->test checkpoint_selection=validation test_metrics=observation_only test_steps=$TEST_STEPS test_seed=$TEST_SEED"
-echo "[StateExposureAuditContract] epochs=$ABFLOW_STATE_EXPOSURE_EPOCHS steps=$ABFLOW_STATE_EXPOSURE_STEPS isolate=coordinate_state sequence_context=same_rollout_St observer_only=1 training_effect=0 rng_restored=1 optimizer_untouched=1 sampler_unchanged=1"
+echo "[StateExposureAuditContract] epochs=$ABFLOW_STATE_EXPOSURE_EPOCHS steps=$ABFLOW_STATE_EXPOSURE_STEPS isolate=coordinate_state boundary_probe=t0.1_t0.2_t0.3 sequence_context=same_rollout_St observer_only=1 training_effect=0 rng_restored=1 optimizer_untouched=1 sampler_unchanged=1"
 
 python - "$CONFIG_PATH" "$OUTPUT_ROOT" <<'PY2'
 import json, os, sys
@@ -219,7 +219,7 @@ python -m py_compile "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" "$PROJECT_ROO
 grep -Fq 'X[paratope_mask] = authority_endpoint_native' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'paratope-only endpoint supervision/writeback missing' >&2; exit 2; }
 grep -Fq 'gen_X[paratope_mask] = interface_X_final' "$PROJECT_ROOT/models/AbFlow/AbFlow_model.py" || { echo 'integrated carrier terminal missing' >&2; exit 2; }
 grep -Fq 'return 0.5 * (cos(step / self.max_step * pi) + 1) * 0.9' "$PROJECT_ROOT/trainer/AbFlow_trainer.py" || { echo 'context_ratio changed unexpectedly' >&2; exit 2; }
-echo "[Preflight] py_compile=PASS resume_supported=PASS run_mode=$RUN_MODE p0_p1_diagnostics=PASS common_pair_frame=PASS h3_native_observation_blocked=PASS torque_tangent=PASS zero_init=PASS train_val_test=UNCHANGED epoch_test=ON single_field=PASS sampler_unchanged=PASS"
+echo "[Preflight] py_compile=PASS resume_supported=PASS run_mode=$RUN_MODE p0_p1_diagnostics=PASS boundary_probe=PASS robustness_summary=PASS common_pair_frame=PASS h3_native_observation_blocked=PASS torque_tangent=PASS zero_init=PASS train_val_test=UNCHANGED epoch_test=ON single_field=PASS sampler_unchanged=PASS"
 
 python - "$PROJECT_ROOT" <<'PY2'
 import hashlib,os,sys

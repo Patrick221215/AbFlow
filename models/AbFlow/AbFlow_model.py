@@ -89,6 +89,61 @@ class AbFlowModel(nn.Module):
             if bool(pose_torque_cfg.get("manual_scale", False)):
                 raise ValueError("R82 forbids manual pose-torque step scaling.")
 
+        # R83: detached one-step OUTER coordinate-state exposure, active on every
+        # training graph from epoch 0. This is the sole scientific delta versus R82:
+        # reconstruct the matched analytic state at t-dt, run one eval/no-grad F01
+        # step with the current model, and use the detached rollout state at the
+        # ORIGINAL sampled time t for the ordinary supervised forward. The carrier
+        # target is then recomputed from the actually exposed state because
+        # Y*(x_t,t) depends explicitly on x_t.
+        outer_cfg = representation_config.get("outer_state_exposure", {})
+        self.outer_state_exposure_enabled = bool(outer_cfg.get("enabled", False))
+        self.outer_state_exposure_mode = str(
+            outer_cfg.get("mode", "off") or "off"
+        ).strip().lower()
+        self.outer_state_exposure_dt = float(outer_cfg.get("step_dt", 0.1))
+        self.outer_state_exposure_prepass = str(
+            outer_cfg.get("prepass", "eval_no_grad") or "eval_no_grad"
+        ).strip().lower()
+        self.outer_state_exposure_target = str(
+            outer_cfg.get("main_target", "recompute_from_exposed_state")
+            or "recompute_from_exposed_state"
+        ).strip().lower()
+        self.outer_state_exposure_sequence = str(
+            outer_cfg.get("sequence_state", "analytic_at_main_time")
+            or "analytic_at_main_time"
+        ).strip().lower()
+        self.last_outer_exposure_diagnostics = {}
+        if self.outer_state_exposure_enabled:
+            if "warmup_epochs" in outer_cfg:
+                raise ValueError(
+                    "R83 formal protocol forbids outer-state exposure warmup; "
+                    "the scientific delta must be active from epoch 0."
+                )
+            for forbidden_key in ("period", "min_t", "max_t"):
+                if forbidden_key in outer_cfg:
+                    raise ValueError(
+                        f"R83 full-exposure protocol forbids outer_state_exposure.{forbidden_key}; "
+                        "every training graph is exposed from epoch 0."
+                    )
+            if self.outer_state_exposure_mode != "detached_one_step_f01_coordinate":
+                raise ValueError(
+                    "R83 outer_state_exposure.mode must be "
+                    "'detached_one_step_f01_coordinate'."
+                )
+            if not (0.0 < self.outer_state_exposure_dt < 1.0):
+                raise ValueError("R83 outer_state_exposure.step_dt must be in (0,1).")
+            if self.outer_state_exposure_prepass != "eval_no_grad":
+                raise ValueError("R83 requires outer_state_exposure.prepass='eval_no_grad'.")
+            if self.outer_state_exposure_target != "recompute_from_exposed_state":
+                raise ValueError(
+                    "R83 requires main_target='recompute_from_exposed_state' to avoid state/target mismatch."
+                )
+            if self.outer_state_exposure_sequence != "analytic_at_main_time":
+                raise ValueError(
+                    "R83 coordinate-only exposure requires sequence_state='analytic_at_main_time'."
+                )
+
         # V219 formal controller: preserve Pair as a first-class EGNN edge condition
         # and restore the original R05 raw Cartesian relative-vector operator.
         # Stability is introduced only at the representation->action boundary by
@@ -1266,6 +1321,31 @@ class AbFlowModel(nn.Module):
         u = torch.frac(torch.sin(idx * 12.9898 + 78.233) * 43758.5453).abs().clamp(1e-4, 1.0 - 1e-4)
         return (math.sqrt(2.0) * torch.erfinv(2.0 * u - 1.0)).reshape(*shape).to(dtype)
 
+    def _outer_state_exposure_active(self):
+        """R83 scientific delta: every training graph is exposed from epoch 0."""
+        return bool(self.training and self.outer_state_exposure_enabled)
+
+    def _same_noise_analytic_state_at_previous_time(
+            self, Xt, source_X0, target_X1, t_int, t_prev_int):
+        """Recover the matched F01 analytic state at t-dt for every graph.
+
+        The R05 path residual is g*sqrt(t(1-t))*eps with one residue-level eps
+        shared across its atoms.  Holding that latent eps fixed gives the exact
+        analytic state at t_prev=max(t-dt,0).  This keeps the sampled main time
+        and sequence corruption unchanged while exposing only the Cartesian state.
+        """
+        t = torch.as_tensor(t_int, device=Xt.device, dtype=Xt.dtype)
+        tp = torch.as_tensor(t_prev_int, device=Xt.device, dtype=Xt.dtype)
+        while t.dim() < Xt.dim():
+            t = t.unsqueeze(-1)
+            tp = tp.unsqueeze(-1)
+        mu_t = (1.0 - t) * source_X0 + t * target_X1
+        mu_prev = (1.0 - tp) * source_X0 + tp * target_X1
+        base_t = (t * (1.0 - t)).clamp_min(self.eps)
+        base_prev = (tp * (1.0 - tp)).clamp_min(0.0)
+        ratio = torch.sqrt(base_prev / base_t)
+        return mu_prev + ratio * (Xt - mu_t)
+
     def _r05_primary_path(self, source_X0, target_X1, t_graph, t_int,
                           interface_batch_id):
         """Residue-level fixed-g FoldFlow R3 path used by R05."""
@@ -2027,8 +2107,133 @@ class AbFlowModel(nn.Module):
         Xt, path_info = self._r05_primary_path(
             interface_X, gt_interface_X, t_graph, t_int,
             interface_batch_id)
-        coord_target, target_info = self._r05_coordinate_target(
+        baseline_coord_target, baseline_target_info = self._r05_coordinate_target(
             Xt, interface_X, gt_interface_X, t_int)
+
+        # R83 exposure is deliberately coordinate-only.  The ordinary main-time
+        # categorical corruption is sampled exactly as in R82; only the Cartesian
+        # state can be replaced by a detached one-step model rollout at the SAME t.
+        exposed_Xt = Xt
+        coord_target = baseline_coord_target
+        target_info = baseline_target_info
+        outer_diag = {
+            'outer_exposure_active': X.new_zeros(()),
+            'outer_exposure_graph_fraction': X.new_zeros(()),
+            'outer_exposure_state_gap_A': X.new_zeros(()),
+            'outer_exposure_target_gap_A': X.new_zeros(()),
+            'outer_exposure_target_identity_err_A': X.new_zeros(()),
+            'outer_exposure_target_identity_rel': X.new_zeros(()),
+            'outer_exposure_t_mean': t_graph.mean().detach(),
+        }
+        if self._outer_state_exposure_active():
+            # Full exposure: every sampled training graph uses a one-step rollout
+            # state. For t < dt, the matched previous time is exactly t_prev=0.
+            t_prev_graph = (
+                t_graph - float(self.outer_state_exposure_dt)
+            ).clamp_min(0.0)
+            t_prev_int = self._time_for_interface(
+                t_prev_graph, interface_batch_id, interface_X)
+            X_prev = self._same_noise_analytic_state_at_previous_time(
+                Xt, interface_X, gt_interface_X, t_int, t_prev_int)
+
+            # Prepass must look like inference, not a second stochastic training
+            # forward.  eval()+no_grad() prevents dropout/RNG drift and detaches
+            # the rollout state; supervised gradients flow only through the main R83 forward.
+            was_training = bool(self.training)
+            rng_devices = (
+                [int(X.device.index)]
+                if X.is_cuda and X.device.index is not None else []
+            )
+            try:
+                self.eval()
+                with torch.no_grad(), torch.random.fork_rng(devices=rng_devices):
+                    if self.struct_only:
+                        pre_sequence_state = None
+                    else:
+                        # This auxiliary sequence state is used only to condition
+                        # the detached coordinate prepass and never becomes a
+                        # rollout sequence state for the main objective.
+                        pre_St = self._sample_categorical_path(
+                            true_S[paratope_mask], interface_S, t_prev_graph,
+                            interface_batch_id,
+                            corrupt_mask=sequence_path_mask[paratope_mask])
+                        pre_sequence_state = pre_St
+                    _, _, _, _, pre_r_interface_X, _, _ = self._forward(
+                        X, S, cmask, smask, paratope_mask, X_pep, S_pep,
+                        surface, residue_pos, template, lengths,
+                        interface_init=X_prev,
+                        sequence_init=pre_sequence_state,
+                        flow_t=t_prev_graph, flow_source_init=interface_X)
+                    pre_carrier = pre_r_interface_X[-1]
+                    rolled_Xt, _ = self.r3_matcher.exact_carrier_scoreflow_step_gfree(
+                        x_t=X_prev, x0=interface_X, carrier=pre_carrier,
+                        t=t_prev_int, t_next=t_int,
+                        canonical_t_min=self.f01_hybrid_t_min)
+            finally:
+                self.train(was_training)
+
+            exposed_Xt = rolled_Xt.detach()
+            coord_target, target_info = self._r05_coordinate_target(
+                exposed_Xt, interface_X, gt_interface_X, t_int)
+
+            with torch.no_grad():
+                atom_pos_exp = self.aa_feature._construct_atom_pos(
+                    true_S[paratope_mask])
+                atom_mask_exp = atom_pos_exp != self.aa_feature.atom_pos_pad_idx
+                exposed_atom = atom_mask_exp
+                if bool(exposed_atom.any()):
+                    state_delta_all = exposed_Xt - Xt
+                    target_delta_all = coord_target - baseline_coord_target
+                    state_delta = state_delta_all[exposed_atom]
+                    target_delta = target_delta_all[exposed_atom]
+                    state_gap = state_delta.float().square().mean().sqrt().to(X.dtype)
+                    target_gap = target_delta.float().square().mean().sqrt().to(X.dtype)
+
+                    # Exact R83 state/target consistency audit.  The hybrid F01
+                    # target is endpoint-like below t_min (therefore independent
+                    # of x_t) and canonical above t_min, where
+                    #   Delta Y* = Delta x_t / (2t).
+                    # This is diagnostic-only and must remain ~0 if the target
+                    # was truly recomputed from the exposed state.
+                    t_res = t_int.reshape(t_int.shape[0], -1)[:, 0]
+                    t_atom = t_res[:, None].expand_as(atom_mask_exp)
+                    t_selected = t_atom[exposed_atom].to(state_delta.dtype)
+                    canonical_selected = (
+                        t_selected >= float(self.f01_hybrid_t_min)
+                    )
+                    expected_target_delta = torch.zeros_like(state_delta)
+                    if bool(canonical_selected.any()):
+                        expected_target_delta[canonical_selected] = (
+                            state_delta[canonical_selected]
+                            / (2.0 * t_selected[canonical_selected, None])
+                        )
+                    identity_delta = target_delta - expected_target_delta
+                    target_identity_err = (
+                        identity_delta.float().square().mean().sqrt().to(X.dtype)
+                    )
+                    target_identity_scale = (
+                        expected_target_delta.float().square().mean().sqrt()
+                    )
+                    target_identity_rel = (
+                        target_identity_err.float()
+                        / target_identity_scale.clamp_min(1.0e-8)
+                    ).to(X.dtype)
+                else:
+                    state_gap = X.new_zeros(())
+                    target_gap = X.new_zeros(())
+                    target_identity_err = X.new_zeros(())
+                    target_identity_rel = X.new_zeros(())
+                outer_diag = {
+                    'outer_exposure_active': X.new_ones(()),
+                    'outer_exposure_graph_fraction': X.new_ones(()),
+                    'outer_exposure_state_gap_A': state_gap,
+                    'outer_exposure_target_gap_A': target_gap,
+                    'outer_exposure_target_identity_err_A': target_identity_err,
+                    'outer_exposure_target_identity_rel': target_identity_rel,
+                    'outer_exposure_t_mean': t_graph.mean().detach().to(X.dtype),
+                }
+
+        self.last_outer_exposure_diagnostics = outer_diag
 
         if self.struct_only:
             St, sequence_state = interface_S, None
@@ -2043,7 +2248,7 @@ class AbFlowModel(nn.Module):
         H, pred_S, r_logits, pred_X, r_interface_X, r_edge_dist, prmsd = self._forward(
             X, S, cmask, smask, paratope_mask, X_pep, S_pep,
             surface, residue_pos, template, lengths,
-            interface_init=Xt, sequence_init=sequence_state,
+            interface_init=exposed_Xt, sequence_init=sequence_state,
             flow_t=t_graph, flow_source_init=interface_X)
 
         snll = X.new_zeros(())
@@ -2085,15 +2290,15 @@ class AbFlowModel(nn.Module):
         if self.single_physical_field:
             with torch.no_grad():
                 final_carrier_x1 = self._carrier_to_endpoint_chart(
-                    Xt, interface_X, r_interface_X[-1], t_int)
+                    exposed_Xt, interface_X, r_interface_X[-1], t_int)
                 pred_endpoint = pred_X[paratope_mask]
                 final_chart_gap = pred_endpoint.detach().float() - final_carrier_x1.detach().float()
                 carrier_rt = self._endpoint_to_carrier_chart(
-                    Xt, interface_X, final_carrier_x1, t_int)
+                    exposed_Xt, interface_X, final_carrier_x1, t_int)
                 endpoint_rt = self._carrier_to_endpoint_chart(
-                    Xt, interface_X,
+                    exposed_Xt, interface_X,
                     self._endpoint_to_carrier_chart(
-                        Xt, interface_X, pred_endpoint, t_int),
+                        exposed_Xt, interface_X, pred_endpoint, t_int),
                     t_int)
 
                 def _masked_rms_A(v, mask=None):
@@ -2208,7 +2413,7 @@ class AbFlowModel(nn.Module):
                         f"carrier={tuple(carrier.shape)} expected={tuple(expected_shape)}."
                     )
                 canonical_x1 = self.r3_matcher.endpoint_from_canonical_carrier_gfree(
-                    x_t=Xt,
+                    x_t=exposed_Xt,
                     x0=interface_X,
                     carrier=carrier,
                     t=t_int,
@@ -2419,6 +2624,10 @@ class AbFlowModel(nn.Module):
             diag = {
                 't_mean': t_graph.mean().detach(),
             }
+            diag.update({
+                k: (v.detach() if torch.is_tensor(v) else v)
+                for k, v in (self.last_outer_exposure_diagnostics or {}).items()
+            })
             for key in (
                 'bridge_single_delta_to_base_ratio',
                 'bridge_pair_delta_to_base_ratio_mean',
@@ -2479,102 +2688,6 @@ class AbFlowModel(nn.Module):
             pair = ((torch.pdist(p) - torch.pdist(q)).abs().mean()
                     if p.shape[0] >= 2 else p.new_tensor(float('nan')))
             rows.append((float(raw.item()), float(aligned.item()), float(pair.item())))
-        return rows
-
-    @torch.no_grad()
-    def _sample_sequence_graph_metrics(
-            self, logits, state_S, true_S, design_mask,
-            interface_batch_id, n_graph):
-        """Per-complex sequence-field diagnostics for the formal Test observer.
-
-        These values are computed *after* the ordinary sampler forward and are
-        never fed back into sampling/training.  ``field_*`` measures the current
-        network logits; ``state_aar`` measures the categorical rollout state
-        before the current refresh.
-        """
-        logits = logits.detach().float()
-        state_S = state_S.detach().long()
-        true_S = true_S.detach().long()
-        design_mask = design_mask.detach().bool()
-        rows = []
-        n_class = int(logits.shape[-1])
-        for gid in range(int(n_graph)):
-            mask = (
-                (interface_batch_id == gid)
-                & design_mask
-                & (true_S >= 0)
-                & (true_S < n_class)
-            )
-            if not bool(mask.any()):
-                rows.append((float('nan'), float('nan'), float('nan')))
-                continue
-            local_logits = logits[mask]
-            local_true = true_S[mask]
-            field_nll = F.cross_entropy(
-                local_logits, local_true, reduction='mean')
-            field_aar = (
-                local_logits.argmax(dim=-1) == local_true
-            ).float().mean()
-            state_aar = (
-                state_S[mask] == local_true
-            ).float().mean()
-            rows.append((
-                float(field_nll.item()),
-                float(field_aar.item()),
-                float(state_aar.item()),
-            ))
-        return rows
-
-    @torch.no_grad()
-    def _sample_sequence_exposure_metrics(
-            self, rollout_logits, oracle_logits, true_S, design_mask,
-            interface_batch_id, n_graph):
-        """Coordinate-state sensitivity of the sequence field.
-
-        The two logits come from the same network/time/sequence context; only
-        the Cartesian H3 state differs (free rollout versus analytic path).
-        Positive ``oracle_gain_*`` therefore means the analytic coordinate state
-        improves the sequence field without changing sequence context.
-        """
-        rollout_logits = rollout_logits.detach().float()
-        oracle_logits = oracle_logits.detach().float()
-        true_S = true_S.detach().long()
-        design_mask = design_mask.detach().bool()
-        rows = []
-        n_class = int(rollout_logits.shape[-1])
-        eps = 1e-8
-        for gid in range(int(n_graph)):
-            mask = (
-                (interface_batch_id == gid)
-                & design_mask
-                & (true_S >= 0)
-                & (true_S < n_class)
-            )
-            if not bool(mask.any()):
-                rows.append((
-                    float('nan'), float('nan'), float('nan'),
-                    float('nan'), float('nan'),
-                ))
-                continue
-            rl = rollout_logits[mask]
-            ol = oracle_logits[mask]
-            y = true_S[mask]
-            rnll = F.cross_entropy(rl, y, reduction='mean')
-            onll = F.cross_entropy(ol, y, reduction='mean')
-            raar = (rl.argmax(dim=-1) == y).float().mean()
-            oaar = (ol.argmax(dim=-1) == y).float().mean()
-            rp = torch.softmax(rl, dim=-1).clamp_min(eps)
-            op = torch.softmax(ol, dim=-1).clamp_min(eps)
-            mp = (0.5 * (rp + op)).clamp_min(eps)
-            jsd = 0.5 * (
-                (rp * (rp.log() - mp.log())).sum(dim=-1)
-                + (op * (op.log() - mp.log())).sum(dim=-1)
-            ).mean()
-            rows.append((
-                float(rnll.item()), float(onll.item()),
-                float(raar.item()), float(oaar.item()),
-                float(jsd.item()),
-            ))
         return rows
 
     @torch.no_grad()
@@ -2751,17 +2864,6 @@ class AbFlowModel(nn.Module):
                     implied_x1, true_h3, interface_batch_id, batch_size)
                 next_metrics = self._sample_h3_graph_metrics(
                     Xt_next, true_h3, interface_batch_id, batch_size)
-                seq_metrics = None
-                if not self.struct_only:
-                    rollout_logits_h3 = r_logits[-1][0][paratope_mask]
-                    seq_metrics = self._sample_sequence_graph_metrics(
-                        rollout_logits_h3,
-                        St,
-                        S[paratope_mask],
-                        smask[paratope_mask],
-                        interface_batch_id,
-                        batch_size,
-                    )
                 bridge_single = self._diag_float(
                     bridge_diag, 'bridge_single_delta_to_base_ratio')
                 bridge_pair = self._diag_float(
@@ -2771,7 +2873,7 @@ class AbFlowModel(nn.Module):
                 for gid in range(batch_size):
                     xr, xa, xp = x1_metrics[gid]
                     nr, na, npair = next_metrics[gid]
-                    row = {
+                    self._sample_authority_records.append({
                         'step': int(i), 't': t_value, 't_next': t_next_value,
                         'x1_raw_A': xr, 'x1_aligned_A': xa, 'x1_pair_mae_A': xp,
                         'xnext_raw_A': nr, 'xnext_aligned_A': na,
@@ -2779,15 +2881,7 @@ class AbFlowModel(nn.Module):
                         'bridge_single_ratio': bridge_single,
                         'bridge_pair_ratio': bridge_pair,
                         'bridge_pair_coord_ratio': bridge_pair_coord,
-                    }
-                    if seq_metrics is not None:
-                        seq_nll, seq_aar, state_aar = seq_metrics[gid]
-                        row.update({
-                            'seq_field_nll': seq_nll,
-                            'seq_field_aar': seq_aar,
-                            'seq_state_aar': state_aar,
-                        })
-                    self._sample_authority_records.append(row)
+                    })
 
             # Matched coordinate-state exposure audit.  It never writes oracle
             # coordinates into the rollout and never contributes to any loss.
@@ -2808,7 +2902,7 @@ class AbFlowModel(nn.Module):
                     prev_capture = bool(getattr(self, '_diagnostic_capture', False))
                     self._diagnostic_capture = False
                     try:
-                        _, _, oracle_r_logits, _, oracle_r_interface_X, _, _ = self._forward(
+                        _, _, _, _, oracle_r_interface_X, _, _ = self._forward(
                             X, S, cmask, smask, paratope_mask, X_pep, S_pep,
                             surface, residue_pos, template, lengths,
                             interface_init=oracle_Xt,
@@ -2828,32 +2922,11 @@ class AbFlowModel(nn.Module):
                     oracle_x1, true_h3, interface_batch_id, batch_size)
                 rollout_x1_metrics = self._sample_h3_graph_metrics(
                     implied_x1, true_h3, interface_batch_id, batch_size)
-
-                # Direct same-network output divergence.  This is distinct from
-                # the difference in error-to-native: it answers how sensitive
-                # the learned field itself is to rollout-vs-analytic state.
-                output_gap_metrics = self._sample_h3_graph_metrics(
-                    implied_x1, oracle_x1, interface_batch_id, batch_size)
-
-                seq_exposure_metrics = None
-                if not self.struct_only:
-                    rollout_logits_h3 = r_logits[-1][0][paratope_mask]
-                    oracle_logits_h3 = oracle_r_logits[-1][0][paratope_mask]
-                    seq_exposure_metrics = self._sample_sequence_exposure_metrics(
-                        rollout_logits_h3,
-                        oracle_logits_h3,
-                        S[paratope_mask],
-                        smask[paratope_mask],
-                        interface_batch_id,
-                        batch_size,
-                    )
-
                 for gid in range(batch_size):
                     sgr, sga, sgp = state_gap_metrics[gid]
                     rr, ra, rp = rollout_x1_metrics[gid]
                     orr, ora, orp = oracle_x1_metrics[gid]
-                    ogr, oga, ogp = output_gap_metrics[gid]
-                    row = {
+                    self._sample_authority_records.append({
                         'step': int(i), 't': t_value, 't_next': t_next_value,
                         'state_gap_raw_A': sgr,
                         'state_gap_aligned_A': sga,
@@ -2864,27 +2937,10 @@ class AbFlowModel(nn.Module):
                         'rollout_x1_raw_A': rr,
                         'rollout_x1_aligned_A': ra,
                         'rollout_x1_pair_mae_A': rp,
-                        'output_gap_raw_A': ogr,
-                        'output_gap_aligned_A': oga,
-                        'output_gap_pair_A': ogp,
-                        # Positive oracle_gain means analytic-path coordinates
-                        # improve the prediction while sequence context is held fixed.
-                        'oracle_gain_raw_A': rr - orr,
-                        'oracle_gain_aligned_A': ra - ora,
-                        'oracle_gain_pair_A': rp - orp,
-                    }
-                    if seq_exposure_metrics is not None:
-                        rnll, onll, raar, oaar, jsd = seq_exposure_metrics[gid]
-                        row.update({
-                            'rollout_seq_nll': rnll,
-                            'oracle_seq_nll': onll,
-                            'rollout_seq_aar': raar,
-                            'oracle_seq_aar': oaar,
-                            'seq_jsd': jsd,
-                            'oracle_gain_seq_nll': rnll - onll,
-                            'oracle_gain_seq_aar': oaar - raar,
-                        })
-                    self._sample_authority_records.append(row)
+                        'exposure_x1_raw_gap_A': rr - orr,
+                        'exposure_x1_aligned_gap_A': ra - ora,
+                        'exposure_x1_pair_gap_A': rp - orp,
+                    })
 
             Xt = Xt_next
 

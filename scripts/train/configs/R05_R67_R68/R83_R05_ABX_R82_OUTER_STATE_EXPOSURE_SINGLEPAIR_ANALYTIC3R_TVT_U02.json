@@ -1,12 +1,12 @@
 {
   "experiment": {
-    "id": "R82_R05_ABX_R81_TORQUE_TANGENT_SINGLEPAIR_ANALYTIC3R_TVT_U02",
-    "parent": "R81_R05_ABX_R79_COMMON_FRAME_SINGLEPAIR_ANALYTIC3R_TVT_U02",
+    "id": "R83_R05_ABX_R82_OUTER_STATE_EXPOSURE_SINGLEPAIR_ANALYTIC3R_TVT_U02",
+    "parent": "R82_R05_ABX_R81_TORQUE_TANGENT_SINGLEPAIR_ANALYTIC3R_TVT_U02",
     "initialization": "scratch",
-    "factor": "Single scientific delta versus clean R81: add a Pair-conditioned centroid-preserving exact Rodrigues rotational tangent to the existing carrier actuator. The R81 common-frame/Angstrom relational contract, anti-leak barrier, losses, recurrence, sampler, and single Cartesian authority remain unchanged.",
+    "factor": "Single scientific delta versus exact R82: on every training graph from epoch 0, replace the analytic Cartesian main-time state with a detached one-step F01 rollout state at the same t, then recompute the canonical/hybrid carrier target from that actual exposed state. No warmup, probabilistic/periodic mixture, time window, new loss, new sampler, new head, new Cartesian field, or sequence rollout.",
     "protocol": "formal_train_val_test",
-    "diagnostic_role": "r82_pair_torque_tangent_actuation_only",
-    "causal_question": "Does completing the Cartesian actuator with an explicit rigid rotational tangent eliminate the measured translation-positive / centered-pose-negative refinement split without sacrificing intrinsic H3 geometry or the R81 interface gains?"
+    "diagnostic_role": "r83_full_outer_coordinate_exposure_from_epoch0",
+    "causal_question": "Does training directly on the model-exposed one-step outer coordinate state at every sampled time, with the mathematically matched recomputed F01 target, close the analytic-state versus free-rollout gap without damaging R82 inner refinement?"
   },
   "data": {
     "train": {
@@ -35,7 +35,7 @@
     }
   },
   "training": {
-    "output_dir": "./results_module/R82_R05_ABX_R81_TORQUE_TANGENT_SINGLEPAIR_ANALYTIC3R_TVT_U02",
+    "output_dir": "./results_module/R83_R05_ABX_R82_OUTER_STATE_EXPOSURE_SINGLEPAIR_ANALYTIC3R_TVT_U02",
     "optimizer": {
       "lr": 0.001,
       "final_lr": 0.0001,
@@ -47,7 +47,7 @@
       "patience": 1000,
       "save_topk": 10,
       "save_interval": 1,
-      "resume_checkpoint": "/home/data3/cjm/project/AbFlow/results_module/R82_R05_ABX_R81_TORQUE_TANGENT_SINGLEPAIR_ANALYTIC3R_TVT_U02/version_0/checkpoint/last_step9936.pt"
+      "resume_checkpoint": ""
     },
     "loader": {
       "per_gpu_batch_size": 5,
@@ -187,7 +187,7 @@
           "fixed_context_writeback": "paratope_only",
           "native_latent_workspace": "retained_from_R72",
           "refinement_supervision": "final_round_only_inherited_from_AbFlow",
-          "diagnostic_hypothesis": "R81 repaired the relational geometry frame/unit contract. R82 addresses the remaining on-path actuator defect measured by v252: translation and aligned shape improve while centered pose/rotation-excess worsen. The sole scientific delta is a Pair-conditioned centroid-preserving exact Rodrigues torque tangent applied to the existing carrier field; loss, sampler, recurrence and Pair trunk remain unchanged."
+          "diagnostic_hypothesis": "R82 proved that the inner 3-round field can solve translation, orientation, intrinsic geometry and interface geometry on the analytic/path-state distribution, but real 10-step Test remains substantially worse. R83 changes only the training coordinate-state distribution: sparse detached one-step outer exposure at the same sampled t, with the carrier target recomputed from the exposed state."
         },
         "round_state_conditioning": {
           "enabled": true,
@@ -217,6 +217,20 @@
           "manual_scale": false,
           "coordinate_clip": false,
           "coordinate_tanh": false
+        },
+        "outer_state_exposure": {
+          "enabled": true,
+          "mode": "detached_one_step_f01_coordinate",
+          "step_dt": 0.1,
+          "prepass": "eval_no_grad",
+          "main_target": "recompute_from_exposed_state",
+          "sequence_state": "analytic_at_main_time",
+          "gradient_through_prepass": false,
+          "changes_sampler": false,
+          "changes_loss": false,
+          "changes_sequence_rollout": false,
+          "scope": "every_training_graph",
+          "start": "epoch0"
         }
       }
     }
@@ -248,7 +262,7 @@
   },
   "generation": {
     "checkpoint": "",
-    "save_dir": "./results_generation/R82_R05_ABX_R81_TORQUE_TANGENT_SINGLEPAIR_ANALYTIC3R_TVT_U02",
+    "save_dir": "./results_generation/R83_R05_ABX_R82_OUTER_STATE_EXPOSURE_SINGLEPAIR_ANALYTIC3R_TVT_U02",
     "batch_size": 20,
     "num_workers": 4,
     "n_steps": 10,
@@ -267,12 +281,12 @@
     "keep_structures": false,
     "failure_policy": "record_and_continue",
     "root_cause_diagnostics": {
-      "validation_transport_pose": true,
-      "validation_centered_orientation_proxy": true,
-      "h3_antigen_pair_distance_mae": true,
+      "validation_inner_refinement_compact": true,
       "test_exact_trajectory_compact": true,
+      "test_state_exposure_matched_oracle_path": "epochs_0_29_49_59",
       "kabsch_metric_only_no_coordinate_mutation": true,
-      "state_exposure_audit": true
+      "state_exposure_audit": true,
+      "outer_target_recompute_identity": "hybrid_exact_delta_check"
     }
   }
 }
