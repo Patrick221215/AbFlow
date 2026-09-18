@@ -1,24 +1,12 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
-# V194_KABSCH_STOPGRAD_FP32: rigid alignment is a nuisance-frame target transform; do not backprop through SVD.
-import functools as fn
-import math
-import numpy as np
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
-from torch.nn import LayerNorm
-from torch.utils.checkpoint import checkpoint
 from torch_scatter import scatter_mean, scatter_sum
 
 from data.pdb_utils import VOCAB
 from evaluation.rmsd import kabsch_torch
-from configs import (
-    RESTYPES, RESTYPE_1TO3, RESTYPE_NUM, ATOM14_ORDER, ATOM14_INDEX,
-    ATOM14_MASK, CHI_ANGLES_ATOMS, NUM_AB_REGIONS,
-)
 
 
 def sequential_and(*tensors):
@@ -33,81 +21,6 @@ def sequential_or(*tensors):
     for mat in tensors[1:]:
         res = torch.logical_or(res, mat)
     return res
-
-
-def normalize_vector(v, dim=-1, eps=1e-6):
-    """Normalize vectors with the same stable convention used by DiffAb."""
-    return v / (torch.linalg.norm(v, ord=2, dim=dim, keepdim=True) + eps)
-
-
-def project_v2v(v, e, dim=-1):
-    """Project vector ``v`` onto unit vector ``e``."""
-    return (e * v).sum(dim=dim, keepdim=True) * e
-
-
-def construct_residue_basis(center, carbon, nitrogen, eps=1e-6):
-    """Construct a right-handed residue frame from CA, C and N.
-
-    This is the DiffAb backbone-frame construction:
-      e1 = normalize(C - CA)
-      e2 = normalize((N - CA) - proj_e1(N - CA))
-      e3 = e1 x e2
-
-    Args:
-        center:   [..., 3], CA coordinates.
-        carbon:   [..., 3], C coordinates.
-        nitrogen: [..., 3], N coordinates.
-    Returns:
-        [..., 3, 3] matrix whose columns are (e1, e2, e3).
-    """
-    e1 = normalize_vector(carbon - center, dim=-1, eps=eps)
-    v2 = nitrogen - center
-    e2 = normalize_vector(v2 - project_v2v(v2, e1, dim=-1), dim=-1, eps=eps)
-    e3 = torch.cross(e1, e2, dim=-1)
-    return torch.stack((e1, e2, e3), dim=-1)
-
-
-def global_to_local(R, t, q):
-    """Convert global coordinates to residue-local coordinates: R^T (q - t)."""
-    q_size = q.shape
-    B, L = q_size[:2]
-    q_flat = q.reshape(B, L, -1, 3).transpose(-1, -2)
-    local = torch.matmul(R.transpose(-1, -2), q_flat - t.unsqueeze(-1))
-    return local.transpose(-1, -2).reshape(q_size)
-
-
-def atom14_to_residue_local(
-    atom14_positions, atom14_exists, fixed_mask,
-    coordinate_scale=0.1, eps=1e-6,
-):
-    """Encode fixed-residue atom14 geometry in a DiffAb-style local frame.
-
-    Frame construction is evaluated in FP32 even under BF16 autocast. Only the
-    resulting invariant local coordinates are cast back before the learned MLP.
-    """
-    n_idx = ATOM14_ORDER['N']
-    ca_idx = ATOM14_ORDER['CA']
-    c_idx = ATOM14_ORDER['C']
-    out_dtype = atom14_positions.dtype
-    exists = atom14_exists.bool()
-    fixed = fixed_mask.bool()
-    with torch.cuda.amp.autocast(enabled=False):
-        pos = atom14_positions.float()
-        ca = pos[..., ca_idx, :]
-        carbon = pos[..., c_idx, :]
-        nitrogen = pos[..., n_idx, :]
-        v1 = carbon - ca
-        e1 = normalize_vector(v1, dim=-1, eps=eps)
-        v2 = nitrogen - ca
-        u2 = v2 - project_v2v(v2, e1, dim=-1)
-        geometry_valid = (torch.linalg.norm(v1, dim=-1) > eps) & (torch.linalg.norm(u2, dim=-1) > eps)
-        frame_valid = fixed & exists[..., n_idx] & exists[..., ca_idx] & exists[..., c_idx] & geometry_valid
-        R = construct_residue_basis(ca, carbon, nitrogen, eps=eps)
-        local = global_to_local(R, ca, pos)
-        atom_valid = exists & frame_valid[..., None]
-        local = torch.where(atom_valid[..., None], local, torch.zeros_like(local))
-        local = local * float(coordinate_scale)
-    return local.to(dtype=out_dtype), frame_valid
 
 
 def graph_to_batch(tensor, batch_id, padding_value=0, mask_is_pad=True):
@@ -624,184 +537,89 @@ class AminoAcidFeature(nn.Module):
 
 
 class SeparatedAminoAcidFeature(AminoAcidFeature):
-    """Single residue/atom feature authority for R05 and the single/pair trunk."""
-
-    def __init__(
-        self, embed_size, atom_embed_size, relative_position=True,
-        edge_constructor=EdgeConstructor, fix_atom_weights=False,
-        backbone_only=False, representation_config=None,
-    ) -> None:
-        super().__init__(
-            embed_size, relative_position=relative_position,
-            edge_constructor=edge_constructor, backbone_only=backbone_only,
-        )
+    '''
+    Separate embeddings of atoms and residues
+    '''
+    def __init__(self, embed_size, atom_embed_size, relative_position=True, edge_constructor=EdgeConstructor, fix_atom_weights=False, backbone_only=False) -> None:
+        super().__init__(embed_size, relative_position=relative_position, edge_constructor=edge_constructor, backbone_only=backbone_only)
         atom_weights_mask = self.residue_atom_type == self.atom_pad_idx
         self.register_buffer('atom_weights_mask', atom_weights_mask)
         self.fix_atom_weights = fix_atom_weights
-
         if fix_atom_weights:
             atom_weights = torch.ones_like(self.residue_atom_type, dtype=torch.float)
         else:
             atom_weights = torch.randn_like(self.residue_atom_type, dtype=torch.float)
         atom_weights[atom_weights_mask] = 0
-        self.atom_weight = nn.Parameter(
-            atom_weights, requires_grad=not fix_atom_weights
-        )
-        self.register_buffer(
-            'zero_atom_weight', torch.zeros_like(atom_weights), persistent=False
-        )
-
-        # R05 residue/atom view.
+        self.atom_weight = nn.parameter.Parameter(atom_weights, requires_grad=not fix_atom_weights)
+        self.zero_atom_weight = nn.parameter.Parameter(torch.zeros_like(atom_weights), requires_grad=False)
+        
+        # override
         self.aa_embedding = AminoAcidEmbedding(
             self.num_aa_type, self.num_atom_type, self.num_atom_pos,
-            embed_size, atom_embed_size, self.atom_pad_idx, relative_position,
-        )
-
-        self.representation_config = None
-        self.single_pair_enabled = False
-        if representation_config is not None:
-            self.configure_single_pair(representation_config)
-
-    def configure_single_pair(self, representation_config):
-        """Attach the compact AbX-style single/pair view to the R05 residue authority."""
-        self.representation_config = representation_config
-        self.single_pair_enabled = True
-        c = seqformer_config(representation_config)
-        seq_channel = int(c.seq_channel)
-        geometry_cfg = representation_config.get("geometry", {})
-        self.single_pair_coordinate_scale = float(
-            geometry_cfg.get("local_coordinate_scale", 0.1)
-        )
-        self.single_pair_frame_eps = float(
-            geometry_cfg.get("frame_eps", 1e-6)
-        )
-
-        # These are independent learned views of the same canonical residue state.
-        # They are intentionally not tied to the parent R05 residue table: tying
-        # them would let R29/R30 auxiliary gradients rewrite the parent embedding
-        # directly and would destroy the parent-preserving ablation boundary.
-        self.single_pair_base_aa = nn.Embedding(
-            RESTYPE_NUM + 3, seq_channel, padding_idx=20
-        )
-        self.single_pair_context_aa = nn.Embedding(
-            RESTYPE_NUM + 3, seq_channel
-        )
-        self.single_pair_cdr = nn.Embedding(
-            NUM_AB_REGIONS + 1, seq_channel
-        )
-        self.single_pair_coordinate = nn.Sequential(
-            Linear(14 * 3 + 7 * 2, seq_channel, init='linear'),
-            nn.ReLU(),
-            Linear(seq_channel, seq_channel, init='linear'),
-        )
-        self.single_pair_antigen_proj = nn.Sequential(
-            LayerNorm(seq_channel),
-            Linear(seq_channel, seq_channel, init='linear'),
-            nn.ReLU(),
-            Linear(seq_channel, seq_channel, init='linear'),
-        )
-        self.single_pair_residue_mlp = nn.Sequential(
-            Linear(seq_channel * 3 + 2, seq_channel * 2, init='linear'),
-            nn.ReLU(),
-            Linear(seq_channel * 2, seq_channel, init='linear'),
-            nn.ReLU(),
-            Linear(seq_channel, seq_channel, init='linear'),
-            nn.ReLU(),
-            Linear(seq_channel, seq_channel, init='linear'),
-        )
-
-
+            embed_size, atom_embed_size, self.atom_pad_idx, relative_position)
+    
     def get_atom_weights(self, residue_types):
         weights = torch.where(
-            self.atom_weights_mask, self.zero_atom_weight, self.atom_weight
-        )
+            self.atom_weights_mask,
+            self.zero_atom_weight,
+            self.atom_weight
+        )  # [num_aa_classes, max_atom_number(n_channel)]
         if not self.fix_atom_weights:
             weights = F.normalize(weights, dim=-1)
         return weights[residue_types]
 
-    def encode_single_pair_base(self, seq, antigen_mask):
-        raw = self.single_pair_base_aa(seq.long())
-        antigen = self.single_pair_antigen_proj(raw).to(dtype=raw.dtype)
-        return torch.where(antigen_mask[..., None], antigen, raw)
-
-    def encode_single_pair_residue(
-        self, batch, seq, atom14_positions, atom14_exists, angles_sin_cos
-    ):
-        """Build the contextual single residue view from one canonical residue state.
-
-        Fixed/observed residues contribute local atom14 geometry.  Design residues
-        keep sequence/topology context through the base single path, but their
-        clean/native structural embedding is blocked.
-        """
-        geometry_mask = batch.get('geometry_condition_mask', batch['fixed_mask'])
-        mask = batch['mask'].bool() & geometry_mask.bool()
-        B, L = mask.shape
-
-        aa = self.single_pair_context_aa(seq.long()) * mask[..., None]
-        cdr = self.single_pair_cdr(batch['cdr_def'].long())
-
-        local_atom14, frame_valid = atom14_to_residue_local(
-            atom14_positions,
-            atom14_exists,
-            fixed_mask=mask,
-            coordinate_scale=self.single_pair_coordinate_scale,
-            eps=self.single_pair_frame_eps,
-        )
-        torsion = angles_sin_cos * frame_valid[..., None, None].to(
-            angles_sin_cos.dtype
-        )
-        coord = self.single_pair_coordinate(torch.cat(
-            [
-                local_atom14.reshape(B, L, -1),
-                torsion.reshape(B, L, -1),
-            ],
-            dim=-1,
-        ))
-
-        out = self.single_pair_residue_mlp(torch.cat(
-            [
-                aa,
-                batch['chain_id'][..., None].to(aa.dtype),
-                batch['residx'][..., None].to(aa.dtype),
-                cdr,
-                coord,
-            ],
-            dim=-1,
-        ))
-        return out * mask[..., None]
-
-
-    def forward(
-        self, X, S, batch_id, k_neighbors, residue_pos=None,
-        smooth_prob=None, smooth_mask=None,
-    ):
+    def forward(self, X, S, batch_id, k_neighbors, residue_pos=None, smooth_prob=None, smooth_mask=None):
         if residue_pos is None:
-            residue_pos = self._construct_residue_pos(S)
-        atom_type = self.residue_atom_type[S]
-        atom_pos = self.residue_atom_pos[S]
+            residue_pos = self._construct_residue_pos(S)  # [N]
+        atom_type = self.residue_atom_type[S]  # [N, n_channel]
+        atom_pos = self.residue_atom_pos[S]     # [N, n_channel]
 
+        # residue embedding
         pos_embedding = self.aa_embedding.res_pos_embedding(residue_pos)
         H = self.aa_embedding.residue_embedding(S)
         if smooth_prob is not None:
             res_embeddings = self.aa_embedding.residue_embedding(
                 torch.arange(
-                    smooth_prob.shape[-1], device=S.device, dtype=S.dtype
+                    smooth_prob.shape[-1],
+                    device=S.device,
+                    dtype=S.dtype,
                 )
-            )
-            with torch.cuda.amp.autocast(enabled=False):
-                smooth_H = smooth_prob.float().mm(res_embeddings.float())
-            H[smooth_mask] = smooth_H.to(dtype=H.dtype)
+            )  # [num_aa_type, embed_size]
+
+            # AMP-safe smooth residue embedding.
+            #
+            # Why this is necessary:
+            # Under torch.cuda.amp.autocast(dtype=torch.bfloat16/float16),
+            # matrix multiplication may return a lower-precision tensor even
+            # when the destination embedding tensor H remains float32.
+            #
+            # PyTorch index assignment requires:
+            #     H[smooth_mask].dtype == source.dtype
+            #
+            # Original code:
+            #     H[smooth_mask] = smooth_prob.mm(res_embeddings)
+            #
+            # may therefore fail with:
+            #     Float destination vs BFloat16 source.
+            #
+            # We keep AMP acceleration for the matmul, but cast the source
+            # back to H.dtype before index assignment.
+            smooth_res_embedding = smooth_prob.to(
+                device=res_embeddings.device,
+                dtype=res_embeddings.dtype,
+            ).mm(res_embeddings)
+
+            H[smooth_mask] = smooth_res_embedding.to(dtype=H.dtype)
+
         H = H + pos_embedding
 
-        atom_embedding = (
-            self.aa_embedding.atom_embedding(atom_type)
-            + self.aa_embedding.atom_pos_embedding(atom_pos)
-        )
+        # atom embedding
+        atom_embedding = self.aa_embedding.atom_embedding(atom_type) +\
+                         self.aa_embedding.atom_pos_embedding(atom_pos)
         atom_weights = self.get_atom_weights(S)
-
+        
         ctx_edges, inter_edges = self.construct_edges(
-            X, S, batch_id, k_neighbors, atom_pos=atom_pos
-        )
+            X, S, batch_id, k_neighbors, atom_pos=atom_pos)
         return H, (ctx_edges, inter_edges), (atom_embedding, atom_weights)
 
 
@@ -887,50 +705,73 @@ class ProteinFeature:
         return cosD, cosA
 
     def coord_loss(self, pred_X, true_X, batch_id, atom_mask, reference=None):
-        """Alignment-invariant coordinate loss with a stable gradient path.
-
-        Kabsch R/t are nuisance-frame variables used only to construct the aligned
-        target. Backpropagating through SVD is ill-conditioned near repeated or
-        close singular values. Compute the same optimal rigid alignment in FP32
-        under no_grad, then differentiate SmoothL1 only through pred_X.
         """
-        pred_X_f = pred_X.float()
-        true_X_f = true_X.float().clone()
-        pred_bb_f, true_bb_f = pred_X_f[:, :4], true_X_f[:, :4]
+        Kabsch/SVD and coordinate geometry losses are computed in float32
+        because CUDA SVD does not support bfloat16 and rigid alignment is
+        numerically sensitive. Gradients still flow to pred_X through the
+        differentiable float() cast.
+        """
+        pred_bb = pred_X[:, :4]
+        true_bb = true_X[:, :4]
         bb_mask = atom_mask[:, :4]
-        ops = []
 
-        align_obj_f = pred_bb_f if reference is None else reference[:, :4].float()
+        pred_X_f = pred_X.float()
+        true_X_aligned = true_X.float().clone()
+        true_bb_f = true_bb.float()
+
+        align_obj = pred_bb if reference is None else reference[:, :4]
+        align_obj_f = align_obj.float()
+
+        ops = []
         n_graph = int(torch.max(batch_id).detach().cpu().item()) + 1
 
         for i in range(n_graph):
             is_cur_graph = batch_id == i
             cur_bb_mask = bb_mask[is_cur_graph]
+
             if not bool(cur_bb_mask.any().detach().cpu().item()):
-                eye = torch.eye(3, device=pred_X.device, dtype=torch.float32)
-                zero = torch.zeros(3, device=pred_X.device, dtype=torch.float32)
-                ops.append((eye, zero))
+                eye = torch.eye(
+                    3,
+                    device=pred_X.device,
+                    dtype=torch.float32,
+                )
+                zero = torch.zeros(
+                    3,
+                    device=pred_X.device,
+                    dtype=torch.float32,
+                )
+                ops.append((eye.detach(), zero.detach()))
                 continue
 
-            with torch.no_grad():
-                with torch.cuda.amp.autocast(enabled=False):
-                    _, R, t = kabsch_torch(
-                        true_bb_f[is_cur_graph][cur_bb_mask],
-                        align_obj_f[is_cur_graph][cur_bb_mask],
-                        requires_grad=False,
-                    )
-                    aligned_true = torch.matmul(
-                        true_X_f[is_cur_graph], R.T
-                    ) + t
-            true_X_f[is_cur_graph] = aligned_true
+            with torch.cuda.amp.autocast(enabled=False):
+                _, R, t = kabsch_torch(
+                    true_bb_f[is_cur_graph][cur_bb_mask],
+                    align_obj_f[is_cur_graph][cur_bb_mask],
+                    requires_grad=True,
+                )
+                aligned_true = (
+                    torch.matmul(true_X_aligned[is_cur_graph], R.T)
+                    + t
+                )
+
+            true_X_aligned[is_cur_graph] = aligned_true.to(
+                dtype=true_X_aligned.dtype
+            )
             ops.append((R.detach(), t.detach()))
 
         atom_mask_sum = atom_mask.sum().clamp_min(1)
         xloss = F.smooth_l1_loss(
-            pred_X_f[atom_mask], true_X_f[atom_mask], reduction='sum'
+            pred_X_f[atom_mask],
+            true_X_aligned[atom_mask],
+            reduction='sum',
         ) / atom_mask_sum
-        bb_sq = ((pred_X_f[:, :4] - true_X_f[:, :4]) ** 2).sum(-1).mean(-1)
-        bb_rmsd = torch.sqrt(bb_sq.clamp_min(0.0))
+
+        bb_rmsd = torch.sqrt(
+            (
+                (pred_X_f[:, :4] - true_X_aligned[:, :4]) ** 2
+            ).sum(-1).mean(-1).clamp_min(0.0)
+        )
+
         return xloss, bb_rmsd, ops
 
     def structure_loss(self, pred_X, true_X, S, cmask, batch_id, xloss_mask, aa_feature, full_profile=False, reference=None):
@@ -941,18 +782,12 @@ class ProteinFeature:
 
         pred_X, true_X, batch_id = pred_X[cmask], true_X[cmask], batch_id[cmask]
 
-        # Geometry losses stay in FP32 under BF16 autocast. The float() cast is
-        # differentiable; only the Kabsch nuisance transform is detached.
-        pred_X_f, true_X_f = pred_X.float(), true_X.float()
-
         # loss of absolute coordinates
-        xloss, bb_rmsd, ops = self.coord_loss(
-            pred_X_f, true_X_f, batch_id, atom_mask, reference
-        )
+        xloss, bb_rmsd, ops = self.coord_loss(pred_X, true_X, batch_id, atom_mask, reference)
 
         # loss of backbone (...N-CA-C(O)-N...) bond length
-        true_bl = self._cal_backbone_bond_lengths(true_X_f, seg_id)
-        pred_bl = self._cal_backbone_bond_lengths(pred_X_f, seg_id)
+        true_bl = self._cal_backbone_bond_lengths(true_X, seg_id)
+        pred_bl = self._cal_backbone_bond_lengths(pred_X, seg_id)
         bond_loss = F.smooth_l1_loss(pred_bl, true_bl)
 
         # loss of backbone dihedral angles
@@ -967,8 +802,8 @@ class ProteinFeature:
             sc_bond_loss, sc_chi_loss = 0, 0
         else:
             # loss of sidechain bonds
-            true_sc_bl = self._cal_sidechain_bond_lengths(S, true_X_f, aa_feature)
-            pred_sc_bl = self._cal_sidechain_bond_lengths(S, pred_X_f, aa_feature)
+            true_sc_bl = self._cal_sidechain_bond_lengths(S, true_X, aa_feature)
+            pred_sc_bl = self._cal_sidechain_bond_lengths(S, pred_X, aa_feature)
             sc_bond_loss = F.smooth_l1_loss(pred_sc_bl, true_sc_bl)
 
             # loss of sidechain chis
@@ -990,6 +825,19 @@ class ProteinFeature:
 
 
 class SeperatedCoordNormalizer(nn.Module):
+    """AbX-style common complex coordinate normalizer.
+
+    v103 rule:
+      1) compute ONE antibody-backbone C-alpha center per complex;
+      2) subtract that SAME center from antibody, antigen and all auxiliary
+         coordinate objects belonging to the complex;
+      3) divide coordinates by 10 Angstrom, matching FoldFlow's
+         coordinate_scaling=0.1.
+
+    This replaces the historical AbFlow behavior that centered antigen and
+    antibody separately.  The common translation preserves every physical
+    antibody-antigen relative vector exactly.
+    """
     def __init__(self) -> None:
         super().__init__()
         self.mean = torch.tensor(0)
@@ -997,58 +845,258 @@ class SeperatedCoordNormalizer(nn.Module):
         self.mean = nn.parameter.Parameter(self.mean, requires_grad=False)
         self.std = nn.parameter.Parameter(self.std, requires_grad=False)
         self.boa_idx = VOCAB.symbol_to_idx(VOCAB.BOA)
+        self.common_centers = None
+        # Historical AbFlow surface pickles are consumed without coordinate
+        # centering, while antigen residue coordinates are antigen-centered in
+        # the legacy pipeline.  Cache that exact legacy antigen center so the
+        # pre-centered surface can be mapped into the new AbX common frame.
+        self.legacy_ag_centers = None
+        # Compatibility aliases used by historical runtime helpers.  In v103
+        # they intentionally point to the SAME common center.
+        self.ag_centers = None
+        self.ab_centers = None
+        self.is_ag = None
+        self.is_ab = None
+        self.center_authority = None
 
     def normalize(self, X):
-        X = (X - self.mean) / self.std
-        return X
+        return (X - self.mean) / self.std
 
     def unnormalize(self, X):
-        X = X * self.std + self.mean
-        return X
+        return X * self.std + self.mean
 
-    def centering(self, X, S, batch_id, aa_feature: AminoAcidFeature):
-        # centering antigen and antibody separatedly
+    @torch.no_grad()
+    def prepare_proposal_common_center(
+        self,
+        X,
+        S,
+        batch_id,
+        aa_feature: AminoAcidFeature,
+        aligned_template,
+        cmask,
+    ):
+        """Cache a PCS-RC proposal-anchored, inference-available common center.
+
+        ``aligned_template`` is the historical compact antibody template
+        (exactly corresponding to ``X[cmask]``) after one rigid transform has
+        placed it in the PCS-RC proposal/PDB frame.
+
+        The formal V143 center is
+
+            c_0 = mean_i CA(T_proposal-aligned)_i.
+
+        The same c_0 is subtracted from antibody context, antigen, PCS-RC H3,
+        flow state and auxiliary coordinates.
+
+        Native antibody coordinates in ``X`` are never used to define c_0.
+        ``X`` is consulted only for observed antigen atoms to recover the
+        legacy antigen-center convention required by historical surface PKLs.
+        """
+        cmask = cmask.bool()
+        n_compact = int(cmask.sum().item())
+        if aligned_template.shape[0] != n_compact:
+            raise RuntimeError(
+                "V143 proposal-center template contract mismatch: "
+                f"template_rows={aligned_template.shape[0]} "
+                f"cmask.sum={n_compact}."
+            )
+
         segment_ids = aa_feature._construct_segment_ids(S)
-        not_bol = S != aa_feature.bol_idx
-        tmp_S = S[not_bol]
-        tmp_X = aa_feature.update_global_coordinates(X[not_bol], tmp_S)
-        self.ag_centers = tmp_X[tmp_S == aa_feature.boa_idx][:, 0]
-        self.ab_centers = tmp_X[tmp_S == aa_feature.boh_idx][:, 0]
+        is_ag = segment_ids == aa_feature.ag_seg_id
+        is_ab = torch.logical_not(is_ag)
+        is_global = sequential_or(
+            S == aa_feature.boa_idx,
+            S == aa_feature.boh_idx,
+            S == aa_feature.bol_idx,
+        )
 
+        n_graph = int(batch_id.max().item()) + 1 if batch_id.numel() else 1
+        template_batch_id = batch_id[cmask]
+        ca_idx = 1 if aligned_template.shape[1] > 1 else 0
+        template_ca = aligned_template[:, ca_idx].float()
+        valid_ca = torch.isfinite(template_ca).all(dim=-1)
+
+        weights = valid_ca.to(template_ca.dtype)
+        sums = scatter_sum(
+            template_ca * weights[:, None],
+            template_batch_id,
+            dim=0,
+            dim_size=n_graph,
+        )
+        counts = scatter_sum(
+            weights,
+            template_batch_id,
+            dim=0,
+            dim_size=n_graph,
+        )
+        if bool((counts <= 0).any()):
+            raise RuntimeError(
+                "V143 proposal common center found a graph with no valid "
+                "proposal-aligned template CA coordinate."
+            )
+        centers = sums / counts.clamp_min(1.0)[:, None]
+
+        # Historical surface PKLs live in the old antigen-centered frame.
+        # Recompute that antigen center from ANTIGEN coordinates only.
+        atom_pos = aa_feature._construct_atom_pos(S)
+        ag_res_mask = is_ag & (~is_global)
+        ag_X = X[ag_res_mask]
+        ag_atom_pos = atom_pos[ag_res_mask]
+        ag_batch = batch_id[ag_res_mask]
+        atom_valid = (
+            (ag_atom_pos != aa_feature.atom_pos_pad_idx)
+            & torch.isfinite(ag_X).all(dim=-1)
+        )
+        if not bool(atom_valid.any()):
+            raise RuntimeError(
+                "V143 could not recover a valid antigen center for surface "
+                "frame conversion."
+            )
+
+        atom_batch = ag_batch[:, None].expand_as(atom_valid)[atom_valid]
+        atom_coords = ag_X[atom_valid].float()
+        ag_sums = scatter_sum(
+            atom_coords, atom_batch, dim=0, dim_size=n_graph
+        )
+        ag_counts = scatter_sum(
+            torch.ones_like(atom_batch, dtype=atom_coords.dtype),
+            atom_batch,
+            dim=0,
+            dim_size=n_graph,
+        )
+        if bool((ag_counts <= 0).any()):
+            raise RuntimeError(
+                "V143 found a graph with no valid antigen atom for legacy "
+                "surface-center recovery."
+            )
+        legacy_ag = ag_sums / ag_counts.clamp_min(1.0)[:, None]
+
+        self.common_centers = centers.to(dtype=X.dtype, device=X.device)
+        self.legacy_ag_centers = legacy_ag.to(dtype=X.dtype, device=X.device)
+        self.ag_centers = self.common_centers
+        self.ab_centers = self.common_centers
+        self.is_ag, self.is_ab = is_ag, is_ab
+        self.center_authority = "proposal_aligned_template"
+        return self.common_centers
+
+    def prepare_common_center(self, X, S, batch_id, aa_feature: AminoAcidFeature):
+        """Cache the AbX antibody-backbone CA center for each graph.
+
+        The center is computed from the raw, uncorrupted antibody coordinates
+        passed into ``_forward`` before masking/proposal replacement.  This
+        mirrors AbX's dataset normalization: antibody and antigen use the same
+        antibody backbone center.  Global BOA/BOH/BOL pseudo-nodes are excluded.
+        """
+        segment_ids = aa_feature._construct_segment_ids(S)
         is_ag = segment_ids == aa_feature.ag_seg_id
         is_ab = torch.logical_not(is_ag)
 
-        # compose centers
-        centers = torch.zeros(X.shape[0], X.shape[-1], dtype=X.dtype, device=X.device)
-        centers[is_ag] = self.ag_centers[batch_id[is_ag]]
-        centers[is_ab] = self.ab_centers[batch_id[is_ab]]
-        X = X - centers.unsqueeze(1)
+        ca_idx = 1 if X.shape[1] > 1 else 0
+        ca = X[:, ca_idx]
+        is_global = sequential_or(
+            S == aa_feature.boa_idx,
+            S == aa_feature.boh_idx,
+            S == aa_feature.bol_idx,
+        )
+        valid = is_ab & (~is_global) & torch.isfinite(ca).all(dim=-1)
+
+        n_graph = int(batch_id.max().item()) + 1 if batch_id.numel() else 1
+        weights = valid.to(X.dtype)
+        sums = scatter_sum(
+            ca * weights[:, None], batch_id, dim=0, dim_size=n_graph
+        )
+        counts_raw = scatter_sum(
+            weights, batch_id, dim=0, dim_size=n_graph
+        )
+        if bool((counts_raw <= 0).any()):
+            raise RuntimeError('AbX common centering found a graph with no valid antibody CA coordinate.')
+        counts = counts_raw.clamp_min(1.0)
+        centers = sums / counts[:, None]
+
+        # Recover the exact antigen center used by historical AbFlow before
+        # v103.  This is needed only to re-express the existing surface pickle,
+        # which historically lived in that antigen-centered frame.
+        not_bol = S != aa_feature.bol_idx
+        tmp_S = S[not_bol]
+        tmp_X = aa_feature.update_global_coordinates(X[not_bol], tmp_S)
+        legacy_ag = tmp_X[tmp_S == aa_feature.boa_idx][:, 0]
+        if legacy_ag.shape[0] != n_graph:
+            raise RuntimeError(
+                f'Expected {n_graph} antigen global centers, got {legacy_ag.shape[0]}.'
+            )
+
+        self.common_centers = centers
+        self.legacy_ag_centers = legacy_ag
+        self.ag_centers = centers
+        self.ab_centers = centers
         self.is_ag, self.is_ab = is_ag, is_ab
-        return X
+        return centers
+
+    def centering(self, X, S, batch_id, aa_feature: AminoAcidFeature, reuse_cached=True):
+        """Apply one shared antibody-derived translation to the full complex."""
+        if (not reuse_cached) or self.common_centers is None:
+            self.prepare_common_center(X, S, batch_id, aa_feature)
+        centers = self.common_centers[batch_id]
+        return X - centers.unsqueeze(1)
+
+    def center_auxiliary(self, X, aux_batch_id):
+        """Raw absolute auxiliary coordinates -> AbX common-centered frame."""
+        if self.common_centers is None:
+            raise RuntimeError('prepare_common_center must be called before center_auxiliary.')
+        centers = self.common_centers[aux_batch_id]
+        while centers.dim() < X.dim():
+            centers = centers.unsqueeze(-2)
+        return X - centers
+
+    def surface_legacy_to_common(self, surface, surface_batch_id):
+        """Map historical antigen-centered surface vertices to AbX common frame.
+
+        Existing AbFlow surface pickles were already compatible with the legacy
+        antigen-centered residue coordinates, which is why the old model only
+        divided ``surface`` by 10 and did not call ``centering`` on it.  If
+        ``S_old = S_raw - c_ag`` then the new common-centered representation is
+
+            S_common = S_old + c_ag - c_ab.
+
+        Applying ``surface - c_ab`` directly would subtract a center twice.
+        """
+        if self.common_centers is None or self.legacy_ag_centers is None:
+            raise RuntimeError('prepare_common_center must be called before surface conversion.')
+        ag = self.legacy_ag_centers[surface_batch_id]
+        ab = self.common_centers[surface_batch_id]
+        shift = ag - ab
+        while shift.dim() < surface.dim():
+            shift = shift.unsqueeze(-2)
+        return surface + shift
+
+    def raw_to_model_frame(self, X, batch_id):
+        """Raw Angstrom -> AbX common-centered, FoldFlow-scaled model frame."""
+        if self.common_centers is None:
+            raise RuntimeError('prepare_common_center must be called before raw_to_model_frame.')
+        centers = self.common_centers[batch_id]
+        while centers.dim() < X.dim():
+            centers = centers.unsqueeze(-2)
+        return self.normalize(X - centers)
 
     def uncentering(self, X, batch_id, _type=1):
+        """Undo the single common translation.  ``_type`` is retained for compatibility."""
+        if self.common_centers is None:
+            raise RuntimeError('No cached common center available for uncentering.')
         if _type == 0:
-            # type 0: [N, 3]
-            X = X.unsqueeze(1) # then it is type 1
-        
-        if _type == 0 or _type == 1:
-            # type 1: [N, n_channel, 3]
-            centers = torch.zeros(X.shape[0], X.shape[-1], dtype=X.dtype, device=X.device)
-            centers[self.is_ag] = self.ag_centers[batch_id[self.is_ag]]
-            centers[self.is_ab] = self.ab_centers[batch_id[self.is_ab]]
+            X = X.unsqueeze(1)
+
+        if _type in {0, 1, 4}:
+            centers = self.common_centers[batch_id]
             X = X + centers.unsqueeze(1)
         elif _type == 2:
-            # type 2: [2, bs, K, 3], X[0] for antigen, X[1] for antibody
-            centers = torch.stack([self.ag_centers, self.ab_centers], dim=0)  # [2, bs, 3]
+            centers = torch.stack([self.common_centers, self.common_centers], dim=0)
             X = X + centers.unsqueeze(-2)
         elif _type == 3:
-            # type 3: [2, Ef, 3], X[0] for antigen, X[1] for antibody
-            centers = torch.stack([self.ag_centers[batch_id], self.ab_centers[batch_id]], dim=0)
+            centers = torch.stack([
+                self.common_centers[batch_id],
+                self.common_centers[batch_id],
+            ], dim=0)
             X = X + centers
-        elif _type == 4:
-            # type 4: [N, n_channel, 3], but all uncentering to the center of antigen
-            centers = self.ag_centers[batch_id]
-            X = X + centers.unsqueeze(1)
         else:
             raise NotImplementedError(f'uncentering for type {_type} not implemented')
 
@@ -1057,1232 +1105,11 @@ class SeperatedCoordNormalizer(nn.Module):
         return X
 
     def clear_cache(self):
-        self.ag_centers, self.ab_centers, self.is_ag, self.is_ab = None, None, None, None
+        self.common_centers = None
+        self.legacy_ag_centers = None
+        self.ag_centers = None
+        self.ab_centers = None
+        self.is_ag = None
+        self.is_ab = None
+        self.center_authority = None
 
-# ============================================================
-# Dense single/pair representation and Seqformer operators
-# ============================================================
-
-class Linear_common(nn.Linear):
-    def __init__(self, input_dim, output_dim, init, bias=True):
-        super().__init__(input_dim, output_dim, bias=bias)
-        assert init in ['gate', 'final', 'attn', 'relu', 'linear']
-        if init in ['gate', 'final']:
-            nn.init.constant_(self.weight, 0.)
-        elif init == 'attn':
-            torch.nn.init.xavier_uniform_(self.weight)
-        elif init in ['relu', 'linear']:
-            distribution_stddev = 0.87962566103423978
-            scale = 2. if init == 'relu' else 1.
-            stddev = np.sqrt(scale / input_dim) / distribution_stddev
-            nn.init.trunc_normal_(self.weight, mean=0., std=stddev)
-        else:
-            raise NotImplementedError(f'{init} not Implemented')
-        if bias:
-            if init == 'gate':
-                nn.init.constant_(self.bias, 1.)
-            else:
-                nn.init.constant_(self.bias, 0.)
-
-def Linear(input_dim, output_dim, init, bias=True, config=None):
-    assert init in ['gate', 'final', 'attn', 'relu', 'linear']
-    return Linear_common(input_dim, output_dim, init, bias)
-
-def apply_dropout(tensor, rate, is_training, broadcast_dim=None):
-    if is_training and rate > 0.0:
-        if broadcast_dim is not None:
-            shape = list(tensor.shape)
-            shape[broadcast_dim] = 1
-            with torch.no_grad():
-                scale = 1. / (1. - rate)
-                keep_rate = torch.full(shape, 1. - rate, dtype=tensor.dtype, device=tensor.device)
-                keep = torch.bernoulli(keep_rate)
-            return scale * keep * tensor
-        else:
-            return F.dropout(tensor, rate)
-    else:
-        return tensor
-
-def pseudo_beta_fn_v2(aatype, all_atom_positions, all_atom_masks=None):
-    n_idx = ATOM14_ORDER['N']
-    ca_idx = ATOM14_ORDER['CA']
-    c_idx = ATOM14_ORDER['C']
-    N = all_atom_positions[..., n_idx, :]
-    CA = all_atom_positions[..., ca_idx, :]
-    C = all_atom_positions[..., c_idx, :]
-    b = CA - N
-    c = C - CA
-    a = torch.cross(b, c, dim=-1)
-    CB = -0.58273431 * a + 0.56802827 * b - 0.54067466 * c + CA
-    if all_atom_masks is not None:
-        CB_mask = torch.all(torch.stack([
-            all_atom_masks[...,n_idx], all_atom_masks[...,ca_idx], all_atom_masks[...,c_idx]
-        ], dim=-1), dim=-1)
-        return CB, CB_mask
-    return CB
-
-def dgram_from_positions(positions, num_bins, min_bin, max_bin):
-    breaks = torch.linspace(min_bin, max_bin, steps=num_bins-1, device=positions.device)
-    sq_breaks = torch.square(breaks)
-    dist2 = torch.sum(torch.square(
-        rearrange(positions, 'b l c -> b l () c') -
-        rearrange(positions, 'b l c -> b () l c')), dim=-1, keepdims=True)
-    true_bins = torch.sum(dist2 > sq_breaks, axis=-1).long()
-    return true_bins
-
-
-
-# SEQFORMER_BATCH_RUNTIME
-# SEQFORMER_WIDTH_CONTRACT
-# - localized/donor width closure retained from V201
-# - triangle chunk is supplied by the selected modular JSON
-# - batch size remains a launcher/config concern; model code never owns batch size
-# Fixes the V200 auxiliary-head width leak: every AbFlow consumer now derives its
-# input width from the active trunk config (localized or donor), rather than
-# silently retaining donor defaults. Scientific state / losses are unchanged.
-# SEQFORMER_RUNTIME
-# ATOM14_OBSERVED_MASK
-# AbFlow's own l2_normalize uses sqrt(sum(square(v)) + epsilon).  Our online
-# atom14->torsion adapter is differentiable w.r.t. the recurrent R05 state, so
-# the epsilon must be inside sqrt; sqrt(r2).clamp_min(eps) still executes the
-# singular SqrtBackward0 at r2==0 before clamp can protect the gradient.
-
-def _dihedral_sin_cos(p0,p1,p2,p3,epsilon=1e-12,diag_tag=None):
-    epsilon = float(epsilon)
-
-    # Keep the geometric construction in FP32 even under BF16 autocast.  This
-    # mirrors the fact that donor AbFlow torsions are precomputed numeric features
-    # while preserving the gradient from current-state geometry in our adapter.
-    with torch.cuda.amp.autocast(enabled=False):
-        p0f,p1f,p2f,p3f = p0.float(),p1.float(),p2.float(),p3.float()
-        b0 = p0f-p1f; b1=p2f-p1f; b2=p3f-p2f
-        b1_sq = (b1*b1).sum(-1,keepdim=True)
-        b1n = b1 / torch.sqrt(b1_sq + epsilon)
-        v = b0 - (b0*b1n).sum(-1,keepdim=True)*b1n
-        w = b2 - (b2*b1n).sum(-1,keepdim=True)*b1n
-        x = (v*w).sum(-1)
-        y = (torch.cross(b1n,v,dim=-1)*w).sum(-1)
-        xy_sq = x*x+y*y
-        n = torch.sqrt(xy_sq + epsilon)
-        out = torch.stack([y/n,x/n],dim=-1)
-
-    return out.to(dtype=p0.dtype) if p0.dtype in (torch.float16, torch.bfloat16) else out
-
-def _atom14_chemical_mask(seq, coords):
-    safe = seq.long().clamp(min=0, max=20)
-    table = ATOM14_MASK.to(device=coords.device, dtype=coords.dtype)
-    chem = table[safe]
-    finite = torch.isfinite(coords).all(dim=-1).to(coords.dtype)
-    return chem * finite
-
-def _abflow_ca_fill_observed_mask(seq, coords, tol2=1e-12):
-    """Infer AbFlow's resolved-atom mask from its CA-fill sentinel.
-
-    AbFlow preprocessing initializes every atom slot to the residue CA and only
-    overwrites slots that are actually resolved.  This fallback is used at
-    inference by legacy generate.py paths that historically removed xloss_mask.
-    Training/validation use the explicit xloss_mask and audit this fallback.
-    """
-    chem = _atom14_chemical_mask(seq, coords).bool()
-    if coords.shape[-2] < 2:
-        return chem.to(dtype=coords.dtype)
-    ca = coords[..., 1:2, :]
-    d2 = ((coords - ca) ** 2).sum(dim=-1)
-    # A real non-CA atom cannot physically coincide with CA.  Use a tiny FP32
-    # tolerance only to survive centering/scaling roundoff. CA itself is valid
-    # whenever chemically present and finite.
-    observed = d2 > float(tol2)
-    observed[..., 1] = True
-    return (chem & observed).to(dtype=coords.dtype)
-
-def _atom14_exists_from_seq(seq, coords, observed_mask=None, tol2=1e-12):
-    chem = _atom14_chemical_mask(seq, coords)
-    if observed_mask is None:
-        observed = _abflow_ca_fill_observed_mask(seq, coords, tol2=tol2)
-    else:
-        if tuple(observed_mask.shape) != tuple(coords.shape[:-1]):
-            raise ValueError(
-                f"atom observed-mask shape mismatch: {tuple(observed_mask.shape)} "
-                f"vs coords {tuple(coords.shape)}"
-            )
-        observed = observed_mask.to(device=coords.device, dtype=coords.dtype)
-    return chem * observed
-
-# VECTOR_TORSION_TABLES: exact atom-index lookup, no Python/GPU sync loop.
-_CHI_INDEX_ROWS = []
-_CHI_VALID_ROWS = []
-for _aa1 in RESTYPES:
-    _res3 = RESTYPE_1TO3[_aa1]
-    _idxmap = ATOM14_INDEX[_res3]
-    _idx_row, _valid_row = [], []
-    for _chi_i in range(4):
-        if _chi_i < len(CHI_ANGLES_ATOMS[_res3]):
-            _names = CHI_ANGLES_ATOMS[_res3][_chi_i]
-            _ok = all(_n in _idxmap for _n in _names)
-            _idx_row.append([_idxmap[_n] if _ok else 0 for _n in _names])
-            _valid_row.append(_ok)
-        else:
-            _idx_row.append([0, 0, 0, 0])
-            _valid_row.append(False)
-    _CHI_INDEX_ROWS.append(_idx_row)
-    _CHI_VALID_ROWS.append(_valid_row)
-# unknown/MASK row
-_CHI_INDEX_ROWS.append([[0, 0, 0, 0] for _ in range(4)])
-_CHI_VALID_ROWS.append([False] * 4)
-CHI_ATOM_INDEX_TABLE = torch.tensor(_CHI_INDEX_ROWS, dtype=torch.long)
-CHI_VALID_TABLE = torch.tensor(_CHI_VALID_ROWS, dtype=torch.bool)
-
-
-def _torsions_from_atom14(seq, coords, chain_id, mask, atom_exists=None, epsilon=1e-12):
-    """Vectorized exact AbFlow 7-torsion construction for padded atom14 tensors.
-
-    This is algebraically the same pre-omega/phi/psi/chi1..4 construction as
-    V199.  It removes per-residue ``.item()/bool`` CUDA synchronizations only;
-    invalid torsions retain the donor default [sin,cos]=[0,1].
-    """
-    B, L = seq.shape
-    out = coords.new_zeros((B, L, 7, 2))
-    out[..., 1] = 1.0
-    exists = (
-        _atom14_exists_from_seq(seq, coords).bool()
-        if atom_exists is None
-        else atom_exists.to(device=coords.device).bool()
-    )
-    valid_res = mask.bool()
-
-    # Neighbor validity without wrap-around leakage.
-    prev_mask = torch.roll(valid_res, shifts=1, dims=1)
-    next_mask = torch.roll(valid_res, shifts=-1, dims=1)
-    prev_chain = torch.roll(chain_id, shifts=1, dims=1)
-    next_chain = torch.roll(chain_id, shifts=-1, dims=1)
-    same_prev = valid_res & prev_mask & (chain_id == prev_chain)
-    same_next = valid_res & next_mask & (chain_id == next_chain)
-    if L:
-        same_prev[:, 0] = False
-        same_next[:, -1] = False
-
-    prev_coords = torch.roll(coords, shifts=1, dims=1)
-    next_coords = torch.roll(coords, shifts=-1, dims=1)
-    prev_exists = torch.roll(exists, shifts=1, dims=1)
-    next_exists = torch.roll(exists, shifts=-1, dims=1)
-
-    pre_ok = same_prev & prev_exists[..., 1] & prev_exists[..., 2] & exists[..., 0] & exists[..., 1]
-    phi_ok = same_prev & prev_exists[..., 2] & exists[..., 0] & exists[..., 1] & exists[..., 2]
-    psi_ok = same_next & exists[..., 0] & exists[..., 1] & exists[..., 2] & next_exists[..., 0]
-
-    pre = _dihedral_sin_cos(prev_coords[..., 1, :], prev_coords[..., 2, :], coords[..., 0, :], coords[..., 1, :], epsilon=epsilon, diag_tag="vector:pre_omega")
-    phi = _dihedral_sin_cos(prev_coords[..., 2, :], coords[..., 0, :], coords[..., 1, :], coords[..., 2, :], epsilon=epsilon, diag_tag="vector:phi")
-    psi = _dihedral_sin_cos(coords[..., 0, :], coords[..., 1, :], coords[..., 2, :], next_coords[..., 0, :], epsilon=epsilon, diag_tag="vector:psi")
-    out[..., 0, :] = torch.where(pre_ok[..., None], pre, out[..., 0, :])
-    out[..., 1, :] = torch.where(phi_ok[..., None], phi, out[..., 1, :])
-    out[..., 2, :] = torch.where(psi_ok[..., None], psi, out[..., 2, :])
-
-    # Four chi torsions from a residue-type lookup table.
-    safe_seq = seq.long().clamp(min=0, max=20)
-    chi_idx_table = CHI_ATOM_INDEX_TABLE.to(device=coords.device)
-    chi_valid_table = CHI_VALID_TABLE.to(device=coords.device)
-    chi_idx = chi_idx_table[safe_seq]                # [B,L,4,4]
-    chi_type_ok = chi_valid_table[safe_seq] & valid_res[..., None]
-
-    coords4 = coords[:, :, None, :, :].expand(B, L, 4, 14, 3)
-    gather_idx = chi_idx[..., None].expand(B, L, 4, 4, 3)
-    chi_pts = torch.gather(coords4, dim=3, index=gather_idx)  # [B,L,4,4,3]
-
-    exists4 = exists[:, :, None, :].expand(B, L, 4, 14)
-    chi_exists = torch.gather(exists4, dim=3, index=chi_idx)
-    chi_ok = chi_type_ok & chi_exists.all(dim=-1)
-    chi = _dihedral_sin_cos(
-        chi_pts[..., 0, :], chi_pts[..., 1, :],
-        chi_pts[..., 2, :], chi_pts[..., 3, :],
-        epsilon=epsilon, diag_tag="vector:chi",
-    )
-    out[..., 3:7, :] = torch.where(
-        chi_ok[..., None], chi, out[..., 3:7, :]
-    )
-    return out
-
-class _Cfg(dict):
-    """OmegaConf-like minimal attribute/dict compatibility used only by the local donor port."""
-    def __getattr__(self, key):
-        try: return self[key]
-        except KeyError as exc: raise AttributeError(key) from exc
-    def __setattr__(self, key, value): self[key] = value
-    @classmethod
-    def from_dict(cls,d):
-        return cls({k:(cls.from_dict(v) if isinstance(v,dict) else v) for k,v in d.items()})
-
-def seqformer_config(config, recycle_features=False, recycle_pos=False):
-    """Build the single/pair trunk config from the selected experiment JSON."""
-    channels = config['channels']
-    attention = config['attention']
-    execution = config.get('execution', {})
-    dropout = config.get('dropout', {})
-
-    seq_channel = int(channels['single'])
-    pair_channel = int(channels['pair'])
-    index_embed = int(channels['time_index'])
-    seq_heads = int(attention['single_heads'])
-    tri_heads = int(attention['triangle_heads'])
-    outer_channel = int(attention['opm_channel'])
-    tri_hidden = int(attention['triangle_hidden'])
-    chunk = int(execution.get('triangle_chunk_size', 64))
-    eval_chunk = int(execution.get('triangle_chunk_size_eval', chunk))
-
-    return _Cfg.from_dict({
-        'seqformer_num_block': int(config.get('blocks', 1)),
-        'seq_channel': seq_channel,
-        'pair_channel': pair_channel,
-        'max_relative_feature': int(config.get('max_relative_feature', 32)),
-        'index_embed_size': index_embed,
-        'recycle_features': bool(recycle_features),
-        'recycle_pos': bool(recycle_pos),
-        'activation_checkpoint': bool(
-            execution.get('activation_checkpoint', True)
-        ),
-        'pair_distance_chunk_size': int(
-            execution.get('pair_distance_chunk_size', 8)
-        ),
-        'pair_distance_chunk_size_eval': int(
-            execution.get(
-                'pair_distance_chunk_size_eval',
-                execution.get('pair_distance_chunk_size', 8),
-            )
-        ),
-        'time_embed': bool(config.get('time_embed', True)),
-        'prev_pos': {
-            'min_bin': 3.375, 'num_bins': 15, 'max_bin': 21.375
-        },
-        'seqformer': {
-            'seq_attention_with_pair_bias': {
-                'orientation': 'per_row', 'num_head': seq_heads,
-                'inp_kernels': [],
-                'dropout_rate': float(dropout.get('single_attention', 0.1)),
-                'shared_dropout': True,
-            },
-            'seq_transition': {
-                'orientation': 'per_row', 'num_intermediate_factor': 4,
-                'dropout_rate': 0.0, 'shared_dropout': True,
-            },
-            'outer_product_mean': {
-                'orientation': 'per_row',
-                'num_outer_channel': outer_channel,
-                'dropout_rate': 0.0, 'shared_dropout': True,
-            },
-            'triangle_multiplication_outgoing': {
-                'orientation': 'per_row',
-                'num_intermediate_channel': tri_hidden,
-                'gating': True, 'num_head': tri_heads,
-                'inp_kernels': [],
-                'dropout_rate': float(dropout.get('triangle', 0.1)),
-                'shared_dropout': False,
-            },
-            'triangle_multiplication_incoming': {
-                'orientation': 'per_column',
-                'num_intermediate_channel': tri_hidden,
-                'gating': True, 'num_head': tri_heads,
-                'inp_kernels': [],
-                'dropout_rate': float(dropout.get('triangle', 0.1)),
-                'shared_dropout': False,
-            },
-            'triangle_attention_starting_node': {
-                'orientation': 'per_row', 'num_head': tri_heads,
-                'gating': True, 'inp_kernels': [],
-                'dropout_rate': float(dropout.get('triangle', 0.1)),
-                'shared_dropout': False,
-                'chunk_size': chunk, 'eval_chunk_size': eval_chunk,
-            },
-            'triangle_attention_ending_node': {
-                'orientation': 'per_column', 'num_head': tri_heads,
-                'gating': True, 'inp_kernels': [],
-                'dropout_rate': float(dropout.get('triangle', 0.1)),
-                'shared_dropout': False,
-                'chunk_size': chunk, 'eval_chunk_size': eval_chunk,
-            },
-            'pair_transition': {
-                'orientation': 'per_row', 'num_intermediate_factor': 4,
-                'dropout_rate': 0.0, 'shared_dropout': True,
-            },
-        },
-    })
-
-
-# Single residue authority is SeparatedAminoAcidFeature above.
-
-class PairEmbedding(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        feat_dim = config.pair_channel
-        self.feat_dim = int(feat_dim)
-        self.pair_distance_chunk_size = max(
-            1, int(getattr(config, 'pair_distance_chunk_size', 8))
-        )
-        self.pair_distance_chunk_size_eval = max(
-            self.pair_distance_chunk_size,
-            int(getattr(
-                config, 'pair_distance_chunk_size_eval',
-                self.pair_distance_chunk_size,
-            )),
-        )
-        self.dgram_config = config.prev_pos
-        self.num_bins = self.dgram_config.num_bins
-        self.max_num_atoms = 14
-        self.max_aa_types = RESTYPE_NUM + 3
-        self.max_relpos = 32
-        self.aa_pair_embed = nn.Embedding(self.max_aa_types*self.max_aa_types, feat_dim)
-        self.relpos_embed = nn.Embedding(2*self.max_relpos+1, feat_dim)
-
-        self.aapair_to_distcoef = nn.Embedding(self.max_aa_types*self.max_aa_types, self.max_num_atoms*self.max_num_atoms)
-        nn.init.zeros_(self.aapair_to_distcoef.weight)
-        self.distance_embed = nn.Sequential(
-            Linear(self.max_num_atoms*self.max_num_atoms, feat_dim, init='linear', bias=True),
-            nn.ReLU(),
-            Linear(feat_dim, feat_dim, init='linear', bias=True),
-            nn.ReLU(),
-        )
-
-        self.dgram_embed = nn.Embedding(self.num_bins, feat_dim)
-
-        infeat_dim = feat_dim * 4
-        self.out_mlp = nn.Sequential(
-            Linear(infeat_dim, feat_dim, init='linear', bias=True),
-            nn.ReLU(),
-            Linear(feat_dim, feat_dim, init='linear', bias=True),
-            nn.ReLU(),
-            Linear(feat_dim, feat_dim, init='linear', bias=True),
-        )
-
-    def _project_pair_components(self, feat_aapair, feat_relpos, feat_dist, feat_dgram):
-        """Apply the donor concat-MLP without materializing a 4C tensor.
-
-        For the first linear layer,
-            W[a;r;d;g] + b
-        is exactly
-            W_a a + W_r r + W_d d + W_g g + b.
-        The parameter matrix is unchanged; only the execution order is factorized
-        to reduce peak memory.
-        """
-        first = self.out_mlp[0]
-        C = self.feat_dim
-        W = first.weight
-        b = first.bias
-        out = F.linear(feat_aapair, W[:, 0:C], b)
-        out = out + F.linear(feat_relpos, W[:, C:2*C], None)
-        out = out + F.linear(feat_dist, W[:, 2*C:3*C], None)
-        out = out + F.linear(feat_dgram, W[:, 3*C:4*C], None)
-        for layer in self.out_mlp[1:]:
-            out = layer(out)
-        return out
-
-    def forward(self, batch, seq, atom14_positions, atom14_gt_exists):
-        """Build dense relational pair states with chunked exact geometry kernels.
-
-        The scientific feature definition is unchanged from the AbX-style donor:
-        amino-acid pair, IMGT relative position, 14x14 atom distances, and
-        pseudo-beta distogram.  Only the row dimension is chunked so the large
-        [B,L,L,14,14,3] / [B,14L,14L] temporaries are never materialized.
-        """
-        geometry_mask = batch.get('geometry_condition_mask', batch['fixed_mask'])
-        fixed = batch['mask'].bool() & geometry_mask.bool()
-        B, L = fixed.shape
-        aa = seq.long()
-        chain_ids = batch['chain_id']
-        residx = batch['residx']
-        coords = atom14_positions
-        ca_exists = atom14_gt_exists[..., ATOM14_ORDER['CA']].to(coords.dtype)
-
-        pseudo_beta = pseudo_beta_fn_v2(aa, coords)
-        disto_bins = dgram_from_positions(pseudo_beta, **self.dgram_config)
-
-        pair_chunks = []
-        # Chunking changes only execution order: every row/pair is still evaluated
-        # by the same exact equations.  Training and eval can therefore use
-        # different memory/speed points without changing the scientific model.
-        chunk = (
-            self.pair_distance_chunk_size
-            if self.training
-            else self.pair_distance_chunk_size_eval
-        )
-
-        # Full right-side atom bank is reused by every row chunk.
-        rhs_atoms = coords.reshape(B, L * self.max_num_atoms, 3).float()
-
-        for start in range(0, L, chunk):
-            stop = min(L, start + chunk)
-            K = stop - start
-
-            aa_i = aa[:, start:stop]
-            aa_pair = (
-                aa_i[:, :, None] * self.max_aa_types
-                + aa[:, None, :]
-            )
-            feat_aapair = self.aa_pair_embed(aa_pair)
-
-            same_chain = (
-                chain_ids[:, start:stop, None]
-                == chain_ids[:, None, :]
-            )
-            relpos = torch.clamp(
-                residx[:, start:stop, None] - residx[:, None, :],
-                min=-self.max_relpos,
-                max=self.max_relpos,
-            )
-            feat_relpos = self.relpos_embed(
-                (relpos + self.max_relpos).long()
-            )
-            feat_relpos = feat_relpos * same_chain[..., None].to(
-                feat_relpos.dtype
-            )
-
-            lhs_atoms = coords[:, start:stop].reshape(
-                B, K * self.max_num_atoms, 3
-            ).float()
-            distance = torch.cdist(
-                lhs_atoms,
-                rhs_atoms,
-                p=2,
-                compute_mode="donot_use_mm_for_euclid_dist",
-            )
-            distance = distance.reshape(
-                B, K, self.max_num_atoms, L, self.max_num_atoms
-            ).permute(0, 1, 3, 2, 4)
-            distance = (distance / 10.0).reshape(
-                B, K, L, self.max_num_atoms * self.max_num_atoms
-            ).to(coords.dtype)
-
-            distance_coef = F.softplus(
-                self.aapair_to_distcoef(aa_pair)
-            )
-            d_gauss = torch.exp(-distance_coef * distance.square())
-
-            # Preserve the established AbX-style CA-resolved pair support.
-            ca_pair = (
-                ca_exists[:, start:stop, None, None]
-                * ca_exists[:, None, :, None]
-            )
-            feat_dist = self.distance_embed(d_gauss * ca_pair)
-
-            feat_dgram = self.dgram_embed(
-                disto_bins[:, start:stop]
-            )
-
-            feat = self._project_pair_components(
-                feat_aapair,
-                feat_relpos,
-                feat_dist,
-                feat_dgram,
-            )
-            pair_mask = (
-                fixed[:, start:stop, None]
-                & fixed[:, None, :]
-            )
-            pair_chunks.append(
-                feat * pair_mask[..., None].to(feat.dtype)
-            )
-
-        return torch.cat(pair_chunks, dim=1)
-
-
-# ===== AbFlow donor timestep embedding =====
-def pair_concat(pair_1, pair_2):
-    assert pair_1.shape[0] == pair_2.shape[0] and pair_1.shape[-1] == pair_2.shape[-1]
-    assert pair_1.device == pair_2.device
-    device = pair_1.device
-    batch_size = pair_1.shape[0]
-    channel = pair_1.shape[-1]
-
-    length_1 = pair_1.shape[1]
-    length_2 = pair_2.shape[1]
-    concat_dim1 = torch.cat(
-        (
-        pair_1, 
-        torch.zeros((batch_size, length_2, length_1, channel), device=device)
-        ), dim=1)
-    
-    concat_dim2 = torch.cat(
-        (
-        torch.zeros((batch_size, length_1, length_2, channel), device=device), 
-        pair_2
-        ), dim=1)
-    pair_all = torch.cat([concat_dim1, concat_dim2], dim=2)
-    return pair_all
-
-
-
-def get_timestep_embedding(timesteps, embedding_dim, max_positions=10000):
-    # Code from https://github.com/hojonathanho/diffusion/blob/master/diffusion_tf/nn.py
-    """
-    From Fairseq.Build sinusoidal embeddings.This matches the implementation in tensor2tensor, but differs slightly
-    from the description in Section 3.5 of "Attention Is All You Need".
-    """
-    assert len(timesteps.shape) == 1
-    timesteps = timesteps * max_positions
-    half_dim = embedding_dim // 2
-    emb = math.log(max_positions) / (half_dim - 1)
-    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=timesteps.device) * -emb)
-    emb = timesteps.float()[:, None] * emb[None, :]
-    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
-    if embedding_dim % 2 == 1: # Zero pad
-        emb = F.pad(emb, (0, 1), mode='constant')
-    assert emb.shape == (timesteps.shape[0], embedding_dim)
-    return emb
-
-class Embedder(nn.Module):
-    """
-    A module for encoding diffusion timesteps and embedding them into sequence and pair representations.
-    
-    Returns:
-        node_embed: [B, N,  seq_channel + index_embed_size]
-        edge_embed: [B, N, N, pair_channel + 2*index_embed_size]
-    """
-    def __init__(self, model_conf):
-        super(Embedder,self).__init__()
-        self._embed_conf = model_conf
-        # Time step embedding
-        index_embed_size = self._embed_conf.index_embed_size
-        
-        self.timestep_embedder = fn.partial(
-            get_timestep_embedding,
-            embedding_dim = index_embed_size
-        )
-
-
-    def _cross_concat(self, feats_1d, num_batch, num_res):
-        return torch.cat([
-            torch.tile(feats_1d[:, :, None, :], (1, 1, num_res, 1)),
-            torch.tile(feats_1d[:, None, :, :], (1, num_res, 1, 1)),
-        ], dim=-1).float().reshape([num_batch, num_res**2, -1])
-
-
-    def forward(self, seq_act, pair_act, batch):
-        num_batch, num_res = batch['seq'].shape
-        # node_feats = []
-        t = batch['t'] 
-        fixed_mask = batch['fixed_mask']
-
-        # Embedding times t
-        fixed_mask = fixed_mask[..., None]
-        prot_t_embed = torch.tile(
-            self.timestep_embedder(t)[:, None, :], (1,num_res,1)
-        ) # [B, N, index_embed_size]
-        #import ipdb; ipdb.set_trace()
-        # Evoformer embedding
-        pair_act = pair_act.reshape([num_batch, num_res**2, -1])
-
-        seq_feats = [seq_act]
-        pair_feats = [pair_act]
-        seq_feats.append(prot_t_embed)
-        pair_feats.append(self._cross_concat(prot_t_embed, num_batch, num_res))
-
-        
-        pair_feats = torch.cat(pair_feats, dim=-1).float()
-        seq_feats = torch.cat(seq_feats, dim=-1).float()
-        pair_feats = pair_feats.reshape([num_batch, num_res, num_res, -1])
-
-        return seq_feats, pair_feats
-    
-
-
-
-# ===== AbFlow donor Seqformer operators: source-faithful local port =====
-class Attention(nn.Module):
-    def __init__(self, input_dim, key_dim, value_dim, output_dim, num_head,split_first=True, gating=True,inp_kernels=None, config=None):
-        super().__init__()
-        assert key_dim % num_head == 0
-        assert value_dim % num_head == 0
-
-        self.key_dim, self.value_dim = key_dim, value_dim
-
-        self.num_head = num_head
-        
-        self.split_first = split_first
-
-        if self.split_first:
-            self.proj_q = Linear(input_dim, key_dim, init='attn', bias=False, config=config)
-            self.proj_k = Linear(input_dim, key_dim, init='attn', bias=False, config=config)
-            self.proj_v = Linear(input_dim, value_dim, init='attn', bias=False, config=config)
-        else:
-            assert (key_dim == value_dim)
-            self.proj_in = Linear(input_dim, key_dim * 3, init='attn', bias=False, config=config)
-        
-        self.gating = gating
-        if gating:
-            self.gate= Linear(input_dim, value_dim, init='gate', config=config)
-
-        self.proj_out = Linear(value_dim, output_dim, init='final', config=config)
-         
-        self.inp_kernels = inp_kernels
-        if inp_kernels:
-            self.inp_q = SpatialDepthWiseInception(key_dim // num_head, inp_kernels)
-            self.inp_k = SpatialDepthWiseInception(key_dim // num_head, inp_kernels)
-            self.inp_v = SpatialDepthWiseInception(value_dim // num_head, inp_kernels)
-
-    def forward(self, q_data, k_data=None, bias=None, k_mask=None):
-        """
-        Arguments:
-            q_data: (batch_size, N_seqs, N_queries, q_channel)
-            k_data: (batch_size, N_seqs, N_keys, k_channel)
-            k_mask: (batch_size, N_seqs, N_keys)
-            bias  : (batch_size, N_queries, N_keys). shared by all seqs
-        Returns:
-            (b s l c)
-        """
-        key_dim, value_dim = self.key_dim // self.num_head, self.value_dim // self.num_head
-        
-        if self.split_first:
-            assert (k_data is not None)
-            q = self.proj_q(q_data) 
-            k = self.proj_k(k_data)
-            v = self.proj_v(k_data)
-            q, k, v = map(lambda t: rearrange(t, 'b s l (h d) -> b s h l d', h = self.num_head), (q, k, v))
-        else:
-            assert (k_data is None)
-            t = rearrange(self.proj_in(q_data), "... l (h d) -> ... h l d", h=self.num_head)
-            q, k, v = torch.chunk(t, 3, dim=-1)
-        
-        if self.inp_kernels:
-            q, k, v = map(lambda t: rearrange(t, 'b s h l d-> b (s h) l d'), (q, k, v))
-            q = self.inp_q(q)
-            k = self.inp_k(k)
-            v = self.inp_v(v)
-            q, k, v = map(lambda t: rearrange(t, 'b (s h) l d-> b s h l d', h = self.num_head), (q, k, v))
-        
-        q = q* key_dim**(-0.5)
-
-        logits = torch.einsum('... h q d, ... h k d -> ... h q k', q, k)
-
-        if bias is not None:
-            logits = logits + rearrange(bias,  'b h q k -> b () h q k')
-
-        if k_mask is not None:
-            mask_value = torch.finfo(logits.dtype).min
-            k_mask = rearrange(k_mask, 'b s k -> b s () () k')
-            logits = logits.masked_fill(~k_mask.bool(), mask_value)
-
-        weights = F.softmax(logits, dim = -1)
-        weighted_avg = torch.einsum('b s h q k, b s h k d -> b s h q d', weights, v)
-        weighted_avg = rearrange(weighted_avg, 'b s h q d -> b s q (h d)')
-        
-        if self.gating:
-            gate_values = torch.sigmoid(self.gate(q_data))
-            weighted_avg = weighted_avg * gate_values
-
-        output = self.proj_out(weighted_avg)
-
-        return output
-
-class SeqAttentionWithPairBias(nn.Module):
-    def __init__(self, config, num_in_seq_channel, num_in_pair_channel):
-        super().__init__()
-        c = config
-        try:
-            LoRA_conf = c.LoRA
-        except:
-            LoRA_conf = None
-        self.seq_norm = LayerNorm(num_in_seq_channel)
-        self.pair_norm = LayerNorm(num_in_pair_channel)
-        self.proj_pair = Linear(num_in_pair_channel, c.num_head, init='linear', bias = False, config=LoRA_conf)
-
-        self.attn = Attention(
-                input_dim=num_in_seq_channel,
-                key_dim=num_in_seq_channel,
-                value_dim=num_in_seq_channel,
-                output_dim=num_in_seq_channel,
-                num_head=c.num_head,
-                split_first=False,
-                inp_kernels=c.inp_kernels,
-                config=LoRA_conf)
-
-        self.config = config
-
-    def forward(self, seq_act, pair_act, mask):
-        """
-        Arguments:
-            seq_act: (b l c)
-            pair_act: (b l l c)
-            mask: (b l), padding mask
-        Returns:
-            (b l c)
-        """
-        mask = rearrange(mask, 'b l -> b () l')
-        seq_act = self.seq_norm(seq_act)
-        
-        pair_act = self.pair_norm(pair_act)
-        bias = rearrange(self.proj_pair(pair_act), 'b i j h -> b h i j')
-        
-        seq_act = rearrange(seq_act, 'b l c -> b () l c')
-        seq_act = self.attn(q_data=seq_act, bias=bias, k_mask=mask)
-        seq_act = rearrange(seq_act, 'b s l c -> (b s) l c')
-        return seq_act
-
-class Transition(nn.Module):
-    def __init__(self, config, num_in_channel):
-        super().__init__()
-
-        c = config
-        try:
-            LoRA_conf = c.LoRA
-        except:
-            LoRA_conf = None
-        intermediate_channel = num_in_channel * c.num_intermediate_factor
-        self.transition = nn.Sequential(
-                LayerNorm(num_in_channel),
-                Linear(num_in_channel, intermediate_channel, init='linear', config=LoRA_conf),
-                nn.ReLU(),
-                Linear(intermediate_channel, num_in_channel, init='final', config=LoRA_conf),
-                )
-
-    def forward(self, act, mask):
-        return self.transition(act)
-
-# AF2 and ESM-FOLD have different implementations
-# Here we just follow ESMFOLD
-class OuterProductMean(nn.Module):
-    def __init__(self, config, num_in_channel, num_out_channel):
-        super().__init__()
-
-        c = config
-        try:
-            LoRA_conf = c.LoRA
-        except:
-            LoRA_conf = None
-        self.norm = LayerNorm(num_in_channel)
-        self.left_proj = Linear(num_in_channel, c.num_outer_channel, init='linear', config=LoRA_conf)
-        self.right_proj = Linear(num_in_channel, c.num_outer_channel, init='linear', config=LoRA_conf)
-
-        self.out_proj = Linear(2 * c.num_outer_channel, num_out_channel, init='final', config=LoRA_conf)
-
-    def forward(self, act, mask):
-        """
-        act: (b l c)
-        mask: (b l)
-        """
-        mask = rearrange(mask, 'b l -> b l ()')
-        act = self.norm(act)
-        left_act = mask * self.left_proj(act)
-        right_act = mask * self.right_proj(act)
-        
-        prod = left_act[:, None, :, :] * right_act[:, :, None, :]
-        diff = left_act[:, None, :, :] - right_act[:, :, None, :]
-
-        act = torch.cat([prod, diff], dim=-1)
-        act = self.out_proj(act)
-
-        return act
-
-class TriangleMultiplication(nn.Module):
-    def __init__(self, config, num_in_channel):
-        super().__init__()
-        c = config
-        assert c.orientation in ['per_row', 'per_column']
-        try:
-            LoRA_conf = c.LoRA
-        except:
-            LoRA_conf = None
-        self.norm = LayerNorm(num_in_channel)
-
-        self.left_proj = Linear(num_in_channel, c.num_intermediate_channel, init='linear', config=LoRA_conf)
-        self.right_proj = Linear(num_in_channel, c.num_intermediate_channel, init='linear', config=LoRA_conf)
-
-        self.final_norm = LayerNorm(c.num_intermediate_channel)
-        
-        if c.gating:
-            self.left_gate = Linear(num_in_channel, c.num_intermediate_channel, init='gate', config=LoRA_conf)
-            self.right_gate = Linear(num_in_channel, c.num_intermediate_channel, init='gate', config=LoRA_conf)
-            self.final_gate = Linear(num_in_channel, num_in_channel, init='gate', config=LoRA_conf)
-        
-        self.proj_out = Linear(c.num_intermediate_channel, num_in_channel, init='final', config=LoRA_conf)
-
-        
-        if c.inp_kernels:
-            self.inp_left = SpatialDepthWiseInception(c.num_intermediate_channel // c.num_head, c.inp_kernels)
-            self.inp_right = SpatialDepthWiseInception(c.num_intermediate_channel // c.num_head, c.inp_kernels)
-
-        self.config = c
-
-    def forward(self, act, mask):
-        """
-        act: (b l l c)
-        mask: (b l)
-        """
-        c = self.config
-
-        #pair_mask = rearrange(mask, 'b l -> b l () ()') * rearrange(mask, 'b l -> b () l ()')
-        pair_mask = mask[:,:,None,None] * mask[:,None,:,None]
-        
-        act = self.norm(act)
-
-        input_act = act
-
-        left_proj_act = self.left_proj(act)
-        right_proj_act = self.right_proj(act)
-        
-        if c.inp_kernels:
-            if c.orientation == 'per_row':
-                equation = 'b i j (h d) -> b (i h) j d'
-            else:
-                equation = 'b i j (h d) -> b (j h) i d'
-
-            left_proj_act, right_proj_act = map(
-                    lambda t: rearrange(t, equation, h = c.num_head), (left_proj_act, right_proj_act))
-
-            left_proj_act = self.inp_left(left_proj_act)
-            right_proj_act = self.inp_right(right_proj_act)
-            
-            if c.orientation == 'per_row':
-                equation = 'b (i h) j d -> b i j (h d)'
-            else:
-                equation = 'b (j h) i d -> b i j (h d)'
-            
-            left_proj_act, right_proj_act = map(
-                    lambda t: rearrange(t, equation, h = c.num_head), (left_proj_act, right_proj_act))
-        
-        left_proj_act = pair_mask * left_proj_act
-        right_proj_act = pair_mask * right_proj_act
-        
-        if c.gating:
-            left_gate_values = torch.sigmoid(self.left_gate(act))
-            right_gate_values = torch.sigmoid(self.right_gate(act))
-
-            left_proj_act = left_proj_act * left_gate_values
-            right_proj_act = right_proj_act * right_gate_values
-
-        if c.orientation == 'per_row':
-            act = torch.einsum('b i k c, b j k c -> b i j c', left_proj_act, right_proj_act)
-        elif c.orientation == 'per_column':
-            act = torch.einsum('b k i c, b k j c -> b i j c', left_proj_act, right_proj_act)
-        else:
-            raise NotImplementedError(f'{self.orientation} not Implemented')
-
-        act = self.final_norm(act)
-        act = self.proj_out(act)
-        
-        if c.gating:
-            gate_values = torch.sigmoid(self.final_gate(input_act))
-            act = act * gate_values
-
-        return act
-
-class TriangleAttention(nn.Module):
-    def __init__(self, config, num_in_pair_channel):
-        super().__init__()
-        c = config
-
-        assert c.orientation in ['per_row', 'per_column']
-        try:
-            LoRA_conf = c.LoRA
-        except:
-            LoRA_conf = None
-
-        self.norm = LayerNorm(num_in_pair_channel)
-        self.proj_pair = Linear(num_in_pair_channel, c.num_head, init='linear', bias = False, config=LoRA_conf)
-        self.attn = Attention(
-                input_dim=num_in_pair_channel,
-                key_dim=num_in_pair_channel,
-                value_dim=num_in_pair_channel,
-                output_dim=num_in_pair_channel,
-                num_head=c.num_head,
-                gating=c.gating,
-                inp_kernels=c.inp_kernels,
-                config=LoRA_conf)
-
-        self.config = config
-
-    def forward(self, pair_act, seq_mask):
-        '''
-        pair_act: (b l l c)
-        seq_mask: (b l)
-        '''
-        c = self.config
-        if c.orientation == 'per_column':
-            pair_act = rearrange(pair_act, 'b i j c -> b j i c')
-
-        pair_act = self.norm(pair_act)
-        seq_mask = rearrange(seq_mask, 'b l -> b () l')
-
-        # V200_EXACT_TRIANGLE_CHUNKING
-        # Triangle attention is independent along the outer ``s`` axis.  Chunk
-        # only that axis while keeping the full q/k bias matrix. Concatenating
-        # the chunks is algebraically identical to the dense donor call, but the
-        # cubic logits/softmax temporary becomes [B,chunk,H,L,L] instead of
-        # [B,L,H,L,L].  No approximation, sparsification or attention deletion.
-        bias = rearrange(self.proj_pair(pair_act), 'b i j h -> b h i j')
-        chunk = max(1, int(
-            c.chunk_size
-            if self.training
-            else getattr(c, 'eval_chunk_size', c.chunk_size)
-        ))
-        if int(pair_act.shape[1]) > chunk:
-            outs = []
-            for start in range(0, int(pair_act.shape[1]), chunk):
-                stop = min(start + chunk, int(pair_act.shape[1]))
-                pc = pair_act[:, start:stop]
-                outs.append(self.attn(
-                    q_data=pc, k_data=pc, bias=bias, k_mask=seq_mask
-                ))
-            pair_act = torch.cat(outs, dim=1)
-        else:
-            pair_act = self.attn(
-                q_data=pair_act, k_data=pair_act, bias=bias, k_mask=seq_mask
-            )
-
-        if c.orientation == 'per_column':
-            pair_act = rearrange(pair_act, 'b i j c -> b j i c')
-
-        return pair_act
-
-class SeqformerIteration(nn.Module):
-    def __init__(self, config, seq_channel, pair_channel):
-        super().__init__()
-        c = config
-
-        self.seq_attn = SeqAttentionWithPairBias(c.seq_attention_with_pair_bias, seq_channel, pair_channel)
-        self.seq_transition = Transition(c.seq_transition, seq_channel)
-        self.outer_product_mean = OuterProductMean(c.outer_product_mean, seq_channel, pair_channel)
-        
-        self.triangle_multiplication_outgoing = TriangleMultiplication(c.triangle_multiplication_outgoing, pair_channel)
-        self.triangle_multiplication_incoming = TriangleMultiplication(c.triangle_multiplication_incoming, pair_channel)
-        self.triangle_attention_starting_node = TriangleAttention(c.triangle_attention_starting_node, pair_channel)
-        self.triangle_attention_ending_node = TriangleAttention(c.triangle_attention_ending_node, pair_channel)
-        self.pair_transition = Transition(c.pair_transition, pair_channel)
-
-        self.config = config
-
-    def forward(self, seq_act, pair_act, seq_mask):
-        """
-        seq_act: (b l c)
-        pair_act: (b l l c)
-        seq_mask: (b l)
-        """
-        c = self.config
-
-        def dropout_fn(input_act, act, config):
-            if self.training and config.dropout_rate > 0.:
-                if config.shared_dropout:
-                    if config.orientation == 'per_row':
-                        broadcast_dim = 1
-                    else:
-                        broadcast_dim = 2
-                else:
-                    broadcast_dim = None
-                act = apply_dropout(act, config.dropout_rate,
-                        is_training=True, broadcast_dim=broadcast_dim)
-            return input_act + act
-        
-        seq_act = dropout_fn(
-                seq_act, self.seq_attn(seq_act, pair_act, seq_mask), c.seq_attention_with_pair_bias)
-        seq_act = seq_act + self.seq_transition(seq_act, seq_mask)
-        
-        pair_act = pair_act + self.outer_product_mean(seq_act, seq_mask)
-        
-        pair_act = dropout_fn(
-                pair_act, self.triangle_multiplication_outgoing(pair_act, seq_mask), c.triangle_multiplication_outgoing)
-        pair_act = dropout_fn(
-                pair_act, self.triangle_multiplication_incoming(pair_act, seq_mask), c.triangle_multiplication_incoming)
-
-        pair_act = dropout_fn(
-                pair_act, self.triangle_attention_starting_node(pair_act, seq_mask), c.triangle_attention_starting_node)
-
-        pair_act = dropout_fn(
-                pair_act, self.triangle_attention_ending_node(pair_act, seq_mask), c.triangle_attention_ending_node)
-        pair_act = pair_act + self.pair_transition(pair_act, seq_mask)
-        
-        return seq_act, pair_act
-
-class Seqformer(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        c = config
-
-        self.activation_checkpoint = bool(c.activation_checkpoint)
-        self.blocks = nn.ModuleList([
-            SeqformerIteration(
-                c.seqformer,
-                c.seq_channel + c.index_embed_size,
-                c.pair_channel + 2 * c.index_embed_size,
-            )
-            for _ in range(c.seqformer_num_block)
-        ])
-
-    def forward(self, seq_act, pair_act, mask, is_recycling=True):
-        checkpoint_enabled = bool(
-            self.training and not is_recycling and self.activation_checkpoint
-        )
-        for block in self.blocks:
-            block_fn = fn.partial(block, seq_mask=mask)
-            if checkpoint_enabled:
-                # AbFlow v4_l3 has one block, so the donor's historical it>0 gate
-                # never checkpointed anything.  Since V200 the persistent AbFlow
-                # trunk runs once per outer forward (outside the three R05 physical
-                # rounds).  Checkpointing this one block preserves equations/RNG/
-                # gradients while dropping its retained intra-block activations.
-                seq_act, pair_act = checkpoint(
-                    block_fn, seq_act, pair_act, preserve_rng_state=True
-                )
-            else:
-                seq_act, pair_act = block_fn(seq_act, pair_act)
-        return seq_act, pair_act
-
-class SpatialDepthWiseConvolution(nn.Module):
-    def __init__(self, head_dim: int, kernel_size: int = 3):
-        super().__init__()
-        self.kernel_size = kernel_size
-        self.conv = nn.Conv1d(in_channels=head_dim, out_channels=head_dim,
-                kernel_size=(kernel_size,),
-                # padding=(kernel_size - 1,),
-                padding=kernel_size//2,
-                groups=head_dim)
-    
-    def forward(self, x: torch.Tensor):
-        batch_size, heads, seq_len, head_dim = x.shape
-        x = x.permute(0, 1, 3, 2).contiguous()
-        x = x.view(batch_size * heads, head_dim, seq_len)
-        x = self.conv(x)
-        #if self.kernel_size>1:
-        #    x = x[:, :, :-(self.kernel_size - 1)]
-        x = x.view(batch_size, heads, head_dim, seq_len)
-        x = x.permute(0, 1, 3, 2)
-        return x
-
-class SpatialDepthWiseInception(nn.Module):
-    def __init__(self, head_dim, kernels):
-        super().__init__()
-       
-        assert len(kernels) > 1 and  kernels[0] == 1
-
-        self.convs = torch.nn.ModuleList([SpatialDepthWiseConvolution(head_dim, kernel_size=k) for k in kernels[1:]])
-        self.kernels = kernels
-    def forward(self, x):
-        # x: (batch, num_heads, len, head_dim)
-        
-        assert x.shape[1] % len(self.kernels) == 0
-        group_num_head = x.shape[1] // len(self.kernels)
-        
-        outputs = [x[:,:group_num_head]]
-
-        for i, conv in enumerate(self.convs):
-            outputs.append(conv(x[:,group_num_head*(i+1):group_num_head*(i+2)]))
-
-        outputs = torch.cat(outputs, dim=1)
-
-        return outputs
-
-# ===== AbFlow donor boundary-local classes =====
-
-class SinglePairEncoder(nn.Module):
-    """Persistent dense single/pair representation used once per outer R05 step."""
-
-    def __init__(self, representation_config):
-        super().__init__()
-        c = seqformer_config(representation_config, False, False)
-        self.config = c
-        self.use_time_embedding = bool(c.time_embed)
-
-        self.proj_rel_pos = nn.Embedding(
-            c.max_relative_feature * 2 + 2, c.pair_channel
-        )
-        self.pair_embedding = PairEmbedding(c)
-        self.seqformer = Seqformer(c)
-        self.time_embedder = Embedder(c)
-
-    def forward(self, batch, residue_feature):
-        c = self.config
-        seq = batch['seq_t']
-        mask = batch['mask'].bool()
-        seq_pos = batch['residx']
-        antibody_len = batch['antibody_len']
-        B, L = seq.shape
-
-        pos_index = torch.arange(L, device=seq.device)[None, :]
-        ab_mask = (pos_index < antibody_len[:, None]) & mask
-        ag_mask = (~ab_mask) & mask
-
-        seq_act = residue_feature.encode_single_pair_base(seq, ag_mask)
-
-        offset = seq_pos[:, None, :] - seq_pos[:, :, None]
-        rel = torch.clip(
-            offset + c.max_relative_feature,
-            min=0, max=2 * c.max_relative_feature,
-        ) + 1
-        same_group = (
-            (ab_mask[:, :, None] & ab_mask[:, None, :])
-            | (ag_mask[:, :, None] & ag_mask[:, None, :])
-        )
-        pair_act = self.proj_rel_pos(rel.long())
-        pair_act = pair_act * same_group[..., None].to(pair_act.dtype)
-
-        seq_act = seq_act + residue_feature.encode_single_pair_residue(
-            batch,
-            batch['seq_t'],
-            batch['atom14_gt_positions'],
-            batch['atom14_gt_exists'],
-            batch['torsion_angles_sin_cos'],
-        )
-        pair_act = pair_act + self.pair_embedding(
-            batch,
-            batch['seq_t'],
-            batch['atom14_gt_positions'],
-            batch['atom14_gt_exists'],
-        )
-
-
-        if self.use_time_embedding:
-            seq_act, pair_act = self.time_embedder(seq_act, pair_act, batch)
-        else:
-            iz = int(c.index_embed_size)
-            seq_act = torch.cat(
-                [seq_act, seq_act.new_zeros((B, L, iz))], dim=-1
-            )
-            pair_act = torch.cat(
-                [pair_act, pair_act.new_zeros((B, L, L, 2 * iz))],
-                dim=-1,
-            )
-
-        seq_act, pair_act = self.seqformer(
-            seq_act, pair_act, mask=mask, is_recycling=False
-        )
-        return seq_act, pair_act
-
-
-class DistogramHead(nn.Module):
-    """AbX donor distogram head adapted only to the active compact pair width.
-
-    The donor equation is unchanged: a zero-initialized linear projection is
-    symmetrized across (i,j)/(j,i).  ``pair_dim`` is supplied by the selected
-    compact R28/R29/R30 representation rather than hard-coded donor widths.
-    """
-    def __init__(self, pair_dim, num_bins=64, first_break=2.3125, last_break=21.6875):
-        super().__init__()
-        self.input_dim = int(pair_dim)
-        self.num_bins = int(num_bins)
-        if self.input_dim <= 0:
-            raise ValueError(f"distogram pair_dim must be positive, got {self.input_dim}")
-        self.register_buffer(
-            'breaks',
-            torch.linspace(first_break, last_break, steps=self.num_bins - 1),
-            persistent=False,
-        )
-        self.proj = Linear(self.input_dim, self.num_bins, init='final')
-
-    def forward(self, pair):
-        if int(pair.shape[-1]) != self.input_dim:
-            raise RuntimeError(
-                "AbFlow distogram width contract violated: "
-                f"z.shape[-1]={int(pair.shape[-1])}, head.input_dim={self.input_dim}. "
-                "The auxiliary head must use the same active AbFlow width profile as the trunk."
-            )
-        x = self.proj(pair)
-        return (x + rearrange(x, 'b i j c -> b j i c')) * 0.5
-
-
-
-
-__all__ = [
-    "AminoAcidFeature", "SeparatedAminoAcidFeature", "ProteinFeature",
-    "EdgeConstructor", "GMEdgeConstructor", "SeperatedCoordNormalizer",
-    "SinglePairEncoder", "PairEmbedding", "Seqformer", "SeqformerIteration",
-    "OuterProductMean", "DistogramHead", "get_timestep_embedding",
-    "pseudo_beta_fn_v2", "_abflow_ca_fill_observed_mask",
-    "_atom14_chemical_mask", "_atom14_exists_from_seq",
-    "_torsions_from_atom14", "seqformer_config", "_knn_edges",
-]

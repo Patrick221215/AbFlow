@@ -41,24 +41,6 @@ class TrainConfig:
         return str(self.__class__) + ': ' + str(self.__dict__)
 
 
-def _normalize_optional_path(value):
-    """Normalize optional path values crossing JSON -> shell -> argparse.
-
-    Historical launchers may serialize an empty JSON string as the literal
-    tokens ``''`` or ``""``.  Those are scratch sentinels, not paths.
-    Strip only whole-string matching quotes and common null sentinels; real
-    non-empty checkpoint paths are left unchanged.
-    """
-    if value is None:
-        return ""
-    text = str(value).strip()
-    while len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
-        text = text[1:-1].strip()
-    if text.lower() in {"", "none", "null"}:
-        return ""
-    return text
-
-
 class Trainer:
     def __init__(self, model, train_loader, valid_loader, config):
         self.model = model
@@ -76,7 +58,7 @@ class Trainer:
 
         # log / run directory
         # Strict resume: continue writing into the original version directory.
-        resume_checkpoint = _normalize_optional_path(getattr(self.config, "resume_checkpoint", ""))
+        resume_checkpoint = str(getattr(self.config, "resume_checkpoint", "") or "").strip()
         if resume_checkpoint:
             resume_checkpoint = os.path.abspath(resume_checkpoint)
             if not os.path.isfile(resume_checkpoint):
@@ -97,25 +79,8 @@ class Trainer:
             self.model_dir = ckpt_dir
             self.config.resume_checkpoint = resume_checkpoint
         else:
-            # The formal R28-R30 launcher sets one explicit version for the whole
-            # torchrun job.  Without this, two DDP ranks can race in _get_version():
-            # rank0 observes no directory and chooses version_0 while rank1 sees
-            # the just-created version_0 and chooses version_1.
-            fixed_version = str(os.environ.get("ABFLOW_FIXED_VERSION", "") or "").strip()
-            if fixed_version:
-                try:
-                    self.version = int(fixed_version)
-                except ValueError as exc:
-                    raise ValueError(
-                        f"ABFLOW_FIXED_VERSION must be a non-negative integer, got {fixed_version!r}"
-                    ) from exc
-                if self.version < 0:
-                    raise ValueError("ABFLOW_FIXED_VERSION must be non-negative")
-            else:
-                self.version = self._get_version()
-            self.config.save_dir = os.path.join(
-                self.config.save_dir, f'version_{self.version}'
-            )
+            self.version = self._get_version()
+            self.config.save_dir = os.path.join(self.config.save_dir, f'version_{self.version}')
             self.model_dir = os.path.join(self.config.save_dir, 'checkpoint')
 
         self.writer = None
@@ -127,17 +92,9 @@ class Trainer:
         self.last_valid_metric = None
         self.topk_ckpt_map = []
         self.patience = self.config.patience
-
-        # Runtime-only numerical diagnostics.  These values are deliberately
-        # absent from checkpoints; they never affect optimizer/scheduler state.
-        self._grad_norm_overflow_epoch = -1
-        self._grad_norm_overflow_count = 0
-        self._grad_norm_overflow_log_limit = max(
-            1, int(os.environ.get("ABFLOW_GRAD_OVERFLOW_LOG_LIMIT", "3") or 3)
-        )
         
         self.last_state_path = None
-        resume_checkpoint = _normalize_optional_path(getattr(self.config, "resume_checkpoint", ""))
+        resume_checkpoint = str(getattr(self.config, "resume_checkpoint", "") or "").strip()
         if resume_checkpoint and os.path.basename(resume_checkpoint).startswith("last_step"):
             self.last_state_path = resume_checkpoint
         self.ema = None
@@ -210,318 +167,43 @@ class Trainer:
         module_to_save = self.model.module if self.local_rank == 0 else self.model
         torch.save(module_to_save, save_path)
 
-    def _runtime_guard_steps(self):
-        return max(0, int(os.environ.get("ABFLOW_GRAD_FINITE_GUARD_STEPS", "8") or 0))
-
-    def _autograd_anomaly_steps(self):
-        # Diagnostic-only.  The first full forward+backward can be wrapped in PyTorch's
-        # anomaly detector so the first autograd Function returning NaN is
-        # reported with its forward traceback.  No optimizer/loss/model math is
-        # changed, and the default is zero outside the V196 diagnostic configs.
-        return max(0, int(os.environ.get("ABFLOW_AUTOGRAD_ANOMALY_STEPS", "0") or 0))
-
-    def _backward_with_optional_anomaly(self, loss):
-        # V197: anomaly mode is enabled before the forward in _train_epoch so
-        # PyTorch can report the forward call site of the first bad backward op.
-        loss.backward()
-
-    def _train_memory_log(self, stage, device):
-        """Early-step CUDA memory audit; diagnostic only, no training semantics."""
-        if (
-            stage != "after_backward"
-            or not torch.cuda.is_available()
-            or int(self.global_step) >= self._runtime_guard_steps()
-            or not self._is_main_proc()
-        ):
-            return
-        dev = torch.device(device) if not isinstance(device, torch.device) else device
-        alloc = torch.cuda.memory_allocated(dev) / (1024 ** 3)
-        reserved = torch.cuda.memory_reserved(dev) / (1024 ** 3)
-        peak_alloc = torch.cuda.max_memory_allocated(dev) / (1024 ** 3)
-        peak_reserved = torch.cuda.max_memory_reserved(dev) / (1024 ** 3)
-        print_log(
-            f"[RuntimeMemory] epoch={self.epoch} step={self.global_step} "
-            f"alloc={alloc:.3f}GiB reserved={reserved:.3f}GiB "
-            f"peak_alloc={peak_alloc:.3f}GiB peak_reserved={peak_reserved:.3f}GiB"
-        )
-
-    def _nonfinite_grad_summary(self, limit=24):
-        """Failure-only forensic summary; never repairs or masks gradients."""
-        from collections import Counter
-        bad, groups = [], Counter()
-        nan_elems = inf_elems = 0
-        for name, param in self.model.named_parameters():
-            grad = param.grad
-            if grad is None:
-                continue
-            finite = torch.isfinite(grad)
-            if bool(finite.all().detach().cpu().item()):
-                continue
-            bad.append(name)
-            groups['.'.join(name.split('.')[:3])] += 1
-            nan_elems += int(torch.isnan(grad).sum().detach().cpu().item())
-            inf_elems += int(torch.isinf(grad).sum().detach().cpu().item())
-        print_log(
-            f"[NonFiniteGradSummary] epoch={self.epoch} step={self.global_step} "
-            f"rank={self.local_rank} bad_params={len(bad)} nan_elems={nan_elems} "
-            f"inf_elems={inf_elems} groups={groups.most_common(12)} "
-            f"params={bad[:limit]}"
-        )
-        return bad
-
-    @staticmethod
-    def _stable_tensor_l2_norm(tensor):
-        """L2 norm with scale separation so finite FP32 values cannot overflow.
-
-        This is algebraically the usual Euclidean norm.  Only the reduction is
-        performed in a numerically stable form; no gradient value is repaired or
-        altered here.
-        """
-        value = tensor.detach().float()
-        if value.numel() == 0:
-            return torch.zeros((), dtype=torch.float64, device=value.device)
-        max_abs = value.abs().amax()
-        if not bool(torch.isfinite(max_abs).detach().cpu().item()):
-            return max_abs.to(torch.float64)
-        if float(max_abs.detach().cpu().item()) == 0.0:
-            return max_abs.to(torch.float64)
-        scaled = value / max_abs
-        scaled_sq = scaled.square().sum(dtype=torch.float64)
-        return max_abs.to(torch.float64) * torch.sqrt(scaled_sq)
-
-    def _stable_finite_grad_l2_norm(self):
-        """Stable global L2 norm for already-verified finite gradients."""
-        grads = [
-            p.grad for p in self.model.parameters()
-            if p.grad is not None
-        ]
-        if not grads:
-            device = next(self.model.parameters()).device
-            return torch.zeros((), dtype=torch.float64, device=device)
-
-        # One global scale gives the exact same norm while preventing g^2 from
-        # overflowing FP32.  The scalar sum is accumulated in FP64.
-        maxima = torch.stack([g.detach().float().abs().amax() for g in grads])
-        global_max = maxima.amax()
-        if not bool(torch.isfinite(global_max).detach().cpu().item()):
-            return global_max.to(torch.float64)
-        if float(global_max.detach().cpu().item()) == 0.0:
-            return global_max.to(torch.float64)
-
-        total_scaled_sq = torch.zeros(
-            (), dtype=torch.float64, device=global_max.device
-        )
-        for grad in grads:
-            scaled = grad.detach().float() / global_max
-            total_scaled_sq = total_scaled_sq + scaled.square().sum(dtype=torch.float64)
-        return global_max.to(torch.float64) * torch.sqrt(total_scaled_sq)
-
-    def _finite_grad_magnitude_summary(self, limit=12):
-        """Failure-only ranking of huge but finite parameter gradients."""
-        rows = []
-        for name, param in self.model.named_parameters():
-            grad = param.grad
-            if grad is None or grad.numel() == 0:
-                continue
-            finite = torch.isfinite(grad)
-            if not bool(finite.all().detach().cpu().item()):
-                continue
-            norm64 = self._stable_tensor_l2_norm(grad)
-            norm = float(norm64.detach().cpu().item())
-            max_abs = float(grad.detach().float().abs().amax().cpu().item())
-            rms = norm / max(float(grad.numel()) ** 0.5, 1.0)
-            rows.append((norm, name, max_abs, rms, int(grad.numel())))
-        rows.sort(key=lambda x: x[0], reverse=True)
-        top = rows[:max(1, int(limit))]
-        text = [
-            {
-                'name': name,
-                'l2': norm,
-                'absmax': max_abs,
-                'rms': rms,
-                'numel': numel,
-            }
-            for norm, name, max_abs, rms, numel in top
-        ]
-        print_log(
-            f"[FiniteGradMagnitude] epoch={self.epoch} step={self.global_step} "
-            f"rank={self.local_rank} top={text}"
-        )
-        return text
-
-    def _stable_clip_finite_grad_norm(self, max_norm):
-        """Apply mathematically intended clipping after FP32 norm overflow.
-
-        Preconditions: every gradient element is finite.  The only recovered
-        condition is a reduction overflow in ``clip_grad_norm_``.
-        """
-        total_norm = self._stable_finite_grad_l2_norm()
-        if not bool(torch.isfinite(total_norm).detach().cpu().item()):
-            raise FloatingPointError(
-                "stable FP64 gradient norm is non-finite despite finite elements"
-            )
-        denom = total_norm + total_norm.new_tensor(1.0e-12)
-        clip_coef = total_norm.new_tensor(float(max_norm)) / denom
-        clip_value = float(clip_coef.detach().cpu().item())
-        if clip_value < 1.0:
-            for param in self.model.parameters():
-                if param.grad is not None:
-                    param.grad.mul_(clip_coef.to(
-                        device=param.grad.device, dtype=param.grad.dtype
-                    ))
-        return total_norm, min(1.0, clip_value)
-
-    def _checked_clip_grad_norm(self):
-        """Parent grad clipping with stable recovery for finite-norm overflow."""
-        max_norm = self.config.grad_clip
-        if max_norm is None:
-            return None
-        try:
-            total_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), max_norm, error_if_nonfinite=True
-            )
-        except TypeError:
-            # torch versions without error_if_nonfinite: localize first, then clip.
-            bad = [
-                name for name, param in self.model.named_parameters()
-                if param.grad is not None
-                and not bool(torch.isfinite(param.grad).all().detach().cpu().item())
-            ][:16]
-            if bad:
-                print_log(
-                    f"[NonFiniteGrad] epoch={self.epoch} step={self.global_step} "
-                    f"rank={self.local_rank} params={bad}"
-                )
-                raise FloatingPointError("non-finite gradient before optimizer.step")
-            total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
-        except RuntimeError as exc:
-            bad = self._nonfinite_grad_summary(limit=24)
-            message = str(exc).lower()
-            norm_overflow = (
-                not bad
-                and "total norm" in message
-                and "non-finite" in message
-            )
-            if not norm_overflow:
-                print_log(
-                    f"[NonFiniteGrad] epoch={self.epoch} step={self.global_step} "
-                    f"rank={self.local_rank} params={bad[:16] or ['<unable-to-localize>']}"
-                )
-                raise FloatingPointError("non-finite gradient before optimizer.step") from exc
-
-            # Every gradient element is finite; only the FP32 norm reduction
-            # overflowed.  Recompute the same Euclidean norm stably and apply
-            # the configured clipping instead of aborting a mathematically
-            # valid optimizer step.
-            total_norm, clip_coef = self._stable_clip_finite_grad_norm(max_norm)
-            current_epoch = int(self.epoch)
-            if self._grad_norm_overflow_epoch != current_epoch:
-                self._grad_norm_overflow_epoch = current_epoch
-                self._grad_norm_overflow_count = 0
-            self._grad_norm_overflow_count += 1
-            if self._grad_norm_overflow_count <= self._grad_norm_overflow_log_limit:
-                print_log(
-                    f"[GradientNormOverflowRecovered] epoch={self.epoch} "
-                    f"step={self.global_step} rank={self.local_rank} "
-                    f"stable_preclip_norm={float(total_norm.detach().cpu().item()):.6e} "
-                    f"clip={float(max_norm):.6g} clip_coef={clip_coef:.6e} "
-                    f"ordinal={self._grad_norm_overflow_count}/{self._grad_norm_overflow_log_limit}"
-                )
-                self._finite_grad_magnitude_summary(limit=12)
-            return total_norm
-
-        if self._is_main_proc() and int(self.global_step) < self._runtime_guard_steps():
-            print_log(
-                f"[GradFinite] epoch={self.epoch} step={self.global_step} "
-                f"preclip_total_norm={float(total_norm.detach().cpu().item()):.6g} "
-                f"clip={float(max_norm):.6g}"
-            )
-        return total_norm
-
-    def _check_parameters_finite_after_step(self):
-        """Early-step optimizer guard; healthy path performs one host sync."""
-        if int(self.global_step) >= self._runtime_guard_steps():
-            return
-        named = [(name, p) for name, p in self.model.named_parameters() if p.requires_grad]
-        if not named:
-            return
-        flags = torch.stack([torch.isfinite(param.detach()).all() for _, param in named])
-        if not bool(flags.all().detach().cpu().item()):
-            bad_mask = (~flags).detach().cpu().tolist()
-            bad = [name for (name, _), is_bad in zip(named, bad_mask) if is_bad][:16]
-            print_log(
-                f"[NonFiniteParamAfterStep] epoch={self.epoch} step={self.global_step} "
-                f"rank={self.local_rank} params={bad}"
-            )
-            raise FloatingPointError("optimizer produced non-finite parameters")
-        if self._is_main_proc():
-            print_log(f"[ParamFinite] epoch={self.epoch} step={self.global_step} status=PASS")
-
     def _train_epoch(self, device):
         # import ipdb; ipdb.set_trace()
         if self.train_loader.sampler is not None and self.local_rank != -1:
             self.train_loader.sampler.set_epoch(self.epoch)
 
-        _tqdm_on = str(os.environ.get("ABFLOW_TQDM", "on")).strip().lower() in {
-            "1", "true", "yes", "y", "on"
-        }
         t_iter = tqdm(
             self.train_loader,
             dynamic_ncols=True,
             mininterval=float(getattr(self.config, "tqdm_mininterval", 5.0)),
             leave=False,
-        ) if self._is_main_proc() and _tqdm_on else self.train_loader
+        ) if self._is_main_proc() else self.train_loader
 
         for batch in t_iter:
             batch = self.to_device(batch, device)
 
             self.optimizer.zero_grad(set_to_none=True)
-            if (
-                torch.cuda.is_available()
-                and int(self.global_step) < self._runtime_guard_steps()
-            ):
-                torch.cuda.reset_peak_memory_stats(device)
 
-            anomaly_on = int(self.global_step) < self._autograd_anomaly_steps()
-            if anomaly_on:
-                print_log(
-                    f"[AutogradAnomaly] epoch={self.epoch} step={self.global_step} "
-                    f"rank={self.local_rank} status=ON scope=forward+backward detect_nan=1"
-                )
-                torch.autograd.set_detect_anomaly(True)
-            try:
-                with self._amp_autocast(device):
-                    loss = self.train_step(batch, self.global_step)
+            with self._amp_autocast(device):
+                loss = self.train_step(batch, self.global_step)
 
-                if not bool(torch.isfinite(loss.detach()).all().cpu().item()):
-                    print_log(
-                        f"[NonFiniteLoss] epoch={self.epoch} step={self.global_step} "
-                        f"rank={self.local_rank} loss={loss.detach()}"
+            if self.grad_scaler is not None:
+                self.grad_scaler.scale(loss).backward()
+                if self.config.grad_clip is not None:
+                    self.grad_scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.config.grad_clip
                     )
-                    raise FloatingPointError("non-finite training loss before backward")
-                self._train_memory_log("after_forward", device)
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
+            else:
+                loss.backward()
+                if self.config.grad_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.config.grad_clip
+                    )
+                self.optimizer.step()
 
-                if self.grad_scaler is not None:
-                    scaled_loss = self.grad_scaler.scale(loss)
-                    self._backward_with_optional_anomaly(scaled_loss)
-                    if self.config.grad_clip is not None:
-                        self.grad_scaler.unscale_(self.optimizer)
-                        self._checked_clip_grad_norm()
-                    self._train_memory_log("after_backward", device)
-                    self.grad_scaler.step(self.optimizer)
-                    self.grad_scaler.update()
-                else:
-                    self._backward_with_optional_anomaly(loss)
-                    if self.config.grad_clip is not None:
-                        self._checked_clip_grad_norm()
-                    self._train_memory_log("after_backward", device)
-                    self.optimizer.step()
-            finally:
-                if anomaly_on:
-                    torch.autograd.set_detect_anomaly(False)
-
-            self._check_parameters_finite_after_step()
-            self._train_memory_log("after_optimizer", device)
             after_optimizer_step(self)
 
             if self._should_log_step(self.global_step) and hasattr(t_iter, 'set_postfix'):
@@ -547,15 +229,12 @@ class Trainer:
         self.model.eval()
         with validation_ema(self):
             with torch.no_grad():
-                _tqdm_on = str(os.environ.get("ABFLOW_TQDM", "on")).strip().lower() in {
-                    "1", "true", "yes", "y", "on"
-                }
                 t_iter = tqdm(
                     self.valid_loader,
                     dynamic_ncols=True,
                     mininterval=float(getattr(self.config, "tqdm_mininterval", 5.0)),
                     leave=False,
-                ) if self._is_main_proc() and _tqdm_on else self.valid_loader
+                ) if self._is_main_proc() else self.valid_loader
                 for batch in t_iter:
                     batch = self.to_device(batch, device)
                     with self._amp_autocast(device):
@@ -676,61 +355,13 @@ class Trainer:
             self._load_topk_checkpoint_map()
 
         if local_rank != -1:
-            def _env_bool(name, default=False):
-                raw = str(os.environ.get(name, 'on' if default else 'off')).strip().lower()
-                if raw in {'1', 'true', 'yes', 'y', 'on'}:
-                    return True
-                if raw in {'0', 'false', 'no', 'n', 'off'}:
-                    return False
-                raise ValueError(f'{name} must be on/off, got {raw!r}')
-
-            find_unused = _env_bool('ABFLOW_DDP_FIND_UNUSED_PARAMETERS', False)
-            static_graph = _env_bool('ABFLOW_DDP_STATIC_GRAPH', False)
-            # The formal relational trunk owns its checkpoint setting in JSON.
-            # Read the live model instead of historical ABFLOW_ABX_* switches.
-            native_trunk = getattr(self.model, 'native_trunk', None)
-            trunk_cfg = getattr(getattr(native_trunk, 'trunk', None), 'config', None)
-            relational_ckpt = bool(getattr(trunk_cfg, 'activation_checkpoint', False))
-
-            if static_graph and find_unused:
-                raise RuntimeError(
-                    'DDP static_graph=True requires find_unused_parameters=False.'
-                )
-            if relational_ckpt and find_unused:
-                raise RuntimeError(
-                    'PyTorch 1.11 re-entrant relational checkpointing requires '
-                    'find_unused_parameters=False.'
-                )
-            if relational_ckpt and not static_graph:
-                raise RuntimeError(
-                    'PyTorch 1.11 formal relational checkpointing requires '
-                    'DDP static_graph=True.'
-                )
-
+            print_log(f'Using data parallel, local rank {local_rank}, all {device_ids}')
             self.model = torch.nn.parallel.DistributedDataParallel(
                 self.model,
                 device_ids=[local_rank],
                 output_device=local_rank,
                 gradient_as_bucket_view=True,
-                find_unused_parameters=find_unused,
             )
-
-            if static_graph:
-                if not hasattr(self.model, '_set_static_graph'):
-                    raise RuntimeError(
-                        'DDP static_graph=True was requested, but this torch DDP '
-                        'implementation does not expose _set_static_graph().'
-                    )
-                self.model._set_static_graph()
-
-            if self._is_main_proc():
-                print_log(
-                    '[DDPGraph] '
-                    f'world={len(device_ids)} '
-                    f'find_unused={int(find_unused)} '
-                    f'static_graph={int(static_graph)} '
-                    f'relational_checkpoint={int(relational_ckpt)}'
-                )
         else:
             print_log(f'training on {device_ids}')
 
